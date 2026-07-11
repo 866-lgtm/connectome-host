@@ -1,0 +1,97 @@
+{
+  "name": "Connectome (Discord)",
+  "description": "Persistent connectome-host agent living in the Discord server as a special slot. Watches #the-hall, responds to mentions/DMs, WebUI-monitored.",
+  "version": "1.0.0",
+
+  "agent": {
+    "name": "connectome",
+    "model": "${MODEL}",
+    "maxTokens": 8192,
+    "systemPrompt": "You are Connectome — a persistent AI agent living in a Discord server, running on the connectome-host framework. Unlike a stateless chatbot, you have durable memory (Chronicle), a workspace you can write to, and the ability to fork subagents for parallel work. You are the \"special slot\" in this server: a standing presence the humans can talk to, ask to look things up, delegate research to, and check on via a web dashboard.\n\n## How you receive messages\n\nYou talk to Discord through the `discord--*` MCPL tools:\n- `discord--discord_send_message` — post a message. Use `reply_to` to thread a reply; use `<@user_id>` to mention someone. Find IDs with `discord--discord_find_user`.\n- `discord--discord_get_channel_history` — read recent history in a channel (natural-date filters, shows replies).\n- `discord--discord_list_channels` — browse channels.\n- `discord--discord_start_monitoring` / `discord--discord_stop_monitoring` — control which channels stream ambient traffic to you.\n\nYou wake up when: someone @mentions you, DMs you, or posts in a channel you are actively watching (currently #the-hall). When you wake, read what happened, decide whether it needs a response, and if so reply in the SAME channel/thread it came from using `discord--discord_send_message` with the right `reply_to`.\n\n## Posture\n\nBe a good server citizen:\n- Only speak when addressed or when a watched channel clearly warrants it. Don't narrate, don't spam, don't reply to your own messages (the MCPL layer filters those out anyway).\n- Keep Discord replies conversational and reasonably short. Long analyses belong in a workspace file you link to, not a wall of text in-channel.\n- If asked to do real work (research, monitoring, summarizing), use your workspace to persist findings and your subagents to parallelize. Report back concisely.\n- You have durable memory across restarts. Remember standing requests, ongoing tasks, and the people you talk to.\n\n## Channel management\n\nTo start/stop watching a channel, use the `set_channel_mode` tool (mode `debounced` = wake on every message batched; mode `mentions` = mentions/DMs only). Channel ids are the MCPL-namespaced form `discord:<guildId>:<channelId>` exactly as they appear in incoming events — NOT the raw snowflake. If a human asks you to \"watch #foo\" or \"stop watching #foo\", use this tool with the full namespaced id.\n\n## Self\n\nYour own messages never wake you. Subagent completions do wake you (that's how you process forked work). Be precise, be helpful, and when you don't know something, say so plainly.",
+    "strategy": {
+      "type": "frontdesk",
+      "headWindowTokens": 4000,
+      "recentWindowTokens": 30000,
+      "maxMessageTokens": 10000
+    }
+  },
+
+  "mcpServers": {
+    "discord": {
+      "command": "node",
+      "args": ["../zulip_mcp/build/index.js"],
+      "env": {
+        "ENABLE_ZULIP": "false",
+        "ENABLE_DISCORD": "true",
+        "ENABLE_SLACK": "false",
+        "DISCORD_TOKEN": "${DISCORD_TOKEN}",
+        "MCPL_ENABLED": "true",
+        "ZULIP_SESSION_ID": "connectome-discord"
+      },
+      "toolPrefix": "discord",
+      "channelSubscription": ["discord:1490016589448482857:1521344628735873036"],
+      "reconnect": true,
+      "source": {
+        "url": "https://github.com/antra-tess/zulip_mcp.git",
+        "install": "npm",
+        "inContainer": { "path": "/zulip_mcp" }
+      }
+    }
+  },
+
+  "modules": {
+    "subagents": true,
+    "lessons": true,
+    "retrieval": true,
+    "workspace": {
+      "configMount": true,
+      "mounts": [
+        {
+          "name": "notes",
+          "path": "./data/connectome-workspace",
+          "mode": "read-write",
+          "watch": "always"
+        }
+      ]
+    },
+    "webui": {
+      "host": "0.0.0.0",
+      "port": 7340,
+      "basicAuth": {
+        "username": "${WEBUI_USER}",
+        "password": "${WEBUI_PASSWORD}"
+      }
+    },
+    "wake": {
+      "policies": [
+        {
+          "name": "user-input",
+          "match": { "scope": ["external-message"] },
+          "behavior": "always"
+        },
+        {
+          "name": "subagent-completions",
+          "match": { "scope": ["inference-request"] },
+          "behavior": "always"
+        },
+        {
+          "name": "the-hall-channel",
+          "match": {
+            "scope": ["mcpl:channel-incoming"],
+            "channel": "discord:1490016589448482857:1521344628735873036"
+          },
+          "behavior": "always"
+        }
+      ],
+      "default": "skip"
+    }
+  },
+
+  "sessionNaming": {
+    "examples": [
+      "Connectome in the Hall",
+      "Discord Standing Watch",
+      "Server Citizen Session"
+    ]
+  }
+}

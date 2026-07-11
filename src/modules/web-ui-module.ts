@@ -884,9 +884,12 @@ export class WebUiModule implements Module {
         : (typeof sysRaw === 'string' ? sysRaw : undefined);
 
       let exactTotalTokens: number | null = null;
-      const countModel = process.env.COUNT_TOKENS_MODEL || 'anthropic/claude-opus-4.5';
-      let countSource = 'count_tokens';
-      try {
+      const provider = process.env.LLM_PROVIDER ?? 'anthropic';
+      const countModel = process.env.COUNT_TOKENS_MODEL || (process.env.MODEL ?? 'anthropic/claude-opus-4.5');
+      let countSource = provider === 'openai-compatible'
+        ? 'unavailable_openai_compatible'
+        : 'count_tokens';
+      if (provider !== 'openai-compatible') try {
         const base = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
         const res = await fetch(base + '/v1/messages/count_tokens', {
           method: 'POST',

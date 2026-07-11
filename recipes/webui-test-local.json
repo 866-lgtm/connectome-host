@@ -1,0 +1,19 @@
+{
+  "name": "WebUI Test (loopback)",
+  "description": "Minimal recipe for WebUI smoke testing, bound to 127.0.0.1 (no auth needed)",
+  "agent": {
+    "name": "agent",
+    "systemPrompt": "You are a helpful assistant for WebUI testing."
+  },
+  "modules": {
+    "subagents": false,
+    "lessons": false,
+    "retrieval": false,
+    "wake": false,
+    "workspace": false,
+    "webui": {
+      "host": "127.0.0.1",
+      "port": 7340
+    }
+  }
+}
