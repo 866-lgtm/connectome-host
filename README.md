@@ -7,7 +7,7 @@ Built on the Connectome stack: [@animalabs/agent-framework](https://github.com/a
 ## Quick start
 
 ```bash
-# Prerequisites: Bun, Rust toolchain, Anthropic API key
+# Prerequisites: Bun, Rust toolchain, and provider credentials
 export ANTHROPIC_API_KEY=sk-ant-...
 
 bun install
@@ -104,7 +104,7 @@ See [`recipes/SETUP.md`](recipes/SETUP.md) for a detailed setup guide for the kn
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+ and [Bun](https://bun.sh/) runtime
-- An Anthropic API key
+- Anthropic credentials, or an OpenAI-compatible Chat Completions endpoint
 
 ### Install
 
@@ -116,9 +116,28 @@ npm install
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
+| `LLM_PROVIDER` | `anthropic` | `anthropic` or `openai-compatible` |
+| `ANTHROPIC_API_KEY` | — | Anthropic API key (required in Anthropic mode unless using `ANTHROPIC_AUTH_TOKEN`) |
+| `ANTHROPIC_AUTH_TOKEN` | — | Anthropic OAuth/Bearer token; takes precedence over the API key |
+| `ANTHROPIC_BASE_URL` | Anthropic API | Optional Anthropic-compatible base URL |
+| `OPENAI_BASE_URL` | — | Required in OpenAI-compatible mode; include `/v1` when the endpoint expects it |
+| `OPENAI_API_KEY` | — | Optional bearer key for the OpenAI-compatible endpoint |
 | `MODEL` | from recipe or `claude-opus-4-6` | Override model |
 | `DATA_DIR` | `./data` | Session and recipe storage |
+
+OpenAI-compatible mode uses the Chat Completions protocol (`POST /chat/completions`):
+
+```bash
+export LLM_PROVIDER=openai-compatible
+export OPENAI_BASE_URL=https://api.example.com/v1
+export OPENAI_API_KEY=...
+export MODEL=provider/model-name
+bun src/index.ts
+```
+
+If an OpenAI-compatible endpoint does not expose token counting, the WebUI
+context-debug endpoint reports exact token counting as unavailable instead of
+calling Anthropic's `/v1/messages/count_tokens` endpoint.
 
 ## Running
 
