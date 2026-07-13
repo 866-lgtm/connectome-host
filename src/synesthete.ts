@@ -47,7 +47,7 @@ export async function generateSessionName(
       ],
       system: buildNamingPrompt(examples),
       config: {
-        model: 'claude-haiku-4-5-20251001',
+        model: process.env.MODEL || 'claude-haiku-4-5-20251001',
         maxTokens: 30,
         temperature: 0.8,
       },
