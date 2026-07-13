@@ -38,6 +38,11 @@
         "install": "npm",
         "inContainer": { "path": "/zulip_mcp" }
       }
+    },
+    "playwright": {
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--headless", "--browser", "chromium"],
+      "toolPrefix": "web"
     }
   },
 
