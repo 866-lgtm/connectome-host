@@ -18,10 +18,17 @@
  *   DATA_DIR            - Data directory for sessions (default: ./data)
  */
 
-import { Membrane, NativeFormatter } from '@animalabs/membrane';
+import {
+  Membrane,
+  NativeFormatter,
+  OpenAIResponsesAPIAdapter,
+  OpenAIResponsesFormatter,
+} from '@animalabs/membrane';
+import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { CallLedger } from './call-ledger.js';
 import { createAdapter } from './provider.js';
 import { SettingsModule } from './modules/settings-module.js';
-import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, type Module, type MountConfig } from '@animalabs/agent-framework';
+import { AgentFramework, AutobiographicalStrategy, PassthroughStrategy, WorkspaceModule, resolveTimeZone, type Module, type MountConfig } from '@animalabs/agent-framework';
 import { resolve, join, basename } from 'node:path';
 import { appendFile, mkdir, stat, rename } from 'node:fs/promises';
 import { readFileSync, existsSync } from 'node:fs';
@@ -37,6 +44,7 @@ import { ActivityModule } from './modules/activity-module.js';
 import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
 import { WebUiModule } from './modules/web-ui-module.js';
+import { ObserversModule } from './modules/observers-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
 import { loadMcplServers, applyAgentOverlay, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { SessionManager } from './session-manager.js';
@@ -59,6 +67,11 @@ const headless = process.argv.includes('--headless');
 const noTui = !headless && (process.argv.includes('--no-tui') || !process.stdin.isTTY);
 
 const config = {
+  apiKey: process.env.ANTHROPIC_API_KEY,
+  // OAuth/Bearer token (e.g. a Claude subscription token). When set, it takes
+  // precedence over the API key so requests never carry both auth schemes.
+  authToken: process.env.ANTHROPIC_AUTH_TOKEN,
+  openaiApiKey: process.env.OPENAI_API_KEY,
   model: process.env.MODEL,
   dataDir: process.env.DATA_DIR || './data',
 };
@@ -131,14 +144,16 @@ async function createFramework(
   recipe: Recipe,
   agentName: string,
   settingsModule: SettingsModule,
+  callLedger: CallLedger | null,
 ): Promise<AgentFramework> {
   const model = config.model || recipe.agent.model || 'claude-opus-4-6';
   const modules = recipe.modules ?? {};
+  const timeZone = resolveTimeZone(recipe.agent.timezone);
 
   // -- Build module list --
   // SettingsModule is constructed in main() (before the adapter, so the
   // adapter can read its state for cross-cutting concerns like reasoning).
-  const moduleInstances: Module[] = [new TuiModule(), new TimeModule(), settingsModule];
+  const moduleInstances: Module[] = [new TuiModule(), new TimeModule(timeZone), settingsModule];
 
   // Subagents
   let subagentModule: SubagentModule | null = null;
@@ -162,10 +177,11 @@ async function createFramework(
 
   // Fleet (cross-process child orchestration). Opt-in via recipe.
   if (modules.fleet === true) {
-    moduleInstances.push(new FleetModule());
+    moduleInstances.push(new FleetModule({ timeZone }));
   } else if (modules.fleet && typeof modules.fleet === 'object') {
     const fleetCfg = modules.fleet;
     const fleetModuleConfig: FleetModuleConfig = {};
+    fleetModuleConfig.timeZone = timeZone;
     if (fleetCfg.children) {
       fleetModuleConfig.autoStart = fleetCfg.children.map((c) => {
         const entry: NonNullable<FleetModuleConfig['autoStart']>[number] = {
@@ -303,7 +319,7 @@ async function createFramework(
   // ability to spawn arbitrary commands via mcpl_deploy; see recipe.ts).
   let mcplAdminModule: McplAdminModule | null = null;
   if (modules.mcplAdmin === true) {
-    mcplAdminModule = new McplAdminModule();
+    mcplAdminModule = new McplAdminModule({ timeZone });
     moduleInstances.push(mcplAdminModule);
   }
 
@@ -311,13 +327,22 @@ async function createFramework(
   let webUiModule: WebUiModule | null = null;
   if (modules.webui !== undefined && modules.webui !== false) {
     const webuiConfig = typeof modules.webui === 'object' ? modules.webui : {};
+    // Observer grants (docs/observability.md): data/observers.json by
+    // default, overridable via OBSERVERS_FILE. The feature is inert until
+    // the file holds at least one grant. The companion ObserversModule
+    // gives the agent grant/revoke tools over the same file — interiority
+    // access is the agent's to give.
+    const observersPath = process.env.OBSERVERS_FILE || resolve(config.dataDir, 'observers.json');
     webUiModule = new WebUiModule({
       port: webuiConfig.port,
       host: webuiConfig.host,
       basicAuth: webuiConfig.basicAuth,
       allowedOrigins: webuiConfig.allowedOrigins,
+      observersPath,
+      ...(callLedger ? { callLedger } : {}),
     });
     moduleInstances.push(webUiModule);
+    moduleInstances.push(new ObserversModule({ path: observersPath }));
   }
 
   // -- Build MCP server list --
@@ -369,7 +394,12 @@ async function createFramework(
   // Apply the agent overlay (mcpl-servers.agent.json): servers the agent
   // deployed for itself load unconditionally (no recipe opt-in), and
   // tombstones suppress recipe/file servers the agent unloaded.
-  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH);
+  const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => ({
+    ...server,
+    // Stdio MCPL children inherit a single agent-facing wall clock. Protocol
+    // timestamps remain UTC; only their rendered text uses this setting.
+    env: { ...(server.env ?? {}), AGENT_TIMEZONE: timeZone },
+  }));
 
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
@@ -390,6 +420,7 @@ async function createFramework(
     compressionModel: strategyConfig?.compressionModel ?? model,
     autoTickOnNewMessage: true,
     maxMessageTokens: strategyConfig?.maxMessageTokens ?? 10000,
+    ...(strategyType === 'frontdesk' ? { timeZone } : {}),
   };
   // Forward optional tuning fields when set. The key list is typed
   // against `RecipeStrategy`, so an unknown field name is a compile
@@ -408,9 +439,13 @@ async function createFramework(
     'toolResultMaxLastN',
     'toolUseInputMaxTokens',
     'adaptiveResolution',
+    'kvStableReachTokens',
+    'kvStableQualityGapRatio',
     'compressionSlackRatio',
+    'overBudgetGraceRatio',
     'foldingStrategy',
     'speculativeProduction',
+    'l1HoldbackChunks',
     'summaryParticipant',
     'summarySystemPrompt',
     'summaryUserPrompt',
@@ -446,6 +481,20 @@ async function createFramework(
         maxStreamTokens: recipe.agent.maxStreamTokens ?? 150000,
         contextBudgetTokens: recipe.agent.contextBudgetTokens,
         ...(recipe.agent.cacheTtl && { cacheTtl: recipe.agent.cacheTtl }),
+        ...(recipe.agent.provider === 'openai-responses' && {
+          providerParams: {
+            reasoning: {
+              effort: recipe.agent.responses?.reasoningEffort ?? 'high',
+              context: recipe.agent.responses?.reasoningContext ?? 'all_turns',
+            },
+            ...(recipe.agent.responses?.compactThreshold ? {
+              context_management: [{
+                type: 'compaction',
+                compact_threshold: recipe.agent.responses.compactThreshold,
+              }],
+            } : {}),
+          },
+        }),
         strategy,
         ...(recipe.agent.thinking && { thinking: recipe.agent.thinking }),
         ...(recipe.agent.refusalHandling && { refusalHandling: recipe.agent.refusalHandling }),
@@ -454,6 +503,7 @@ async function createFramework(
     modules: moduleInstances,
     mcplServers: finalServers,
     gate: gateOptions,
+    timeZone,
   });
 
   // Wire post-creation hooks
@@ -733,6 +783,24 @@ function countLines(path: string): number {
 
 async function main() {
   const recipe = await resolveRecipe();
+  // Recipe wins; LLM_PROVIDER env keeps working for deployments that predate
+  // the recipe-level `agent.provider` field (e.g. openai-compatible gateways).
+  const provider =
+    recipe.agent.provider ??
+    (process.env.LLM_PROVIDER === 'openai-compatible' ? 'openai-compatible' : 'anthropic');
+
+  if (provider === 'openai-responses' && !config.openaiApiKey) {
+    console.error('Missing OPENAI_API_KEY for recipe provider "openai-responses".');
+    process.exit(1);
+  }
+  if (provider === 'openai-compatible' && !process.env.OPENAI_BASE_URL) {
+    console.error('Missing OPENAI_BASE_URL for provider "openai-compatible".');
+    process.exit(1);
+  }
+  if (provider === 'anthropic' && !config.apiKey && !config.authToken) {
+    console.error('Missing ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN). Set one in .env or environment.');
+    process.exit(1);
+  }
 
   // SettingsModule constructed early so the adapter can read its state for
   // cross-cutting concerns (currently: reasoning). It's wired into the
@@ -747,7 +815,36 @@ async function main() {
     config.dataDir,
     `llm-calls.${new Date().toISOString().replace(/[:.]/g, '-')}.jsonl`,
   );
-  const adapter = createAdapter(llmLogPath, () => settingsModule.getReasoning());
+  const callLedger = provider === 'anthropic'
+    ? new CallLedger({
+        dataDir: config.dataDir,
+        defaultTtl: recipe.agent.cacheTtl ?? '5m',
+      })
+    : null;
+  // OAuth (subscription) auth wins over API-key auth when both are present.
+  // Subscription tokens (sk-ant-oat…) additionally require the oauth beta
+  // header on every request.
+  const adapter = provider === 'openai-compatible'
+    ? createAdapter(llmLogPath, () => settingsModule.getReasoning())
+    : provider === 'openai-responses'
+    ? new OpenAIResponsesAPIAdapter({
+        apiKey: config.openaiApiKey!,
+        baseURL: process.env.OPENAI_BASE_URL || undefined,
+      })
+    : new LoggingAnthropicAdapter(
+        {
+          ...(config.authToken
+            ? {
+                authToken: config.authToken,
+                defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+              }
+            : { apiKey: config.apiKey! }),
+          baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
+        },
+        llmLogPath,
+        () => settingsModule.getReasoning(),
+        (record) => callLedger!.record(record),
+      );
 
   // Session management — resolved before Membrane construction so the
   // active session's import-source sidecar can contribute to agent-name
@@ -780,7 +877,9 @@ async function main() {
   const agentName = resolved.name;
 
   const membrane = new Membrane(adapter, {
-    formatter: new NativeFormatter(),
+    formatter: provider === 'openai-responses'
+      ? new OpenAIResponsesFormatter()
+      : new NativeFormatter(),
     // Anchor the assistant role for internal callers that don't set
     // request.assistantParticipant themselves (autobio compression,
     // executeMerge). Mismatch here flips stored assistant turns to
@@ -789,7 +888,7 @@ async function main() {
   });
 
   const storePath = sessionManager.getStorePath(activeSession.id);
-  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule);
+  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger);
 
   // Build app context
   const app: AppContext = {
@@ -810,7 +909,7 @@ async function main() {
       // re-resolution would matter only if recipe.agent.name is absent
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule);
+      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger);
       this.framework.start();
       this.userMessageCount = 0;
       resetBranchState(this.branchState);

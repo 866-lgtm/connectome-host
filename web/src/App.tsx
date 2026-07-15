@@ -12,6 +12,7 @@ import { McplPanel, type McplServerRow } from './Mcpl';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
+import { ObserverGateScreen } from './ObserverGate';
 import {
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
@@ -21,6 +22,7 @@ import {
   type MessageBlock,
   type TokenUsage,
   type PerAgentCost,
+  type CallLedgerSnapshot,
 } from '@conhost/web/protocol';
 
 /** Client-side block: the wire MessageBlock plus live-stream bookkeeping. */
@@ -115,6 +117,7 @@ export function App() {
   let pendingHistoryTimer: number | undefined;
   const [usage, setUsage] = createSignal<TokenUsage>({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
   const [perAgentCost, setPerAgentCost] = createSignal<PerAgentCost[]>([]);
+  const [callLedger, setCallLedger] = createSignal<CallLedgerSnapshot | null>(null);
   const [draft, setDraft] = createSignal('');
   /** Currently-focused tree node + the panel mode rendered on its behalf.
    *  `mode` decides whether the side panel shows live stream events or a
@@ -704,6 +707,7 @@ export function App() {
         appendMessage: (m) => setMessages(produce(arr => arr.push(m))),
         setUsage,
         setPerAgentCost,
+        setCallLedger,
         appendStreamToken,
         appendToolUseBlocks,
         updateToolStatus,
@@ -836,6 +840,20 @@ export function App() {
     <div class="flex flex-col h-screen">
       <Header welcome={welcome()} usage={usage()} status={wire.status()} />
       <ReconnectBanner status={wire.status()} />
+      <Show when={wire.observerState() === 'observer' && wire.observer()}>
+        {(info) => (
+          <div class="bg-violet-950/60 border-b border-violet-900 px-4 py-1.5 text-xs text-violet-200 flex items-center gap-2">
+            <span class="w-2 h-2 rounded-full bg-violet-500" />
+            <span>
+              Observing as <span class="font-semibold">{info().label}</span> — read-only, scopes:{' '}
+              <code class="font-mono">{info().scopes.join(', ')}</code>. Content outside your scopes is elided.
+            </span>
+          </div>
+        )}
+      </Show>
+      <Show when={wire.observerState() === 'denied' || wire.observerState() === 'unavailable'}>
+        <ObserverGateScreen state={wire.observerState() as 'denied' | 'unavailable'} />
+      </Show>
       <Show when={protoMismatch() !== null}>
         <div class="bg-amber-950/60 border-b border-amber-900 px-4 py-1.5 text-xs text-amber-200 flex items-center gap-2">
           <span class="w-2 h-2 rounded-full bg-amber-500" />
@@ -952,6 +970,7 @@ export function App() {
               node={focusedNode()!}
               sessionUsage={usage()}
               perAgentCost={perAgentCost()}
+              callLedger={callLedger()}
               onClose={closePanel}
             />
           )}
@@ -1051,6 +1070,7 @@ interface HandlerHooks {
   appendMessage: (msg: Message) => void;
   setUsage: (u: TokenUsage) => void;
   setPerAgentCost: (c: PerAgentCost[]) => void;
+  setCallLedger: (ledger: CallLedgerSnapshot | null) => void;
   appendStreamToken: (token: string, blockType?: string) => void;
   /** Attach yielded tool calls to the streaming assistant message. */
   appendToolUseBlocks: (calls: Array<{ id: string; name: string; input?: unknown }>) => void;
@@ -1084,6 +1104,7 @@ function handleServerMessage(
       hooks.applyWelcome(msg);
       hooks.setUsage(msg.usage);
       hooks.setPerAgentCost(msg.perAgentCost ?? []);
+      hooks.setCallLedger(msg.callLedger ?? null);
       return;
     }
     case 'message-appended':
@@ -1095,6 +1116,9 @@ function handleServerMessage(
     case 'usage':
       hooks.setUsage(msg.usage);
       if (msg.perAgentCost) hooks.setPerAgentCost(msg.perAgentCost);
+      return;
+    case 'call-ledger':
+      hooks.setCallLedger(msg.ledger);
       return;
     case 'trace': {
       const e = msg.event;
