@@ -330,6 +330,20 @@ export interface RecipeModules {
   subagents?: boolean | { defaultModel?: string; defaultMaxTokens?: number };
   lessons?: boolean;
   retrieval?: boolean | { model?: string; maxInjected?: number };
+  /**
+   * Vector memory shared with SillyTavern via the local memory-service
+   * (st-qdrant-memory compatible collections). Off by default. `userIds`
+   * (required) are the Discord user ids whose turns trigger retrieval and
+   * saving — other wakes (bot mentions, heartbeat, autonomous) get neither.
+   */
+  memory?: {
+    serviceUrl?: string;
+    bot?: string;
+    userIds: string[];
+    excludeRecentCount?: number;
+    saveRecentCount?: number;
+    requestTimeoutMs?: number;
+  };
   wake?: boolean | import('@animalabs/agent-framework').GateConfig;
   workspace?: boolean | { mounts: RecipeWorkspaceMount[]; configMount?: boolean };
   /**
@@ -928,6 +942,22 @@ export function validateRecipe(raw: unknown): Recipe {
         if (m.mode !== undefined && m.mode !== 'read-write' && m.mode !== 'read-only') {
           throw new Error(`workspace.mounts[${i}].mode must be "read-write" or "read-only"`);
         }
+      }
+    }
+
+    // Validate memory if present (object-only module — no boolean shorthand,
+    // because userIds has no sensible default).
+    if (mods.memory !== undefined) {
+      if (!mods.memory || typeof mods.memory !== 'object') {
+        throw new Error('modules.memory must be an object ({ userIds: [...] })');
+      }
+      const mem = mods.memory as Record<string, unknown>;
+      if (
+        !Array.isArray(mem.userIds) ||
+        mem.userIds.length === 0 ||
+        !mem.userIds.every((u) => typeof u === 'string' && u)
+      ) {
+        throw new Error('modules.memory.userIds must be a non-empty array of Discord user id strings');
       }
     }
 

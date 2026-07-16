@@ -36,6 +36,7 @@ import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { SubagentModule } from './modules/subagent-module.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
+import { MemoryModule } from './modules/memory-module.js';
 import type { RecipeWorkspaceMount, RecipeStrategy } from './recipe.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
@@ -213,6 +214,12 @@ async function createFramework(
       retrievalModel: retrievalConfig.model,
       maxInjectedLessons: retrievalConfig.maxInjected,
     }));
+  }
+
+  // Vector memory shared with SillyTavern (thin client for the local
+  // memory-service, which owns embeddings + Qdrant). Opt-in via recipe.
+  if (modules.memory && typeof modules.memory === 'object') {
+    moduleInstances.push(new MemoryModule(modules.memory));
   }
 
   // Gate config — core AF EventGate feature.
