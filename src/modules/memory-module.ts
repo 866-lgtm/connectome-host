@@ -8,10 +8,15 @@
  *   RETRIEVE (gatherContext): when the current turn was triggered by a
  *   message from one of the configured users (Helen), embed-search past
  *   memories for that message's text and inject them as an ephemeral
- *   `afterUser` block. Heartbeat wakes, tool continuations of other turns,
- *   and bot-mention turns get nothing — matching the "only my turns" policy.
- *   afterUser (not system) keeps the changing memory block near the context
- *   tail, so the prompt-cache prefix stays stable across turns.
+ *   `system` block (appended to the system prompt, adjacent to where the
+ *   autobiographical head/summaries begin). Heartbeat wakes, tool
+ *   continuations of other turns, and bot-mention turns get nothing —
+ *   matching the "only my turns" policy.
+ *   Position history: this started as `afterUser` to keep the prompt-cache
+ *   prefix stable, but a block glued to the user's turn gets current-turn
+ *   salience — the model reads it as something the user pasted ("the log
+ *   you pasted") instead of ambient memory. Top placement costs prefix
+ *   cache on injected turns; clarity won.
  *
  *   SAVE (gatherContext + onAgentSpeech): on those same user-triggered
  *   turns, report the user's recent messages and the agent's auto-published
@@ -197,7 +202,7 @@ export class MemoryModule implements Module {
       const injections: ContextInjection[] = formatted
         ? [{
             namespace: 'memory',
-            position: 'afterUser',
+            position: 'system',
             content: [{ type: 'text', text: formatted }],
           }]
         : [];
