@@ -100,6 +100,12 @@ export interface RecipeAgent {
   /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
    *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads. */
   cacheTtl?: '5m' | '1h';
+  /**
+   * Home channel for no-trigger turns (heartbeats, timers): plain-text speech
+   * on such a turn routes here instead of the last-active channel. Composite
+   * channel-id form, e.g. `discord:{guildId}:{channelId}`.
+   */
+  homeChannel?: string;
   strategy?: RecipeStrategy;
   /**
    * Native extended thinking. When `enabled: true`, the agent's API requests
@@ -744,6 +750,10 @@ export function validateRecipe(raw: unknown): Recipe {
 
   if (agent.maxStreamTokens !== undefined && (typeof agent.maxStreamTokens !== 'number' || agent.maxStreamTokens <= 0)) {
     throw new Error('Recipe agent.maxStreamTokens must be a positive number.');
+  }
+
+  if (agent.homeChannel !== undefined && (typeof agent.homeChannel !== 'string' || agent.homeChannel.length === 0)) {
+    throw new Error('Recipe agent.homeChannel must be a non-empty composite channel id (e.g. "discord:{guildId}:{channelId}").');
   }
 
   // Recipes are runtime JSON; a typo'd TTL ("1hr", "60m") would otherwise

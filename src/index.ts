@@ -516,6 +516,7 @@ async function createFramework(
     mcplServers: finalServers,
     gate: gateOptions,
     timeZone,
+    ...(recipe.agent.homeChannel && { homeChannel: recipe.agent.homeChannel }),
   });
 
   // Wire post-creation hooks
