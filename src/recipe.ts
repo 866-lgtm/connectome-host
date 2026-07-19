@@ -106,6 +106,11 @@ export interface RecipeAgent {
    * channel-id form, e.g. `discord:{guildId}:{channelId}`.
    */
   homeChannel?: string;
+  /**
+   * Same-round routing policy for ordinary text emitted beside think().
+   * Omitted preserves the compatibility carry-forward in Agent Framework.
+   */
+  sameRoundThinkTextPolicy?: 'public' | 'private';
   strategy?: RecipeStrategy;
   /**
    * Native extended thinking. When `enabled: true`, the agent's API requests
@@ -121,6 +126,7 @@ export interface RecipeAgent {
   responses?: {
     reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
     reasoningContext?: 'current_turn' | 'all_turns';
+    serviceTier?: string;
     compactThreshold?: number;
   };
   /**
@@ -742,6 +748,9 @@ export function validateRecipe(raw: unknown): Recipe {
     if (responses.reasoningContext !== undefined && responses.reasoningContext !== 'current_turn' && responses.reasoningContext !== 'all_turns') {
       throw new Error(`Invalid agent.responses.reasoningContext ${JSON.stringify(responses.reasoningContext)}.`);
     }
+    if (responses.serviceTier !== undefined && (typeof responses.serviceTier !== 'string' || !responses.serviceTier.trim())) {
+      throw new Error('Recipe agent.responses.serviceTier must be a non-empty string.');
+    }
     if (responses.compactThreshold !== undefined &&
         (typeof responses.compactThreshold !== 'number' || responses.compactThreshold <= 0)) {
       throw new Error('Recipe agent.responses.compactThreshold must be a positive number.');
@@ -762,6 +771,16 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.cacheTtl must be '5m' or '1h', got ${JSON.stringify(agent.cacheTtl)}.`);
   }
   agent.cacheTtl ??= '1h';
+
+  if (
+    agent.sameRoundThinkTextPolicy !== undefined &&
+    agent.sameRoundThinkTextPolicy !== 'public' &&
+    agent.sameRoundThinkTextPolicy !== 'private'
+  ) {
+    throw new Error(
+      `Recipe agent.sameRoundThinkTextPolicy must be 'public' or 'private', got ${JSON.stringify(agent.sameRoundThinkTextPolicy)}.`,
+    );
+  }
 
   // Validate agent.thinking if present. Catches typos and constraint
   // violations (notably max_tokens > budget_tokens) at recipe-load time
@@ -820,6 +839,11 @@ export function validateRecipe(raw: unknown): Recipe {
     ) {
       throw new Error('Recipe agent.strategy.compressionContextBudgetTokens must be a positive safe integer.');
     }
+  }
+
+  const refusalHandling = agent.refusalHandling as Record<string, unknown> | undefined;
+  if (refusalHandling && Object.hasOwn(refusalHandling, 'primarySummaryFallback')) {
+    throw new Error('Recipe agent.refusalHandling.primarySummaryFallback was removed and is unsupported.');
   }
 
   // Validate mcpServers entries if present
