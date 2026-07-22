@@ -21,6 +21,7 @@
  */
 
 import { CURVE_PAGE_HTML } from './web-ui-curve-page.js';
+import { PROMPT_PAGE_HTML } from './web-ui-prompt-page.js';
 import type {
   AgentFramework,
   Module,
@@ -1044,7 +1045,7 @@ export class WebUiModule implements Module {
     }
 
     // Per-route scope gates for observer sessions (basic auth passes all).
-    if ((url.pathname.startsWith('/debug/') || url.pathname === '/curve') && !httpAllowed('debug')) {
+    if ((url.pathname.startsWith('/debug/') || url.pathname === '/curve' || url.pathname === '/prompt') && !httpAllowed('debug')) {
       return this.unauthorized();
     }
     if (url.pathname === '/healthz' && !httpAllowed('health')) {
@@ -1078,6 +1079,13 @@ export class WebUiModule implements Module {
     }
     if (url.pathname === '/curve') {
       return new Response(CURVE_PAGE_HTML, {
+        headers: { 'content-type': 'text/html; charset=utf-8' },
+      });
+    }
+    // Prompt inspector: renders /debug/context (the exact activation request)
+    // with per-section token estimates. Same scope gate as /curve.
+    if (url.pathname === '/prompt') {
+      return new Response(PROMPT_PAGE_HTML, {
         headers: { 'content-type': 'text/html; charset=utf-8' },
       });
     }
