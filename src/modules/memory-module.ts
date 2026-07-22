@@ -57,6 +57,9 @@ export interface MemoryModuleConfig {
   bot?: string;
   /** Discord user ids whose turns trigger retrieval and saving (required) */
   userIds: string[];
+  /** false = save-only: archive the conversation, never retrieve/inject.
+   *  Keeps the prompt-cache prefix stable (default: true) */
+  inject?: boolean;
   /** How many recent discord message ids to exclude from retrieval (default: 25) */
   excludeRecentCount?: number;
   /** How many recent user messages to (re)offer for saving each turn (default: 10) */
@@ -98,6 +101,7 @@ export class MemoryModule implements Module {
       excludeRecentCount: config.excludeRecentCount ?? 25,
       saveRecentCount: config.saveRecentCount ?? 10,
       requestTimeoutMs: config.requestTimeoutMs ?? 3500,
+      inject: config.inject ?? true,
     };
     this.contextTimeoutMs = this.config.requestTimeoutMs + 500;
   }
@@ -186,6 +190,16 @@ export class MemoryModule implements Module {
       // Save the user's recent messages (service dedups by id) — don't let
       // a save hiccup break retrieval.
       this.saveUserMessages(discordMessages).catch(() => {});
+
+      // Save-only mode (`inject: false`): archive the conversation but never
+      // retrieve/inject. Keeps the prompt-cache prefix byte-stable — for
+      // agents where a per-turn system-block injection would break the cache
+      // on every message (the whole compiled window re-billed as cache
+      // writes). Speech capture (onAgentSpeech) still runs via userTurnLive.
+      if (this.config.inject === false) {
+        this.cached = { seq: gate.sequence, injections: [] };
+        return [];
+      }
 
       const excludeIds = discordMessages
         .slice(-this.config.excludeRecentCount)
