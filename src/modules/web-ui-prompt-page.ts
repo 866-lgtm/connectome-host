@@ -122,7 +122,7 @@ function renderBlock(b){
   const label = b.type + (b.name ? ' \\u00b7 ' + b.name : '');
   let text;
   if (b.type === 'text') text = b.text || '';
-  else if (isImage(b)) text = '[image payload \\u2014 ' + Math.round(JSON.stringify(b).length / 1024) + 'kb base64, excluded from estimate]';
+  else if (isImage(b)) text = '[image \\u2014 payload stripped server-side, excluded from estimate]\\n' + JSON.stringify(b, stripMedia, 2);
   else text = JSON.stringify(b, stripMedia, 2);
   return '<div class="blk"><div class="bk">' + esc(label) + '</div><pre>' + esc(text) + '</pre></div>';
 }
@@ -136,11 +136,11 @@ async function load(withInj){
   try {
     // The injected view needs the base system prompt to split out the suffix.
     if (withInj && baseSystem === null) {
-      const r0 = await fetch('/debug/context');
+      const r0 = await fetch('/debug/context?media=0');
       if (!r0.ok) throw new Error('HTTP ' + r0.status + ': ' + await r0.text());
       baseSystem = (await r0.json()).request.system || '';
     }
-    const r = await fetch('/debug/context' + (withInj ? '?injections=1' : ''));
+    const r = await fetch('/debug/context?media=0' + (withInj ? '&injections=1' : ''));
     if (!r.ok) throw new Error('HTTP ' + r.status + ': ' + await r.text());
     const data = await r.json();
     render(data, withInj);
@@ -213,8 +213,8 @@ function render(data, withInj){
       + '<span class="est">' + fmt(msgEst(m)) + '</span></summary>'
       + '<div class="body">' + (m.content || []).map(renderBlock).join('') + '</div></details>'
     ).join(''), true, true);
-  h += sec('tools', 'var(--c-tool)', tools.length + ' defs \\u00b7 ' + fmt(eTool) + ' est tok',
-    tools.map(t =>
+  h += sec('tools (largest first)', 'var(--c-tool)', tools.length + ' defs \\u00b7 ' + fmt(eTool) + ' est tok',
+    tools.slice().sort((a,b) => est(toolJson(b)) - est(toolJson(a))).map(t =>
       '<details class="msg"><summary><span class="who">' + esc(t.name) + '</span>'
       + '<span class="kinds">' + esc((t.description || '').split('\\n')[0].slice(0, 110)) + '</span>'
       + '<span class="est">' + fmt(est(toolJson(t))) + '</span></summary>'

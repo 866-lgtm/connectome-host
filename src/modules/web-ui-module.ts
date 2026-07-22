@@ -1220,12 +1220,26 @@ export class WebUiModule implements Module {
       );
     }
 
+    // media=0: collapse base64 payloads (inlined Discord images) to size
+    // placeholders. The full response can run to several MB, which stalls
+    // browser fetches over tunnels; the /prompt inspector always asks for
+    // the stripped form. Default keeps full fidelity.
+    const stripMedia = url.searchParams.get('media') === '0';
+    const mediaReplacer = (_k: string, v: unknown): unknown => {
+      if (typeof v === 'string' && v.length > 2048) {
+        const kb = Math.round(v.length / 1024);
+        const dataUrl = /^(data:[^;,]+);base64,/.exec(v);
+        if (dataUrl) return `${dataUrl[1]};base64,[stripped ${kb}kb]`;
+        if (/^[A-Za-z0-9+/=\r\n]+$/.test(v)) return `[base64 stripped ${kb}kb]`;
+      }
+      return v;
+    };
     try {
       const request = await app.framework.previewActivation(agentName, { injections });
       // `transparent` reflects whether this call was side-effect-free.
       const body = JSON.stringify(
         { agent: agentName, injections, transparent: !injections, request },
-        null,
+        stripMedia ? mediaReplacer : undefined,
         pretty ? 2 : undefined,
       );
       return new Response(body, { headers: { 'content-type': 'application/json' } });
