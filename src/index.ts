@@ -19,12 +19,17 @@
  */
 
 import {
+  AnthropicXmlFormatter,
+  BedrockAdapter,
   Membrane,
   NativeFormatter,
   OpenAIResponsesAPIAdapter,
   OpenAIResponsesFormatter,
+  OpenRouterAdapter,
 } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { LoggingBedrockAdapter } from './logging-bedrock-adapter.js';
+import { CodexSubscriptionAdapter } from './codex-subscription-adapter.js';
 import { CallLedger } from './call-ledger.js';
 import { createAdapter } from './provider.js';
 import { SettingsModule } from './modules/settings-module.js';
@@ -62,6 +67,7 @@ import {
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
 import { buildFrameworkAgentConfig } from './framework-agent-config.js';
 import { buildFrameworkStrategy } from './framework-strategy.js';
+import { loadExtensions } from './extensions.js';
 
 export type { AppContext };
 
@@ -74,6 +80,8 @@ const config = {
   // precedence over the API key so requests never carry both auth schemes.
   authToken: process.env.ANTHROPIC_AUTH_TOKEN,
   openaiApiKey: process.env.OPENAI_API_KEY,
+  openrouterApiKey: process.env.OPENROUTER_API_KEY,
+  codexBinary: process.env.CODEX_BINARY,
   model: process.env.MODEL,
   dataDir: process.env.DATA_DIR || './data',
 };
@@ -96,6 +104,7 @@ interface AppContext {
   agentName: string;
   branchState: BranchState;
   userMessageCount: number;
+  codexAdapter?: CodexSubscriptionAdapter;
 
   /** Stop current framework, switch to a different session, start new framework. */
   switchSession(id: string): Promise<void>;
@@ -148,9 +157,15 @@ async function createFramework(
   settingsModule: SettingsModule,
   callLedger: CallLedger | null,
 ): Promise<AgentFramework> {
-  const model = config.model || recipe.agent.model || 'claude-opus-4-6';
+  const model = config.model || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
   const modules = recipe.modules ?? {};
   const timeZone = resolveTimeZone(recipe.agent.timezone);
+
+  // Load recipe extensions first — custom strategies must be registered
+  // before buildFrameworkStrategy runs, and custom modules join the module
+  // list below. The loader is a dumb local import; see src/extensions.ts.
+  const extensionRegistry = await loadExtensions(recipe);
 
   // -- Build module list --
   // SettingsModule is constructed in main() (before the adapter, so the
@@ -353,6 +368,16 @@ async function createFramework(
     moduleInstances.push(new ObserversModule({ path: observersPath }));
   }
 
+  // Extension-registered modules. Instantiated last so built-in modules keep
+  // their historical positions; each factory gets the minimal runtime context
+  // plus its declaring extension's config blob.
+  const extensionModules: Module[] = [];
+  for (const entry of extensionRegistry.modules) {
+    const instance = entry.factory({ timeZone, storePath, model, config: entry.config });
+    extensionModules.push(instance);
+    moduleInstances.push(instance);
+  }
+
   // -- Build MCP server list --
   //
   // Recipes are opt-in: a file entry from mcpl-servers.json is loaded only
@@ -412,14 +437,14 @@ async function createFramework(
   // No server augmentation needed — gate is wired via FrameworkConfig.gate
 
   // -- Build strategy --
-  const strategy = buildFrameworkStrategy(recipe, model, timeZone);
+  const strategy = buildFrameworkStrategy(recipe, model, timeZone, extensionRegistry);
   const agentConfig = buildFrameworkAgentConfig(recipe, agentName, model, strategy);
 
   // -- Create framework --
   const framework = await AgentFramework.create({
     storePath,
     membrane,
-    agents: [agentConfig],
+agents: [agentConfig],
     modules: moduleInstances,
     mcplServers: finalServers,
     gate: gateOptions,
@@ -477,6 +502,13 @@ async function createFramework(
 
   if (channelModeModule) {
     channelModeModule.setFramework(framework);
+  }
+
+  // Extension modules get the same duck-typed post-creation hook the
+  // built-ins use: if the instance exposes setFramework, call it.
+  for (const instance of extensionModules) {
+    const hooked = instance as unknown as { setFramework?: (f: AgentFramework) => void };
+    hooked.setFramework?.(framework);
   }
 
   if (mcplAdminModule) {
@@ -749,12 +781,20 @@ async function main() {
     recipe.agent.provider ??
     (process.env.LLM_PROVIDER === 'openai-compatible' ? 'openai-compatible' : 'anthropic');
 
+  if (provider === 'openrouter' && !config.openrouterApiKey) {
+    console.error('Missing OPENROUTER_API_KEY for recipe provider "openrouter".');
+    process.exit(1);
+  }
   if (provider === 'openai-responses' && !config.openaiApiKey) {
     console.error('Missing OPENAI_API_KEY for recipe provider "openai-responses".');
     process.exit(1);
   }
   if (provider === 'openai-compatible' && !process.env.OPENAI_BASE_URL) {
     console.error('Missing OPENAI_BASE_URL for provider "openai-compatible".');
+    process.exit(1);
+  }
+  if (provider === 'bedrock' && !(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY)) {
+    console.error('Missing AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY for recipe provider "bedrock".');
     process.exit(1);
   }
   if (provider === 'anthropic' && !config.apiKey && !config.authToken) {
@@ -781,6 +821,30 @@ async function main() {
         defaultTtl: recipe.agent.cacheTtl ?? '5m',
       })
     : null;
+  // The Codex subscription adapter owns ChatGPT login/refresh independently
+  // of the API-key transports below.
+  const codexAdapter = provider === 'openai-codex'
+    ? new CodexSubscriptionAdapter({
+        codexBinary: config.codexBinary,
+        fastMode: recipe.agent.codex?.fastMode ?? false,
+      })
+    : undefined;
+  const openrouterAdapter = provider === 'openrouter'
+    ? new OpenRouterAdapter({
+        apiKey: config.openrouterApiKey!,
+        xTitle: recipe.agent.name ?? recipe.name,
+      })
+    : undefined;
+  // Bedrock: legacy Claude models (3.5 Sonnet 0620/1022, Opus 3) that have
+  // left the Anthropic API but survive on AWS. The adapter reads AWS_* env
+  // vars (AWS_REGION defaults us-west-2) and maps standard Claude model IDs
+  // to Bedrock IDs (explicit map + `anthropic.<id>-v1:0` fallback). Uses the
+  // Anthropic-native message shape, so NativeFormatter applies unchanged.
+  // No CallLedger: prompt caching is rejected outright by legacy Bedrock
+  // models (tested 2026-07-21). Wrapped for llm-calls.jsonl visibility.
+  const bedrockAdapter = provider === 'bedrock'
+    ? new LoggingBedrockAdapter({}, llmLogPath)
+    : undefined;
   // OAuth (subscription) auth wins over API-key auth when both are present.
   // Subscription tokens (sk-ant-oat…) additionally require the oauth beta
   // header on every request.
@@ -791,14 +855,25 @@ async function main() {
         apiKey: config.openaiApiKey!,
         baseURL: process.env.OPENAI_BASE_URL || undefined,
       })
-    : new LoggingAnthropicAdapter(
+    : bedrockAdapter ?? openrouterAdapter ?? codexAdapter ?? new LoggingAnthropicAdapter(
         {
+          // Anthropic OAuth wins over API-key auth when both are present.
+          // Subscription tokens additionally require this beta header.
+          // Recipe-declared betas (agent.anthropicBetas, e.g. context-1m)
+          // are merged into the same anthropic-beta header either way.
           ...(config.authToken
             ? {
                 authToken: config.authToken,
-                defaultHeaders: { 'anthropic-beta': 'oauth-2025-04-20' },
+                defaultHeaders: {
+                  'anthropic-beta': ['oauth-2025-04-20', ...(recipe.agent.anthropicBetas ?? [])].join(','),
+                },
               }
-            : { apiKey: config.apiKey! }),
+            : {
+                apiKey: config.apiKey!,
+                ...(recipe.agent.anthropicBetas?.length
+                  ? { defaultHeaders: { 'anthropic-beta': recipe.agent.anthropicBetas.join(',') } }
+                  : {}),
+              }),
           baseURL: process.env.ANTHROPIC_BASE_URL || undefined,
         },
         llmLogPath,
@@ -837,9 +912,15 @@ async function main() {
   const agentName = resolved.name;
 
   const membrane = new Membrane(adapter, {
-    formatter: provider === 'openai-responses'
+    formatter: provider === 'openai-responses' || provider === 'openai-codex'
       ? new OpenAIResponsesFormatter()
-      : new NativeFormatter(),
+      : recipe.agent.formatter === 'anthropic-xml'
+        ? new AnthropicXmlFormatter()
+        : new NativeFormatter(),
+    // Bedrock legacy Claude models 400 on any cache_control block
+    // ("your request did not allow prompt caching") — suppress the
+    // historical promptCaching=true default on that transport.
+    ...(provider === 'bedrock' ? { defaultPromptCaching: false } : {}),
     // Anchor the assistant role for internal callers that don't set
     // request.assistantParticipant themselves (autobio compression,
     // executeMerge). Mismatch here flips stored assistant turns to
@@ -859,6 +940,7 @@ async function main() {
     agentName,
     branchState: createBranchState(),
     userMessageCount: 0,
+    codexAdapter,
 
     async switchSession(id: string) {
       handleExport(this);
@@ -906,14 +988,18 @@ async function main() {
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);
 
-  if (headless) {
-    const { runHeadless } = await import('./headless.js');
-    await runHeadless(app, process.argv.slice(2));
-  } else if (noTui) {
-    await runPiped(app);
-  } else {
-    const { runTui } = await import('./tui.js');
-    await runTui(app);
+  try {
+    if (headless) {
+      const { runHeadless } = await import('./headless.js');
+      await runHeadless(app, process.argv.slice(2));
+    } else if (noTui) {
+      await runPiped(app);
+    } else {
+      const { runTui } = await import('./tui.js');
+      await runTui(app);
+    }
+  } finally {
+    codexAdapter?.dispose();
   }
 }
 

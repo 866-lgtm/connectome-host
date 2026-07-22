@@ -1,12 +1,13 @@
 {
   "name": "@animalabs/connectome-host",
-  "version": "0.3.9",
+  "version": "0.3.10",
   "description": "General-purpose agent TUI host with recipe-based configuration",
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
     "dev": "bun --watch src/index.ts",
     "test": "bun test",
+    "version": "bun scripts/release-changelog.ts && git add CHANGELOG.md",
     "build:web": "npm --prefix web install && npm --prefix web run build",
     "build:web:ci": "npm ci --prefix web && npm --prefix web run build",
     "relock:web": "rm -rf web/node_modules web/package-lock.json && npm --prefix web install",

@@ -1,6 +1,6 @@
 # connectome-host
 
-A general-purpose agent TUI host with recipe-based configuration. Point it at any use case by loading a recipe — a JSON file that defines the system prompt, MCP servers, modules, and agent settings.
+A general-purpose agent host with recipe-based configuration. Point it at any use case by loading a recipe — a JSON file that defines the system prompt, MCP servers, modules, and agent settings. Interact through the web UI (browser operator console), the interactive TUI, or run headless under a fleet parent.
 
 Built on the Connectome stack: [@animalabs/agent-framework](https://github.com/anima-research/agent-framework) + [@animalabs/context-manager](https://github.com/anima-research/context-manager) + [@animalabs/chronicle](https://github.com/anima-research/chronicle) + [@animalabs/membrane](https://github.com/anima-research/membrane).
 
@@ -96,8 +96,31 @@ Recipe servers merge with `mcpl-servers.json`. The file wins on conflict, so use
 
 See [`recipes/SETUP.md`](recipes/SETUP.md) for a detailed setup guide for the knowledge-miner recipe.
 
+### ChatGPT subscription provider
+
+Install the Codex CLI, sign in with `codex login`, then select the subscription
+transport in a recipe:
+
+```json
+{
+  "agent": {
+    "provider": "openai-codex",
+    "model": "gpt-5.4",
+    "codex": { "fastMode": false },
+    "systemPrompt": "You are a helpful assistant."
+  }
+}
+```
+
+Connectome asks the Codex app-server to refresh the ChatGPT login and starts a
+device-code flow if needed. No `OPENAI_API_KEY` is used for this provider. Use
+`/fast on` or `/fast off` at runtime. Connectome requests Codex's Fast tier and
+warns if the service reports that it fell back to Standard; Fast mode consumes
+subscription credits at a higher rate when applied.
+
 ## What it provides
 
+- **Web UI**: browser operator console (`modules.webui`) — live chat with full interiority (thinking, tool calls, streaming), agent/fleet tree, context makeup + compression coverage, call ledger with cache verdicts and billing-grade costs, health/ops alerts, Chronicle branch tree, lessons, MCPL config, workspace files; scoped read-only observer access via device keys
 - **TUI + readline modes**: OpenTUI interactive terminal or `--no-tui` for pipes/CI
 - **Subagent forking**: Spawn/fork parallel agents with fleet tree view (Tab to toggle)
 - **Persistent lessons**: Knowledge store with confidence scores, tags, and semantic retrieval
@@ -109,7 +132,7 @@ See [`recipes/SETUP.md`](recipes/SETUP.md) for a detailed setup guide for the kn
 ## Prerequisites
 
 - [Node.js](https://nodejs.org/) 20+ and [Bun](https://bun.sh/) runtime
-- Anthropic credentials, or an OpenAI-compatible Chat Completions endpoint
+- An Anthropic API key, OpenAI API key, an OpenAI-compatible Chat Completions endpoint, or the Codex CLI signed in with ChatGPT
 
 ### Install
 
@@ -126,8 +149,11 @@ npm install
 | `ANTHROPIC_AUTH_TOKEN` | — | Anthropic OAuth/Bearer token; takes precedence over the API key |
 | `ANTHROPIC_BASE_URL` | Anthropic API | Optional Anthropic-compatible base URL |
 | `OPENAI_BASE_URL` | — | Required in OpenAI-compatible mode; include `/v1` when the endpoint expects it |
-| `OPENAI_API_KEY` | — | Optional bearer key for the OpenAI-compatible endpoint |
-| `MODEL` | from recipe or `claude-opus-4-6` | Override model |
+| `OPENAI_API_KEY` | — | Bearer key: OpenAI Platform key for `openai-responses`, or optional key for the OpenAI-compatible endpoint |
+| `CODEX_BINARY` | `codex` | Codex CLI executable for `openai-codex` subscription auth |
+| `CODEX_HOME` | `~/.codex` | Codex credential/config directory |
+| `CODEX_BASE_URL` | ChatGPT Codex backend | Optional subscription transport override |
+| `MODEL` | from recipe or provider default | Override model |
 | `DATA_DIR` | `./data` | Session and recipe storage |
 
 OpenAI-compatible mode uses the Chat Completions protocol (`POST /chat/completions`):
@@ -149,9 +175,28 @@ calling Anthropic's `/v1/messages/count_tokens` endpoint.
 ```bash
 bun src/index.ts                    # Interactive TUI
 bun src/index.ts --no-tui           # Readline mode
+bun src/index.ts --headless         # Daemon: JSONL IPC over unix socket, no terminal
 echo "Hello" | bun src/index.ts     # Piped mode
 bun --watch src/index.ts            # Dev mode
 ```
+
+## Web UI
+
+Enable with `"modules": { "webui": true }` (or `{ "port": 7340, "host": "0.0.0.0" }`)
+in the recipe. The host serves the SPA and its WebSocket protocol on port 7340;
+non-loopback binds require basic-auth credentials. Build the SPA bundle once with
+`bun run build:web` (also runs on `npm install` via postinstall).
+
+- Chat with full interiority: thinking blocks, tool calls + results, live streaming
+- Sidebar: agent/fleet tree, lessons, MCPL servers, workspace files, context makeup + compression coverage, health (runtime settings, failure streaks, compression quarantine)
+- Header branch chip opens the Chronicle branch lineage tree (checkout from the UI)
+- Ops alerts (compression quarantine, refusal streaks, inference-exhausted) render as persistent banner rows
+- Usage panel: per-agent costs and a billing-grade call ledger with cache verdicts
+- `/curve` — compression-curve visualization; `/healthz` — liveness JSON for doctor/fleet tooling
+- Read-only observer access via Ed25519 device keys with per-grant scopes (see `docs/webui-deployment.md`)
+
+For SPA development: `cd web && bun run dev` proxies the Vite dev server onto a
+locally running host.
 
 ## Slash commands
 
@@ -175,6 +220,7 @@ bun --watch src/index.ts            # Dev mode
 | `/mcp remove <id>` | Remove a server |
 | `/mcp env <id> KEY=VALUE [...]` | Set env vars on a server |
 | `/budget [tokens]` | Show/set stream token budget |
+| `/fast [on\|off\|status]` | Toggle Codex subscription Fast mode |
 | `/session list\|new\|switch\|rename\|delete` | Session management |
 | `/quit` | Exit |
 
@@ -195,7 +241,7 @@ bun --watch src/index.ts            # Dev mode
 | Up/Down | Navigate tree |
 | Enter/Right | Expand/collapse |
 | Left | Collapse |
-| `p` | Peek at running subagent's stream |
+| `p` | Peek the selected node's live stream — local subagents, fleet children, or a single agent/subagent inside a fleet child |
 | `Delete` | Stop a running subagent |
 
 ## Architecture
