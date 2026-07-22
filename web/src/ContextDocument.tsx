@@ -40,10 +40,14 @@ export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTML
   const load = async () => {
     setLoading(true); setErr(null);
     try {
-      const q = props.agent ? `?agent=${encodeURIComponent(props.agent)}` : '';
+      const q = props.agent ? `&agent=${encodeURIComponent(props.agent)}` : '';
+      // media=0: inlined base64 images can push the full response to several
+      // MB, which stalls and kills the fetch over proxied tunnels. The
+      // document view renders text only, so the stripped body is lossless
+      // for display purposes.
       const [ctxRes, mkRes] = await Promise.all([
-        fetch(`/debug/context${q}`, { credentials: 'same-origin' }),
-        fetch(`/debug/context/makeup${q}`, { credentials: 'same-origin' }),
+        fetch(`/debug/context?media=0${q}`, { credentials: 'same-origin' }),
+        fetch(`/debug/context/makeup?pretty=0${q}`, { credentials: 'same-origin' }),
       ]);
       if (!ctxRes.ok) throw new Error(`context HTTP ${ctxRes.status}`);
       const ctx = await ctxRes.json();
