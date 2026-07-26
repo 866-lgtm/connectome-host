@@ -9,10 +9,16 @@
  * NOT as standalone tools (the former reasoning_status/enable/disable trio
  * was tool bloat for one boolean + number).
  *
- * The host's adapter wrapper (LoggingAnthropicAdapter) reads `getReasoning()`
- * on each call and injects `thinking: {type:'enabled', budget_tokens: N}` into
- * the outgoing Anthropic request when enabled — keeping the cross-cutting
- * "request mutator" plumbing out of every call site.
+ * Both adapter wrappers read `getReasoning()` on each call and mutate the
+ * outgoing request when enabled — keeping the cross-cutting "request mutator"
+ * plumbing out of every call site:
+ *   - LoggingAnthropicAdapter injects `thinking: {type:'adaptive'}`.
+ *   - LoggingProviderAdapter (openai-compatible) strips the recipe's
+ *     `reasoning` param when disabled. Magnitude for that path is the recipe's
+ *     `agent.responses.reasoningEffort`, deliberately NOT mirrored into this
+ *     state — one source of truth for effort, no chronicle-persisted override
+ *     silently shadowing the recipe.
+ * `budgetTokens` therefore applies to the Anthropic path only.
  *
  * Designed to be extensible: new domains add their own slice in
  * `SettingsState` + a few tools + a typed accessor. Bundled with the host;
@@ -37,10 +43,20 @@ export interface ReasoningSettings {
 
 export interface SettingsState {
   reasoning: ReasoningSettings;
+  /** Bumped when a default changes in a way that must override state persisted
+   *  under the old default. See the migration in start(). */
+  schemaVersion?: number;
 }
 
+/** v2 (2026-07-25): reasoning defaults ON. It was `false` while only the
+ *  Anthropic adapter honored it; the openai-compatible path now honors it too
+ *  (see LoggingProviderAdapter), and this deployment runs a reasoning model in
+ *  a tool-heavy environment where thinking is the default-correct state. */
+const SCHEMA_VERSION = 2;
+
 const DEFAULTS: SettingsState = {
-  reasoning: { enabled: false, budgetTokens: 8192 },
+  reasoning: { enabled: true, budgetTokens: 8192 },
+  schemaVersion: SCHEMA_VERSION,
 };
 
 export class SettingsModule implements Module {
@@ -57,7 +73,16 @@ export class SettingsModule implements Module {
       // for state persisted by older versions.
       this.state = {
         reasoning: { ...DEFAULTS.reasoning, ...(saved.reasoning ?? {}) },
+        schemaVersion: SCHEMA_VERSION,
       };
+      // Pre-v2 state was written while the default was `enabled: false` and no
+      // non-Anthropic adapter read it, so a persisted `false` there carries no
+      // intent — it is indistinguishable from "never touched". Re-apply the new
+      // default once rather than let a dead flag keep thinking switched off.
+      if ((saved.schemaVersion ?? 1) < 2) {
+        this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
+      }
+      ctx.setState(this.state);
     }
   }
 
@@ -110,7 +135,10 @@ export class SettingsModule implements Module {
         },
         reasoning_budget_tokens: {
           type: 'number',
-          description: 'Token budget for thinking blocks (min 1024).',
+          description:
+            'Token budget for thinking blocks (min 1024). Anthropic-provider ' +
+            'hint only — on the openai-compatible provider the magnitude comes ' +
+            'from the recipe (agent.responses.reasoningEffort).',
         },
       },
       keys: ['reasoning_enabled', 'reasoning_budget_tokens'],

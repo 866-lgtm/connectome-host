@@ -7,9 +7,12 @@
  * complete()/stream() to capture the raw provider request via the membrane
  * onRequest hook and the raw response.
  *
- * Unlike LoggingAnthropicAdapter, this wrapper does NOT inject reasoning
- * (thinking blocks are Anthropic-native). The reasoning getter is accepted
- * but unused for non-Anthropic providers.
+ * Reasoning: the recipe supplies the magnitude as a `reasoning: {effort}`
+ * provider param (framework-agent-config), which membrane carries in
+ * `request.extra` and the openai-compatible adapter merges into the outgoing
+ * Chat Completions body. This wrapper applies the agent's runtime kill switch
+ * on top: when `agent_settings.reasoning_enabled` is false it strips that param
+ * so the toggle is real on this path instead of silently doing nothing.
  */
 
 import type {
@@ -67,6 +70,20 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     return this.inner.supportsModel(modelId);
   }
 
+  /** Honor the agent's runtime reasoning kill switch. Enabled (the default) is
+   *  a pass-through: the recipe's `reasoning` param is already in `extra` and
+   *  carries the effort. Disabled strips it, which drops the endpoint back to
+   *  its own default rather than forcing `effort: 'none'` — a provider that
+   *  never understood the param is left exactly as it was. */
+  private withReasoning(request: ProviderRequest): ProviderRequest {
+    const r = this.getReasoning?.();
+    if (!r || r.enabled) return request;
+    const extra = request.extra as Record<string, unknown> | undefined;
+    if (!extra || extra.reasoning === undefined) return request;
+    const { reasoning, ...rest } = extra;
+    return { ...request, extra: rest };
+  }
+
   private log(record: Record<string, unknown>): void {
     try {
       appendFileSync(this.logPath, JSON.stringify(record, stripInlineMedia) + '\n');
@@ -98,14 +115,15 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     const t0 = Date.now();
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
+    const effective = this.withReasoning(request);
     try {
-      const response = await this.inner.complete(request, wrapped);
+      const response = await this.inner.complete(effective, wrapped);
       this.log({
         type: 'call', kind: 'complete',
         timestamp: new Date().toISOString(), durationMs: Date.now() - t0,
         rawRequest: sink.rawRequest,
         rawResponse: (response as { raw?: unknown }).raw ?? null,
-        normalizedRequest: request,
+        normalizedRequest: effective,
         normalizedResponse: response,
       });
       return response;
@@ -114,7 +132,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
         type: 'error', kind: 'complete',
         timestamp: new Date().toISOString(), durationMs: Date.now() - t0,
         rawRequest: sink.rawRequest,
-        normalizedRequest: request,
+        normalizedRequest: effective,
         error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
       });
       throw err;
@@ -129,14 +147,15 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     const t0 = Date.now();
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
+    const effective = this.withReasoning(request);
     try {
-      const response = await this.inner.stream(request, callbacks, wrapped);
+      const response = await this.inner.stream(effective, callbacks, wrapped);
       this.log({
         type: 'call', kind: 'stream',
         timestamp: new Date().toISOString(), durationMs: Date.now() - t0,
         rawRequest: sink.rawRequest,
         rawResponse: (response as { raw?: unknown }).raw ?? null,
-        normalizedRequest: request,
+        normalizedRequest: effective,
         normalizedResponse: response,
       });
       return response;
@@ -145,7 +164,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
         type: 'error', kind: 'stream',
         timestamp: new Date().toISOString(), durationMs: Date.now() - t0,
         rawRequest: sink.rawRequest,
-        normalizedRequest: request,
+        normalizedRequest: effective,
         error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
       });
       throw err;

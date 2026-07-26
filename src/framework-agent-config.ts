@@ -49,6 +49,22 @@ export function buildFrameworkAgentConfig(
         } : {}),
       },
     }),
+    // OpenAI-compatible Chat Completions (LiteRouter et al.) accepts the same
+    // unified `reasoning` object, but only its `effort` key — `context` is a
+    // Responses-API field. Probed against LiteRouter/gpt-5.1 on 2026-07-25:
+    //   - `reasoning: {effort}`  → reasons AND returns the trace on
+    //     `message.reasoning` / `delta.reasoning`, which the openai-compatible
+    //     provider converts into thinking blocks. This is the spelling we want.
+    //   - `reasoning_effort`     → reasons but hides the trace entirely.
+    //   - effort above 'high' ('xhigh'/'max') is accepted but normalized
+    //     upstream, so 'high' is the effective ceiling for this model.
+    // Emitted only when the recipe names an effort: other openai-compatible
+    // recipes (base models, non-reasoning endpoints) must not receive the param.
+    ...(recipe.agent.provider === 'openai-compatible' && recipe.agent.responses?.reasoningEffort && {
+      providerParams: {
+        reasoning: { effort: recipe.agent.responses.reasoningEffort },
+      },
+    }),
     strategy,
     ...(recipe.agent.thinking && { thinking: recipe.agent.thinking }),
     ...(recipe.agent.refusalHandling && { refusalHandling: recipe.agent.refusalHandling }),
