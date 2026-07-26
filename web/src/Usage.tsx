@@ -13,6 +13,7 @@
 
 import { For, Show } from 'solid-js';
 import type { UiNode } from './tree';
+import { displayName } from './display';
 import { aggregateTokens } from './tree';
 import type {
   TokenUsage,
@@ -73,9 +74,9 @@ export function UsagePanel(props: {
   const headline = (): string => {
     switch (props.node.kind) {
       case 'process': return 'session total';
-      case 'fleet-child': return `child: ${props.node.label}`;
-      case 'framework': return `agent: ${props.node.label}`;
-      case 'subagent': return `subagent: ${props.node.label}`;
+      case 'fleet-child': return `child: ${displayName(props.node.label)}`;
+      case 'framework': return `agent: ${displayName(props.node.label)}`;
+      case 'subagent': return `subagent: ${displayName(props.node.label)}`;
     }
   };
 
@@ -83,7 +84,7 @@ export function UsagePanel(props: {
     <div class="border-l border-neutral-800 w-[52rem] max-w-[68vw] shrink-0 bg-neutral-950 flex flex-col h-full">
       <div class="border-b border-neutral-800 px-3 py-2 flex items-center gap-2">
         <span class="text-[10px] uppercase tracking-wider text-neutral-500 font-semibold">usage</span>
-        <span class="font-mono text-sm text-neutral-200 truncate">{props.node.label}</span>
+        <span class="font-mono text-sm text-neutral-200 truncate">{displayName(props.node.label)}</span>
         <button
           type="button"
           class="ml-auto px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 rounded text-xs"
@@ -265,7 +266,7 @@ function BreakdownRow(props: { node: UiNode; perAgentCost: PerAgentCost[] }) {
   return (
     <div class="border-l-2 border-neutral-800 pl-2 py-0.5">
       <div class="flex items-baseline gap-2">
-        <span class="font-mono text-neutral-300 truncate">{props.node.label}</span>
+        <span class="font-mono text-neutral-300 truncate">{displayName(props.node.label)}</span>
         <span class="text-[10px] text-neutral-600 uppercase tracking-wider">{kindHint()}</span>
         <Show when={cost() && cost()!.total > 0}>
           <span class="ml-auto text-emerald-300 text-[10px]" title={cost()!.currency}>

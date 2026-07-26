@@ -2,6 +2,7 @@ import { For, Show } from 'solid-js';
 import type { AgentNode } from '@conhost/state/agent-tree-reducer';
 import type { UiNode } from './tree';
 import { aggregateTokens, flattenUiTree } from './tree';
+import { displayName } from './display';
 
 export interface TreeSidebarProps {
   roots: UiNode[];
@@ -144,7 +145,7 @@ function NodeLabel(props: { node: UiNode; onUsageClick: () => void }) {
     return (
       <>
         <span class="text-neutral-600">▣</span>
-        <span class="font-mono text-neutral-200 truncate">{n.label}</span>
+        <span class="font-mono text-neutral-200 truncate">{displayName(n.label)}</span>
         <span class="text-[10px] text-neutral-600 uppercase tracking-wider">parent</span>
         <span class="ml-auto text-neutral-500 text-[10px] font-mono whitespace-nowrap">
           <UsageBadge label={`${fmtTokens(agg.output)}out`} hidden={agg.output === 0} onClick={props.onUsageClick} title="Show session usage" />
@@ -157,7 +158,7 @@ function NodeLabel(props: { node: UiNode; onUsageClick: () => void }) {
     return (
       <>
         <span class="text-cyan-400">▢</span>
-        <span class="font-mono text-neutral-200 truncate">{n.label}</span>
+        <span class="font-mono text-neutral-200 truncate">{displayName(n.label)}</span>
         <span class="text-[10px] text-cyan-500 uppercase tracking-wider">child</span>
         <span class="ml-auto text-neutral-500 text-[10px] font-mono whitespace-nowrap">
           <UsageBadge label={`${fmtTokens(agg.output)}out`} hidden={agg.output === 0} onClick={props.onUsageClick} title="Show child usage" />
@@ -169,7 +170,7 @@ function NodeLabel(props: { node: UiNode; onUsageClick: () => void }) {
   const a = n.agent!;
   return (
     <>
-      <span class="font-mono text-neutral-300 truncate">{n.label}</span>
+      <span class="font-mono text-neutral-300 truncate">{displayName(n.label)}</span>
       <span class={`px-1 rounded text-[10px] ${phaseColor(a.phase)}`}>
         {a.phase}
       </span>

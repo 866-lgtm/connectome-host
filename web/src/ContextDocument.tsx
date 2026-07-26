@@ -12,6 +12,7 @@
  */
 
 import { createSignal, onMount, For, Show } from 'solid-js';
+import { displayName } from './display';
 
 interface Msg { participant?: string; role?: string; content: unknown }
 interface Seg { messages: number; tokens: number }
@@ -128,7 +129,7 @@ export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTML
             const zone = zoneOf(i());
             const firstOfZone = i() === 0 || zoneOf(i() - 1) !== zone;
             const summary = isSummary(m);
-            const who = m.participant ?? m.role ?? '?';
+            const who = displayName(m.participant ?? m.role ?? '?');
             const t = textOf(m.content);
             return (
               <>

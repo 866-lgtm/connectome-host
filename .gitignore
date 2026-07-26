@@ -12,3 +12,7 @@ output/
 review-output/
 tsconfig.tsbuildinfo
 dev-start.sh
+
+# Agent scratch artifacts (playwright-mcp captures, runtime logs)
+.playwright-mcp/
+logs/

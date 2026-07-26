@@ -3,6 +3,7 @@ import { createStore, produce } from 'solid-js/store';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { createWireClient, type WireClient } from './wire';
+import { displayName } from './display';
 import { createTreeStore, type StreamSource, type UiNode } from './tree';
 import { TreeSidebar } from './TreeSidebar';
 import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
@@ -1132,7 +1133,7 @@ export function App() {
             const node = focusedNode()!;
             return (
               <StreamPanel
-                label={node.label}
+                label={displayName(node.label)}
                 scopeHint={streamHint(node.streamSource)}
                 lines={streamLines()}
                 onClose={closePanel}

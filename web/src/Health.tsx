@@ -17,6 +17,7 @@
  */
 
 import { For, Show } from 'solid-js';
+import { displayName } from './display';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -106,7 +107,7 @@ export function OpsAlertStrip(props: {
       return (
         <div class={`border-b px-4 py-1.5 text-xs flex items-center gap-2 ${tone.row}`}>
           <span class={`w-2 h-2 rounded-full shrink-0 ${tone.dot}`} />
-          <span class="font-mono font-semibold shrink-0">{a.agent}</span>
+          <span class="font-mono font-semibold shrink-0">{displayName(a.agent)}</span>
           <span class="font-mono text-[10px] uppercase tracking-wider opacity-70 shrink-0">{a.kind}</span>
           <span class="truncate" title={a.message}>{a.message}</span>
           <span class="ml-auto shrink-0 opacity-60 font-mono text-[10px]">
@@ -185,7 +186,7 @@ export function HealthPanel(props: {
         <For each={agents()}>{(a) => (
           <section class="border border-neutral-800 rounded px-2.5 py-2 space-y-1.5">
             <div class="flex items-center gap-2">
-              <span class="text-neutral-100">{a.name}</span>
+              <span class="text-neutral-100">{displayName(a.name)}</span>
               <span class={statusTone(a.status)}>{a.status ?? '?'}</span>
               <Show when={(a.consecutiveInferenceFailures ?? 0) > 0}>
                 <span class="ml-auto text-rose-400">
