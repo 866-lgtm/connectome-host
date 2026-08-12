@@ -365,7 +365,13 @@ async function createFramework(
       ...(callLedger ? { callLedger } : {}),
     });
     moduleInstances.push(webUiModule);
-    moduleInstances.push(new ObserversModule({ path: observersPath }));
+    // The observer grant/revoke tools ride along with the webui by default, but
+    // are independently suppressible: `webui.observerTools: false` keeps the
+    // viewer while dropping the agent-facing observers--{get,grant,revoke}
+    // tools from the surface. Operators can still edit observers.json directly.
+    if (webuiConfig.observerTools !== false) {
+      moduleInstances.push(new ObserversModule({ path: observersPath }));
+    }
   }
 
   // Extension-registered modules. Instantiated last so built-in modules keep

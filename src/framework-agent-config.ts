@@ -60,9 +60,17 @@ export function buildFrameworkAgentConfig(
     //     upstream, so 'high' is the effective ceiling for this model.
     // Emitted only when the recipe names an effort: other openai-compatible
     // recipes (base models, non-reasoning endpoints) must not receive the param.
-    ...(recipe.agent.provider === 'openai-compatible' && recipe.agent.responses?.reasoningEffort && {
+    ...(recipe.agent.provider === 'openai-compatible'
+      && (recipe.agent.responses?.reasoningEffort || recipe.agent.responses?.forceThinkFirst) && {
       providerParams: {
-        reasoning: { effort: recipe.agent.responses.reasoningEffort },
+        ...(recipe.agent.responses?.reasoningEffort
+          ? { reasoning: { effort: recipe.agent.responses.reasoningEffort } }
+          : {}),
+        // Force a `think` call on round 0 of each turn (auto after). The
+        // openai-compatible provider reads this control flag, detects round 0
+        // from the message tail, and emits the NAMED tool_choice — the generic
+        // "required" is silently dropped by LiteRouter/gpt-5.1 (probed 2026-08-12).
+        ...(recipe.agent.responses?.forceThinkFirst ? { force_think_first: true } : {}),
       },
     }),
     strategy,

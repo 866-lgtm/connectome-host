@@ -149,6 +149,15 @@ export interface RecipeAgent {
     /** OpenAI Responses API processing tier. `priority` is the API-key
      * equivalent of Codex fast mode. */
     serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
+    /**
+     * Force a `think` tool call on the FIRST inference round of each turn
+     * (then auto). openai-compatible only. The provider detects round 0 from
+     * the message tail and emits the NAMED tool_choice
+     * (`{type:'function', function:{name:'think'}}`) — the generic `"required"`
+     * is silently ignored by LiteRouter/gpt-5.1. No-op if no `think` tool is
+     * present. Pairs with the think loop guard (THINK_*_CAP) for "think once,
+     * then act". */
+    forceThinkFirst?: boolean;
   };
   /** ChatGPT-subscription Codex settings. Only used with
    * `provider: "openai-codex"`. Runtime `/fast` overrides fastMode. */
@@ -489,6 +498,14 @@ export interface RecipeWebUi {
    * — only sensible when something else upstream is enforcing it.
    */
   allowedOrigins?: string[];
+  /**
+   * Whether to expose the agent-facing observer grant tools
+   * (`observers--get` / `--grant` / `--revoke`) over its own consent file.
+   * On by default whenever the webui is enabled. Set `false` to keep the web
+   * viewer but drop those three tools from the agent's surface; operators can
+   * still manage `data/observers.json` directly.
+   */
+  observerTools?: boolean;
 }
 
 export interface RecipeFleet {
