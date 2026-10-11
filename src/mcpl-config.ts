@@ -510,9 +510,13 @@ export function resolveOverlayEntry(
   if (read.url && rec.reconnect === undefined) rec.reconnect = true;
   const denied = new Set<string>([
     ...AGENT_DEPLOY_DENIED_CAPABILITIES,
-    // Text, numbers and true/false, as main's String() read them; anything
-    // else names no capability, and String() could throw on it.
-    ...(Array.isArray(rec.disabledCapabilities) ? (rec.disabledCapabilities as unknown[]).filter(isPlain).map(String) : []),
+    // Each item as main's String() read it, so a nested list such as
+    // [["channels"]] still denies "channels" (Nell-1783's review of
+    // ef84ab1). String() throws on a parsed object whose own toString isn't
+    // a function, and such an item names nothing.
+    ...(Array.isArray(rec.disabledCapabilities)
+      ? (rec.disabledCapabilities as unknown[]).flatMap((c) => { try { return [String(c)]; } catch { return []; } })
+      : []),
   ]);
   return {
     id,

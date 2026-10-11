@@ -303,14 +303,16 @@ describe('what an overlay replacement lacks of the operator definition', () => {
       writeFileSync(path, JSON.stringify({ mcplServers: { world: numberAccess, shell: odd } }));
       expect(() => overlayWarnings([shell, { id: 'world', url: 'wss://w/mcpl', access: 'portal' }], path)).not.toThrow();
       // A parsed object whose own toString isn't a function makes String()
-      // throw, so the host never stringifies one (sw-ch228b I43): an env value
-      // passes on as written, and a capability that isn't text names nothing.
+      // throw (sw-ch228b I43): an env value passes on as written, and such a
+      // capability names nothing. Every other capability reads as main's
+      // String() read it, so a nested list still denies its name (Nell-1783's
+      // review of ef84ab1).
       writeFileSync(path, JSON.stringify({ mcplServers: {
-        unprintable: { command: 'node', env: { A: { toString: 1 } }, disabledCapabilities: [{ toString: 1 }, 'channels'] },
+        unprintable: { command: 'node', env: { A: { toString: 1 } }, disabledCapabilities: [{ toString: 1 }, ['memory'], 'channels'] },
       } }));
       expect(() => overlayWarnings([], path)).not.toThrow();
       const [loaded] = applyAgentOverlay([], path) as Array<Record<string, unknown>>;
-      expect(loaded!.disabledCapabilities).toEqual([...AGENT_DEPLOY_DENIED_CAPABILITIES, 'channels'].sort());
+      expect(loaded!.disabledCapabilities).toEqual([...AGENT_DEPLOY_DENIED_CAPABILITIES, 'channels', 'memory'].sort());
     });
   });
 
