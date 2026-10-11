@@ -11,7 +11,10 @@
 // usage, and content-block shape (type + size per block) on every call.
 //
 // Each line: { type: 'call'|'error', kind: 'complete'|'stream', timestamp,
-//   durationMs, requestSummary, response?, rawRequest?, error? }
+//   durationMs, requestSummary, response?, rawRequest?, error?, errorType?,
+//   httpStatus?, providerErrorCode?, retryable?, errorChars? }
+// A failure's `error` is { name, message } with its text bounded, or a
+// non-Error's text (logging-error-fields.ts).
 
 import { BedrockAdapter } from '@animalabs/membrane';
 import type {
@@ -21,6 +24,7 @@ import type {
   StreamCallbacks,
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
+import { describeErrorObject } from './logging-error-fields.js';
 
 type BedrockConfig = ConstructorParameters<typeof BedrockAdapter>[0];
 
@@ -105,7 +109,7 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
         durationMs: Date.now() - started,
         requestSummary: summarizeRequest(request),
         rawRequest,
-        error: error instanceof Error ? { message: error.message, name: error.name } : String(error),
+        ...describeErrorObject(error, false),
       });
       throw error;
     }
@@ -137,7 +141,7 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
         durationMs: Date.now() - started,
         requestSummary: summarizeRequest(request),
         rawRequest,
-        error: error instanceof Error ? { message: error.message, name: error.name } : String(error),
+        ...describeErrorObject(error, false),
       });
       throw error;
     }

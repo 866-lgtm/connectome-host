@@ -31,10 +31,12 @@
 // A record whose request or response couldn't be summarized keeps only the
 // head fields and, for a failure, the error (summaryUnavailable: true).
 //
-// The error text is bounded (MAX_ERROR_CHARS): a provider can echo the whole
-// rejected request in its error body, and that text would otherwise sit in
-// the record beside the request it echoes. The size guard below drops raw
-// bodies, never the error string, so the error string bounds itself.
+// The error text is bounded, and read without throwing, by
+// logging-error-fields.ts, which the Anthropic and Bedrock writers share: a
+// provider can echo the whole rejected request in its error body, and that
+// text would otherwise sit in the record beside the request it echoes. The
+// size guard below drops raw bodies, never the error string, so the error
+// string bounds itself.
 //
 // Logging never changes what the caller gets: a successful call's record is
 // written after the provider call's try, and every write is guarded.
@@ -47,73 +49,10 @@ import type {
   StreamCallbacks,
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
+import { describeError } from './logging-error-fields.js';
 
 /** Above this many serialized bytes, drop raw bodies and keep summaries. */
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
-
-/** Longest error text a record keeps (head and tail, the omission stated). */
-const MAX_ERROR_CHARS = 4_000;
-/** Longest provider error code or type kept; real ones are short tokens. */
-const MAX_CODE_CHARS = 128;
-
-/**
- * `text` when it fits; otherwise its head and tail around a marker stating
- * how many of how many characters were omitted. The whole stays within `max`
- * whenever `max` fits the marker itself (at most 49 characters), as both
- * bounds here do; a smaller `max` gets the marker alone, longer than `max`.
- * Cuts move only toward omission, so no surrogate pair is split.
- */
-function boundText(text: string, max: number): string {
-  if (text.length <= max) return text;
-  const isLow = (index: number): boolean => {
-    const code = text.charCodeAt(index);
-    return code >= 0xdc00 && code <= 0xdfff;
-  };
-  const marker = ` …[${text.length} of ${text.length} characters omitted]… `.length;
-  const budget = Math.max(0, max - marker);
-  const tail = Math.floor(budget / 4);
-  let headEnd = budget - tail;
-  if (headEnd > 0 && isLow(headEnd)) headEnd--;
-  let tailStart = text.length - tail;
-  if (tailStart < text.length && isLow(tailStart)) tailStart++;
-  return `${text.slice(0, headEnd)} …[${tailStart - headEnd} of ${text.length} characters omitted]… ${text.slice(tailStart)}`;
-}
-
-/**
- * The error fields of a record: the bounded text, plus the classification a
- * membrane error carries, so a reader can tell a request-shaped rejection
- * from a transient failure without the text. Reading a hostile error never
- * throws: logging must never break inference.
- */
-function describeError(error: unknown): Record<string, unknown> {
-  // Each part is read on its own: a field whose getter throws loses only
-  // itself, never the provider's text or the rest of its classification.
-  const read = <T>(get: () => T): T | undefined => {
-    try { return get(); } catch { return undefined; }
-  };
-  const fields: Record<string, unknown> = {};
-  let text: string;
-  // Even the type test is guarded: a revoked Proxy or a throwing
-  // getPrototypeOf trap makes `instanceof` itself throw.
-  if (read(() => error instanceof Error) === true) {
-    const e = error as Error & { type?: unknown; httpStatus?: unknown; providerErrorCode?: unknown; retryable?: unknown };
-    const name = read(() => String(e.name)) ?? 'Error';
-    const message = read(() => String(e.message));
-    text = message === undefined ? `${name}: [message could not be read]` : `${name}: ${message}`;
-    const type = read(() => e.type);
-    if (typeof type === 'string') fields.errorType = boundText(type, MAX_CODE_CHARS);
-    const httpStatus = read(() => e.httpStatus);
-    if (typeof httpStatus === 'number') fields.httpStatus = httpStatus;
-    const code = read(() => e.providerErrorCode);
-    if (typeof code === 'string') fields.providerErrorCode = boundText(code, MAX_CODE_CHARS);
-    const retryable = read(() => e.retryable);
-    if (typeof retryable === 'boolean') fields.retryable = retryable;
-  } else {
-    text = read(() => String(error)) ?? '[error could not be read]';
-  }
-  const bounded = boundText(text, MAX_ERROR_CHARS);
-  return { error: bounded, ...fields, ...(bounded !== text ? { errorChars: text.length } : {}) };
-}
 
 function summarizeRequest(request: ProviderRequest): Record<string, unknown> {
   const msgs = (request.messages ?? []) as Array<{ role?: string; content?: unknown }>;

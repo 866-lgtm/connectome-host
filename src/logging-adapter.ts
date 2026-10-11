@@ -20,7 +20,10 @@
 // One file per process lifetime (timestamped at construction). Each line is a
 // JSON object with shape:
 //   { type: 'call'|'error', kind: 'complete'|'stream', timestamp, durationMs,
-//     requestSummary, rawRequest?, rawResponse, error? }
+//     requestSummary, rawRequest?, rawResponse, error?, errorType?,
+//     httpStatus?, providerErrorCode?, retryable?, errorChars? }
+// A failure's `error` is { name, message, stack } with its text bounded, or
+// a non-Error's text (logging-error-fields.ts).
 
 import { AnthropicAdapter } from '@animalabs/membrane';
 import type {
@@ -31,6 +34,7 @@ import type {
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
 import { summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
+import { describeErrorObject } from './logging-error-fields.js';
 
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
@@ -378,7 +382,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         timestamp, durationMs,
         requestSummary: this.requestSummary(request, sink.rawRequest),
         rawRequest: sink.rawRequest,
-        error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
+        ...describeErrorObject(err, true),
       });
       this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, undefined, err);
       throw err;
@@ -415,7 +419,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         timestamp, durationMs,
         requestSummary: this.requestSummary(request, sink.rawRequest),
         rawRequest: sink.rawRequest,
-        error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : String(err),
+        ...describeErrorObject(err, true),
       });
       this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, undefined, err);
       throw err;
