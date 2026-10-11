@@ -223,8 +223,8 @@ export interface AgentOverlayFile {
  * naming the file, as main threw on both. The boot stops on it until the
  * file is fixed: the file carries the agent's tombstones, so reading past it
  * would load servers the agent unloaded.
- * No writer produces those shapes; saveAgentOverlay always writes
- * `{ "mcplServers": { … } }`. The error never quotes the file, which can
+ * No writer produces those shapes: saveAgentOverlay writes an object root
+ * whose `mcplServers` is a map. The error never quotes the file, which can
  * hold credentials.
  */
 export function readAgentOverlayFile(overlayPath: string): {
@@ -357,6 +357,11 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
       if (e[k] !== undefined && (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string'))) {
         return { problem: `its ${k} isn't a list of names` };
       }
+      // An empty name matches nothing, so in an allow-list it's the deny-all
+      // that an empty list is kept from being.
+      if (e[k] !== undefined && (e[k] as string[]).some((x) => x.trim() === '')) {
+        return { problem: `its ${k} holds an empty name, which matches nothing` };
+      }
     }
     if (e.reconnect !== undefined && typeof e.reconnect !== 'boolean') return { problem: 'its reconnect is neither true nor false' };
   }
@@ -410,19 +415,42 @@ export function overlayEntryTombstones(entry: unknown): boolean {
 }
 
 /**
- * Write the agent overlay file, in place, as saveMcplServers writes its file.
- * Writing through the existing file keeps its mode (it can hold tokens), a
- * symlink at its path, and a single-file bind mount; a new file renamed over
- * it would lose all three, and the rename fails outright on such a mount.
- * A crash in the middle of this small write can still leave the file
- * truncated, so the next boot stops on it, as it always could.
+ * Write the agent overlay file, as saveMcplServers writes its file
+ * (writeServersFile). Writing through the existing file keeps its mode (it
+ * can hold tokens), a symlink at its path, and a single-file bind mount; a
+ * new file renamed over it would lose all three, and the rename fails
+ * outright on such a mount. A crash in the middle of this small write can
+ * still leave the file truncated, so the next boot stops on it, as it always
+ * could.
  */
 export function saveAgentOverlay(
   overlayPath: string,
   servers: Record<string, AgentOverlayEntry>,
 ): void {
-  const data: AgentOverlayFile = { mcplServers: servers };
-  writeFileSync(overlayPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  writeServersFile(overlayPath, servers);
+}
+
+/**
+ * Write `servers` as a servers file's `mcplServers`, in place. The root's
+ * other keys are kept as JSON.parse reads them: no reader acts on them, but
+ * they're whoever wrote them's, such as an entry under a misspelled key. A
+ * root that isn't an object holds no entries for any reader, and is
+ * replaced. A file that doesn't parse is never overwritten: its readers
+ * refuse it, so the save refuses too, without quoting it.
+ */
+function writeServersFile(path: string, servers: Record<string, unknown>): void {
+  let root: Record<string, unknown> = {};
+  if (existsSync(path)) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf-8'));
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new Error(`${path} isn't valid JSON, so it wasn't overwritten`);
+      throw error;
+    }
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) root = parsed as Record<string, unknown>;
+  }
+  writeFileSync(path, JSON.stringify({ ...root, mcplServers: servers }, null, 2) + '\n', 'utf-8');
 }
 
 /**
@@ -569,7 +597,7 @@ export function applyAgentOverlay<T extends { id: string }>(
 
   // A malformed entry is skipped: neither a tombstone nor a replacement.
   const result: Array<T | ({ id: string } & Record<string, unknown>)> =
-    servers.filter(s => !overlayEntryTombstones(overlay[s.id]));
+    servers.filter(s => !overlayEntryTombstones(Object.hasOwn(overlay, s.id) ? overlay[s.id] : undefined));
 
   for (const [id, entry] of Object.entries(overlay)) {
     const loaded = resolveOverlayEntry(id, entry, overlayPath);
@@ -800,8 +828,7 @@ export function readMcplServersFile(configPath: string): Record<string, ServerFi
  * Write server entries to the config file.
  */
 export function saveMcplServers(configPath: string, servers: Record<string, ServerFileEntry>): void {
-  const data: McplServersFile = { mcplServers: servers };
-  writeFileSync(configPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  writeServersFile(configPath, servers);
 }
 
 /**

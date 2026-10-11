@@ -11,6 +11,7 @@ import { join, resolve } from 'node:path';
 import {
   readAgentOverlay,
   saveAgentOverlay,
+  saveMcplServers,
   applyAgentOverlay,
   resolveOverlayEntry,
   serverProvisions,
@@ -49,6 +50,27 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
       };
       saveAgentOverlay(path, entries);
       expect(readAgentOverlay(path)).toEqual(entries);
+    });
+  });
+
+  // Both servers files keep the root's other keys on a save; a root that
+  // isn't an object holds no entries and is replaced; and a file that
+  // doesn't parse is refused, never overwritten.
+  test("a save keeps the root's other keys, replaces a root that isn't an object, and never overwrites a file that doesn't parse", () => {
+    withTmp((dir) => {
+      const overlay = join(dir, 'mcpl-servers.agent.json');
+      const operator = join(dir, 'mcpl-servers.json');
+      writeFileSync(operator, JSON.stringify({ $comment: 'shared', mcpServers: { typo: {} }, mcplServers: {} }));
+      saveMcplServers(operator, { chat: { command: 'node' } });
+      expect(JSON.parse(readFileSync(operator, 'utf-8'))).toEqual({
+        $comment: 'shared', mcpServers: { typo: {} }, mcplServers: { chat: { command: 'node' } },
+      });
+      writeFileSync(overlay, JSON.stringify(['not', 'an', 'overlay']));
+      saveAgentOverlay(overlay, { mine: { command: 'bun' } });
+      expect(JSON.parse(readFileSync(overlay, 'utf-8'))).toEqual({ mcplServers: { mine: { command: 'bun' } } });
+      writeFileSync(overlay, '{ "token": "secret-value", not json');
+      expect(() => saveAgentOverlay(overlay, {})).toThrow(`${overlay} isn't valid JSON, so it wasn't overwritten`);
+      expect(readFileSync(overlay, 'utf-8')).toBe('{ "token": "secret-value", not json');
     });
   });
 });
