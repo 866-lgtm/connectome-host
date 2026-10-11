@@ -140,4 +140,37 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
       });
     }
   }
+
+  // A stack that doesn't open with the message keeps its text, bounded like
+  // the message, and only the writer that records stacks reads one.
+  test('anthropic: a long stack that doesn\'t open with the message is bounded, with the omission stated', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-native-errors-'));
+    dirs.push(dir);
+    const log = join(dir, 'llm-calls.jsonl');
+    const thrown = new Error('short');
+    Object.defineProperty(thrown, 'stack', { value: `Wrapped: ${'y'.repeat(50_000)}\n    at frame (file.js:1:1)` });
+    failWith(AnthropicAdapter, thrown);
+    const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, log);
+    await expect(adapter.complete(request)).rejects.toBe(thrown);
+    const [record] = records(log);
+    const stack = (record!.error as { stack: string }).stack;
+    expect(stack.length).toBeLessThanOrEqual(4_000);
+    expect(stack).toStartWith('Wrapped: yyy');
+    expect(stack).toContain('characters omitted]');
+    expect(stack).toEndWith('    at frame (file.js:1:1)');
+  });
+
+  test('bedrock: a stack is never read', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'llm-native-errors-'));
+    dirs.push(dir);
+    const log = join(dir, 'llm-calls.jsonl');
+    const thrown = new Error('short');
+    let reads = 0;
+    Object.defineProperty(thrown, 'stack', { get() { reads++; return 'never wanted'; } });
+    failWith(BedrockAdapter, thrown);
+    const adapter = new LoggingBedrockAdapter({ region: 'us-east-1', accessKeyId: 'test', secretAccessKey: 'test' } as never, log);
+    await expect(adapter.complete(request)).rejects.toBe(thrown);
+    expect(reads).toBe(0);
+    expect('stack' in (records(log)[0]!.error as object)).toBe(false);
+  });
 });

@@ -4,8 +4,9 @@
 //
 // The error text is bounded (MAX_ERROR_CHARS): a provider can echo the whole
 // rejected request in its error body, and that text would otherwise sit in
-// the record beside the request it echoes. Each writer's size guard drops raw
-// bodies, never the error, so the error bounds itself.
+// the record beside the request it echoes. The generic writer's size guard
+// drops raw bodies, never the error, so the error bounds itself; the Anthropic
+// and Bedrock writers have no such guard, and keep the raw request whole.
 //
 // Reading a hostile error never throws: logging must never break inference,
 // and a throw inside a writer's catch block would replace the provider's
@@ -58,8 +59,10 @@ interface ReadError {
 }
 
 /** Reads each part of a thrown value on its own: a part whose getter throws
- *  loses only itself, never the provider's text or the rest. */
-function readError(error: unknown): ReadError {
+ *  loses only itself, never the provider's text or the rest. The stack is
+ *  read only when asked for: V8 formats it on first read, which repeats a
+ *  huge message, and a custom getter may do anything. */
+function readError(error: unknown, withStack: boolean): ReadError {
   // Even the type test is guarded: a revoked Proxy or a throwing
   // getPrototypeOf trap makes `instanceof` itself throw.
   if (read(() => error instanceof Error) !== true) {
@@ -75,7 +78,7 @@ function readError(error: unknown): ReadError {
   if (typeof code === 'string') classification.providerErrorCode = boundText(code, MAX_CODE_CHARS);
   const retryable = read(() => e.retryable);
   if (typeof retryable === 'boolean') classification.retryable = retryable;
-  const stack = read(() => e.stack);
+  const stack = withStack ? read(() => e.stack) : undefined;
   return {
     isError: true,
     name: read(() => String(e.name)) ?? 'Error',
@@ -92,7 +95,7 @@ function readError(error: unknown): ReadError {
  * `errorChars`, the whole text's length, when it was cut.
  */
 export function describeError(error: unknown): Record<string, unknown> {
-  const e = readError(error);
+  const e = readError(error, false);
   const text = e.isError
     ? (e.message === undefined ? `${e.name}: [message could not be read]` : `${e.name}: ${e.message}`)
     : e.text!;
@@ -110,7 +113,7 @@ export function describeError(error: unknown): Record<string, unknown> {
  * the whole message's length, when it was cut.
  */
 export function describeErrorObject(error: unknown, withStack: boolean): Record<string, unknown> {
-  const e = readError(error);
+  const e = readError(error, withStack);
   if (!e.isError) {
     const bounded = boundText(e.text!, MAX_ERROR_CHARS);
     return { error: bounded, ...(bounded !== e.text ? { errorChars: e.text!.length } : {}) };
@@ -118,7 +121,7 @@ export function describeErrorObject(error: unknown, withStack: boolean): Record<
   const message = e.message === undefined ? '[message could not be read]' : e.message;
   const bounded = boundText(message, MAX_ERROR_CHARS);
   const fields: Record<string, unknown> = { name: e.name, message: bounded };
-  if (withStack && e.stack !== undefined) {
+  if (e.stack !== undefined) {
     const header = `${e.name}: ${message}`;
     const stack = e.message !== undefined && e.stack.startsWith(header)
       ? `${e.name}: [the message above]${e.stack.slice(header.length)}`
