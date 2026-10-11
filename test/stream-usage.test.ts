@@ -180,13 +180,22 @@ describe('usage samples from a real stream', () => {
   });
 
   test('a second stream counts from zero after its inference:started', async () => {
-    const run = await runStream('worker');
-    const tokens = fold([...run.events, ...run.events]).getNode('worker')!.tokens;
+    // Its first call is above the first stream's totals in every count, so
+    // only its inference:started says the counts began again.
+    const big: CallUsage[] = [
+      { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 10000, cacheCreationTokens: 5000 },
+      { inputTokens: 900, outputTokens: 150, cacheReadTokens: 15000, cacheCreationTokens: 300 },
+      { inputTokens: 700, outputTokens: 120, cacheReadTokens: 15300, cacheCreationTokens: 200 },
+    ];
+    const first = await runStream('worker');
+    const second = await runStream('worker', big);
+    const total = (calls: CallUsage[], k: keyof CallUsage) => calls.reduce((n, c) => n + c[k], 0);
+    const tokens = fold([...first.events, ...second.events]).getNode('worker')!.tokens;
     expect(tokens).toEqual({
-      input: prompt(CALLS[2]!),
-      output: 2 * sum('outputTokens'),
-      cacheRead: 2 * sum('cacheReadTokens'),
-      cacheWrite: 2 * sum('cacheCreationTokens'),
+      input: prompt(big[2]!),
+      output: sum('outputTokens') + total(big, 'outputTokens'),
+      cacheRead: sum('cacheReadTokens') + total(big, 'cacheReadTokens'),
+      cacheWrite: sum('cacheCreationTokens') + total(big, 'cacheCreationTokens'),
     });
   });
 
@@ -268,6 +277,34 @@ describe('usage samples from a real stream', () => {
     });
   }
 
+  test("a subagent's restarted stream counts from zero, so its context size is the new call's prompt", async () => {
+    // The first call's fresh input passes the subagent's 500k maxStreamTokens,
+    // so the framework restarts it at the tool boundary. The new stream's call
+    // is above the first in every count: only the subagent's inference:started
+    // reset makes its sample one call.
+    const script: CallUsage[] = [
+      { inputTokens: 600_000, outputTokens: 30, cacheReadTokens: 100, cacheCreationTokens: 4000 },
+      { inputTokens: 600_100, outputTokens: 40, cacheReadTokens: 4100, cacheCreationTokens: 4100 },
+    ];
+    const h = await harness(script);
+    try {
+      const done: Array<Extract<SubagentStreamEvent, { type: 'done' }>> = [];
+      h.subagent.onPeekStream('*', (event) => { if (event.type === 'done') done.push(event); });
+      const result = await h.subagent.handleToolCall({
+        id: 'spawn-1',
+        name: 'spawn',
+        callerAgentName: 'parent',
+        input: { name: 'probe', systemPrompt: 'Answer.', task: 'answer', tools: ['probe--ping'], sync: true },
+      } as unknown as ToolCall);
+      expect(result.success).toBe(true);
+      expect(h.adapter.calls).toBe(2);
+      expect(h.traces.filter((e) => e.type === 'inference:stream_restarted').length).toBe(1);
+      expect(done.map((e) => e.lastInputTokens)).toEqual([prompt(script[1]!)]);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   test("a completion carrying a call no sample reported sets the subagent's context size to it", async () => {
     // agent-framework's completions repeat the last sample, so this one is
     // widened by a call on its way to the listeners.
@@ -318,6 +355,15 @@ describe('foldUsageSample', () => {
       expect(step.added).toEqual(sample);
       expect(step.prompt).toBeUndefined();
     }
+  });
+
+  test('after a sample read as a new stream, the next counts from it', () => {
+    const restart = foldUsageSample({ input: 40, output: 5, cacheRead: 900, cacheCreation: 10 }, sample);
+    expect(restart.total).toEqual(sample);
+    const next = { input: 70, output: 25, cacheRead: 650, cacheCreation: 40 };
+    expect(foldUsageSample(restart.total, next)).toEqual({
+      total: next, added: { input: 20, output: 15, cacheRead: 350, cacheCreation: 20 }, prompt: 390,
+    });
   });
 
   test('a previous sample with a count missing, as a malformed snapshot might carry, never makes NaN', () => {
