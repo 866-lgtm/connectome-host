@@ -32,7 +32,7 @@ interface Run {
   maxTokens: number;
   systemPrompt: string;
   /** The model, stream budget, strategy message cap and tool rules it was
-   *  created with (sw-ch213 I14). The strategy's windows have no public
+   *  created with. The strategy's windows have no public
    *  reader. */
   model: string;
   maxStreamTokens: number;
@@ -384,7 +384,7 @@ describe('fork orientation', () => {
       for (const name of run.surface) expect(start).toContain(name);
 
       // Its own prompt replaces the default; with no parent there's no prompt
-      // it overrides (sw-ch213 I34).
+      // it overrides.
       const own = await h.subagent.handleToolCall(
         call('fork', 'toolu_fork_5b', { name: 'stray', task: 'list them again', systemPrompt: 'you list files' }, null),
       );
@@ -458,7 +458,7 @@ describe('fork orientation', () => {
       const text = detached.data as string;
       expect(text).toStartWith("Subagent 'slow' moved to background.");
       // The detach fires on its timer, whether or not the run has reached the
-      // stub yet, so wait for the run itself (sw-ch213 I9).
+      // stub yet, so wait for the run itself.
       await held;
       expect(h.runs[1]!.firstContext).toContain(launchBlock(text));
       h.releaseHeld();
@@ -519,7 +519,7 @@ describe('spawn orientation', () => {
   });
 });
 
-describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe)", () => {
+describe("a spawn's tool rule says what the list grants", () => {
   async function ruleFor(tools: string[], module: Partial<SubagentModuleConfig> = {}, parent: Partial<AgentConfig> = {}) {
     const h = await makeHarness({ parent, module, modules: [toolModule('probe', 1)] });
     try {
@@ -552,7 +552,7 @@ describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe
     );
   });
 
-  // The process offers subagent--fork; the depth removes it (sw-ch213 I12).
+  // The process offers subagent--fork; the depth removes it.
   test('at the depth limit, names a listed subagent tool as removed by the depth, not as not offered', async () => {
     const rule = await ruleFor(['probe--t1', 'subagent--fork'], { maxDepth: 1 });
     expect(rule).toContain('; it also listed subagent--fork, which this depth removes');
@@ -560,7 +560,7 @@ describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe
   });
 
   // agentToolSurface adds prose_help under explicit routing, whatever the
-  // list says (sw-ch213 I7).
+  // list says.
   test('under explicit prose routing, a listed prose_help is not dropped, and the rule says the routing shows it', async () => {
     const rule = await ruleFor(['probe--t1', 'prose_help'], {}, { proseRouting: 'explicit' });
     expect(rule).not.toContain("prose_help, which isn't offered");
@@ -570,7 +570,7 @@ describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe
 });
 
 describe('what a launch block says beyond the settings it compares', () => {
-  // sw-ch213 I22: an empty list is no tools, not "0: ".
+  // An empty list is no tools, not "0: ".
   test('a parent restricted to no tools is said to be', async () => {
     const h = await makeHarness({ parent: { allowedTools: [] } });
     try {
@@ -588,7 +588,7 @@ describe('what a launch block says beyond the settings it compares', () => {
 
   // The stream's agent is built from the launch alone, so its agent settings
   // are the framework's defaults. The start block sets them against the
-  // parent's, naming only what differs (sw-ch213 I8, Nell-1783's review).
+  // parent's, naming only what differs.
   test('a fork names the agent settings it does not carry from its parent, with the parent\'s', async () => {
     const h = await makeHarness({ parent: {
       thinking: { enabled: true, budgetTokens: 2048 },
@@ -653,7 +653,7 @@ describe('a module without its framework yet', () => {
     const bare = new SubagentModule();
     const res = await bare.handleToolCall(call('spawn', 'toolu_bare', { name: 'early', systemPrompt: 'p', task: 't' }));
     expect(res.success).toBe(false);
-    // The missing framework is the reason, not any error (sw-ch213 I32).
+    // The missing framework is the reason, not any error.
     expect(String(res.error)).toStartWith("Couldn't spawn 'early': SubagentModule: framework not set.");
     const forked = await bare.handleToolCall(call('fork', 'toolu_bare_fork', { name: 'early-fork', task: 't' }));
     expect(String(forked.error)).toStartWith("Couldn't fork 'early-fork': SubagentModule: framework not set.");
@@ -810,7 +810,7 @@ describe('a queued launch', () => {
         expect(launchBlock(receipt)).toContain('- Output limit: 256 tokens, the same as ');
         expect(run.maxTokens).toBe(256);
         expect(run.proseRouting).toBe('hybrid');
-        // The rest of the launch, too (sw-ch213 I14).
+        // The rest of the launch, too.
         expect(run.model).toBe('mock');
         expect(run.maxStreamTokens).toBe(500_000);
         expect(run.maxMessageTokens).toBe(10_000);
@@ -921,8 +921,7 @@ describe('the first request a fork actually sends', () => {
   });
 
   // A spawn's Tools line lists its surface in full, and the request it sends
-  // must carry exactly those, prose_help under explicit routing included
-  // (sw-ch213 I11).
+  // must carry exactly those, prose_help under explicit routing included.
   test('a spawn with a tool the board offers sends exactly the tools its orientation lists', async () => {
     const { adapter, subagent, cleanup } = await realHarness({ parent: { proseRouting: 'explicit' } });
     try {
