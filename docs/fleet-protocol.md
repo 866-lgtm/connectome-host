@@ -222,7 +222,7 @@ prompt. autoStart, autoRestart and `fleet--restart` bypass the check.
 | `fleet--command` | `name, command` | Send a `command`; returns immediately — output arrives as `command-output` events (see `fleet--peek`). |
 | `fleet--peek` | `name, lines?=50` | Last N raw events from the child's 500-event ring buffer. |
 | `fleet--kill` | `name` | `shutdown`, wait `gracefulShutdownMs`, SIGTERM, wait `sigtermEscalationMs`, SIGKILL. |
-| `fleet--restart` | `name` | Kill, then relaunch with the same recipe, dataDir, subscription, `env` and `autoRestart`. Cancels a pending automatic restart and starts a fresh retry budget (§4.6). |
+| `fleet--restart` | `name` | Kill, then relaunch with the same recipe, dataDir, subscription, `env` and `autoRestart`. Cancels a pending automatic restart and starts a fresh retry budget (§4.6), as a `fleet--launch` of the same name does. |
 | `fleet--relay` | `from, to, prefix?` | Send `from`'s last `inference:speech` to `to`. |
 | `fleet--await` | `names[], timeoutMs?=300000, requireAll?=true` | Block until the named children emit `lifecycle:idle`; fails fast on crash/exit, partial result on timeout. |
 
@@ -236,7 +236,9 @@ spawned detached with env `{...process.env, ...env, AGENT_TIMEZONE, DATA_DIR}`.
 The parent waits for the socket file, connects, sends `subscribe`, and waits
 for `lifecycle:ready`.
 
-**Failed launch.** Transient missing-socket and connection-refused errors are retried while the child sets up its socket, using `socketWaitTimeoutMs` as the retry deadline. On a startup socket, `subscribe` or readiness failure, the parent sends SIGKILL to the process this launch spawned if it is still running, then waits up to 2 s to observe its exit before returning the error. If termination remains unconfirmed, the error says so and the record stays `starting`, blocking another launch of that name until the exit is observed. The SIGKILL is a signal death and does not trigger autoRestart (§4.6); a natural non-zero exit remains eligible under that section's conditions.
+**Failed launch.** Transient missing-socket and connection-refused errors are retried while the child sets up its socket. `socketWaitTimeoutMs` is checked between attempts, and each connect has its own 3 s timeout, so the final error can come up to 3 s after that deadline. A child that dies after its socket appeared is reported with the refused connect, not as one that never bound. On a startup socket, `subscribe` or readiness failure, the parent sends SIGKILL to the process this launch spawned if it is still running, then waits up to 2 s to observe its exit before returning the error. The record's `exitReason` keeps the failure beside the exit (`child did not become ready: … (exit: SIGKILL)`), whichever came first. If termination remains unconfirmed, the error says so and the record stays `starting`, blocking another launch of that name until the exit is observed. The SIGKILL is a signal death and does not trigger autoRestart (§4.6), so a replacement that fails to start ends automatic restarts until a manual `fleet--launch` or `fleet--restart`; a natural non-zero exit remains eligible under that section's conditions. An adopted process (§4.5) that fails its readiness check is not killed: it is left running, and its record stays blocked (`starting`, with the failure in `exitReason`) until a later launch or restart adopts it.
+
+**Interrupted launch.** Every launch yields while it loads the recipe and reconciles leftovers. It is refused, and nothing is spawned, if during that time the parent began shutting down, a `fleet--kill` was acknowledged on the generation it replaces, or another launch replaced that generation; the error names which.
 
 **Leftover artifacts.** A launch never spawns into a dataDir that still holds
 `ipc.sock` or `headless.pid`. If the parent tracks a child of that name with
@@ -308,7 +310,7 @@ never when the child was asked to stop or the parent is shutting down. Backoff
 is roughly 1 s, 3 s, 10 s plus jitter; after 3 attempts within 60 s,
 restarting is disabled for that child.
 
-Attempt history carries across automatic replacements, so a crash loop advances the backoff and reaches the cap. `fleet--kill`, `fleet--restart` and parent shutdown cancel a pending restart, and `fleet--restart` starts a fresh budget. The history is kept in the parent's memory, not persisted, so a child adopted by a new parent process starts with a fresh budget.
+Attempt history carries across automatic replacements, so a crash loop advances the backoff and reaches the cap. When the cap stops automatic restarts, `fleet--status` says so in `autoRestartStopped`, beside `autoRestart`. `fleet--kill`, `fleet--restart`, a `fleet--launch` of the same name and parent shutdown cancel a pending restart, and `fleet--restart` and `fleet--launch` start a fresh budget. A replacement that fails to start ends automatic restarts until one of those (§4.3). The history is kept in the parent's memory, not persisted, so a child adopted by a new parent process starts with a fresh budget.
 
 ### 4.7 The unified tree
 
@@ -346,8 +348,8 @@ Behavior of the code as it stands, worth knowing before relying on it:
 
 - **Snapshots saved before #180 may still hold resolved `children[].env`
   values** in the session's Chronicle history and in backups. Current
-  snapshots don't, but the old ones remain until they're pruned, so rotate
-  any credentials they carried.
+  snapshots don't, but nothing prunes the old ones, so rotate any credentials
+  they carried.
 - **Narrow subscriptions hide things.** `recipes/triumvirate.json` does not
   subscribe its children to `ops:alert`, so child ops alerts don't reach the
   parent's TUI.
