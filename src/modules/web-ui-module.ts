@@ -3078,7 +3078,17 @@ export class WebUiModule implements Module {
     // pending connections get their welcome from handleObserverHello.
     if (client.auth === 'pending') return;
 
-    const welcome = await this.buildWelcome();
+    // The one await comes first. From building the welcome to marking the
+    // client welcomed nothing yields, so no event falls between what the
+    // welcome copies and the client's stream (a client skips live events
+    // until it's welcomed). That covers the fleet children's trees, which the
+    // welcome copies. It names the parent's agents without their trace state
+    // (see buildWelcome), so the client's parent nodes start from the live
+    // stream, and a parent trace before the welcome, during this await
+    // included, reaches the client in neither.
+    const childRecipes = await this.loadWelcomeRecipes();
+    if (!sharedServer?.app) return;
+    const welcome = this.buildWelcome(childRecipes);
     this.send(client, client.scopes === null ? welcome : scopeWelcome(welcome, client.scopes));
     client.welcomed = true;
     // Live trace forwarding is driven by the single fan-out listener
@@ -3126,7 +3136,29 @@ export class WebUiModule implements Module {
     });
   }
 
-  private async buildWelcome(): Promise<WelcomeMessage> {
+  /** Each fleet child's recipe, for its tree in the welcome. sendWelcome
+   *  loads them before the welcome reads anything: state copied before an
+   *  await would miss whatever landed during it, such as a child's usage
+   *  sample, which the client's next sample would then count as part of its
+   *  own call. */
+  private async loadWelcomeRecipes(): Promise<Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>> {
+    const recipes = new Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>();
+    const aggregator = sharedServer?.treeAggregator;
+    const fleetMod = aggregator
+      ? sharedServer?.app?.framework.getAllModules().find((m) => m.name === 'fleet') as FleetModule | undefined
+      : undefined;
+    if (aggregator && fleetMod) {
+      for (const name of aggregator.getAllChildNames()) {
+        recipes.set(name, await this.loadChildRecipeInfo(fleetMod, name));
+      }
+    }
+    return recipes;
+  }
+
+  /** The welcome, read synchronously (see sendWelcome). */
+  private buildWelcome(
+    childRecipes: Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>,
+  ): WelcomeMessage {
     const app = sharedServer?.app!;
     const fw = app.framework;
     const agents = fw.getAllAgents();
@@ -3164,11 +3196,11 @@ export class WebUiModule implements Module {
       }
     }
 
-    // Parent-local snapshot via a transient reducer fed by the framework's
-    // current trace history. We have no replayable past traces, so the
-    // initial snapshot just registers the agents — the live trace stream
-    // takes over from there. Future: persist a parent-local reducer if
-    // cold-attach state recovery becomes important.
+    // Parent-local snapshot via a transient reducer that only registers the
+    // agents: there's no replayable trace history, so the live trace stream
+    // takes over from there, and no parent trace before the welcome is in
+    // it. Future: persist a parent-local reducer if cold-attach state
+    // recovery becomes important.
     const localReducer = new AgentTreeReducer();
     localReducer.seedFrameworkAgents(agents.map(a => a.name));
     const localSnap: AgentTreeSnapshot = localReducer.getSnapshot();
@@ -3179,11 +3211,12 @@ export class WebUiModule implements Module {
     // either way the live event stream keeps it current.
     const childTrees: WelcomeMessage['childTrees'] = [];
     if (sharedServer?.treeAggregator) {
-      const fleetMod = sharedServer.app?.framework.getAllModules().find((m) => m.name === 'fleet') as
-        | FleetModule | undefined;
-      for (const name of sharedServer?.treeAggregator.getAllChildNames()) {
-        const nodes = sharedServer?.treeAggregator.getChildNodes(name);
-        const recipeInfo = fleetMod ? await this.loadChildRecipeInfo(fleetMod, name) : undefined;
+      for (const name of sharedServer.treeAggregator.getAllChildNames()) {
+        const nodes = sharedServer.treeAggregator.getChildNodes(name);
+        // A child that registered while the recipes loaded is sent without
+        // its recipe, like one that registers after the welcome: a client
+        // learns recipes only from a welcome.
+        const recipeInfo = childRecipes.get(name);
         childTrees.push({
           name,
           asOfTs: Date.now(),
