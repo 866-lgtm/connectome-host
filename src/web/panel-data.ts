@@ -1055,6 +1055,10 @@ export interface CountablePreview {
   messages?: NormalizedMessage[];
   tools?: ToolDefinition[];
   config?: { thinking?: { enabled: boolean; budgetTokens?: number } };
+  /** The agent's prefill scaffold message, which the activation request
+   *  carries when the agent has one and the anthropic-xml formatter sends
+   *  first. */
+  prefillUserMessage?: string;
 }
 
 /** Anthropic count_tokens payload (everything but `model`). */
@@ -1070,8 +1074,10 @@ export type CountFormatter = Pick<NativeFormatter, 'buildMessages'>;
 /**
  * Build the count_tokens payload by running the previewed activation through
  * the SAME formatter path inference uses (`buildMessages`, multiuser, the
- * agent as assistant, native tools): participant prefixes land per text block
- * exactly as on the wire, non-text-only messages get no name block, tool
+ * agent as assistant, native tools): participant prefixes land on the text
+ * blocks the formatter prefixes, exactly as on the wire, non-text-only
+ * messages get no name block, an anthropic-xml agent's prefill message
+ * leads as it does at inference, tool
  * pairs are normalized and same-role runs merged by the formatter itself, and
  * every block the provider will be sent — signed `thinking` /
  * `redacted_thinking`, `tool_use`, `tool_result`, images — is counted.
@@ -1099,6 +1105,10 @@ export function buildCountTokensPayload(
     toolMode,
     thinking: preview.config?.thinking,
     systemPrompt: preview.system,
+    // Inference passes the agent's prefill message to the formatter, which
+    // for anthropic-xml sends it as the first user message; without it the
+    // count was short by that message.
+    ...(preview.prefillUserMessage ? { prefillUserMessage: preview.prefillUserMessage } : {}),
     promptCaching: false,
     cacheMarkers: 'membrane-system',
   });

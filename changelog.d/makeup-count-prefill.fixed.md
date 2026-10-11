@@ -1,0 +1,1 @@
+- Makeup panel: an anthropic-xml agent's exact `count_tokens` figure includes the agent's `prefillUserMessage`, which inference sends as the first user message. It used to count without it, and for an agent with no system prompt, with the formatter's default opening in its place.

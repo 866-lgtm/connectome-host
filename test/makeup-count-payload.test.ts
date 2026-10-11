@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { NativeFormatter } from '@animalabs/membrane';
+import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
 import type { NormalizedMessage } from '@animalabs/membrane';
 import { buildCountTokensPayload } from '../src/web/panel-data.js';
 
@@ -100,5 +100,38 @@ describe('buildCountTokensPayload', () => {
     expect(blocksOf(payload.messages[0]).map((b) => b.text)).toEqual(['Lari: one', 'Antra: two']);
     expect(payload.tools).toBeUndefined();
     expect(payload.system).toBeUndefined();
+  });
+
+  // The anthropic-xml path, which prefill agents' counts take
+  // (buildContextMakeup): the payload is that formatter's own output, and an
+  // agent's prefill message leads it as at inference.
+  test('an anthropic-xml count matches that formatter, and carries the agent\'s prefill message first', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const options = {
+      participantMode: 'multiuser' as const, assistantParticipant: 'agent', toolMode: 'xml' as const,
+      promptCaching: false, cacheMarkers: 'membrane-system' as const,
+    };
+    const withPrefill = buildCountTokensPayload(
+      { messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    const reference = new AnthropicXmlFormatter().buildMessages(messages, { ...options, prefillUserMessage: 'PREFILL SCAFFOLD' });
+    expect(withPrefill.messages).toEqual(reference.messages as unknown[]);
+    expect(JSON.stringify(withPrefill.messages[0])).toContain('PREFILL SCAFFOLD');
+    // Without a prefill, the formatter's own default leads instead.
+    const without = buildCountTokensPayload({ messages }, 'agent', new AnthropicXmlFormatter(), 'xml');
+    expect(without.messages).toEqual(new AnthropicXmlFormatter().buildMessages(messages, options).messages as unknown[]);
+    expect(JSON.stringify(without.messages)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  // An empty system and an empty tool list send neither field.
+  test('an empty system and an empty tool list leave both out of the payload', () => {
+    const payload = buildCountTokensPayload({
+      system: '', tools: [], messages: [{ participant: 'Lari', content: [{ type: 'text', text: 'hi' }] }],
+    }, 'agent');
+    expect('system' in payload).toBe(false);
+    expect('tools' in payload).toBe(false);
   });
 });
