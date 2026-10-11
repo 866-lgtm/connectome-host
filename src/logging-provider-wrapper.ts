@@ -203,12 +203,23 @@ export class LoggingProviderAdapter implements ProviderAdapter {
       }
       if (line === undefined || line.length > MAX_RECORD_BYTES) {
         const { rawRequest: _rq, rawResponse: _rr, ...rest } = record;
-        line = JSON.stringify({
-          ...rest,
-          truncated: line === undefined
-            ? 'raw bodies dropped (they could not be serialized)'
-            : 'raw bodies dropped (record exceeded size guard)',
-        });
+        try {
+          line = JSON.stringify({
+            ...rest,
+            truncated: line === undefined
+              ? 'raw bodies dropped (they could not be serialized)'
+              : 'raw bodies dropped (record exceeded size guard)',
+          });
+        } catch {
+          // Even the summaries can't be serialized (a BigInt in usage, say):
+          // keep the head and the error alone, so the call is never silent.
+          const keep = ['type', 'provider', 'kind', 'timestamp', 'durationMs', 'error', 'errorType',
+            'httpStatus', 'providerErrorCode', 'retryable', 'errorChars'];
+          line = JSON.stringify({
+            ...Object.fromEntries(keep.filter((k) => k in record).map((k) => [k, record[k]])),
+            truncated: 'only the head and the error kept (the record could not be serialized)',
+          });
+        }
       }
       appendFileSync(this.logPath, line + '\n');
     } catch {

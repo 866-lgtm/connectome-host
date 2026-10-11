@@ -270,6 +270,17 @@ describe('LoggingProviderAdapter error records', () => {
     expect(record).toMatchObject({ type: 'error', errorType: 'invalid_request', httpStatus: 400, retryable: false });
   });
 
+  test('a record whose summaries cannot be serialized either keeps its head and error (Nell-1783, room-437 #70633)', async () => {
+    const path = logFile();
+    const response = { content: [], stopReason: 'end_turn', usage: { inputTokens: 1n, outputTokens: 1 } } as unknown as ProviderResponse;
+    const wrapped = new LoggingProviderAdapter(succeeding(response), path);
+    expect(await wrapped.complete(request)).toBe(response);
+    const [record] = records(path);
+    expect(record).toMatchObject({ type: 'call', provider: 'ok-fixture', kind: 'complete' });
+    expect(record!.truncated).toBe('only the head and the error kept (the record could not be serialized)');
+    expect('response' in record!).toBe(false);
+  });
+
   test('a request that cannot be serialized drops the raw bodies and keeps the record (sw-ch216 I16)', async () => {
     const path = logFile();
     const cyclic = { model: 'zz-model', maxTokens: 16, messages: [{ role: 'user', content: 'zz' }] } as Record<string, unknown>;
