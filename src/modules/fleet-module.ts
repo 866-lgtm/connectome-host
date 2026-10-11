@@ -203,8 +203,27 @@ interface FleetChild {
   autoRestart: boolean;
   /** True between kill request and process exit — suppresses autoRestart for intentional shutdowns. */
   killRequested: boolean;
-  /** Timestamps of recent autoRestart attempts, for flap protection. */
+  /** Host-local flap history; not persisted, so reconstructed children start with a fresh retry budget. */
   restartAttempts: number[];
+  /** Pending replacement of this generation, cancelled by manual control. */
+  restartTimer?: ReturnType<typeof setTimeout>;
+  /** Kills acknowledged on this generation. A launch replacing it refuses if
+   *  one lands during the launch's awaits. Not persisted. */
+  killAcks?: number;
+  /** A launch is adopting this generation's living process. Another launch
+   *  of the name is refused meanwhile: the child keeps only its latest
+   *  client, so two adoptions would leave one record holding a dead socket.
+   *  Not persisted. */
+  adopting?: boolean;
+  /** Why automatic restarts stopped for this generation: the flap cap, a
+   *  signal exit (never retried), a kill, a manual launch that took over, or
+   *  a replacement that was refused. Shown by fleet status until a launch or
+   *  restart replaces the generation. Kept in memory, like the retry
+   *  history, not persisted. */
+  autoRestartStopped?: string;
+  /** A failed launch's reason, kept so the exit, whenever it's recorded,
+   *  carries it beside the exit itself. */
+  launchFailure?: string;
   /** Runtime-only env overrides for restart. Recovered from current config on adoption. */
   env?: Record<string, string>;
   /**
@@ -214,6 +233,17 @@ interface FleetChild {
    * tool calls.  Used by fleet--relay.
    */
   lastCompletedSpeech: string;
+}
+
+/** How an exit reads in a record's exitReason: the signal, else "clean" or
+ *  the code. */
+function exitText(code: number | null, signal: NodeJS.Signals | string | null): string {
+  return signal ?? (code === 0 ? 'clean' : `code=${code}`);
+}
+
+/** A failed launch's reason beside the exit that ended it. */
+function withLaunchFailure(failure: string, exit: string): string {
+  return `${failure} (exit: ${exit})`;
 }
 
 // ---------------------------------------------------------------------------
@@ -639,16 +669,27 @@ export class FleetModule implements Module {
     finally { if (fd !== undefined) closeSync(fd); }
   }
 
+  private cancelAutoRestart(child: FleetChild): void {
+    if (child.restartTimer !== undefined) {
+      clearTimeout(child.restartTimer);
+      child.restartTimer = undefined;
+    }
+  }
+
   /**
-   * Attempt to restart a crashed child.  Tracks recent attempts per-child
-   * and refuses further restarts once the flap cap is exceeded within the
-   * flap window.  Delay grows exponentially per attempt so a deterministic
-   * startup bug doesn't fire-hose the log before the flap cap kicks in.
+   * Attempt to restart a crashed child. Track attempts across replacements and
+   * stop at the flap cap. Backoff keeps startup failures from flooding the log.
    */
   private tryAutoRestart(child: FleetChild): void {
+    if (this.stopping || child.killRequested || this.children.get(child.name) !== child) return;
     const now = Date.now();
     child.restartAttempts = child.restartAttempts.filter((t) => now - t < this.restartFlapWindowMs);
     if (child.restartAttempts.length >= this.restartFlapCap) {
+      // Recorded on the generation, so fleet status shows it until a manual
+      // launch or restart replaces it.
+      child.autoRestartStopped =
+        `${this.restartFlapCap} restarts within ${this.restartFlapWindowMs / 1000}s; ` +
+        'fleet restart or launch starts it again, with a fresh retry budget';
       console.error(
         `[fleet] autoRestart disabled for "${child.name}" — ${this.restartFlapCap} crashes in ${this.restartFlapWindowMs / 1000}s`,
       );
@@ -674,18 +715,27 @@ export class FleetModule implements Module {
     };
     if (child.env !== undefined) input.env = child.env;
 
-    // Retain the reaped process as cleanup authority until handleLaunch replaces it.
-
-    setTimeout(() => {
-      if (this.stopping) return;
-      this.handleLaunch(input, { viaAutoStart: true })
+    // Keep this generation visible through backoff, including its retry history
+    // and process handle. A replacement may also need it to reconcile artifacts.
+    child.restartTimer = setTimeout(() => {
+      child.restartTimer = undefined;
+      if (this.stopping || child.killRequested || this.children.get(child.name) !== child) return;
+      this.handleLaunch(input, { viaAutoStart: true, autoRestartOf: child })
         .then((res) => {
           if (!res.success) {
             console.error(`[fleet] autoRestart "${child.name}" failed: ${res.error}`);
+            // Refused before spawning, the replacement left this generation
+            // in place, and nothing will restart it: the record says why.
+            if (this.children.get(child.name) === child) {
+              child.autoRestartStopped ??= `the replacement was refused: ${res.error}`;
+            }
           }
         })
         .catch((err: unknown) => {
           console.error(`[fleet] autoRestart "${child.name}" threw: ${String(err)}`);
+          if (this.children.get(child.name) === child) {
+            child.autoRestartStopped ??= `the replacement failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
         });
     }, delayMs);
   }
@@ -693,6 +743,7 @@ export class FleetModule implements Module {
   async stop(): Promise<void> {
     // Mark shutdown so the process 'exit' handlers don't trigger autoRestart.
     this.stopping = true;
+    for (const child of this.children.values()) this.cancelAutoRestart(child);
 
     // Uninstall the 'exit' safety net first so we don't pin this instance in
     // memory after a clean shutdown, and so MaxListenersExceededWarning doesn't
@@ -962,7 +1013,7 @@ export class FleetModule implements Module {
 
   private async handleLaunch(
     input: LaunchInput,
-    opts: { viaAutoStart: boolean } = { viaAutoStart: false },
+    opts: { viaAutoStart: boolean; autoRestartOf?: FleetChild; killsAtStart?: number } = { viaAutoStart: false },
   ): Promise<ToolResult> {
     if (!input.name || typeof input.name !== 'string') {
       return { success: false, isError: true, error: 'launch requires "name" string' };
@@ -1005,7 +1056,33 @@ export class FleetModule implements Module {
       input = { ...input, env: undefined };
     }
 
+    if (this.stopping) {
+      return { success: false, isError: true, error: `Child '${input.name}' wasn't launched: the host is stopping.` };
+    }
     const existing = this.children.get(input.name);
+    // A restart counts kills from its own start, before its kill wait, so a
+    // kill acknowledged during that wait still refuses the relaunch.
+    const killsAtStart = opts.killsAtStart ?? existing?.killAcks ?? 0;
+    // Recipe loading and ownership reconciliation both yield. Afterward every
+    // launch, manual or automatic, must still replace the generation it began
+    // from, the host must not have begun stopping, and no kill may have been
+    // acknowledged on that generation meanwhile. An automatic retry must also
+    // find its generation uncancelled. The refusal names which.
+    type Stale = { cause: 'stopping' | 'replaced' | 'killed' | 'cancelled'; why: (stage: string) => string };
+    const staleReason = (): Stale | null => {
+      if (this.stopping) return { cause: 'stopping', why: (stage) => `the host began stopping during ${stage}` };
+      if (this.children.get(input.name) !== existing) {
+        return { cause: 'replaced', why: (stage) => `another launch replaced it during ${stage}; reconcile before retrying` };
+      }
+      if ((existing?.killAcks ?? 0) !== killsAtStart) return { cause: 'killed', why: (stage) => `it was killed during ${stage}` };
+      if (opts.autoRestartOf && (existing !== opts.autoRestartOf || existing.killRequested)) {
+        return { cause: 'cancelled', why: (stage) => `its automatic restart was cancelled during ${stage}` };
+      }
+      return null;
+    };
+    const staleRefusal = (stage: string, stale: Stale): ToolResult => ({
+      success: false, isError: true, error: `Child '${input.name}' wasn't launched: ${stale.why(stage)}.`,
+    });
     if (existing && (existing.process || existing.adopted) &&
         (existing.status === 'starting' || existing.status === 'ready')) {
       return {
@@ -1013,6 +1090,21 @@ export class FleetModule implements Module {
         isError: true,
         error: `Child '${input.name}' is already ${existing.status}`,
       };
+    }
+    // A manual launch or restart takes over from automatic replacement now,
+    // before its own awaits: a pending timer is cancelled, and an automatic
+    // launch already past its timer finds its generation cancelled at its
+    // next check, as it does for a restart. On a stopped generation the flag
+    // only ends automatic restarts, and the record says so, so a launch
+    // refused later leaves a record that tells the truth; a launch that
+    // succeeds replaces the record.
+    if (existing && !opts.autoRestartOf) {
+      if (existing.autoRestart && existing.status === 'crashed') {
+        existing.autoRestartStopped ??= 'a manual launch or restart took over; ' +
+          'until one succeeds, nothing restarts this child';
+      }
+      this.cancelAutoRestart(existing);
+      existing.killRequested = true;
     }
 
     const recipePath = isUrlOrAbsolute(input.recipe)
@@ -1055,31 +1147,51 @@ export class FleetModule implements Module {
 
     const socketPath = join(dataDir, 'ipc.sock');
     const subscription = input.subscription ?? this.config.defaultSubscription;
-    if (this.children.get(input.name) !== existing) {
-      return { success: false, isError: true, error: `Child '${input.name}' changed during launch; reconcile before retrying.` };
-    }
+    const staleAtLaunch = staleReason();
+    if (staleAtLaunch) return staleRefusal('the launch', staleAtLaunch);
     if (existing && existing.dataDir === dataDir && existing.socketPath === socketPath &&
         existing.recipePath === recipePath) {
-      if (this.canRetryAdoption(existing) && !existing.process && !existing.socket && await this.probeLiveness(existing)) {
+      // One adoption at a time: the child keeps only its latest client.
+      if (existing.adopting) {
+        return { success: false, isError: true, error: `Child '${input.name}' is being adopted by another launch` };
+      }
+      if (this.canRetryAdoption(existing) && !existing.process && !existing.socket) {
+        existing.adopting = true;
         try {
-          const adopted = await this.reattachToLivingChild({
-            ...existing, subscription: [...subscription],
-          });
-          if (this.children.get(input.name) !== existing) {
-            adopted.socket?.destroy();
-            return { success: false, isError: true, error: `Child '${input.name}' changed during adoption; retry launch.` };
+          if (await this.probeLiveness(existing)) {
+            try {
+              const adopted = await this.reattachToLivingChild({
+                ...existing, subscription: [...subscription],
+              });
+              const staleAtAdoption = staleReason();
+              if (staleAtAdoption) {
+                // The process was just confirmed as this child, and nothing
+                // else owns it, since no other launch adopts while this one
+                // does. So stop it rather than leave it running unowned,
+                // unless the host is detaching to leave its children for a
+                // later parent.
+                if (staleAtAdoption.cause !== 'stopping' || !this.detachMode) {
+                  try { await this.killChild(adopted); } catch (err) {
+                    console.error(`[fleet] could not stop "${input.name}" after its refused adoption: ${String(err)}`);
+                  }
+                }
+                adopted.socket?.destroy();
+                return staleRefusal('adoption', staleAtAdoption);
+              }
+              this.children.set(input.name, adopted);
+              this.persistState();
+              return { success: true, data: { name: adopted.name, pid: adopted.pid, status: adopted.status,
+                dataDir: adopted.dataDir, socketPath: adopted.socketPath } };
+            } catch { /* Preserve artifacts and let the refusal explain recovery. */ }
           }
-          this.children.set(input.name, adopted);
-          this.persistState();
-          return { success: true, data: { name: adopted.name, pid: adopted.pid, status: adopted.status,
-            dataDir: adopted.dataDir, socketPath: adopted.socketPath } };
-        } catch { /* Preserve artifacts and let the refusal explain recovery. */ }
+        } finally {
+          existing.adopting = false;
+        }
       }
       await this.cleanupStaleChildFiles(existing);
     }
-    if (this.children.get(input.name) !== existing) {
-      return { success: false, isError: true, error: `Child '${input.name}' changed during reconciliation; retry launch.` };
-    }
+    const staleAtReconciliation = staleReason();
+    if (staleAtReconciliation) return staleRefusal('reconciliation', staleAtReconciliation);
     for (const artifact of [socketPath, join(dataDir, 'headless.pid')]) {
       try {
         lstatSync(artifact); // Includes dangling symlinks and special files; never read/connect.
@@ -1119,10 +1231,13 @@ export class FleetModule implements Module {
       subscription: [...subscription],
       autoRestart: input.autoRestart ?? false,
       killRequested: false,
-      restartAttempts: [],
+      // Install history before spawning: an early crash must consume the next
+      // retry attempt even if this launch promise has not settled yet.
+      restartAttempts: [...(opts.autoRestartOf?.restartAttempts ?? [])],
       lastCompletedSpeech: '',
     };
-    if (input.env !== undefined) child.env = input.env;
+    if (input.env !== undefined) child.env = { ...input.env };
+    if (existing) this.cancelAutoRestart(existing);
     this.children.set(input.name, child);
 
     if (!this.config.childIndexPath) {
@@ -1178,7 +1293,8 @@ export class FleetModule implements Module {
     proc.on('exit', (code, signal) => {
       child.exitedAt = Date.now();
       child.exitCode = code ?? null;
-      child.exitReason = signal ?? (code === 0 ? 'clean' : `code=${code}`);
+      const exit = exitText(code, signal);
+      child.exitReason = child.launchFailure !== undefined ? withLaunchFailure(child.launchFailure, exit) : exit;
       child.status = code === 0 ? 'exited' : 'crashed';
       try { child.socket?.destroy(); } catch { /* noop */ }
       child.socket = null;
@@ -1198,34 +1314,26 @@ export class FleetModule implements Module {
         !this.stopping
       ) {
         this.tryAutoRestart(child);
+      } else if (child.autoRestart && code === null && !child.killRequested && !this.stopping) {
+        // A signal exit is never retried, whoever sent it: the parent, after
+        // a failed start, or anything else, such as the OOM killer. Say so,
+        // naming the signal rather than who sent it, since a child can also
+        // die on its own after its launch has failed.
+        child.autoRestartStopped ??= `${child.launchFailure !== undefined ? 'its start failed and ' : ''}` +
+          `it was ended by ${signal ?? 'a signal'}, which is not retried; fleet restart or launch starts it again`;
       }
     });
 
+    let failureStage = 'launch failed';
     try {
-      await this.waitForSocket(child);
-      const socketStat = lstatSync(socketPath, { bigint: true });
-      if (socketStat.isSocket()) child.ownedSocket = {
-        dev: socketStat.dev, ino: socketStat.ino, ctimeNs: socketStat.ctimeNs,
-      };
-      await this.connectChildSocket(child);
-    } catch (err) {
-      try { proc.kill('SIGKILL'); } catch { /* noop */ }
-      child.status = 'crashed';
-      child.exitReason = err instanceof Error ? err.message : String(err);
-      return { success: false, isError: true, error: `launch failed: ${child.exitReason}` };
-    }
-
-    // Set the subscription filter on the child immediately.
-    try {
+      await this.connectStartingChild(child);
+      failureStage = 'subscribe failed';
       this.sendToChild(child, { type: 'subscribe', events: subscription });
-    } catch (err) {
-      return { success: false, isError: true, error: `subscribe failed: ${(err as Error).message}` };
-    }
-
-    try {
+      failureStage = 'child did not become ready';
       await this.waitForReady(child);
     } catch (err) {
-      return { success: false, isError: true, error: `child did not become ready: ${(err as Error).message}` };
+      const reason = `${failureStage}: ${err instanceof Error ? err.message : String(err)}`;
+      return await this.failLaunch(child, reason);
     }
 
     this.persistState();
@@ -1278,6 +1386,8 @@ export class FleetModule implements Module {
       timeZone: this.config.timeZone,
       exitCode: c.exitCode,
       exitReason: c.exitReason,
+      autoRestart: c.autoRestart,
+      autoRestartStopped: c.autoRestartStopped ?? null,
       eventCount: c.events.length,
       subscription: [...c.subscription],
     };
@@ -1315,10 +1425,21 @@ export class FleetModule implements Module {
   private async handleKill(input: { name: string }): Promise<ToolResult> {
     const c = this.children.get(input.name);
     if (!c) return { success: false, isError: true, error: `Unknown child: ${input.name}` };
+    this.cancelAutoRestart(c);
+    c.killRequested = true;
+    // A launch replacing this generation, still in its awaits, sees each
+    // acknowledged kill and doesn't start. Only an acknowledged kill counts:
+    // one that throws (not attached, death unconfirmed) reports an error and
+    // refuses nothing. The count only grows, so a launch can never see a kill
+    // appear and then vanish.
     if (c.status === 'exited' || c.status === 'crashed') {
+      c.killAcks = (c.killAcks ?? 0) + 1;
+      if (c.autoRestart) c.autoRestartStopped ??= 'fleet kill ended automatic restarts; fleet restart or launch starts it again';
       return { success: true, data: { name: c.name, status: c.status, note: 'already stopped' } };
     }
     await this.killChild(c);
+    c.killAcks = (c.killAcks ?? 0) + 1;
+    if (c.autoRestart) c.autoRestartStopped ??= 'fleet kill ended automatic restarts; fleet restart or launch starts it again';
     return {
       success: true,
       data: { name: c.name, status: c.status, exitCode: c.exitCode, exitReason: c.exitReason },
@@ -1333,13 +1454,20 @@ export class FleetModule implements Module {
       recipe: c.recipePath,
       dataDir: c.dataDir,
       subscription: [...c.subscription],
+      autoRestart: c.autoRestart,
     };
+    if (c.env !== undefined) relaunch.env = { ...c.env };
+    // Kills are counted from the restart's start, so one acknowledged while
+    // the restart waits for its own kill still refuses the relaunch.
+    const killsAtStart = c.killAcks ?? 0;
+    this.cancelAutoRestart(c);
+    c.killRequested = true;
     if ((c.process || c.adopted) && (c.status === 'starting' || c.status === 'ready')) {
       await this.killChild(c);
     }
     // Restart is implicitly allowed — we're using the exact recipe the child
     // was originally launched with (which already passed the allowlist check).
-    return await this.handleLaunch(relaunch, { viaAutoStart: true });
+    return await this.handleLaunch(relaunch, { viaAutoStart: true, killsAtStart });
   }
 
   /**
@@ -1553,17 +1681,56 @@ export class FleetModule implements Module {
   // Subprocess + socket plumbing
   // =========================================================================
 
-  private async waitForSocket(child: FleetChild): Promise<void> {
+  private async waitForSocket(
+    child: FleetChild,
+    deadline = Date.now() + this.config.socketWaitTimeoutMs,
+    lastRefusal?: unknown,
+  ): Promise<void> {
     const timeout = this.config.socketWaitTimeoutMs;
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      if (child.process && child.process.exitCode !== null) {
-        throw new Error(`child exited (code=${child.process.exitCode}) before socket appeared`);
+    while (Date.now() < deadline) {
+      if (child.process && (child.process.exitCode !== null || child.process.signalCode !== null)) {
+        const exit = `code=${child.process.exitCode}, signal=${child.process.signalCode}`;
+        // A socket file, or a refused connect, doesn't show this child bound:
+        // the file may be one a killed predecessor left. So the message says
+        // only what is known, with the refusal when there was one.
+        if (lastRefusal !== undefined || existsSync(child.socketPath)) {
+          const refusal = lastRefusal === undefined ? ''
+            : `; the last connect failed: ${lastRefusal instanceof Error ? lastRefusal.message : String(lastRefusal)}`;
+          throw new Error(`child exited (${exit}) before the parent could connect${refusal}`);
+        }
+        throw new Error(`child exited (${exit}) before socket appeared`);
       }
       if (existsSync(child.socketPath)) return;
       await new Promise((r) => setTimeout(r, 50));
     }
     throw new Error(`socket did not appear at ${child.socketPath} within ${timeout}ms`);
+  }
+
+  /** A killed child can leave its pathname behind. Wait for the replacement
+   * runtime to bind, without deleting files whose ownership may have changed. */
+  private async connectStartingChild(child: FleetChild): Promise<void> {
+    const deadline = Date.now() + this.config.socketWaitTimeoutMs;
+    let lastRefusal: unknown;
+    do {
+      await this.waitForSocket(child, deadline, lastRefusal);
+      try {
+        // Retain the socket identity observed for this owned generation, so
+        // later cleanup cannot remove a replacement endpoint (#170).
+        const socketStat = lstatSync(child.socketPath, { bigint: true });
+        if (socketStat.isSocket()) child.ownedSocket = {
+          dev: socketStat.dev, ino: socketStat.ino, ctimeNs: socketStat.ctimeNs,
+        };
+        await this.connectChildSocket(child);
+        return;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ECONNREFUSED') throw err;
+        lastRefusal = err;
+      }
+      await new Promise(resolve => setTimeout(resolve, 50));
+    } while (Date.now() < deadline);
+    const refusal = lastRefusal instanceof Error ? lastRefusal.message : String(lastRefusal);
+    throw new Error(`socket at ${child.socketPath} refused connections for ${this.config.socketWaitTimeoutMs}ms; the last connect failed: ${refusal}`);
   }
 
   private async connectChildSocket(child: FleetChild): Promise<void> {
@@ -1827,6 +1994,49 @@ export class FleetModule implements Module {
     });
   }
 
+  /** Abort only the subprocess owned by this launch, never an adopted child.
+   * Natural nonzero exits keep their retry even when notification races cleanup. */
+  private async failLaunch(child: FleetChild, reason: string): Promise<ToolResult> {
+    const proc = child.process;
+    // The exit handler records the failure beside the exit, whenever the exit
+    // is observed.
+    child.launchFailure = reason;
+    if (this.stopping && this.detachMode) {
+      // The shutdown closed the connection the launch was waiting on, and a
+      // detaching parent leaves its children for a later parent to adopt.
+      return { success: false, isError: true, error: `${reason}; the parent is detaching, so the child is left running` };
+    }
+    if (proc && proc.exitCode === null && proc.signalCode === null) {
+      // SIGKILL exits are already excluded from autoRestart. Leave the manual
+      // cancellation flag alone: a natural nonzero exit may be pending even
+      // while ChildProcess still exposes null exit fields.
+      try { child.socket?.destroy(); } catch { /* noop */ }
+      child.socket = null;
+      try { proc.kill('SIGKILL'); } catch { /* exit confirmation below is authoritative */ }
+      if (!await this.waitForExit(proc, 2_000)) {
+        // Keep launches blocked until the exit handler observes actual death.
+        child.status = 'starting';
+        child.exitReason = `${reason}; child termination unconfirmed (pid=${child.pid})`;
+        this.persistState();
+        return { success: false, isError: true, error: child.exitReason };
+      }
+    } else if (proc && child.exitedAt === null) {
+      // The process shows its exit, but its 'exit' event hasn't run: record
+      // the exit now, so the launch can't stay 'starting'. The event, when it
+      // comes, records the same and may still retry.
+      child.exitedAt = Date.now();
+      child.exitCode = proc.exitCode;
+      child.status = proc.exitCode === 0 ? 'exited' : 'crashed';
+      child.exitReason = withLaunchFailure(reason, exitText(proc.exitCode, proc.signalCode));
+      this.persistState();
+    } else if (proc && child.exitReason !== null && !child.exitReason.startsWith(reason)) {
+      // The exit was recorded before the failure was known: add the failure.
+      child.exitReason = withLaunchFailure(reason, child.exitReason);
+      this.persistState();
+    }
+    return { success: false, isError: true, error: reason };
+  }
+
   private async killChild(child: FleetChild): Promise<void> {
     if (child.status === 'exited' || child.status === 'crashed') return;
     const proc = child.process;
@@ -1865,6 +2075,7 @@ export class FleetModule implements Module {
     }
     if (!confirmed) throw new Error(`Child '${child.name}' death unconfirmed (pid=${pid}); retry fleet status/restart.`);
     if (!proc) {
+      // Adopted children have no process exit handler to update their record.
       child.status = 'exited';
       child.exitedAt = Date.now();
       child.exitCode = null; // signal-0 cannot recover the adopted process's exit code.
