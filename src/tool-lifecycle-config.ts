@@ -32,8 +32,9 @@ const CLASS_SET: ReadonlySet<string> = new Set(TOOL_CLASSES);
  * doubt, a tool is left out rather than guessed.
  *
  * Not listed, on purpose:
- * - `identity--request` calls an arbitrary private service API (it can post
- *   as well as read), so no single class describes it.
+ * - `identity--request` calls an arbitrary private service API (it can write
+ *   with POST, PUT, PATCH and DELETE as well as read), so no single class
+ *   describes it.
  * - modules with no agent tools (webui, retrieval, instructions, tts-relay,
  *   tui, settings, subscription-gc).
  */
