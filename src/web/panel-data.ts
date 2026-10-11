@@ -20,7 +20,7 @@
 
 import type { AgentFramework } from '@animalabs/agent-framework';
 import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
-import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
 import type { QuotaMeter } from '../quota-meter.js';
@@ -1056,9 +1056,9 @@ export interface CountablePreview {
   tools?: ToolDefinition[];
   config?: { thinking?: { enabled: boolean; budgetTokens?: number } };
   /** The agent's prefill scaffold message, which the activation request
-   *  carries when the agent has one and the anthropic-xml formatter sends
-   *  first. */
-  prefillUserMessage?: string;
+   *  carries when the agent has one. Typed by membrane's own request, so a
+   *  rename there fails the build instead of silently dropping it here. */
+  prefillUserMessage?: NormalizedRequest['prefillUserMessage'];
 }
 
 /** Anthropic count_tokens payload (everything but `model`). */
@@ -1074,13 +1074,16 @@ export type CountFormatter = Pick<NativeFormatter, 'buildMessages'>;
 /**
  * Build the count_tokens payload by running the previewed activation through
  * the SAME formatter path inference uses (`buildMessages`, multiuser, the
- * agent as assistant, native tools): participant prefixes land on the text
- * blocks the formatter prefixes, exactly as on the wire, non-text-only
- * messages get no name block, an anthropic-xml agent's prefill message
- * leads as it does at inference, tool
- * pairs are normalized and same-role runs merged by the formatter itself, and
- * every block the provider will be sent — signed `thinking` /
- * `redacted_thinking`, `tool_use`, `tool_result`, images — is counted.
+ * agent as assistant, the tool mode the caller passes): participant prefixes
+ * land on the text blocks the formatter prefixes, exactly as on the wire,
+ * non-text-only messages get no name block, and the agent's prefill message
+ * goes where the formatter puts it (anthropic-xml sends it first, in place of
+ * its default opener, whenever its request would otherwise open with the
+ * assistant's turn, as a prefill transcript usually does).
+ * Tool pairs are normalized and same-role runs merged by the formatter
+ * itself, and every block the formatter sends is counted: for the native
+ * formatter that includes signed `thinking` / `redacted_thinking`,
+ * `tool_use`, `tool_result` and images.
  *
  * The previous version flattened each message to its text blocks and sent no
  * tool definitions: on a keep-all model (Opus >= 4.5, Sonnet >= 4.6, Fable)
@@ -1106,16 +1109,18 @@ export function buildCountTokensPayload(
     thinking: preview.config?.thinking,
     systemPrompt: preview.system,
     // Inference passes the agent's prefill message to the formatter, which
-    // for anthropic-xml sends it as the first user message; without it the
-    // count was short by that message.
+    // for anthropic-xml sends it first, in place of its default opener,
+    // whenever the request would otherwise open with the assistant's turn;
+    // without it the count had that default in its place.
     ...(preview.prefillUserMessage ? { prefillUserMessage: preview.prefillUserMessage } : {}),
     promptCaching: false,
     cacheMarkers: 'membrane-system',
   });
   const tools = Array.isArray(built.nativeTools) ? built.nativeTools : undefined;
+  const system = built.systemContent;
   return {
-    ...(built.systemContent !== undefined && built.systemContent !== null && built.systemContent !== ''
-      ? { system: built.systemContent }
+    ...(system !== undefined && system !== null && system !== '' && !(Array.isArray(system) && system.length === 0)
+      ? { system }
       : {}),
     messages: built.messages as unknown[],
     ...(tools && tools.length > 0 ? { tools } : {}),
@@ -1159,8 +1164,9 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
   const cm = (agent as unknown as { getContextManager: () => { getRenderStats: () => unknown } }).getContextManager();
   const stats = cm.getRenderStats();
 
-  // Count through the formatter the agent actually runs on (prefill agents
-  // render the XML scaffold; everyone else the native shape).
+  // Count through the formatter the agent's recipe names: an anthropic-xml
+  // agent's count takes the XML scaffold, prefill or not; everyone else the
+  // native shape.
   const xml = app.recipe.agent.formatter === 'anthropic-xml';
   const payload = buildCountTokensPayload(
     request as unknown as CountablePreview,
