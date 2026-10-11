@@ -226,6 +226,12 @@ describe('mcpl_deploy', () => {
       [{ reconnect: 'yes' }, 'its reconnect is neither true nor false'],
       [{ enabledTools: 'say' }, "its enabledTools isn't a list of names"],
       [{ command: 5 }, "its command isn't text"],
+      // The other kind's empty value is no unspecified form here.
+      [{ reconnect: '' }, 'its reconnect is neither true nor false'],
+      [{ args: '' }, "its args aren't a list of text"],
+      [{ env: '' }, "its env isn't a map of names to values"],
+      [{ toolPrefix: [] }, "its toolPrefix isn't text"],
+      [{ enabledTools: '' }, "its enabledTools isn't a list of names"],
     ];
     for (const [fields, problem] of cases) {
       const result = await call(mod, 'mcpl_deploy', { id: 'odd', command: 'node', ...fields });

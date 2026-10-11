@@ -454,30 +454,33 @@ export class McplAdminModule implements Module {
     // Each field the caller gives is judged as given, by the strict reading
     // below, rather than dropped or coerced into shape first, so a wrong kind
     // is refused instead of vanishing. A field is unspecified when it's left
-    // out, null, or what strict function calling sends for it when every
-    // field is required: "" for text, [] for a list. A persisted empty
-    // enabledFeatureSets would be deny-all under the §5.3 pin (Mica's
-    // silently eventless eidoverse, 2026-08-04); deny-all is
-    // disabledTools: ["*"] for tools, and for feature sets, where `*`
-    // matches one dot-separated segment, a pattern per depth (see
+    // out, null, or what strict function calling sends for its own kind when
+    // every field is required: "" for a text field, [] for a list (env
+    // included, as before). Anything else is given, so "" for a list or for
+    // reconnect, which has no unspecified value, is a wrong kind, not a
+    // default. A persisted empty enabledFeatureSets would be deny-all under
+    // the §5.3 pin (Mica's silently eventless eidoverse, 2026-08-04);
+    // deny-all is disabledTools: ["*"] for tools, and for feature sets, where
+    // `*` matches one dot-separated segment, a pattern per depth (see
     // resolveOverlayEntry). Numbers and true/false in a list are read as
     // their text, as the boot reads args.
-    const given = (v: unknown): boolean =>
-      v !== undefined && v !== null && v !== '' && !(Array.isArray(v) && v.length === 0);
+    const given = (v: unknown): boolean => v !== undefined && v !== null;
+    const givenText = (v: unknown): boolean => given(v) && v !== '';
+    const givenList = (v: unknown): boolean => given(v) && !(Array.isArray(v) && v.length === 0);
     const list = (v: unknown): unknown =>
       Array.isArray(v) ? v.map((x) => (typeof x === 'number' || typeof x === 'boolean' ? String(x) : x)) : v;
 
-    const command = given(input.command) ? input.command : undefined;
-    const url = given(input.url) ? input.url : undefined;
+    const command = givenText(input.command) ? input.command : undefined;
+    const url = givenText(input.url) ? input.url : undefined;
     if (command === undefined && url === undefined) return fail('mcpl_deploy requires either `command` (stdio) or `url` (websocket).');
     if (command !== undefined && url !== undefined) return fail('`command` and `url` are mutually exclusive.');
 
     const fields: Record<string, unknown> = {};
     if (command !== undefined) fields.command = command;
     if (url !== undefined) { fields.url = url; fields.transport = 'websocket'; }
-    if (given(input.args)) fields.args = list(input.args);
-    if (given(input.env)) fields.env = input.env;
-    if (given(input.token)) fields.token = input.token;
+    if (givenList(input.args)) fields.args = list(input.args);
+    if (givenList(input.env)) fields.env = input.env;
+    if (givenText(input.token)) fields.token = input.token;
     if (typeof input.access === 'string' ? input.access.trim() !== '' : given(input.access)) {
       if (typeof input.access === 'string' && !this.identity) {
         return fail(
@@ -487,10 +490,10 @@ export class McplAdminModule implements Module {
       }
       fields.access = typeof input.access === 'string' ? input.access.trim() : input.access;
     }
-    if (given(input.toolPrefix)) fields.toolPrefix = input.toolPrefix;
+    if (givenText(input.toolPrefix)) fields.toolPrefix = input.toolPrefix;
     if (given(input.reconnect)) fields.reconnect = input.reconnect;
     for (const k of ['enabledFeatureSets', 'disabledFeatureSets', 'enabledTools', 'disabledTools']) {
-      if (given(input[k])) fields[k] = list(input[k]);
+      if (givenList(input[k])) fields[k] = list(input[k]);
     }
 
     // Never save an entry the boot would skip: what loads now must be what
