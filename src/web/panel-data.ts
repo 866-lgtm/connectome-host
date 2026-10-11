@@ -1208,19 +1208,75 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
 }
 
 /**
+ * Whether the curve's plan fits, from the framework's feasibility preview: the
+ * same accounting the settings panel reports. A dry compile plots an
+ * over-budget plan instead of throwing, so without this the plot of a context
+ * that won't fit looks like a healthy one. null when the preview is
+ * unavailable (no previewContextSettings, or a strategy without a fold plan).
+ */
+function curveVerdict(
+  app: PanelAppRef,
+  agentName: string,
+  maxTokens: number,
+  reserveForResponse: number,
+): Record<string, unknown> | null {
+  try {
+    const fw = app.framework as unknown as {
+      previewContextSettings?: (name: string, budget: number) => unknown;
+    };
+    const r = fw.previewContextSettings?.(agentName, maxTokens) as
+      | { finalTokens?: number; budgetTokens?: number; exhausted?: boolean }
+      | null
+      | undefined;
+    if (!r) return null;
+    const effectiveBudgetTokens = Math.max(0, maxTokens - reserveForResponse);
+    const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
+    const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudgetTokens;
+    const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
+      ? finalTokens <= r.budgetTokens
+      : undefined;
+    return {
+      plannedTokens: Number.isFinite(finalTokens) ? finalTokens : null,
+      effectiveBudgetTokens,
+      rejectionBudgetTokens: r.budgetTokens ?? null,
+      fitsRequested,
+      withinGrace,
+      unreachable: r.exhausted === true && !fitsRequested,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Context curve: compile the agent's window and return one record per
  * compiled entry with its provenance — kind (raw / L1..Ln summary), rendered
  * token estimate, the raw-history tokens it covers (leaf messages,
  * recursively through the summary tree), date span, and full text.
  *
- * The compile is a dry run: shown, never sent, so it commits no fold
- * resolutions and queues no compression work. It isn't free of every effect:
- * context-manager 0.13's adaptive select still records its estimate and arms
- * calibration on a dry run, so a render between a real compile and its first
- * usage report replaces that estimate with one at the same live budget. A
- * plan over budget is reported rather than thrown at the plan check, so the
- * panel plots where that check used to fail it; a later stage that can't fit
- * still throws, as for a real compile. No inference, no message writes.
+ * The budget is the agent's live context budget (runtime settings, else the
+ * recipe) with the recipe's response reserve. That's close to, but not
+ * exactly, what the agent's next turn compiles at: the framework's compile
+ * budget can also hold back room for a pending tool batch.
+ *
+ * The compile is a dry run: shown, never sent, so its select commits no fold
+ * resolutions and queues no compression from the plan. Once context-manager's
+ * thinking binding (#160) is released, a committed compile that's never sent
+ * would also fence the replies the resident is streaming; a dry run won't.
+ * With context-manager 0.13 a dry compile isn't free of every effect:
+ * - the adaptive select still records its estimate and arms calibration, and
+ *   overwrites the frontier, the transition status and the render stats that
+ *   the Context panel reads, until the next real compile (context-manager
+ *   #161 restores them after a dry select);
+ * - compile() releases a compression hold past its deadline before selecting,
+ *   which can start compression work a moment early (#161 will skip that for
+ *   a dry compile).
+ *
+ * A plan over budget at the plan check is plotted rather than thrown, and the
+ * response carries a verdict from the framework's feasibility preview, the
+ * one the settings panel reports, so the plot says it won't fit. The
+ * head/tail reservation check and the emission check still throw on a budget
+ * that can't fit, as for a real compile. No inference, no message writes.
  */
 export async function buildContextCurve(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
   requireAgent(app, agentName);
@@ -1245,6 +1301,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // case), and once thinking binding lands it would fence the replies the
   // resident is streaming (Ada-1017, context-manager #155).
   const compiled = await cm.compile({ maxTokens, reserveForResponse }, undefined, { dryRun: true });
+  const verdict = curveVerdict(app, agentName, maxTokens, reserveForResponse);
 
   // Curve inspection only needs text and source metadata. Resolving every
   // historical blob here re-inlines all base64 media and can expand a
@@ -1318,6 +1375,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     generatedAt: new Date().toISOString(),
     branch: cm.currentBranch().name,
     budget: { maxTokens, reserveForResponse },
+    verdict,
     totals: {
       entries: entries.length,
       rendered: entries.reduce((a, e) => a + e.rendered, 0),

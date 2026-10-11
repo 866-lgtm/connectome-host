@@ -125,10 +125,16 @@ try {
 const D = payload.entries;
 document.getElementById('title').textContent = payload.agent + ' — compiled context';
 document.title = payload.agent + ' — context curve';
+const V = payload.verdict;
 document.getElementById('meta').textContent =
   'branch ' + payload.branch + ' · compiled ' + payload.generatedAt.slice(0, 16).replace('T', ' ') +
   'Z · budget ' + Math.round(payload.budget.maxTokens / 1000) + 'k (hard ' +
-  Math.round((payload.budget.maxTokens - payload.budget.reserveForResponse) / 1000) + 'k)';
+  Math.round((payload.budget.maxTokens - payload.budget.reserveForResponse) / 1000) + 'k)' +
+  // A dry compile plots a plan that won't fit instead of failing, so say so.
+  (V && V.fitsRequested === false
+    ? ' · OVER BUDGET: plan ' + Math.round(V.plannedTokens / 1000) + 'k > ' + Math.round(V.effectiveBudgetTokens / 1000) + 'k' +
+      (V.withinGrace === false ? ', past the grace margin: the next real compile will refuse it' : ', within the grace margin')
+    : '');
 
 let cx = 0, cy = 0;
 for (const e of D) { e.x0 = cx; e.y0 = cy; cx += e.rawCovered; cy += e.rendered; e.x1 = cx; e.y1 = cy; }
