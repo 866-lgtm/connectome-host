@@ -47,7 +47,6 @@ import {
   overlayEntryReplaces,
   overlayEntryTombstones,
   hostVariableReferences,
-  dialsUrl,
   type AgentOverlayEntry,
   type ServerProvisions,
 } from '../mcpl-config.js';
@@ -128,6 +127,18 @@ export class McplAdminModule implements Module {
   }
 
   /**
+   * What to do about an overlay entry the boot skips. mcpl_unload of it takes
+   * the tombstone branch, since the entry replaces nothing, so for an id the
+   * operator defines it tombstones the operator's server, which then stays
+   * unloaded (sw-ch228b I11).
+   */
+  private skippedAdvice(id: string): string {
+    return this.operatorServers.has(id)
+      ? 'redeploy with mcpl_deploy to replace it; mcpl_unload would tombstone the operator\'s definition, so it stays unloaded'
+      : 'redeploy with mcpl_deploy, or mcpl_unload it';
+  }
+
+  /**
    * A receipt's sentences about `id`'s overlay entry, or nothing: that it
    * replaces the operator's definition (always on deploy, which makes the
    * replacement; on restart only when it lacks something), what it lacks
@@ -141,8 +152,12 @@ export class McplAdminModule implements Module {
     const problem = entry === undefined ? null : overlayEntryProblem(entry);
     if (problem !== null) {
       return ` Your overlay entry for "${id}" is malformed (${problem}), so the next host start skips it` +
-        `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''}; ` +
-        'redeploy with mcpl_deploy, or mcpl_unload it.';
+        `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''}; ${this.skippedAdvice(id)}.`;
+    }
+    // A restart of a tombstoned id fails as "not configured", which doesn't
+    // say why or that the next start leaves it unloaded too (sw-ch228b I15).
+    if (!onDeploy && overlayEntryTombstones(entry)) {
+      return ` Your overlay tombstones "${id}", so the next host start leaves it unloaded; redeploy with mcpl_deploy to restore it.`;
     }
     if (!overlayEntryReplaces(entry)) return '';
     const replacement = this.replacement(id, overlay);
@@ -340,8 +355,10 @@ export class McplAdminModule implements Module {
       const source = overlayEntryReplaces(overlay[s.id])
         ? overlaySource
         : s.id in fileServers ? 'file/recipe' : 'recipe';
-      // What the framework opened: a URL it dials, else the command it spawned.
-      const target = (dialsUrl(s) ? s.url : s.command ?? s.url) ?? '?';
+      // The command, else the url, as main labelled it. The framework's status
+      // carries no transport, so for a definition that names both, this can't
+      // tell which one the framework opened (sw-ch228b I3).
+      const target = s.command ?? s.url ?? '?';
       const connectionState = s.connected ? 'CONNECTED' : s.retrying ? 'RETRYING' : 'DISCONNECTED';
       const policyState = s.policyEstablished === undefined
         ? 'unknown'
@@ -366,7 +383,10 @@ export class McplAdminModule implements Module {
     for (const [id, entry] of Object.entries(overlay)) {
       const problem = overlayEntryProblem(entry);
       if (problem !== null) {
-        lines.push(`${id}: MALFORMED in your overlay (${problem}), so the boot skips it — redeploy with mcpl_deploy, or mcpl_unload it`);
+        lines.push(
+          `${id}: MALFORMED in your overlay (${problem}), so the boot skips it` +
+          `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''} — ${this.skippedAdvice(id)}`,
+        );
       } else if (overlayEntryTombstones(entry)) {
         lines.push(`${id}: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore)`);
       } else if (!liveIds.has(id)) {
@@ -495,13 +515,20 @@ export class McplAdminModule implements Module {
     let note: string;
     try {
       note = this.overlayNote(id, readAgentOverlay(this.overlayPath), false);
-      // The restart reconnects with the configuration of the last connect,
-      // while the note reads the file as it is now (Nell-1783's probe).
-      if (note) note += ' That describes your overlay file as it is now: a hand edit since the last mcpl_deploy takes effect at the next host start, unless a later mcpl_deploy replaces it; not at this restart.';
+      // The restart reconnects with the configuration of the server's last
+      // connect, while the note reads the file as it is now (Nell-1783's
+      // probe). An edit made before that connect is already in it
+      // (sw-ch228b I20).
+      if (note) {
+        note += ' That describes your overlay file as it is now. The restart reconnects with the configuration of the ' +
+          'server\'s last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then ' +
+          'takes effect at the next host start, unless a later mcpl_deploy replaces it.';
+      }
     } catch {
-      // readAgentOverlay throws for a file the boot can't read either, so
-      // the next start stops on it (sw-ch228 I8).
-      note = ' Your overlay file couldn\'t be read or parsed, so nothing is said here about your entry, ' +
+      // readAgentOverlay throws only where the boot does too: a file it
+      // can't read, that isn't JSON, or whose root is null. So the next
+      // start stops on it (sw-ch228 I8, sw-ch228b I40).
+      note = ' Your overlay file couldn\'t be read as an overlay, so nothing is said here about your entry, ' +
         'and the next host start will stop on it until the file is fixed.';
     }
     try {

@@ -143,8 +143,10 @@ describe('mcpl_deploy', () => {
   });
 
   // Nell-1783's reading of abbae35: an env value the boot would skip was
-  // saved, then resolveOverlayEntry returned null and the deploy threw.
-  test('an env the boot would skip is refused before anything is saved; a number is deployed as its text', async () => {
+  // saved, then resolveOverlayEntry returned null and the deploy threw. A
+  // new write is held to the plain shapes, and a number passes on as main
+  // passed it: the child gets its text when it's spawned.
+  test('an env value that isn\'t text, a number or true/false is refused before anything is saved; a number is deployed as given', async () => {
     const { stub } = makeStubFramework();
     const envs: unknown[] = [];
     const connect = (stub as unknown as { connectMcplServer: (c: { env?: unknown }) => Promise<void> }).connectMcplServer;
@@ -160,7 +162,8 @@ describe('mcpl_deploy', () => {
 
     const deployed = await call(mod, 'mcpl_deploy', { id: 'door', command: 'node', env: { PORT: 3101 } });
     expect(deployed.success).toBe(true);
-    expect(envs).toEqual([expect.objectContaining({ PORT: '3101' })]);
+    expect(envs).toEqual([expect.objectContaining({ PORT: 3101 })]);
+    expect(readAgentOverlay(overlayPath).door).toEqual({ command: 'node', env: { PORT: 3101 } });
 
     // An empty list is strict function calling's "unspecified": no env, and nothing refused (sw-ch228 I7).
     const strictModel = await call(mod, 'mcpl_deploy', { id: 'quiet', command: 'node', env: [] });
@@ -258,15 +261,22 @@ describe('mcpl_unload', () => {
 });
 
 describe('mcpl_list labels', () => {
-  test('a server the framework dials is labelled by its url, even when its entry also names a command (sw-ch228 I10)', async () => {
-    const { stub, servers } = makeStubFramework();
-    await (stub as unknown as { connectMcplServer: (c: { id: string; command?: string; url?: string }) => Promise<void> })
-      .connectMcplServer({ id: 'world', command: 'node', url: 'wss://x.test/mcpl' });
-    (servers.get('world') as unknown as { transport: string }).transport = 'websocket';
-    await (stub as unknown as { connectMcplServer: (c: { id: string; command?: string }) => Promise<void> })
-      .connectMcplServer({ id: 'shell', command: 'node' });
+  // agent-framework's listMcplServers carries a server's command and url but
+  // not its transport, so the label is the command, else the url, as main
+  // labelled it; for a definition naming both it can't say which the
+  // framework opened (sw-ch228 I10, sw-ch228b I3).
+  test('a server is labelled by its command, else its url, from the status the framework reports', async () => {
+    const { stub } = makeStubFramework();
+    const connect = (stub as unknown as { connectMcplServer: (c: { id: string; command?: string; url?: string; transport?: string }) => Promise<void> })
+      .connectMcplServer;
+    await connect({ id: 'world', url: 'wss://x.test/mcpl' });
+    await connect({ id: 'both', command: 'node', url: 'wss://y.test/mcpl', transport: 'websocket' });
+    await connect({ id: 'shell', command: 'node' });
+    const status = stub.listMcplServers();
+    expect(status.every((s) => !('transport' in s))).toBe(true);
     const text = String((await call(makeModule(stub), 'mcpl_list')).data);
     expect(text).toMatch(/world: CONNECTED .*, wss:\/\/x\.test\/mcpl$/m);
+    expect(text).toMatch(/both: CONNECTED .*, node$/m);
     expect(text).toMatch(/shell: CONNECTED .*, node$/m);
   });
 });
@@ -335,12 +345,41 @@ describe('mcpl_list', () => {
     expect(String(restarted.data)).toContain('Restarted server "discord" — connected');
     expect(String(restarted.data)).toContain(
       'Your overlay entry for "discord" is malformed (its args aren\'t a list of text, numbers or true/false), ' +
-      'so the next host start skips it and loads the operator\'s definition',
+      'so the next host start skips it and loads the operator\'s definition; redeploy with mcpl_deploy to replace it; ' +
+      'mcpl_unload would tombstone the operator\'s definition, so it stays unloaded.',
     );
     expect(String(restarted.data)).not.toContain("couldn't be read");
-    // Unloading it for good tombstones the operator's server over the malformed entry.
+    // The advice says what mcpl_unload does for an id the operator defines,
+    // and stays plain for one it doesn't (sw-ch228b I11).
+    const listed = String((await call(mod, 'mcpl_list')).data);
+    expect(listed).toContain(
+      'discord: MALFORMED in your overlay (its args aren\'t a list of text, numbers or true/false), so the boot skips it ' +
+      'and loads the operator\'s definition — redeploy with mcpl_deploy to replace it; mcpl_unload would tombstone the ' +
+      'operator\'s definition, so it stays unloaded',
+    );
+    expect(listed).toContain("stray: MALFORMED in your overlay (it isn't an object), so the boot skips it — redeploy with mcpl_deploy, or mcpl_unload it");
+    // Unloading it for good tombstones the operator's server over the malformed entry, as the advice says.
     await call(mod, 'mcpl_unload', { id: 'discord' });
     expect(readAgentOverlay(overlayPath).discord).toEqual({ disabled: true });
+  });
+
+  // A tombstone that carries other fields is a tombstone: mcpl_list says
+  // so, and a restart says the overlay keeps the server unloaded at the next
+  // start (sw-ch228b I15, I32).
+  test('a tombstone, junk fields and all, is listed as unloaded, and a restart of it says why', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'discord', command: 'node' }]);
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: { discord: { disabled: true, command: 5, args: 'x', env: 'y' } } }));
+    const listed = String((await call(mod, 'mcpl_list')).data);
+    expect(listed).toContain('discord: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore)');
+    expect(listed).not.toContain('MALFORMED');
+    const restarted = await call(mod, 'mcpl_restart', { id: 'discord' });
+    expect(restarted.success).toBe(false);
+    expect(restarted.error).toContain('mcpl_restart failed: MCPL server "discord" is not configured.');
+    expect(restarted.error).toContain(
+      'Your overlay tombstones "discord", so the next host start leaves it unloaded; redeploy with mcpl_deploy to restore it.',
+    );
   });
 
   test('distinguishes older-framework unknown and bounds untrusted revisions', async () => {
@@ -430,8 +469,14 @@ describe('an overlay entry that replaces the operator definition', () => {
     expect(text).not.toContain('s3cret-token');
     expect(text).toContain('mcpl_unload "shell"');
     expect(text).toContain('the operator\'s loads again at the next host start');
-    // The restart reconnects with the last connect's configuration; the note reads the file.
-    expect(text).toContain('That describes your overlay file as it is now: a hand edit since the last mcpl_deploy takes effect at the next host start, unless a later mcpl_deploy replaces it; not at this restart.');
+    // The restart reconnects with the last connect's configuration; the note
+    // reads the file, so an edit made before that connect is already in it
+    // (sw-ch228b I20).
+    expect(text).toContain(
+      'That describes your overlay file as it is now. The restart reconnects with the configuration of the server\'s ' +
+      'last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then takes effect ' +
+      'at the next host start, unless a later mcpl_deploy replaces it.',
+    );
   });
 
   test('mcpl_restart says nothing more when the entry lacks nothing, or replaces nothing', async () => {
@@ -527,7 +572,7 @@ describe('an overlay entry that replaces the operator definition', () => {
 
     expect(result.success).toBe(true);
     expect(String(result.data)).toBe(
-      'Restarted server "shell" — connected, 1 tools. Your overlay file couldn\'t be read or parsed, so nothing is said here ' +
+      'Restarted server "shell" — connected, 1 tools. Your overlay file couldn\'t be read as an overlay, so nothing is said here ' +
       'about your entry, and the next host start will stop on it until the file is fixed.',
     );
     expect(String(result.data)).not.toContain('s3cret');
