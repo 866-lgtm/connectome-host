@@ -416,12 +416,23 @@ export function overlayEntryTombstones(entry: unknown): boolean {
  * it would lose all three, and the rename fails outright on such a mount.
  * A crash in the middle of this small write can still leave the file
  * truncated, so the next boot stops on it, as it always could.
+ *
+ * The root's keys besides `mcplServers` are written back as the file holds
+ * them now: the boot ignores them, and warns of them, but they're the
+ * agent's, such as an entry under a misspelled key it may yet fix.
  */
 export function saveAgentOverlay(
   overlayPath: string,
   servers: Record<string, AgentOverlayEntry>,
 ): void {
-  const data: AgentOverlayFile = { mcplServers: servers };
+  let root: Record<string, unknown> = {};
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(overlayPath, 'utf-8'));
+    if (parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)) root = parsed as Record<string, unknown>;
+  } catch {
+    // No file yet, or one that isn't an object: nothing else to keep.
+  }
+  const data: AgentOverlayFile = { ...root, mcplServers: servers };
   writeFileSync(overlayPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
 }
 

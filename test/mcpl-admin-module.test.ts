@@ -4,9 +4,10 @@
  */
 
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import type { AgentFramework } from '@animalabs/agent-framework';
 
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.js';
@@ -104,10 +105,11 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-function makeModule(framework: AgentFramework) {
+function makeModule(framework: AgentFramework, timeZone?: string) {
   const mod = new McplAdminModule({
     overlayPath,
     configPath: join(dir, 'mcpl-servers.json'),
+    ...(timeZone !== undefined ? { timeZone } : {}),
   });
   mod.setFramework(framework);
   return mod;
@@ -178,6 +180,94 @@ describe('mcpl_deploy', () => {
     expect((await call(mod, 'mcpl_deploy', { id: 'x' })).success).toBe(false);
     expect((await call(mod, 'mcpl_deploy', { id: 'x', command: 'a', url: 'ws://b' })).success).toBe(false);
     expect((await call(mod, 'mcpl_deploy', { id: 'bad id!', command: 'a' })).success).toBe(false);
+  });
+
+  // A deployed child used to get AGENT_TIMEZONE alone, without the
+  // refusal-reaction baseline every boot-loaded server gets.
+  test('gives a deployed child the env the boot composes for every server', async () => {
+    const { stub } = makeStubFramework();
+    const configs: Array<{ id: string; env?: Record<string, string> }> = [];
+    const connect = (stub as unknown as { connectMcplServer: (c: { id: string; env?: Record<string, string> }) => Promise<void> }).connectMcplServer;
+    (stub as unknown as { connectMcplServer: (c: { id: string; env?: Record<string, string> }) => Promise<void> }).connectMcplServer =
+      async (c) => { configs.push(c); return connect(c); };
+    const mod = makeModule(stub, 'Pacific/Auckland');
+
+    await call(mod, 'mcpl_deploy', { id: 'chat', command: 'node', env: { TOKEN: 'mine' } });
+    await call(mod, 'mcpl_deploy', { id: 'quiet', command: 'node', env: { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'own', AGENT_TIMEZONE: 'Mars/Olympus' } });
+
+    expect(configs[0]!.env).toEqual({
+      DISCORD_SUPPRESSED_REACTIONS_BASELINE: REFUSAL_REACTION_BASELINE.join(','),
+      TOKEN: 'mine',
+      AGENT_TIMEZONE: 'Pacific/Auckland',
+    });
+    // The entry's own baseline overrides the default; the host's zone wins over the entry's.
+    expect(configs[1]!.env!.DISCORD_SUPPRESSED_REACTIONS_BASELINE).toBe('own');
+    expect(configs[1]!.env!.AGENT_TIMEZONE).toBe('Pacific/Auckland');
+    // The overlay keeps only what the agent gave.
+    expect(readAgentOverlay(overlayPath).chat).toEqual({ command: 'node', env: { TOKEN: 'mine' } });
+  });
+
+  // A field of the wrong kind used to be dropped (or coerced: a null arg
+  // saved as "null"), so the deploy said it succeeded with what the caller
+  // gave missing or changed.
+  test('judges each field as given: a wrong kind is refused, and nothing is saved or connected', async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    const cases: Array<[Record<string, unknown>, string]> = [
+      [{ env: 'TOKEN=x' }, "its env isn't a map of names to values"],
+      [{ env: 5 }, "its env isn't a map of names to values"],
+      [{ env: false }, "its env isn't a map of names to values"],
+      [{ env: ['A=1'] }, "its env isn't a map of names to values"],
+      [{ args: 'server.js' }, "its args aren't a list of text"],
+      [{ args: ['server.js', null] }, "its args aren't a list of text"],
+      [{ toolPrefix: 5 }, "its toolPrefix isn't text"],
+      [{ token: 5 }, "its token isn't text"],
+      [{ access: 5 }, "its access isn't text"],
+      [{ reconnect: 'yes' }, 'its reconnect is neither true nor false'],
+      [{ enabledTools: 'say' }, "its enabledTools isn't a list of names"],
+      [{ command: 5 }, "its command isn't text"],
+    ];
+    for (const [fields, problem] of cases) {
+      const result = await call(mod, 'mcpl_deploy', { id: 'odd', command: 'node', ...fields });
+      expect(result.error).toBe(`mcpl_deploy refused: the entry would be malformed (${problem}), so nothing was saved.`);
+    }
+    expect(calls).toEqual([]);
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+  });
+
+  test('leaves out what strict function calling sends as unspecified, and saves list numbers as text', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    const result = await call(mod, 'mcpl_deploy', {
+      id: 'plain', command: 'node', args: ['--port', 3101, true], env: null,
+      token: '', access: '', toolPrefix: '', url: '', enabledTools: [], disabledFeatureSets: [],
+    });
+    expect(result.success).toBe(true);
+    // An empty toolPrefix would have been kept by the framework in place of its default prefix.
+    expect(readAgentOverlay(overlayPath).plain).toEqual({ command: 'node', args: ['--port', '3101', 'true'] });
+  });
+
+  test('refuses the id __proto__, which would never be saved, and takes any other name as an id', async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    const refused = await call(mod, 'mcpl_deploy', { id: '__proto__', command: 'node' });
+    expect(refused.error).toBe("`id` can't be __proto__, which JavaScript reads as an object's prototype rather than a name.");
+    expect(calls).toEqual([]);
+    const named = await call(mod, 'mcpl_deploy', { id: 'constructor', command: 'node' });
+    expect(named.success).toBe(true);
+    expect(String(named.data)).not.toContain('malformed');
+    expect(JSON.parse(readFileSync(overlayPath, 'utf-8')).mcplServers).toEqual({ constructor: { command: 'node' } });
+  });
+
+  test("keeps the overlay root's other keys, such as a misspelled one, when it saves", async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    writeFileSync(overlayPath, JSON.stringify({ mcplServer: { old: { disabled: true } }, mcplServers: {} }));
+    await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' });
+    expect(JSON.parse(readFileSync(overlayPath, 'utf-8'))).toEqual({
+      mcplServer: { old: { disabled: true } },
+      mcplServers: { mytool: { command: 'node' } },
+    });
   });
 
   test('connect failure keeps the overlay entry and reports the error', async () => {
@@ -258,6 +348,107 @@ describe('mcpl_unload', () => {
     expect(result.success).toBe(true);
     expect(readAgentOverlay(overlayPath)).toEqual({ newer: { command: 'node' }, discord: { disabled: true } });
   });
+
+  // The unload used to disconnect first and read the overlay after, so a
+  // file the boot stops on left the server down with nothing recorded.
+  test('an overlay the boot would stop on refuses the unload, with the server still loaded', async () => {
+    const { stub, servers, calls } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'discord', command: 'node' });
+    writeFileSync(overlayPath, '{ not json');
+    const mod = makeModule(stub);
+    const result = await call(mod, 'mcpl_unload', { id: 'discord' });
+    expect(result.success).toBe(false);
+    expect(result.error).toStartWith('mcpl_unload failed: the agent overlay ');
+    expect(calls).toEqual(['connect:discord']);
+    expect(servers.has('discord')).toBe(true);
+  });
+
+  test('a disconnect that fails changes nothing in the overlay, and says so', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'discord', command: 'node' }]);
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'discord', command: 'node' });
+    await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' });
+    const before = readFileSync(overlayPath, 'utf-8');
+    (stub as unknown as { disconnectMcplServer: () => Promise<void> }).disconnectMcplServer =
+      async () => { throw new Error('stuck'); };
+    for (const id of ['discord', 'mytool']) {
+      expect((await call(mod, 'mcpl_unload', { id })).error)
+        .toBe(`Server "${id}" couldn't be disconnected: stuck. It may still be loaded in this session, and your overlay is unchanged.`);
+    }
+    (stub as unknown as { disconnectMcplServer: () => Promise<void> }).disconnectMcplServer =
+      async () => { throw 'socket wedged'; };
+    expect((await call(mod, 'mcpl_unload', { id: 'discord', persist: false })).error)
+      .toBe('Server "discord" couldn\'t be disconnected: socket wedged. It may still be loaded in this session, and your overlay is unchanged.');
+    expect(readFileSync(overlayPath, 'utf-8')).toBe(before);
+  });
+
+  test('an id the overlay alone names is not disconnected: its entry is removed, or its tombstone kept', async () => {
+    const { stub, calls } = makeStubFramework();
+    (stub as unknown as { disconnectMcplServer: () => Promise<void> }).disconnectMcplServer =
+      async () => { throw new Error('MCPL subsystem is not initialized'); };
+    saveAgentOverlay(overlayPath, { stale: { command: 'node' }, gone: { disabled: true } });
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'gone', command: 'node' }]);
+    expect((await call(mod, 'mcpl_unload', { id: 'stale' })).data)
+      .toBe('Server "stale" wasn\'t loaded in this session. Removed from your agent overlay.');
+    expect((await call(mod, 'mcpl_unload', { id: 'gone' })).data).toBe(
+      'Server "gone" wasn\'t loaded in this session. Tombstoned in your overlay — it stays unloaded across host restarts; ' +
+      'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file loads the ' +
+      'operator\'s definition again.',
+    );
+    expect(calls).toEqual([]);
+    expect(readAgentOverlay(overlayPath)).toEqual({ gone: { disabled: true } });
+  });
+
+  // A malformed entry loads nothing for an id the operator doesn't define,
+  // so unloading it removes it rather than leaving a tombstone in its place.
+  test("a malformed entry is removed for an id the operator doesn't define", async () => {
+    const { stub } = makeStubFramework();
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: { stray: null, odd: { command: 'node', args: 'x' } } }));
+    const mod = makeModule(stub);
+    expect((await call(mod, 'mcpl_unload', { id: 'stray' })).data).toBe('Server "stray" wasn\'t loaded in this session. Removed from your agent overlay.');
+    expect((await call(mod, 'mcpl_unload', { id: 'odd' })).data).toBe('Server "odd" wasn\'t loaded in this session. Removed from your agent overlay.');
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+  });
+
+  test('a session-only unload says what the next start loads, read from the overlay', async () => {
+    const { stub } = makeStubFramework();
+    const connect = (id: string) => (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id, command: 'node' });
+    await connect('discord');
+    await connect('adhoc');
+    await connect('heartbeat');
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'discord', command: 'node' }, { id: 'heartbeat', command: 'node' }]);
+    await call(mod, 'mcpl_deploy', { id: 'mine', command: 'bun' });
+    saveAgentOverlay(overlayPath, { ...readAgentOverlay(overlayPath), heartbeat: { disabled: true } });
+    const unload = async (id: string) => String((await call(mod, 'mcpl_unload', { id, persist: false })).data);
+    const head = (id: string) => `Unloaded server "${id}" — its tools are gone from your toolset. Session-only: `;
+    expect(await unload('discord')).toBe(`${head('discord')}the operator's definition loads it again at the next host start.`);
+    expect(await unload('mine')).toBe(`${head('mine')}your overlay entry loads it again at the next host start.`);
+    expect(await unload('heartbeat')).toBe(`${head('heartbeat')}your overlay tombstones it, so the next host start leaves it unloaded.`);
+    expect(await unload('adhoc')).toBe(`${head('adhoc')}nothing loads it at the next host start.`);
+  });
+
+  test('a deploy of the same id landing during the disconnect keeps its entry, and the receipt says only what the unload did', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' });
+    const disconnect = (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer;
+    (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer = async (id) => {
+      await disconnect(id);
+      saveAgentOverlay(overlayPath, { ...readAgentOverlay(overlayPath), mytool: { command: 'bun' } });
+    };
+    const result = await call(mod, 'mcpl_unload', { id: 'mytool' });
+    expect(result.data).toBe(
+      'Disconnected the server that was loaded as "mytool". Your overlay entry for it changed while it disconnected ' +
+      '(a deploy?), so it was left as it is: your overlay entry loads it again at the next host start.',
+    );
+    expect(readAgentOverlay(overlayPath).mytool).toEqual({ command: 'bun' });
+  });
 });
 
 describe('mcpl_list labels', () => {
@@ -292,6 +483,18 @@ describe('mcpl_restart', () => {
 
     expect(result.success).toBe(true);
     expect(calls).toEqual(['connect:discord', 'restart:discord']);
+  });
+
+  // An inherited name read straight off the overlay would be a function,
+  // which the note would call a malformed entry.
+  test('a server named like an inherited key gets no note about an entry it lacks', async () => {
+    const { stub } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'toString', command: 'node' });
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'toString', command: 'node' }]);
+    const result = await call(mod, 'mcpl_restart', { id: 'toString' });
+    expect(result.data).toBe('Restarted server "toString" — connected, 1 tools.');
   });
 });
 
@@ -405,6 +608,15 @@ describe('mcpl_list', () => {
       'redeploy with mcpl_deploy to restore it',
     );
     expect(listed).not.toContain('heartbeat: UNLOADED');
+  });
+
+  test('a recipe server named like an inherited key is labelled recipe, not file/recipe', async () => {
+    const { stub } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'constructor', command: 'node' });
+    const mod = makeModule(stub);
+    expect(String((await call(mod, 'mcpl_list')).data)).toContain('constructor: CONNECTED');
+    expect(String((await call(mod, 'mcpl_list')).data)).toContain('source=recipe,');
   });
 
   test('distinguishes older-framework unknown and bounds untrusted revisions', async () => {
