@@ -294,6 +294,11 @@ describe('what an overlay replacement lacks of the operator definition', () => {
       const withToken = serverProvisions({ id: 'world', url: 'wss://w/mcpl', token: 'tok' });
       expect(lostByReplacement(withToken, { url: 'wss://w/mcpl', token: 7 } as unknown as AgentOverlayEntry)).toBeNull();
       expect(lostByReplacement(withToken, { url: 'wss://w/mcpl', token: '' })).toBe('token');
+      // The operator's side reads its token the same way, so a number token
+      // a replacement drops is lacking (sw-ch228c I14).
+      const numberToken = serverProvisions({ id: 'world', url: 'wss://w/mcpl', token: 12345 });
+      expect(numberToken.token).toBe(true);
+      expect(lostByReplacement(numberToken, { url: 'wss://w/mcpl' })).toBe('token');
       // Args that aren't a list stopped main's start, so the boot skips the
       // entry: it replaces nothing, so it lacks nothing and names nothing.
       const odd = { command: 'node', args: 'not-a-list', env: ['${A}'] } as unknown as AgentOverlayEntry;
@@ -310,7 +315,10 @@ describe('what an overlay replacement lacks of the operator definition', () => {
       writeFileSync(path, JSON.stringify({ mcplServers: {
         unprintable: { command: 'node', env: { A: { toString: 1 } }, disabledCapabilities: [{ toString: 1 }, ['memory'], 'channels'] },
       } }));
-      expect(() => overlayWarnings([], path)).not.toThrow();
+      // Main stopped the start on that item, so the reading differs and is named (sw-ch228c I12).
+      expect(overlayWarnings([], path)).toEqual([
+        `[mcpl] server "unprintable": the agent overlay (${path}) entry loads, but its disabledCapabilities holds an item that can't be read as text, which denies nothing, where the host used to stop the start`,
+      ]);
       const [loaded] = applyAgentOverlay([], path) as Array<Record<string, unknown>>;
       expect(loaded!.disabledCapabilities).toEqual([...AGENT_DEPLOY_DENIED_CAPABILITIES, 'channels', 'memory'].sort());
     });
@@ -408,7 +416,11 @@ describe('what an overlay replacement lacks of the operator definition', () => {
       expect(loaded.get('reconnectNull')!.reconnect).toBeNull();
       // A blank list passes on blank, which the framework reads as no restriction.
       expect(loaded.get('blankTools')!.enabledTools).toBe('');
-      expect(overlayWarnings([], path)).toEqual([]);
+      // Only the entry the framework can't open is named, though it loads as
+      // on main (sw-ch228c I1).
+      expect(overlayWarnings([], path)).toEqual([
+        `[mcpl] server "wsNoUrl": the agent overlay (${path}) entry loads, but its transport is websocket, with no url to dial, so the framework can't open it`,
+      ]);
     });
   });
 
@@ -421,15 +433,19 @@ describe('what an overlay replacement lacks of the operator definition', () => {
         numberArgs: { command: 'node', args: ['server.js', 8080, true] },
         numberPrefix: { command: 'node', toolPrefix: 5 },
         truePrefix: { command: 'node', toolPrefix: true },
+        objectPrefix: { command: 'node', toolPrefix: { p: 1 } },
         oneName: { command: 'node', disabledTools: 'shell_exec' },
         oneCapability: { command: 'node', disabledCapabilities: 'channels' },
         wsTransport: { transport: 'ws', url: 'wss://w/mcpl' },
+        stdioNoCommand: { transport: 'stdio', url: 'wss://w/mcpl' },
       };
       writeFileSync(path, JSON.stringify({ mcplServers: entries }));
       const loaded = new Map(applyAgentOverlay([], path).map((s) => [s.id, s as Record<string, unknown>]));
       expect(loaded.get('numberArgs')!.args).toEqual(['server.js', '8080', 'true']);
       expect(loaded.get('numberPrefix')!.toolPrefix).toBe('5');
       expect(loaded.get('truePrefix')!.toolPrefix).toBe('true');
+      // An object has no text either, so the default prefix routes its tools (sw-ch228c I22).
+      expect('toolPrefix' in loaded.get('objectPrefix')!).toBe(false);
       expect(loaded.get('oneName')!.disabledTools).toEqual(['shell_exec']);
       expect(loaded.get('oneCapability')!.disabledCapabilities).toEqual([...AGENT_DEPLOY_DENIED_CAPABILITIES, 'channels'].sort());
       // The framework ignores a transport it doesn't know, so a url with no
@@ -441,9 +457,13 @@ describe('what an overlay replacement lacks of the operator definition', () => {
         `${loads('numberArgs')} its args hold numbers or true/false, read as their text, where the host used to stop the start`,
         `${loads('numberPrefix')} its toolPrefix is a number, read as its text, so calls to its tools reach it`,
         `${loads('truePrefix')} its toolPrefix is true or false, read as its text, so calls to its tools reach it`,
+        `${loads('objectPrefix')} its toolPrefix isn't text, so its tools take the default prefix, which calls to them reach`,
         `${loads('oneName')} its disabledTools is one name, read as a list of one`,
         `${loads('oneCapability')} its disabledCapabilities is one name, read as a list of one`,
         `${loads('wsTransport')} its transport is neither stdio nor websocket, so the framework ignores it`,
+        // Passed on as main passed it, and named, since it replaces any
+        // operator definition with nothing that connects (sw-ch228c I1).
+        `${loads('stdioNoCommand')} its transport is stdio, with no command to spawn, so the framework can't open it`,
       ]);
       // No line quotes a value from the file (sw-ch228b I28).
       expect(lines.join('\n')).not.toContain('"ws"');
@@ -570,7 +590,7 @@ describe('what an overlay replacement lacks of the operator definition', () => {
       const path = join(dir, 'mcpl-servers.agent.json');
       const said = (what: string) => `[mcpl] the agent overlay (${path}) ${what}`;
       const noRoot = said('has a root that isn\'t an object, so it holds no entries, as main read it');
-      const noMap = said('has an mcplServers that isn\'t a map of entries, so it holds no entries, as main read it');
+      const noMap = said('has an mcplServers that isn\'t a map of entries, so nothing in it loads, as on main');
       for (const [text, line] of [
         ['[]', noRoot],
         ['[{"command": "node"}]', noRoot],

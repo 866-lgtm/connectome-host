@@ -139,6 +139,18 @@ export class McplAdminModule implements Module {
   }
 
   /**
+   * How to bring back a tombstoned id. For an id the operator defines, no
+   * tool restores the operator's definition: mcpl_deploy loads the agent's
+   * own entry in its place, and mcpl_unload writes the tombstone again. Only
+   * removing the tombstone from the file does (sw-ch228c I31).
+   */
+  private tombstoneAdvice(id: string): string {
+    return this.operatorServers.has(id)
+      ? 'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file loads the operator\'s definition again'
+      : 'redeploy with mcpl_deploy to restore it';
+  }
+
+  /**
    * A receipt's sentences about `id`'s overlay entry, or nothing: that it
    * replaces the operator's definition (always on deploy, which makes the
    * replacement; on restart only when it lacks something), what it lacks
@@ -157,7 +169,7 @@ export class McplAdminModule implements Module {
     // A restart of a tombstoned id fails as "not configured", which doesn't
     // say why or that the next start leaves it unloaded too (sw-ch228b I15).
     if (!onDeploy && overlayEntryTombstones(entry)) {
-      return ` Your overlay tombstones "${id}", so the next host start leaves it unloaded; redeploy with mcpl_deploy to restore it.`;
+      return ` Your overlay tombstones "${id}", so the next host start leaves it unloaded; ${this.tombstoneAdvice(id)}.`;
     }
     if (!overlayEntryReplaces(entry)) return '';
     const replacement = this.replacement(id, overlay);
@@ -378,7 +390,8 @@ export class McplAdminModule implements Module {
       );
     }
 
-    // Tombstoned / overlay-only entries that aren't currently loaded
+    // The overlay's entries the live list doesn't explain: malformed ones,
+    // tombstones, and entries that aren't currently loaded
     const liveIds = new Set(live.map(s => s.id));
     for (const [id, entry] of Object.entries(overlay)) {
       const problem = overlayEntryProblem(entry);
@@ -388,7 +401,11 @@ export class McplAdminModule implements Module {
           `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''} — ${this.skippedAdvice(id)}`,
         );
       } else if (overlayEntryTombstones(entry)) {
-        lines.push(`${id}: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore)`);
+        // A tombstone written while its server runs leaves it connected for
+        // this session, which the line above already shows (sw-ch228c I7).
+        lines.push(liveIds.has(id)
+          ? `${id}: TOMBSTONED in your overlay, still connected this session; the next host start leaves it unloaded — ${this.tombstoneAdvice(id)}`
+          : `${id}: UNLOADED (tombstoned in your overlay — ${this.tombstoneAdvice(id)})`);
       } else if (!liveIds.has(id)) {
         lines.push(`${id}: NOT LOADED (in your overlay but not connected — try mcpl_deploy again)`);
       }
@@ -514,12 +531,15 @@ export class McplAdminModule implements Module {
     // error can quote the file, which may hold values, so it isn't repeated.
     let note: string;
     try {
-      note = this.overlayNote(id, readAgentOverlay(this.overlayPath), false);
+      const overlay = readAgentOverlay(this.overlayPath);
+      note = this.overlayNote(id, overlay, false);
       // The restart reconnects with the configuration of the server's last
       // connect, while the note reads the file as it is now (Nell-1783's
       // probe). An edit made before that connect is already in it
-      // (sw-ch228b I20).
-      if (note) {
+      // (sw-ch228b I20). That's said of a replacing entry only: a skipped one
+      // takes no effect, and a tombstoned id has no configuration left to
+      // reconnect with once unloaded (sw-ch228c I9, I23).
+      if (note && overlayEntryReplaces(Object.hasOwn(overlay, id) ? overlay[id] : undefined)) {
         note += ' That describes your overlay file as it is now. The restart reconnects with the configuration of the ' +
           'server\'s last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then ' +
           'takes effect at the next host start, unless a later mcpl_deploy replaces it.';

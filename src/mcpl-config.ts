@@ -258,7 +258,9 @@ export function readAgentOverlayFile(overlayPath: string): {
     };
   }
   if (typeof servers !== 'object') {
-    return { servers: {}, otherKeys, notes: ['has an mcplServers that isn\'t a map of entries, so it holds no entries, as main read it'] };
+    // main iterated a text's characters as entries, each naming nothing to
+    // run, and a number or true/false as none: nothing loaded either way.
+    return { servers: {}, otherKeys, notes: ['has an mcplServers that isn\'t a map of entries, so nothing in it loads, as on main'] };
   }
   return { servers: servers as Record<string, AgentOverlayEntry>, otherKeys, notes: [] };
 }
@@ -304,10 +306,17 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  * - a name list given as one non-empty text reads as a list of one, where
  *   main read it character by character (a tool or feature-set list) or not
  *   at all (`disabledCapabilities`);
- * - a number or true/false `toolPrefix` reads as its text, where main
- *   mis-routed calls to the server's tools (`prefix.length` is undefined);
+ * - a number or true/false `toolPrefix` reads as its text, and an object or
+ *   list one as absent, so the default prefix applies, where main mis-routed
+ *   calls to the server's tools (it isn't text, so `prefix.length` misleads);
+ * - a `disabledCapabilities` item that String() can't read, such as a parsed
+ *   object whose own `toString` isn't a function, denies nothing, where
+ *   main's String() stopped the start;
  * - a `transport` other than stdio or websocket is named, though it passes
- *   on as main passed it and the framework ignores it.
+ *   on as main passed it and the framework ignores it; so is a websocket
+ *   transport with no url, or a stdio one with no command, which the
+ *   framework can't open and which still replaces any operator definition,
+ *   as on main.
  *
  * Skipped, so the operator's definition, if any, stays: an entry that isn't
  * an object, and `args` that aren't a list of text, numbers or true/false,
@@ -369,10 +378,23 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   if (typeof e.toolPrefix === 'number' || typeof e.toolPrefix === 'boolean') {
     notes.push(`its toolPrefix is ${typeof e.toolPrefix === 'number' ? 'a number' : 'true or false'}, read as its text, so calls to its tools reach it`);
     e.toolPrefix = String(e.toolPrefix);
+  } else if (e.toolPrefix !== null && typeof e.toolPrefix === 'object') {
+    // An object or a list isn't text either, so main mis-routed these
+    // calls too (sw-ch228c I22): the default prefix routes them.
+    notes.push('its toolPrefix isn\'t text, so its tools take the default prefix, which calls to them reach');
+    delete e.toolPrefix;
+  }
+  if (Array.isArray(e.disabledCapabilities) && e.disabledCapabilities.some((c) => { try { String(c); return false; } catch { return true; } })) {
+    // main's String() stopped the start on such an item (sw-ch228c I12).
+    notes.push('its disabledCapabilities holds an item that can\'t be read as text, which denies nothing, where the host used to stop the start');
   }
   if (e.transport !== undefined && e.transport !== null && e.transport !== 'stdio' && e.transport !== 'websocket') {
     notes.push('its transport is neither stdio nor websocket, so the framework ignores it');
   }
+  // Passed on as main passed them, and named: such an entry replaces any
+  // operator definition with one the framework fails to open (sw-ch228c I1).
+  if (e.transport === 'websocket' && !e.url && e.command) notes.push('its transport is websocket, with no url to dial, so the framework can\'t open it');
+  if (e.transport === 'stdio' && !e.command && e.url) notes.push('its transport is stdio, with no command to spawn, so the framework can\'t open it');
   if (!e.command && !e.url) return { problem: 'it names nothing to run or dial' };
   return { entry: e as AgentOverlayEntry, notes };
 }
@@ -581,7 +603,9 @@ export function serverProvisions(definition: Record<string, unknown>): ServerPro
   const access = typeof definition.access === 'string' ? definition.access : '';
   return {
     env: env.sort(),
-    token: typeof definition.token === 'string' && definition.token !== '',
+    // As the framework sends it: any truthy token goes on the dial, as
+    // lostByReplacement reads the replacement's (sw-ch228c I14).
+    token: Boolean(definition.token),
     access: access || null,
     inheritEnv: definition.inheritEnv === true,
   };

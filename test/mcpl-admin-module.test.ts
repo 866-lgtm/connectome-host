@@ -349,6 +349,8 @@ describe('mcpl_list', () => {
       'mcpl_unload would tombstone the operator\'s definition, so it stays unloaded.',
     );
     expect(String(restarted.data)).not.toContain("couldn't be read");
+    // A skipped entry takes no effect, so the last-connect sentence isn't said (sw-ch228c I9).
+    expect(String(restarted.data)).not.toContain('last connect');
     // The advice says what mcpl_unload does for an id the operator defines,
     // and stays plain for one it doesn't (sw-ch228b I11).
     const listed = String((await call(mod, 'mcpl_list')).data);
@@ -372,14 +374,38 @@ describe('mcpl_list', () => {
     mod.setOperatorServers([{ id: 'discord', command: 'node' }]);
     writeFileSync(overlayPath, JSON.stringify({ mcplServers: { discord: { disabled: true, command: 5, args: 'x', env: 'y' } } }));
     const listed = String((await call(mod, 'mcpl_list')).data);
-    expect(listed).toContain('discord: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore)');
+    // For an id the operator defines, no tool brings its definition back:
+    // only removing the tombstone does (sw-ch228c I31).
+    const advice = 'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file ' +
+      'loads the operator\'s definition again';
+    expect(listed).toContain(`discord: UNLOADED (tombstoned in your overlay — ${advice})`);
     expect(listed).not.toContain('MALFORMED');
     const restarted = await call(mod, 'mcpl_restart', { id: 'discord' });
     expect(restarted.success).toBe(false);
     expect(restarted.error).toContain('mcpl_restart failed: MCPL server "discord" is not configured.');
-    expect(restarted.error).toContain(
-      'Your overlay tombstones "discord", so the next host start leaves it unloaded; redeploy with mcpl_deploy to restore it.',
+    expect(restarted.error).toContain(`Your overlay tombstones "discord", so the next host start leaves it unloaded; ${advice}.`);
+    // Nothing is left to reconnect with, so the last-connect sentence isn't said (sw-ch228c I23).
+    expect(restarted.error).not.toContain('last connect');
+    // An id nothing else defines is the agent's own, which a deploy restores.
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: { mine: { disabled: true } } }));
+    expect(String((await call(mod, 'mcpl_list')).data)).toContain('mine: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore it)');
+  });
+
+  // A tombstone written while its server runs leaves it connected for this
+  // session, and the list says so rather than UNLOADED (sw-ch228c I7).
+  test('a tombstone for a server still connected is listed as tombstoned, not as unloaded', async () => {
+    const { stub } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'heartbeat', command: 'node' });
+    const mod = makeModule(stub);
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: { heartbeat: { disabled: true } } }));
+    const listed = String((await call(mod, 'mcpl_list')).data);
+    expect(listed).toContain('heartbeat: CONNECTED');
+    expect(listed).toContain(
+      'heartbeat: TOMBSTONED in your overlay, still connected this session; the next host start leaves it unloaded — ' +
+      'redeploy with mcpl_deploy to restore it',
     );
+    expect(listed).not.toContain('heartbeat: UNLOADED');
   });
 
   test('distinguishes older-framework unknown and bounds untrusted revisions', async () => {
