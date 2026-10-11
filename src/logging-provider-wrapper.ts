@@ -161,6 +161,10 @@ function summarizeResponse(response: ProviderResponse, convention: ProviderAdapt
 export class LoggingProviderAdapter implements ProviderAdapter {
   readonly name: string;
 
+  /** Credential-monitor taps (see LoggingAnthropicAdapter). */
+  onProviderError?: (error: unknown, kind: 'complete' | 'stream') => void;
+  onProviderSuccess?: (kind: 'complete' | 'stream') => void;
+
   constructor(
     private readonly inner: ProviderAdapter,
     private readonly logPath: string,
@@ -241,6 +245,13 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     outcome: { response: ProviderResponse } | { error: unknown },
   ): void {
     const failed = 'error' in outcome;
+    // The credential monitor's taps (main's 8ed0a18). They follow the
+    // explicit outcome, so a rejection with undefined is reported as the
+    // failure it is.
+    try {
+      if (failed) this.onProviderError?.(outcome.error, kind);
+      else this.onProviderSuccess?.(kind);
+    } catch { /* observers never affect provider traffic */ }
     const head = {
       type: failed ? 'error' : 'call',
       provider: this.name,

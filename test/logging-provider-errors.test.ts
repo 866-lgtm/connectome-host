@@ -229,6 +229,27 @@ describe('LoggingProviderAdapter error records', () => {
     });
   }
 
+  test('the credential monitor\'s taps follow the outcome, and a throwing tap changes nothing (merge with main\'s 8ed0a18)', async () => {
+    for (const kind of ['complete', 'stream'] as const) {
+      const seen: Array<[string, unknown]> = [];
+      const tap = (wrapped: LoggingProviderAdapter) => {
+        wrapped.onProviderError = (error) => { seen.push(['error', error]); throw new Error('zz tap failed'); };
+        wrapped.onProviderSuccess = () => { seen.push(['success', undefined]); throw new Error('zz tap failed'); };
+        return wrapped;
+      };
+      const call = (w: LoggingProviderAdapter) => (kind === 'complete' ? w.complete(request) : w.stream(request, {} as never));
+      const response = { content: [], stopReason: 'end_turn' } as unknown as ProviderResponse;
+      expect(await call(tap(new LoggingProviderAdapter(succeeding(response), logFile())))).toBe(response);
+      const error = membraneLike('zz');
+      await expect(call(tap(new LoggingProviderAdapter(failing(error), logFile())))).rejects.toBe(error);
+      // A rejection with undefined is a failure for the taps too.
+      let thrown: unknown = 'not thrown';
+      try { await call(tap(new LoggingProviderAdapter(failing(undefined), logFile()))); } catch (e) { thrown = e; }
+      expect(thrown).toBeUndefined();
+      expect(seen).toEqual([['success', undefined], ['error', error], ['error', undefined]]);
+    }
+  });
+
   test('each classification field is read on its own: a throwing getter or a wrong type loses only that field (sw-ch216 I5)', async () => {
     const all = { type: 'invalid_request', httpStatus: 400, providerErrorCode: 'invalid_request_error', retryable: false };
     const recordField = { type: 'errorType', httpStatus: 'httpStatus', providerErrorCode: 'providerErrorCode', retryable: 'retryable' } as const;
