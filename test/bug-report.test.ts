@@ -5,7 +5,7 @@
  * may reach the report, its title, its link, the command's output or the
  * file it saves.
  */
-import { describe, expect, test } from 'bun:test';
+import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -33,6 +33,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const NOW = new Date('2026-10-11T23:50:00.000Z');
 /** Spelled so no casing of the report's own words can contain it. */
 const CANARY = 'zqxcanaryzqx';
+/** A data directory under the checkout, as DATA_DIR's default puts it. */
+const SESSION_FILE_DIR = join(ROOT, `data-bug-probe-${process.pid}`, 'workspace');
 
 function scratch(): string {
   return mkdtempSync(join(tmpdir(), 'bug-report-'));
@@ -41,6 +43,8 @@ function scratch(): string {
 /** A data directory holding a canary in every source of text. */
 function canaryDataDir(): string {
   const dir = scratch();
+  mkdirSync(SESSION_FILE_DIR, { recursive: true });
+  writeFileSync(join(SESSION_FILE_DIR, `${CANARY}-scene.js`), '// written by a session\n');
   const call = (fields: Record<string, unknown>) => JSON.stringify({
     kind: 'stream', timestamp: '2026-10-11T23:40:00.000Z', durationMs: 900,
     rawRequest: { system: `system ${CANARY}`, messages: [{ role: 'user', content: `hi ${CANARY}` }] },
@@ -74,6 +78,10 @@ function canaryDataDir(): string {
     `Zqxcanaryzqx${'Error'}: a class name the user's code made up`,
     `    at handleBug (${join(ROOT, 'src/commands.ts')}:40:9)`,
     `    at forged (${join(ROOT, `src/${CANARY}.ts`)}:1:1)`,
+    // A file a session wrote under the checkout's data directory, with a
+    // name from the conversation: it exists, but isn't our code.
+    'ReferenceError: x is not defined',
+    `    at run (${join(SESSION_FILE_DIR, `${CANARY}-scene.js`)}:3:1)`,
     `a quoted message: "${CANARY}"`,
   ].join('\n') + '\n');
   return dir;
@@ -126,6 +134,8 @@ function canaryFacts(dir: string, mode: 'tui' | 'headless' = 'tui'): BugReportFa
   });
 }
 
+afterAll(() => rmSync(dirname(SESSION_FILE_DIR), { recursive: true, force: true }));
+
 function expectNoCanary(text: string, where: string): void {
   expect(text.toLowerCase().includes(CANARY), `${where} carries the canary:\n${text}`).toBe(false);
 }
@@ -157,6 +167,8 @@ describe('the guarantee', () => {
       expect(full.report).toContain('connectome-host/src/commands.ts:12');
       expect(full.report).toContain('another error class ×1');
       expect(full.report).toContain('connectome-host/src/commands.ts:40');
+      // The session's file is no frame: the error is named, with no location.
+      expect(full.report).toMatch(/ReferenceError ×1 · sig [0-9a-f]{8}\n\n/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -191,14 +203,36 @@ describe('the guarantee', () => {
     }
   });
 
-  test('a custom model id with a public look still stays out unless it matches its own provider', () => {
+  test('a model id goes in only when every word of it is a public model word, a number or a date', () => {
     expect(publicModelId('anthropic', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5');
+    expect(publicModelId('anthropic', 'claude-3-5-sonnet-20240620')).toBe('claude-3-5-sonnet-20240620');
     expect(publicModelId('bedrock', 'us.anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe('us.anthropic.claude-sonnet-4-5-20250929-v1:0');
-    expect(publicModelId('bedrock', 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/x')).toBe('custom');
+    expect(publicModelId('openai-responses', 'gpt-4o-mini')).toBe('gpt-4o-mini');
+    expect(publicModelId('openai-codex', 'o3')).toBe('o3');
     expect(publicModelId('openrouter', 'anthropic/claude-sonnet-4.5')).toBe('anthropic/claude-sonnet-4.5');
+    expect(publicModelId('openrouter', 'meta-llama/llama-3.1-70b-instruct')).toBe('meta-llama/llama-3.1-70b-instruct');
+    // A user's words after a public-looking prefix, or an unknown vendor.
+    expect(publicModelId('anthropic', `claude-${CANARY}`)).toBe('custom');
+    expect(publicModelId('bedrock', `anthropic.claude-${CANARY}`)).toBe('custom');
+    expect(publicModelId('openai-responses', `gpt-${CANARY}`)).toBe('custom');
+    expect(publicModelId('openrouter', `${CANARY}/secret-model`)).toBe('custom');
+    expect(publicModelId('openrouter', `openai/${CANARY}`)).toBe('openai/custom');
+    expect(publicModelId('bedrock', 'arn:aws:bedrock:us-east-1:123456789012:inference-profile/x')).toBe('custom');
     expect(publicModelId('openai-compatible', 'claude-sonnet-4-5')).toBe('custom');
-    expect(publicModelId('anthropic', `claude-${CANARY} with spaces`)).toBe('custom');
     expect(publicModelId('anthropic', undefined)).toBe(null);
+  });
+
+  test('versions and the OS release keep their numeric core only', () => {
+    const root = scratch();
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: `0.9.0-${CANARY}` }));
+      const facts = gatherBugReportFacts({ now: NOW, mode: 'batch', dataDir: root, recipe: {}, liveServers: [], serverConfig: () => undefined, root });
+      expect(facts.host.version).toBe('0.9.0');
+      expect(facts.runtime.release === null || /^\d+(\.\d+)+$/.test(facts.runtime.release)).toBe(true);
+      expectNoCanary(buildBugReport('x', facts).full.report, 'the report');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });
 
@@ -265,6 +299,23 @@ describe('the shapes', () => {
       { at: '2026-10-11T23:30:00Z', kind: 'complete', provider: null, status: null, type: null, retryable: null, code: 'other' },
       { at: '2026-10-11T23:20:00Z', kind: 'complete', provider: 'bedrock', status: 429, type: 'rate_limit', retryable: true, code: 'ThrottlingException' },
     ]);
+  });
+
+  test("the framework's own family and transport come first; with no configuration, the live entry's command or url by presence", () => {
+    const rows = serverRows(
+      [
+        { id: 'h', family: 'modern', transport: 'http', url: `https://${CANARY}.example/mcp`, connected: true, toolCount: 1 },
+        { id: 'deployed', command: `/home/${CANARY}/bin/x`, connected: true, toolCount: 2 },
+        { id: 'odd', family: CANARY, transport: CANARY },
+      ],
+      (id) => (id === 'h' ? { url: `https://${CANARY}.example/mcp` } : undefined),
+    );
+    expect(rows).toEqual([
+      { kind: 'a url server', transport: 'http', family: 'modern', connected: true, retrying: false, refused: false, toolCount: 1 },
+      { kind: 'a local command', transport: 'stdio', family: 'legacy', connected: true, retrying: false, refused: false, toolCount: 2 },
+      { kind: 'unknown', transport: 'unknown', family: 'legacy', connected: false, retrying: false, refused: false, toolCount: 0 },
+    ]);
+    expectNoCanary(JSON.stringify(rows), 'the rows');
   });
 
   test('servers are rows by ordinal, and only our own packages are named', () => {

@@ -56,15 +56,43 @@ const TITLE_CHARS = 80;
 
 const PROVIDERS = new Set(['anthropic', 'openai-responses', 'openai-codex', 'openrouter', 'bedrock', 'openai-compatible', 'mock']);
 
-/** A model id goes in only when it reads as a public id of its provider; a
- *  fine-tune's or a custom endpoint's name is the user's choice of words,
- *  and a Bedrock ARN holds an account number. */
-const PUBLIC_MODEL_ID: Record<string, RegExp> = {
-  anthropic: /^claude-[a-z0-9][a-z0-9.-]{0,60}$/,
-  bedrock: /^(?:(?:us|eu|apac|global)\.)?anthropic\.claude-[a-z0-9][a-z0-9.:-]{0,70}$/,
-  'openai-responses': /^(?:gpt|o[0-9]|chatgpt|codex)[a-z0-9.-]{0,60}$/,
-  'openai-codex': /^(?:gpt|o[0-9]|codex)[a-z0-9.-]{0,60}$/,
-  openrouter: /^[a-z0-9][a-z0-9.-]{0,40}\/[a-z0-9][a-z0-9.:-]{0,60}$/,
+/**
+ * A model id goes in only when every word of it is from this fixed
+ * vocabulary of public model names, the rest being numbers, dates and
+ * version marks. A pattern with a free tail would let a user's words
+ * through after a public-looking prefix (`claude-<anything>`, which a proxy
+ * behind the anthropic provider accepts); a fine-tune's or a custom
+ * endpoint's name is the user's choice of words, and a Bedrock ARN holds an
+ * account number.
+ */
+const MODEL_WORDS = new Set([
+  // Anthropic, and Bedrock's spelling of it
+  'claude', 'opus', 'sonnet', 'haiku', 'fable', 'mythos', 'instant', 'latest', 'anthropic', 'us', 'eu', 'apac', 'global',
+  // OpenAI
+  'gpt', 'chatgpt', 'codex', 'mini', 'nano', 'pro', 'turbo', 'preview', 'chat', 'max', 'high', 'low', 'medium',
+  'instruct', 'search', 'audio', 'realtime', 'thinking',
+  // Other vendors' families, as OpenRouter lists them
+  'gemini', 'gemma', 'flash', 'lite', 'exp', 'llama', 'mistral', 'mixtral', 'large', 'small', 'codestral',
+  'deepseek', 'coder', 'reasoner', 'qwen', 'qwq', 'grok', 'beta', 'vision', 'command', 'r', 'plus', 'free',
+]);
+/** OpenRouter vendors named as themselves; any other is `custom`. */
+const OPENROUTER_VENDORS = new Set([
+  'anthropic', 'openai', 'google', 'meta-llama', 'mistralai', 'deepseek', 'qwen', 'x-ai', 'cohere',
+]);
+/** A word that is a number, a date, a version mark or an OpenAI o-series name. */
+const MODEL_NUMBER = /^(?:\d{1,8}|v\d{1,3}|o\d{1,2}|\d{1,3}[a-z]?)$/;
+
+function modelWords(id: string): boolean {
+  const words = id.split(/[-.:_]/);
+  return words.length <= 12 && words.every((word) => MODEL_WORDS.has(word) || MODEL_NUMBER.test(word));
+}
+
+/** The first word a provider's public ids begin with. */
+const MODEL_FAMILY: Record<string, (first: string) => boolean> = {
+  anthropic: (first) => first === 'claude',
+  bedrock: (first) => first === 'anthropic' || ['us', 'eu', 'apac', 'global'].includes(first),
+  'openai-responses': (first) => ['gpt', 'chatgpt', 'codex'].includes(first) || /^o\d{1,2}$/.test(first),
+  'openai-codex': (first) => ['gpt', 'codex'].includes(first) || /^o\d{1,2}$/.test(first),
 };
 
 /** Our built-in modules (RecipeModules' keys). Anything else is counted. */
@@ -131,6 +159,8 @@ export const HOST_LOG_TAGS = new Set([
   'webui-observers', 'windowed-passthrough', 'workspace',
 ]);
 
+/** The directories a package's own code lives in: frames elsewhere aren't named. */
+const CODE_DIRECTORIES = ['src', 'dist'];
 /** The dependencies whose frames a report names (under node_modules/@animalabs). */
 const OUR_PACKAGES = ['agent-framework', 'membrane', 'context-manager', 'mcpl-core', 'chronicle'];
 
@@ -167,7 +197,7 @@ export interface BugReportFacts {
 
 export interface ServerRow {
   kind: string;
-  transport: 'stdio' | 'websocket' | 'unknown';
+  transport: 'stdio' | 'websocket' | 'http' | 'unknown';
   family: 'legacy' | 'modern';
   connected: boolean;
   retrying: boolean;
@@ -209,12 +239,15 @@ export interface HostErrorSummary {
 // Reading values through the allowlists
 // ---------------------------------------------------------------------------
 
-const VERSION = /^[0-9][0-9A-Za-z.+-]{0,40}$/;
+/** A version's numeric core only: a prerelease tag in an edited
+ *  package.json, or a self-built kernel's local version, could be words. */
+const VERSION = /^\d{1,6}(?:\.\d{1,6}){1,3}/;
 const SHA = /^[0-9a-f]{7,40}$/;
 const ISO = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
 function version(value: unknown): string | null {
-  return typeof value === 'string' && VERSION.test(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  return VERSION.exec(value)?.[0] ?? null;
 }
 
 function count(value: unknown): number | null {
@@ -224,8 +257,16 @@ function count(value: unknown): number | null {
 /** The provider's model id when it reads as a public one, else `custom`. */
 export function publicModelId(provider: string | null, model: unknown): string | null {
   if (typeof model !== 'string' || model === '') return null;
-  const pattern = provider ? PUBLIC_MODEL_ID[provider] : undefined;
-  return pattern && pattern.test(model) ? model : 'custom';
+  if (model.length > 100) return 'custom';
+  if (provider === 'openrouter') {
+    const slash = model.indexOf('/');
+    if (slash < 0) return 'custom';
+    const vendor = model.slice(0, slash);
+    if (!OPENROUTER_VENDORS.has(vendor)) return 'custom';
+    return modelWords(model.slice(slash + 1)) ? model : `${vendor}/custom`;
+  }
+  const family = provider ? MODEL_FAMILY[provider] : undefined;
+  return family && family(model.split(/[-.:_]/)[0]!) && modelWords(model) ? model : 'custom';
 }
 
 // ---------------------------------------------------------------------------
@@ -249,13 +290,19 @@ export interface ServerConfigLike {
   source?: { npm?: unknown; url?: unknown };
 }
 
-/** A live server, as `listMcplServers()` gives it (fields read on their own). */
+/** A live server, as `listMcplServers()` gives it (fields read on their own).
+ *  Newer frameworks also give its family, transport, command and url; the
+ *  command and url are read for presence only. */
 export interface LiveServerLike {
   id: string;
   connected?: unknown;
   retrying?: unknown;
   toolCount?: unknown;
   refused?: unknown;
+  family?: unknown;
+  transport?: unknown;
+  command?: unknown;
+  url?: unknown;
 }
 
 const OUR_PACKAGE_SPEC = /^@animalabs\/[a-z0-9][a-z0-9-]{0,60}@[0-9][0-9A-Za-z.+-]{0,40}$/;
@@ -292,22 +339,34 @@ export function serverRows(
   configFor: (id: string) => ServerConfigLike | undefined,
 ): ServerRow[] {
   return live.map((server) => {
+    // An agent-deployed server lives in the overlay, with no recipe or
+    // servers-file entry: then the live entry says whether it has a command
+    // or a url, by presence only.
     const config = configFor(server.id) ?? {};
     const npm = config.source && typeof config.source.npm === 'string' ? config.source.npm : undefined;
-    const url = typeof config.url === 'string' && config.url !== '' ? config.url : undefined;
+    const hasUrl = (typeof config.url === 'string' && config.url !== '') || (typeof server.url === 'string' && server.url !== '');
+    const hasCommand = typeof config.command === 'string' || (typeof server.command === 'string' && server.command !== '');
     const kind = npm && OUR_PACKAGE_SPEC.test(npm)
       ? npm
       : npm ? 'a registry package'
-      : url ? 'a url server'
-      : typeof config.command === 'string' ? 'a local command'
+      : hasUrl ? 'a url server'
+      : hasCommand ? 'a local command'
       : 'unknown';
-    const transport = config.transport === 'websocket' || (url && config.transport !== 'stdio')
-      ? 'websocket'
-      : config.transport === 'stdio' || typeof config.command === 'string' ? 'stdio' : 'unknown';
+    // The framework's own reading when it gives one (a newer framework dials
+    // an https url as modern MCP over HTTP); otherwise the configuration's,
+    // as an older framework reads it: any url is a WebSocket.
+    const transport: ServerRow['transport'] = server.transport === 'stdio' || server.transport === 'websocket' || server.transport === 'http'
+      ? server.transport
+      : config.transport === 'websocket' || (hasUrl && config.transport !== 'stdio')
+        ? 'websocket'
+        : config.transport === 'stdio' || hasCommand ? 'stdio' : 'unknown';
+    const family: ServerRow['family'] = server.family === 'legacy' || server.family === 'modern'
+      ? server.family
+      : config.protocol === 'modern' ? 'modern' : 'legacy';
     return {
       kind,
       transport,
-      family: config.protocol === 'modern' ? 'modern' : 'legacy',
+      family,
       connected: server.connected === true,
       retrying: server.retrying === true,
       // `refused` is a sentence naming the server and its url: only whether
@@ -384,15 +443,21 @@ export function ourFrame(path: string, line: string, root: string, exists: (file
   } catch {
     return null;
   }
+  // Only a package's code directories: a checkout's data and workspace
+  // directories sit under it too (DATA_DIR defaults to ./data), and a
+  // session can write a file there under a name from the conversation.
+  const codeDirectory = (rest: string[]): boolean => rest.length >= 2 && CODE_DIRECTORIES.includes(rest[0]!);
   const located = ((): string | null => {
     const parts = file.split(sep);
-    for (let i = parts.length - 2; i >= 1; i--) {
+    for (let i = parts.length - 2; i >= 2; i--) {
       if (parts[i - 1] === '@animalabs' && parts[i - 2] === 'node_modules' && OUR_PACKAGES.includes(parts[i]!)) {
-        return `@animalabs/${parts[i]}/${parts.slice(i + 1).join('/')}`;
+        const rest = parts.slice(i + 1);
+        return codeDirectory(rest) ? `@animalabs/${parts[i]}/${rest.join('/')}` : null;
       }
     }
-    if (file.startsWith(root + sep) && !file.slice(root.length + 1).split(sep).includes('node_modules')) {
-      return `connectome-host/${relative(root, file).split(sep).join('/')}`;
+    if (file.startsWith(root + sep)) {
+      const rest = relative(root, file).split(sep);
+      return codeDirectory(rest) && !rest.includes('node_modules') ? `connectome-host/${rest.join('/')}` : null;
     }
     return null;
   })();
@@ -699,7 +764,7 @@ export function gatherBugReportFacts(opts: GatherOptions): BugReportFacts {
     packages,
     runtime: {
       os: platform(),
-      release: /^[0-9A-Za-z._+-]{1,60}$/.test(releaseText) ? releaseText : null,
+      release: version(releaseText),
       arch: arch(),
       bun: version(process.versions.bun),
       node: version(process.versions.node),

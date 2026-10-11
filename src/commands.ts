@@ -32,7 +32,10 @@ import type { AgentFramework } from '@animalabs/agent-framework';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import type { CredentialActionId, CredentialState } from './credential-state.js';
-import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH, type ServerFileEntry } from './mcpl-config.js';
+import {
+  readMcplServersFile, saveMcplServers, readAgentOverlay, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH,
+  type AgentOverlayEntry, type ServerFileEntry,
+} from './mcpl-config.js';
 import { buildBugReport, gatherBugReportFacts, runtimeMode } from './bug-report.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
@@ -632,19 +635,26 @@ function handleBug(command: string, app: AppContext): CommandResult {
     };
   }
   const dataDir = resolve(process.env.DATA_DIR || './data');
+  // Each server's configuration as the host composed it: the recipe's, the
+  // servers file's over it, and the agent overlay's over both (an
+  // agent-deployed server is only there). An unreadable file adds nothing.
   let fileServers: Record<string, ServerFileEntry> = {};
+  let overlay: Record<string, AgentOverlayEntry> = {};
   try {
     fileServers = readMcplServersFile(DEFAULT_CONFIG_PATH);
-  } catch {
-    // An unreadable servers file gives no configurations; its servers are
-    // then reported as of unknown kind.
-  }
+  } catch { /* no configurations from it */ }
+  try {
+    overlay = readAgentOverlay(DEFAULT_AGENT_OVERLAY_PATH);
+  } catch { /* no configurations from it */ }
   const facts = gatherBugReportFacts({
     mode: runtimeMode(),
     dataDir,
     recipe: app.recipe,
     liveServers: app.framework.listMcplServers(),
-    serverConfig: (id) => app.recipe.mcpServers?.[id] ?? fileServers[id],
+    serverConfig: (id) => {
+      const layers = [app.recipe.mcpServers?.[id], fileServers[id], overlay[id]].filter((layer) => layer !== undefined);
+      return layers.length > 0 ? Object.assign({}, ...layers) : undefined;
+    },
   });
   const { full, url, cut } = buildBugReport(text, facts);
   const path = join(dataDir, `bug-report-${facts.now.toISOString().replace(/[:.]/g, '-')}.txt`);
