@@ -7,7 +7,7 @@
  *   2. Parent process, against `fleetModule.onChildEvent(name, ...)` — one
  *      reducer per fleet child, drives that child's subtree in the TUI.
  *   3. Inside each headless child, against its own `framework.onTrace()` —
- *      `describe` IPC handler returns `reducer.getTree()` over the wire.
+ *      `describe` IPC handler returns `reducer.getSnapshot()` over the wire.
  *
  * Mirrors the canonical fold currently scattered across:
  *   - tui.ts's noteUsageSample (token readouts on inference:usage / completed);

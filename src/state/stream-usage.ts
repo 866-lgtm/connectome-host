@@ -47,8 +47,11 @@ export interface UsageStep {
   /** The prompt of the call this sample reports (fresh input plus cache reads
    *  and writes), which is the agent's context size at that call. Absent when
    *  the sample doesn't isolate one call: it added nothing (a completion
-   *  repeating the last sample), or no earlier sample of its stream was there
-   *  to compare with (a reader that joined late, or a new stream's sample). */
+   *  repeating the last sample), or it had no baseline from its own stream
+   *  (a reader that joined mid-stream, or a new stream whose
+   *  `inference:started` was missed, told apart by a count that went back).
+   *  A stream whose start was seen begins from `emptyUsage()`, so its first
+   *  sample names its prompt. */
   prompt?: number;
 }
 

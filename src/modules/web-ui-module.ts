@@ -3080,7 +3080,11 @@ export class WebUiModule implements Module {
     // The one await comes first. From building the welcome to marking the
     // client welcomed nothing yields, so no event falls between what the
     // welcome copies and the client's stream (a client skips live events
-    // until it's welcomed).
+    // until it's welcomed). That covers the fleet children's trees, which the
+    // welcome copies. It names the parent's agents without their trace state
+    // (see buildWelcome), so the client's parent nodes start from the live
+    // stream, and a parent trace before the welcome, during this await
+    // included, reaches the client in neither.
     const childRecipes = await this.loadWelcomeRecipes();
     if (!sharedServer?.app) return;
     const welcome = this.buildWelcome(childRecipes);
@@ -3191,11 +3195,11 @@ export class WebUiModule implements Module {
       }
     }
 
-    // Parent-local snapshot via a transient reducer fed by the framework's
-    // current trace history. We have no replayable past traces, so the
-    // initial snapshot just registers the agents — the live trace stream
-    // takes over from there. Future: persist a parent-local reducer if
-    // cold-attach state recovery becomes important.
+    // Parent-local snapshot via a transient reducer that only registers the
+    // agents: there's no replayable trace history, so the live trace stream
+    // takes over from there, and no parent trace before the welcome is in
+    // it. Future: persist a parent-local reducer if cold-attach state
+    // recovery becomes important.
     const localReducer = new AgentTreeReducer();
     localReducer.seedFrameworkAgents(agents.map(a => a.name));
     const localSnap: AgentTreeSnapshot = localReducer.getSnapshot();
@@ -3208,8 +3212,9 @@ export class WebUiModule implements Module {
     if (sharedServer?.treeAggregator) {
       for (const name of sharedServer.treeAggregator.getAllChildNames()) {
         const nodes = sharedServer.treeAggregator.getChildNodes(name);
-        // A child that registered while the recipes loaded gets its recipe
-        // at the next welcome.
+        // A child that registered while the recipes loaded is sent without
+        // its recipe, like one that registers after the welcome: a client
+        // learns recipes only from a welcome.
         const recipeInfo = childRecipes.get(name);
         childTrees.push({
           name,
