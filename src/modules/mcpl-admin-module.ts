@@ -304,11 +304,11 @@ export class McplAdminModule implements Module {
         case 'mcpl_list':
           return this.handleList();
         case 'mcpl_deploy':
-          return await this.handleDeploy(input);
+          return await this.forServer(input, () => this.handleDeploy(input));
         case 'mcpl_restart':
-          return await this.handleRestart(input);
+          return await this.forServer(input, () => this.handleRestart(input));
         case 'mcpl_unload':
-          return await this.handleUnload(input);
+          return await this.forServer(input, () => this.handleUnload(input));
         default:
           return fail(`Unknown tool: ${call.name}`);
       }
@@ -316,6 +316,27 @@ export class McplAdminModule implements Module {
       const err = error instanceof Error ? error : new Error(String(error));
       return fail(`${call.name} failed: ${err.message}`);
     }
+  }
+
+  /** The tail of each server id's queue of deploy, restart and unload calls. */
+  private readonly serverQueues = new Map<string, Promise<void>>();
+
+  /**
+   * Run `work` once every earlier deploy, restart or unload of the same id
+   * has settled, so two calls for one server never interleave. An unload's
+   * disconnect is never overtaken by a deploy that connects the server again,
+   * which its overlay entry, identical or not, can't reveal, and a deploy's
+   * connect is never overtaken by an unload that removes its entry. Calls
+   * for other ids run as before.
+   */
+  private forServer(input: Record<string, unknown>, work: () => Promise<ToolResult>): Promise<ToolResult> {
+    const id = typeof input.id === 'string' ? input.id.trim() : '';
+    if (!id) return work();
+    const run = (this.serverQueues.get(id) ?? Promise.resolve()).then(work);
+    const tail = run.then(() => undefined, () => undefined);
+    this.serverQueues.set(id, tail);
+    void tail.then(() => { if (this.serverQueues.get(id) === tail) this.serverQueues.delete(id); });
+    return run;
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -595,8 +616,7 @@ export class McplAdminModule implements Module {
     // Read before anything changes: a file the boot would stop on refuses
     // the unload here, with the server still loaded.
     const overlay = readAgentOverlay(this.overlayPath);
-    const readEntry = entryOf(overlay, id);
-    if (!known && readEntry === undefined) {
+    if (!known && entryOf(overlay, id) === undefined) {
       return fail(`Server "${id}" is not loaded and not in your overlay.`);
     }
 
@@ -618,20 +638,11 @@ export class McplAdminModule implements Module {
       : `Server "${id}" wasn't loaded in this session.`;
 
     // Read again after the disconnect and saved with nothing awaited between,
-    // so a write that landed meanwhile (another deploy, say) is kept; and the
-    // entry for this id changes only if it's still the one read above, since
-    // one a deploy wrote meanwhile is that deploy's.
+    // so a write for another id that landed meanwhile (its deploy, say) is
+    // kept. No call for this id can land meanwhile (forServer).
     const current = known ? readAgentOverlay(this.overlayPath) : overlay;
     if (!persist) return ok(`${head} Session-only: ${this.nextStart(id, current)}`);
     const entry = entryOf(current, id);
-    if (JSON.stringify(entry ?? null) !== JSON.stringify(readEntry ?? null)) {
-      // The deploy that landed has connected its own server under this id,
-      // whose tools may well be there: say only what this call did.
-      return ok(
-        `Disconnected the server that was loaded as "${id}". Your overlay entry for it changed while it ` +
-        `disconnected (a deploy?), so it was left as it is: ${this.nextStart(id, current)}`,
-      );
-    }
     // An agent-deployed entry is removed, and so is a malformed one for an
     // id the operator doesn't define, which loads nothing. Otherwise a
     // tombstone keeps it unloaded: the operator's server, a malformed entry

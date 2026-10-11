@@ -433,21 +433,28 @@ describe('mcpl_unload', () => {
     expect(await unload('adhoc')).toBe(`${head('adhoc')}nothing loads it at the next host start.`);
   });
 
-  test('a deploy of the same id landing during the disconnect keeps its entry, and the receipt says only what the unload did', async () => {
-    const { stub } = makeStubFramework();
-    const mod = makeModule(stub);
-    await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' });
-    const disconnect = (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer;
-    (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer = async (id) => {
-      await disconnect(id);
-      saveAgentOverlay(overlayPath, { ...readAgentOverlay(overlayPath), mytool: { command: 'bun' } });
-    };
-    const result = await call(mod, 'mcpl_unload', { id: 'mytool' });
-    expect(result.data).toBe(
-      'Disconnected the server that was loaded as "mytool". Your overlay entry for it changed while it disconnected ' +
-      '(a deploy?), so it was left as it is: your overlay entry loads it again at the next host start.',
-    );
-    expect(readAgentOverlay(overlayPath).mytool).toEqual({ command: 'bun' });
+  // Calls for one server run one at a time, so a deploy made while an
+  // unload disconnects waits for it. Its entry, identical or not, is never
+  // removed as the unload's, and each receipt is true when it's given.
+  test('a deploy of the same id made during the disconnect runs after the unload, and keeps its entry', async () => {
+    for (const command of ['bun', 'node']) {
+      const { stub, servers, calls } = makeStubFramework();
+      const mod = makeModule(stub);
+      await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' });
+      const disconnect = (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer;
+      let redeploy: ReturnType<typeof call> | undefined;
+      (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer = async (id) => {
+        redeploy = call(mod, 'mcpl_deploy', { id: 'mytool', command });
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        await disconnect(id);
+      };
+      const unloaded = await call(mod, 'mcpl_unload', { id: 'mytool' });
+      expect(unloaded.data).toBe('Unloaded server "mytool" — its tools are gone from your toolset. Removed from your agent overlay.');
+      expect(String((await redeploy!).data)).toStartWith('Deployed server "mytool" — connected');
+      expect(readAgentOverlay(overlayPath).mytool).toEqual({ command });
+      expect(servers.has('mytool')).toBe(true);
+      expect(calls).toEqual(['connect:mytool', 'disconnect:mytool', 'connect:mytool']);
+    }
   });
 });
 
