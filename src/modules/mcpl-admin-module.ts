@@ -43,7 +43,9 @@ import {
   resolveOverlayEntry,
   serverProvisions,
   lostByReplacement,
+  overlayEntryProblem,
   overlayEntryReplaces,
+  overlayEntryTombstones,
   hostVariableReferences,
   type AgentOverlayEntry,
   type ServerProvisions,
@@ -125,6 +127,30 @@ export class McplAdminModule implements Module {
   }
 
   /**
+   * What to do about an overlay entry the boot skips. mcpl_unload of it takes
+   * the tombstone branch, since the entry replaces nothing, so for an id the
+   * operator defines it tombstones the operator's server, which then stays
+   * unloaded.
+   */
+  private skippedAdvice(id: string): string {
+    return this.operatorServers.has(id)
+      ? 'redeploy with mcpl_deploy to replace it; mcpl_unload would tombstone the operator\'s definition, so it stays unloaded'
+      : 'redeploy with mcpl_deploy, or mcpl_unload it';
+  }
+
+  /**
+   * How to bring back a tombstoned id. For an id the operator defines, no
+   * tool restores the operator's definition: mcpl_deploy loads the agent's
+   * own entry in its place, and mcpl_unload writes the tombstone again. Only
+   * removing the tombstone from the file does.
+   */
+  private tombstoneAdvice(id: string): string {
+    return this.operatorServers.has(id)
+      ? 'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file loads the operator\'s definition again'
+      : 'redeploy with mcpl_deploy to restore it';
+  }
+
+  /**
    * A receipt's sentences about `id`'s overlay entry, or nothing: that it
    * replaces the operator's definition (always on deploy, which makes the
    * replacement; on restart only when it lacks something), what it lacks
@@ -132,7 +158,19 @@ export class McplAdminModule implements Module {
    * only a recipe substitutes.
    */
   private overlayNote(id: string, overlay: Record<string, AgentOverlayEntry>, onDeploy: boolean): string {
-    const entry = overlay[id];
+    const entry = Object.hasOwn(overlay, id) ? overlay[id] : undefined;
+    // A malformed entry isn't what this server runs on, and the next start
+    // skips it: say so, rather than nothing.
+    const problem = entry === undefined ? null : overlayEntryProblem(entry);
+    if (problem !== null) {
+      return ` Your overlay entry for "${id}" is malformed (${problem}), so the next host start skips it` +
+        `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''}; ${this.skippedAdvice(id)}.`;
+    }
+    // A restart of a tombstoned id fails as "not configured", which doesn't
+    // say why or that the next start leaves it unloaded too.
+    if (!onDeploy && overlayEntryTombstones(entry)) {
+      return ` Your overlay tombstones "${id}", so the next host start leaves it unloaded; ${this.tombstoneAdvice(id)}.`;
+    }
     if (!overlayEntryReplaces(entry)) return '';
     const replacement = this.replacement(id, overlay);
     const refs = hostVariableReferences(entry);
@@ -329,6 +367,9 @@ export class McplAdminModule implements Module {
       const source = overlayEntryReplaces(overlay[s.id])
         ? overlaySource
         : s.id in fileServers ? 'file/recipe' : 'recipe';
+      // The command, else the url, as main labelled it. The framework's status
+      // carries no transport, so for a definition that names both, this can't
+      // tell which one the framework opened.
       const target = s.command ?? s.url ?? '?';
       const connectionState = s.connected ? 'CONNECTED' : s.retrying ? 'RETRYING' : 'DISCONNECTED';
       const policyState = s.policyEstablished === undefined
@@ -349,11 +390,22 @@ export class McplAdminModule implements Module {
       );
     }
 
-    // Tombstoned / overlay-only entries that aren't currently loaded
+    // The overlay's entries the live list doesn't explain: malformed ones,
+    // tombstones, and entries that aren't currently loaded
     const liveIds = new Set(live.map(s => s.id));
     for (const [id, entry] of Object.entries(overlay)) {
-      if (entry.disabled) {
-        lines.push(`${id}: UNLOADED (tombstoned in your overlay — redeploy with mcpl_deploy to restore)`);
+      const problem = overlayEntryProblem(entry);
+      if (problem !== null) {
+        lines.push(
+          `${id}: MALFORMED in your overlay (${problem}), so the boot skips it` +
+          `${this.operatorServers.has(id) ? ' and loads the operator\'s definition' : ''} — ${this.skippedAdvice(id)}`,
+        );
+      } else if (overlayEntryTombstones(entry)) {
+        // A tombstone written while its server runs leaves it connected for
+        // this session, which the line above already shows.
+        lines.push(liveIds.has(id)
+          ? `${id}: TOMBSTONED in your overlay, still connected this session; the next host start leaves it unloaded — ${this.tombstoneAdvice(id)}`
+          : `${id}: UNLOADED (tombstoned in your overlay — ${this.tombstoneAdvice(id)})`);
       } else if (!liveIds.has(id)) {
         lines.push(`${id}: NOT LOADED (in your overlay but not connected — try mcpl_deploy again)`);
       }
@@ -383,7 +435,10 @@ export class McplAdminModule implements Module {
     if (command) entry.command = command;
     if (url) { entry.url = url; entry.transport = 'websocket'; }
     if (Array.isArray(input.args)) entry.args = input.args.map(String);
-    if (input.env && typeof input.env === 'object') entry.env = input.env as Record<string, string>;
+    // An empty list is strict function calling's "unspecified", not an env.
+    if (input.env && typeof input.env === 'object' && !(Array.isArray(input.env) && input.env.length === 0)) {
+      entry.env = input.env as Record<string, string>;
+    }
     if (typeof input.token === 'string') entry.token = input.token;
     if (typeof input.access === 'string' && input.access.trim()) {
       if (!this.identity) {
@@ -408,6 +463,14 @@ export class McplAdminModule implements Module {
     if (Array.isArray(input.disabledFeatureSets) && input.disabledFeatureSets.length) entry.disabledFeatureSets = input.disabledFeatureSets.map(String);
     if (Array.isArray(input.enabledTools) && input.enabledTools.length) entry.enabledTools = input.enabledTools.map(String);
     if (Array.isArray(input.disabledTools) && input.disabledTools.length) entry.disabledTools = input.disabledTools.map(String);
+
+    // Never save an entry the boot would skip: what loads now must be what
+    // loads at the next start. Without this, an env value such as null was
+    // saved, resolveOverlayEntry returned null for it, and the deploy threw
+    // after saving. A new write is held to
+    // the plain shapes (strict), though the boot reads older files leniently.
+    const problem = overlayEntryProblem(entry, { strict: true });
+    if (problem) return fail(`mcpl_deploy refused: the entry would be malformed (${problem}), so nothing was saved.`);
 
     // Persist to the overlay first — a connect failure still leaves the entry
     // in place so the agent can fix the server and mcpl_restart it.
@@ -462,9 +525,38 @@ export class McplAdminModule implements Module {
     const id = typeof input.id === 'string' ? input.id.trim() : '';
     if (!id) return fail('mcpl_restart requires `id`.');
 
-    await framework.restartMcplServer(id);
+    // The note is read before the restart, so a restart that throws still
+    // carries it, and an overlay file that can't be read costs only the
+    // note: the restart's own outcome is what the receipt reports. A parse
+    // error can quote the file, which may hold values, so it isn't repeated.
+    let note: string;
+    try {
+      const overlay = readAgentOverlay(this.overlayPath);
+      note = this.overlayNote(id, overlay, false);
+      // The restart reconnects with the configuration of the server's last
+      // connect, while the note reads the file as it is now. An edit made
+      // before that connect is already in it. That's said of a replacing
+      // entry only: a skipped one
+      // takes no effect, and a tombstoned id has no configuration left to
+      // reconnect with once unloaded.
+      if (note && overlayEntryReplaces(Object.hasOwn(overlay, id) ? overlay[id] : undefined)) {
+        note += ' That describes your overlay file as it is now. The restart reconnects with the configuration of the ' +
+          'server\'s last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then ' +
+          'takes effect at the next host start, unless a later mcpl_deploy replaces it.';
+      }
+    } catch {
+      // readAgentOverlay throws only where the boot does too: a file it
+      // can't read, that isn't JSON, or whose root is null. So the next
+      // start stops on it.
+      note = ' Your overlay file couldn\'t be read as an overlay, so nothing is said here about your entry, ' +
+        'and the next host start will stop on it until the file is fixed.';
+    }
+    try {
+      await framework.restartMcplServer(id);
+    } catch (error) {
+      return fail(`mcpl_restart failed: ${error instanceof Error ? error.message : String(error)}.${note}`);
+    }
     const status = framework.listMcplServers().find(s => s.id === id);
-    const note = this.overlayNote(id, readAgentOverlay(this.overlayPath), false);
     if (!status?.connected) {
       return fail(`Restarted server "${id}", but it isn't connected${status?.retrying ? ' (it keeps retrying)' : ''}.${note}`);
     }
@@ -478,8 +570,7 @@ export class McplAdminModule implements Module {
     const persist = input.persist !== false;
 
     const known = framework.listMcplServers().some(s => s.id === id);
-    const overlay = readAgentOverlay(this.overlayPath);
-    if (!known && !(id in overlay)) {
+    if (!known && !Object.hasOwn(readAgentOverlay(this.overlayPath), id)) {
       return fail(`Server "${id}" is not loaded and not in your overlay.`);
     }
 
@@ -487,7 +578,10 @@ export class McplAdminModule implements Module {
 
     let persistNote = 'Session-only: it will load again on the next host restart.';
     if (persist) {
-      if (overlay[id] && !overlay[id]!.disabled) {
+      // Read after the await, so an entry a concurrent mcpl_deploy wrote
+      // meanwhile isn't written back away.
+      const overlay = readAgentOverlay(this.overlayPath);
+      if (overlayEntryReplaces(Object.hasOwn(overlay, id) ? overlay[id] : undefined)) {
         // Agent-deployed server: forget it entirely. If it replaced the
         // operator's definition, that definition is what the next start loads.
         const replaced = this.replacement(id, overlay) !== null;
