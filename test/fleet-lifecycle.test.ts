@@ -293,6 +293,8 @@ describe('FleetModule lifecycle', () => {
       expect(child.restartAttempts).toHaveLength(1);
       // The natural exit's code stays beside the launch failure.
       expect(child.exitReason).toBe('launch failed: socket failure with natural exit notification pending (exit: code=1)');
+      // Its retry is pending, so nothing says automatic restarts stopped.
+      expect(child.autoRestartStopped).toBeUndefined();
     } finally {
       if (proc && kill) (proc as ChildProcess).kill = kill;
     }
@@ -454,6 +456,8 @@ describe('FleetModule lifecycle', () => {
     child.restartAttempts.push(Date.now() - 61_000, Date.now() - 60_001, Date.now() - 60_000);
     await crash(fleet, child);
     expect(clock.pending).toHaveLength(1);
+    // The first attempt's delay: 1 s plus jitter under a quarter of it.
+    expect(clock.pending[0]!.delay).toBeGreaterThanOrEqual(1_000);
     expect(clock.pending[0]!.delay).toBeLessThan(1_250);
     expect(child.restartAttempts).toHaveLength(1);
   });
@@ -817,7 +821,7 @@ describe('FleetModule lifecycle: every launch answers to stop, kill and newer la
     writeFileSync(input.recipe, JSON.stringify(NESTED_FLEET_RECIPE));
     clock.release(0);
     await until(() => clock.completed.length === 2, 'replacement refused');
-    expect(crashed.autoRestartStopped).toStartWith("its automatic restart was refused: fleet child recipe 'leaf'");
+    expect(crashed.autoRestartStopped).toStartWith("the replacement was refused: fleet child recipe 'leaf'");
   });
 
   // Only an acknowledged kill refuses a launch: one that throws reports an
@@ -886,4 +890,98 @@ describe('FleetModule lifecycle: every launch answers to stop, kill and newer la
       }
     });
   }
+
+  // A kill ends automatic restarts, and the record says so.
+  test('a kill during backoff records that it ended automatic restarts', async () => {
+    const { fleet, input } = fixture();
+    controlRestarts(fleet);
+    expect((await internal(fleet).handleLaunch({ ...input, autoRestart: true }, { viaAutoStart: true })).success).toBe(true);
+    const crashed = fleet.getChildren().get('leaf')!;
+    await crash(fleet, crashed);
+    expect((await fleet.handleToolCall({ id: 'kill', name: 'kill', input: { name: 'leaf' } })).success).toBe(true);
+    expect(crashed.autoRestartStopped).toBe('fleet kill ended automatic restarts; fleet restart or launch starts it again');
+  });
+
+  // A signal exit is never retried, whoever sent it, and the record says so.
+  test('a signal exit from outside records that it is not retried', async () => {
+    const { fleet, input } = fixture();
+    const clock = controlRestarts(fleet);
+    expect((await internal(fleet).handleLaunch({ ...input, autoRestart: true }, { viaAutoStart: true })).success).toBe(true);
+    const child = fleet.getChildren().get('leaf')!;
+    child.process!.kill('SIGKILL'); // as the OOM killer would
+    await until(() => child.status === 'crashed', 'child ended by a signal');
+    expect(clock.pending).toHaveLength(0);
+    expect(child.autoRestartStopped).toBe('it was ended by SIGKILL, which is not retried; fleet restart or launch starts it again');
+  });
+
+  // A replacement whose launch throws, rather than refusing, is recorded too.
+  test('an automatic replacement that throws records why restarts stopped', async () => {
+    const { fleet, input } = fixture();
+    const clock = controlRestarts(fleet);
+    const api = internal(fleet);
+    expect((await api.handleLaunch({ ...input, autoRestart: true }, { viaAutoStart: true })).success).toBe(true);
+    const crashed = fleet.getChildren().get('leaf')!;
+    await crash(fleet, crashed);
+    api.handleLaunch = async () => { throw new Error('boom'); };
+    clock.release(0);
+    await until(() => crashed.autoRestartStopped !== undefined, 'throw recorded');
+    expect(crashed.autoRestartStopped).toBe('the replacement failed: boom');
+  });
+
+  // A detaching shutdown closes the connection a launch waits on; the launch
+  // fails without killing the child the parent means to leave running.
+  test('a detaching stop during a launch\'s ready wait leaves the child running', async () => {
+    const { fleet, input } = fixture({ ready: false }, { readyTimeoutMs: 300 });
+    const launch = internal(fleet).handleLaunch(input, { viaAutoStart: true });
+    await until(() => fleet.getChildren().get('leaf')?.socket != null, 'launch connected');
+    const pid = fleet.getChildren().get('leaf')!.pid!;
+    try {
+      fleet.setDetachMode(true);
+      await fleet.stop();
+      const result = await launch;
+      expect(result.error).toEndWith('; the parent is detaching, so the child is left running');
+      expect(isAlive(pid)).toBe(true);
+    } finally {
+      fleet.setDetachMode(false);
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already gone */ }
+    }
+  });
+
+  // At the deadline, the error says the wait ran out, not just the last
+  // connect's refusal.
+  test('a socket that keeps refusing connections is reported as having run out its wait', async () => {
+    const { fleet, input } = fixture({}, { socketWaitTimeoutMs: 300 });
+    const api = internal(fleet);
+    api.connectChildSocket = async () => {
+      throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
+    };
+    const result = await api.handleLaunch(input, { viaAutoStart: true });
+    expect(result.error).toContain('refused connections for 300ms; the last connect failed: connect ECONNREFUSED');
+  });
+
+  // The child keeps only its latest client, so a second launch of the name
+  // is refused while one is adopting.
+  test('a launch while another adopts the child is refused', async () => {
+    const { fleet, input } = fixture();
+    const api = internal(fleet) as Internal & {
+      canRetryAdoption: (child: Child) => boolean;
+      probeLiveness: (child: Child) => Promise<boolean>;
+      reattachToLivingChild: (child: Child) => Promise<Child>;
+    };
+    expect((await api.handleLaunch(input, { viaAutoStart: true })).success).toBe(true);
+    const child = fleet.getChildren().get('leaf')!;
+    await crash(fleet, child);
+    (child as { process: ChildProcess | null }).process = null;
+    let entered = false;
+    let release!: () => void;
+    const adoption = new Promise<void>(resolve => { release = resolve; });
+    api.canRetryAdoption = () => true;
+    api.probeLiveness = async () => { entered = true; await adoption; return false; };
+    const first = api.handleLaunch(input, { viaAutoStart: true });
+    await until(() => entered, 'adoption started');
+    expect((await api.handleLaunch(input, { viaAutoStart: true })).error).toBe("Child 'leaf' is being adopted by another launch");
+    release();
+    await first;
+    expect(child.adopting).toBe(false);
+  });
 });

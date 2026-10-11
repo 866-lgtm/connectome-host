@@ -210,9 +210,16 @@ interface FleetChild {
   /** Kills acknowledged on this generation. A launch replacing it refuses if
    *  one lands during the launch's awaits. Not persisted. */
   killAcks?: number;
-  /** Why automatic restarts stopped for this generation (the flap cap), shown
-   *  by fleet status until a manual launch or restart. Kept in
-   *  memory, like the retry history, not persisted. */
+  /** A launch is adopting this generation's living process. Another launch
+   *  of the name is refused meanwhile: the child keeps only its latest
+   *  client, so two adoptions would leave one record holding a dead socket.
+   *  Not persisted. */
+  adopting?: boolean;
+  /** Why automatic restarts stopped for this generation: the flap cap, a
+   *  signal exit (never retried), a kill, a manual launch that took over, or
+   *  a replacement that was refused. Shown by fleet status until a launch or
+   *  restart replaces the generation. Kept in memory, like the retry
+   *  history, not persisted. */
   autoRestartStopped?: string;
   /** A failed launch's reason, kept so the exit, whenever it's recorded,
    *  carries it beside the exit itself. */
@@ -674,8 +681,7 @@ export class FleetModule implements Module {
    * stop at the flap cap. Backoff keeps startup failures from flooding the log.
    */
   private tryAutoRestart(child: FleetChild): void {
-    if (this.stopping || child.killRequested || this.children.get(child.name) !== child ||
-        child.restartTimer !== undefined) return;
+    if (this.stopping || child.killRequested || this.children.get(child.name) !== child) return;
     const now = Date.now();
     child.restartAttempts = child.restartAttempts.filter((t) => now - t < this.restartFlapWindowMs);
     if (child.restartAttempts.length >= this.restartFlapCap) {
@@ -721,12 +727,15 @@ export class FleetModule implements Module {
             // Refused before spawning, the replacement left this generation
             // in place, and nothing will restart it: the record says why.
             if (this.children.get(child.name) === child) {
-              child.autoRestartStopped ??= `its automatic restart was refused: ${res.error}`;
+              child.autoRestartStopped ??= `the replacement was refused: ${res.error}`;
             }
           }
         })
         .catch((err: unknown) => {
           console.error(`[fleet] autoRestart "${child.name}" threw: ${String(err)}`);
+          if (this.children.get(child.name) === child) {
+            child.autoRestartStopped ??= `the replacement failed: ${err instanceof Error ? err.message : String(err)}`;
+          }
         });
     }, delayMs);
   }
@@ -1142,31 +1151,42 @@ export class FleetModule implements Module {
     if (staleAtLaunch) return staleRefusal('the launch', staleAtLaunch);
     if (existing && existing.dataDir === dataDir && existing.socketPath === socketPath &&
         existing.recipePath === recipePath) {
-      if (this.canRetryAdoption(existing) && !existing.process && !existing.socket && await this.probeLiveness(existing)) {
+      // One adoption at a time: the child keeps only its latest client.
+      if (existing.adopting) {
+        return { success: false, isError: true, error: `Child '${input.name}' is being adopted by another launch` };
+      }
+      if (this.canRetryAdoption(existing) && !existing.process && !existing.socket) {
+        existing.adopting = true;
         try {
-          const adopted = await this.reattachToLivingChild({
-            ...existing, subscription: [...subscription],
-          });
-          const staleAtAdoption = staleReason();
-          if (staleAtAdoption) {
-            // The process was just confirmed as this child, and nothing else
-            // owns it. An acknowledged kill means it should stop, and so does
-            // a shutdown, unless the host is detaching to leave its children
-            // for a later parent. Another launch that replaced the generation
-            // owns the name, so then only let go of it.
-            if (staleAtAdoption.cause === 'killed' || (staleAtAdoption.cause === 'stopping' && !this.detachMode)) {
-              try { await this.killChild(adopted); } catch (err) {
-                console.error(`[fleet] could not stop "${input.name}" after its refused adoption: ${String(err)}`);
+          if (await this.probeLiveness(existing)) {
+            try {
+              const adopted = await this.reattachToLivingChild({
+                ...existing, subscription: [...subscription],
+              });
+              const staleAtAdoption = staleReason();
+              if (staleAtAdoption) {
+                // The process was just confirmed as this child, and nothing
+                // else owns it, since no other launch adopts while this one
+                // does. So stop it rather than leave it running unowned,
+                // unless the host is detaching to leave its children for a
+                // later parent.
+                if (staleAtAdoption.cause !== 'stopping' || !this.detachMode) {
+                  try { await this.killChild(adopted); } catch (err) {
+                    console.error(`[fleet] could not stop "${input.name}" after its refused adoption: ${String(err)}`);
+                  }
+                }
+                adopted.socket?.destroy();
+                return staleRefusal('adoption', staleAtAdoption);
               }
-            }
-            adopted.socket?.destroy();
-            return staleRefusal('adoption', staleAtAdoption);
+              this.children.set(input.name, adopted);
+              this.persistState();
+              return { success: true, data: { name: adopted.name, pid: adopted.pid, status: adopted.status,
+                dataDir: adopted.dataDir, socketPath: adopted.socketPath } };
+            } catch { /* Preserve artifacts and let the refusal explain recovery. */ }
           }
-          this.children.set(input.name, adopted);
-          this.persistState();
-          return { success: true, data: { name: adopted.name, pid: adopted.pid, status: adopted.status,
-            dataDir: adopted.dataDir, socketPath: adopted.socketPath } };
-        } catch { /* Preserve artifacts and let the refusal explain recovery. */ }
+        } finally {
+          existing.adopting = false;
+        }
       }
       await this.cleanupStaleChildFiles(existing);
     }
@@ -1294,6 +1314,12 @@ export class FleetModule implements Module {
         !this.stopping
       ) {
         this.tryAutoRestart(child);
+      } else if (child.autoRestart && code === null && !child.killRequested && !this.stopping) {
+        // A signal exit is never retried, whoever sent it: the parent, after
+        // a failed start, or anything else, such as the OOM killer. Say so.
+        child.autoRestartStopped ??= child.launchFailure !== undefined
+          ? 'its start failed and the parent stopped it, which is not retried; fleet restart or launch starts it again'
+          : `it was ended by ${signal ?? 'a signal'}, which is not retried; fleet restart or launch starts it again`;
       }
     });
 
@@ -1407,10 +1433,12 @@ export class FleetModule implements Module {
     // appear and then vanish.
     if (c.status === 'exited' || c.status === 'crashed') {
       c.killAcks = (c.killAcks ?? 0) + 1;
+      if (c.autoRestart) c.autoRestartStopped ??= 'fleet kill ended automatic restarts; fleet restart or launch starts it again';
       return { success: true, data: { name: c.name, status: c.status, note: 'already stopped' } };
     }
     await this.killChild(c);
     c.killAcks = (c.killAcks ?? 0) + 1;
+    if (c.autoRestart) c.autoRestartStopped ??= 'fleet kill ended automatic restarts; fleet restart or launch starts it again';
     return {
       success: true,
       data: { name: c.name, status: c.status, exitCode: c.exitCode, exitReason: c.exitReason },
@@ -1700,7 +1728,8 @@ export class FleetModule implements Module {
       }
       await new Promise(resolve => setTimeout(resolve, 50));
     } while (Date.now() < deadline);
-    throw lastRefusal;
+    const refusal = lastRefusal instanceof Error ? lastRefusal.message : String(lastRefusal);
+    throw new Error(`socket at ${child.socketPath} refused connections for ${this.config.socketWaitTimeoutMs}ms; the last connect failed: ${refusal}`);
   }
 
   private async connectChildSocket(child: FleetChild): Promise<void> {
@@ -1966,6 +1995,11 @@ export class FleetModule implements Module {
     // The exit handler records the failure beside the exit, whenever the exit
     // is observed.
     child.launchFailure = reason;
+    if (this.stopping && this.detachMode) {
+      // The shutdown closed the connection the launch was waiting on, and a
+      // detaching parent leaves its children for a later parent to adopt.
+      return { success: false, isError: true, error: `${reason}; the parent is detaching, so the child is left running` };
+    }
     if (proc && proc.exitCode === null && proc.signalCode === null) {
       // SIGKILL exits are already excluded from autoRestart. Leave the manual
       // cancellation flag alone: a natural nonzero exit may be pending even
@@ -1979,14 +2013,6 @@ export class FleetModule implements Module {
         child.exitReason = `${reason}; child termination unconfirmed (pid=${child.pid})`;
         this.persistState();
         return { success: false, isError: true, error: child.exitReason };
-      }
-      // A signal exit is never retried, so a start the parent had to stop
-      // ends automatic restarts; say so, unless a natural exit won the race
-      // and its retry is pending.
-      if (child.autoRestart && proc.signalCode !== null && child.restartTimer === undefined) {
-        child.autoRestartStopped ??= 'its start failed and the parent stopped it, which is not retried; ' +
-          'fleet restart or launch starts it again';
-        this.persistState();
       }
     } else if (proc && child.exitedAt === null) {
       // The process shows its exit, but its 'exit' event hasn't run: record
