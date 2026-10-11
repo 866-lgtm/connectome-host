@@ -318,7 +318,7 @@ describe('FleetModule lifecycle', () => {
     expect(child.exitReason).toEndWith(' (exit: SIGKILL)');
     // A start the parent had to stop is never retried, and the record says so.
     expect(child.autoRestartStopped).toBe(
-      'its start failed and the parent stopped it, which is not retried; fleet restart or launch starts it again',
+      'its start failed and it was ended by SIGKILL, which is not retried; fleet restart or launch starts it again',
     );
   });
 

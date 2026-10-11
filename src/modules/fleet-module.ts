@@ -1316,10 +1316,11 @@ export class FleetModule implements Module {
         this.tryAutoRestart(child);
       } else if (child.autoRestart && code === null && !child.killRequested && !this.stopping) {
         // A signal exit is never retried, whoever sent it: the parent, after
-        // a failed start, or anything else, such as the OOM killer. Say so.
-        child.autoRestartStopped ??= child.launchFailure !== undefined
-          ? 'its start failed and the parent stopped it, which is not retried; fleet restart or launch starts it again'
-          : `it was ended by ${signal ?? 'a signal'}, which is not retried; fleet restart or launch starts it again`;
+        // a failed start, or anything else, such as the OOM killer. Say so,
+        // naming the signal rather than who sent it, since a child can also
+        // die on its own after its launch has failed.
+        child.autoRestartStopped ??= `${child.launchFailure !== undefined ? 'its start failed and ' : ''}` +
+          `it was ended by ${signal ?? 'a signal'}, which is not retried; fleet restart or launch starts it again`;
       }
     });
 
