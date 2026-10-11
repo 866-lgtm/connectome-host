@@ -586,17 +586,43 @@ describe('what a launch block says beyond the settings it compares', () => {
     }
   });
 
-  // The stream's agent is built from the launch alone, so these take the
-  // framework's defaults (sw-ch213 I8).
-  test('names the agent settings the stream is not given', async () => {
+  // The stream's agent is built from the launch alone, so its agent settings
+  // are the framework's defaults. The start block sets them against the
+  // parent's, naming only what differs (sw-ch213 I8, Nell-1783's review).
+  test('a fork names the agent settings it does not carry from its parent, with the parent\'s', async () => {
+    const h = await makeHarness({ parent: {
+      thinking: { enabled: true, budgetTokens: 2048 },
+      providerParams: { reasoning: { effort: 'high' } },
+      promptCaching: false,
+    } });
+    try {
+      const input = { name: 'plain', task: 't' };
+      seedForkCall(h.framework, 'toolu_plain', input);
+      await h.subagent.handleToolCall(call('fork', 'toolu_plain', input));
+      await h.asyncPromise('plain');
+      const start = startSection(h.runs.find((r) => r.name.startsWith('plain-'))!.firstContext);
+      const settings = line(start, '- Agent settings');
+      expect(settings).toStartWith(
+        "- Agent settings not carried from the parent stream, so the framework's defaults apply: " +
+          "extended thinking off (the parent stream's: enabled), provider parameters none (the parent stream's: set (reasoning)), " +
+          "prompt caching on (the parent stream's: off). The rest match: ",
+      );
+      expect(settings).toContain('tool-wrapper prose guard');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test('a fork from a parent on the defaults says they match', async () => {
     const h = await makeHarness({});
     try {
-      const input = { name: 'plain', systemPrompt: 'p', task: 't' };
-      const res = await h.subagent.handleToolCall(call('spawn', 'toolu_plain', input));
-      await h.asyncPromise('plain');
-      expect(line(launchBlock(res.data as string), '- Not set for this stream')).toBe(
-        '- Not set for this stream: thinking, temperature, prompt caching and its TTL, provider parameters such as ' +
-          "reasoning effort, refusal handling and the tool-result guard, whatever the caller uses; the framework's defaults apply.",
+      const input = { name: 'same', task: 't' };
+      seedForkCall(h.framework, 'toolu_same', input);
+      await h.subagent.handleToolCall(call('fork', 'toolu_same', input));
+      await h.asyncPromise('same');
+      const start = startSection(h.runs.find((r) => r.name.startsWith('same-'))!.firstContext);
+      expect(line(start, '- Agent settings')).toStartWith(
+        "- Agent settings: the framework's defaults, the same as the parent stream's now (extended thinking, provider parameters, ",
       );
     } finally {
       await h.cleanup();
@@ -819,6 +845,7 @@ describe('a queued launch', () => {
       expect(run.allText).not.toContain('please look into it');
       const start = startSection(run.firstContext);
       expect(start).toContain('- Inherited: nothing; the parent stream "helper" was no longer registered when this stream started.');
+      expect(line(start, '- Agent settings')).toEndWith('; not compared, since the parent stream was no longer registered when this stream started.');
       expect(start).toContain(`- Tools: ${run.surface.length} available to this stream: `);
       expect(start).not.toContain('Compared with');
       expect(start).not.toContain("couldn't be read");

@@ -383,6 +383,49 @@ export interface SubagentStart {
   tools: string[];
   /** What the calling stream is shown now; undefined when it can't be read. */
   parentTools?: string[];
+  /** The agent settings the stream was created with, each rendered; and the
+   *  parent's (a fork's) or the caller's (a spawn's) at the start, undefined
+   *  when that stream is gone. */
+  agentSettings: AgentSettings;
+  parentAgentSettings?: AgentSettings;
+}
+
+/**
+ * The agent settings a stream's agent doesn't take from its launch. It's
+ * built from the launch alone (ephemeralAgentConfig), so each is the
+ * framework's default, whatever the parent's or caller's is (sw-ch213 I8,
+ * with Nell-1783's review). Each is rendered without values that could be
+ * long or private: the prefill message as set or not, provider parameters by
+ * their keys.
+ */
+export type AgentSettings = Record<string, string>;
+
+export function agentSettingsOf(agent: {
+  thinking?: { enabled?: boolean; type?: string } | undefined;
+  providerParams?: Record<string, unknown> | undefined;
+  promptCaching?: boolean;
+  cacheTtl?: string;
+  prefillUserMessage?: string | undefined;
+  refusalHandling?: unknown;
+  toolResultGuard?: { enabled?: boolean };
+  toolWrapperProseGuard?: boolean;
+  getRuntimeSettings?(): { sameRoundThinkTextPolicy?: string };
+}): AgentSettings {
+  const onOff = (v: boolean | undefined) => (v ? 'on' : 'off');
+  const keys = Object.keys(agent.providerParams ?? {}).sort();
+  let thinkText: string | undefined;
+  try { thinkText = agent.getRuntimeSettings?.().sameRoundThinkTextPolicy; } catch { /* unreadable: unstated */ }
+  return {
+    'extended thinking': agent.thinking?.enabled ? (agent.thinking.type ?? 'enabled') : 'off',
+    'provider parameters': keys.length > 0 ? `set (${joinAll(keys)})` : 'none',
+    'prompt caching': onOff(agent.promptCaching),
+    'prompt-cache TTL': agent.cacheTtl ?? 'unset',
+    'prefill user message': agent.prefillUserMessage ? 'set' : 'none',
+    'same-round think-text policy': thinkText ?? 'unset',
+    'refusal handling': agent.refusalHandling ? 'set' : 'none',
+    'tool-result guard': onOff(agent.toolResultGuard?.enabled),
+    'tool-wrapper prose guard': onOff(agent.toolWrapperProseGuard),
+  };
 }
 
 const formatTokens = (n: number): string => `${n.toLocaleString('en-US')} tokens`;
@@ -581,14 +624,6 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     lines.push(`- Against the parent at the call: ${parts.join(' ')}`);
   }
   for (const x of settings) lines.push(x.line);
-  // The stream's agent is built from the launch alone (ephemeralAgentConfig),
-  // so the agent-level settings a host can give an agent aren't carried from
-  // the parent, and the framework's defaults apply (sw-ch213 I8).
-  lines.push(
-    '- Not set for this stream: thinking, temperature, prompt caching and its TTL, provider parameters such as ' +
-      `reasoning effort, refusal handling and the tool-result guard${p ? `, whatever ${them} uses` : ''}; ` +
-      "the framework's defaults apply.",
-  );
   return lines.join('\n');
 }
 
@@ -643,6 +678,25 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
   );
   if (launch.proseRouting === undefined) {
     lines.push(`- Prose routing: ${start.proseRouting}, the framework's default: ${PROSE_ROUTING_EFFECT[start.proseRouting]}.`);
+  }
+
+  // Settings the stream's agent takes as the framework's defaults, set
+  // against the parent's or caller's as it is now (sw-ch213 I8).
+  const ours = start.agentSettings;
+  const names = Object.keys(ours);
+  const theirSettings = p ? start.parentAgentSettings : undefined;
+  if (theirSettings === undefined) {
+    lines.push(
+      `- Agent settings, the framework's defaults: ${names.map((n) => `${n} ${ours[n]}`).join(', ')}` +
+        (p ? `; not compared, since ${them} was no longer registered when this stream started.` : '.'),
+    );
+  } else {
+    const differ = names.filter((n) => theirSettings[n] !== ours[n]);
+    lines.push(differ.length === 0
+      ? `- Agent settings: the framework's defaults, the same as ${them}'s now (${joinAll(names)}).`
+      : `- Agent settings not carried from ${them}, so the framework's defaults apply: ` +
+          `${differ.map((n) => `${n} ${ours[n]} (${them}'s: ${theirSettings[n]})`).join(', ')}. ` +
+          `The rest match: ${joinAll(names.filter((n) => !differ.includes(n)))}.`);
   }
 
   const mine = start.tools;
@@ -2002,19 +2056,22 @@ export class SubagentModule implements Module {
    *  call, then what happened when the stream was created. */
   private orientationFor(
     launch: SubagentLaunch,
-    agent: {
+    agent: Omit<Parameters<typeof agentSettingsOf>[0], 'getRuntimeSettings'> & {
       canUseTool(name: string): boolean;
-      getRuntimeSettings(): { contextBudgetTokens: number };
+      getRuntimeSettings(): { contextBudgetTokens: number; sameRoundThinkTextPolicy?: string };
       proseRouting: ProseRouting;
     },
     inherited: SubagentStart['inherited'],
   ): string {
     const framework = this.getFramework();
     let parentTools: string[] | undefined;
-    if (launch.parent && framework.getAgent(launch.parent.stream)) {
+    let parentAgentSettings: AgentSettings | undefined;
+    const parentAgent = launch.parent ? framework.getAgent(launch.parent.stream) : undefined;
+    if (launch.parent && parentAgent) {
       try {
         parentTools = framework.listToolClasses(launch.parent.stream).map((t) => t.tool);
       } catch { /* stated as unreadable */ }
+      parentAgentSettings = agentSettingsOf(parentAgent as unknown as Parameters<typeof agentSettingsOf>[0]);
     }
     const start: SubagentStart = {
       inherited,
@@ -2022,6 +2079,8 @@ export class SubagentModule implements Module {
       proseRouting: agent.proseRouting,
       tools: this.streamSurface(agent),
       ...(parentTools !== undefined ? { parentTools } : {}),
+      agentSettings: agentSettingsOf(agent),
+      ...(parentAgentSettings !== undefined ? { parentAgentSettings } : {}),
     };
     return `${describeSubagentLaunch(launch)}\n${describeSubagentStart(launch, start)}`;
   }
