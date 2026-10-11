@@ -199,21 +199,31 @@ SESSION_SERVER_TOKEN=<same token the shell daemon was started with>
 HEARTBEAT_CONFIG_FILE=<abs>/data/heartbeat-config.json
 ```
 
-The host reads `.env`, but stdio MCPL servers see only what their recipe entry
-maps in `env` (plus a small system allowlist), e.g.
-`"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`. A variable left only in `.env` is
-unset for the server, unless its entry sets `inheritEnv: true`, which passes
-the host's whole environment, `.env` included.
+The host reads `.env`, but a stdio MCPL server sees only what its entry maps
+in `env`, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`, plus a small
+system allowlist and the two variables the host sets for every server,
+`AGENT_TIMEZONE` and `DISCORD_SUPPRESSED_REACTIONS_BASELINE`. For a server
+defined in `mcpl-servers.json`, that is the file's `env`: a recipe can't add
+env to a file server. A variable left only in `.env` is unset for the server,
+unless its entry (in the recipe or `mcpl-servers.json`) sets `inheritEnv:
+true`, which passes the host's whole environment, `.env` and every secret in
+it included, so prefer mapping the variables a server needs. An agent's own
+overlay can't set `inheritEnv`.
 
-**Run the host (headless), supervised,** from `<agent>-cm/`: Bun loads `.env`
-from the working directory, and `data/` is `./data` there unless `DATA_DIR`
-says otherwise. A supervisor sets that directory itself (launchd's
-`WorkingDirectory`, systemd's `WorkingDirectory=`).
+**Run the host (headless), supervised,** from `<agent>-cm/`. Several things
+resolve from the working directory: Bun loads `.env` from it, `data/` is
+`./data` there unless `DATA_DIR` says otherwise, and the host reads
+`mcpl-servers.json` and the agent's `mcpl-servers.agent.json` from it. By
+hand:
 ```bash
 cd ~/connectome-local/<agent>-cm
 bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
   ~/connectome-local/<agent>-cm/recipes/<agent>.json --headless
 ```
+Under a supervisor, the command is the `bun …` line alone, and the unit sets
+the directory: launchd's `WorkingDirectory` key, systemd's
+`WorkingDirectory=`. Neither defaults to it: launchd starts jobs in `/`, and a
+systemd user unit in your home directory.
 - macOS: launchd agent (e.g. `cc.<agent>.agent`) — stop with `launchctl bootout`,
   restart with `launchctl kickstart -k gui/$(id -u)/<label>`.
 - Linux: systemd-user (e.g. `<agent>-agent.service`) —
