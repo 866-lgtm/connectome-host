@@ -375,16 +375,18 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, response);
       return response;
     } catch (err) {
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      this.log({
-        type: 'error', kind: 'complete',
-        timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
-        rawRequest: sink.rawRequest,
-        ...describeErrorObject(err, true),
-      });
-      this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, undefined, err);
+      try {
+        const timestamp = new Date().toISOString();
+        const durationMs = Date.now() - t0;
+        this.log({
+          type: 'error', kind: 'complete',
+          timestamp, durationMs,
+          requestSummary: this.requestSummary(request, sink.rawRequest),
+          rawRequest: sink.rawRequest,
+          ...describeErrorObject(err, true),
+        });
+        this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, undefined, err);
+      } catch { /* logging never replaces the provider's error */ }
       throw err;
     }
   }
@@ -412,16 +414,18 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, response);
       return response;
     } catch (err) {
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      this.log({
-        type: 'error', kind: 'stream',
-        timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
-        rawRequest: sink.rawRequest,
-        ...describeErrorObject(err, true),
-      });
-      this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, undefined, err);
+      try {
+        const timestamp = new Date().toISOString();
+        const durationMs = Date.now() - t0;
+        this.log({
+          type: 'error', kind: 'stream',
+          timestamp, durationMs,
+          requestSummary: this.requestSummary(request, sink.rawRequest),
+          rawRequest: sink.rawRequest,
+          ...describeErrorObject(err, true),
+        });
+        this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, undefined, err);
+      } catch { /* logging never replaces the provider's error */ }
       throw err;
     }
   }

@@ -31,10 +31,20 @@ function failWith(base: { prototype: object }, thrown: unknown): void {
   restores.push(() => { proto.complete = complete; proto.stream = stream; });
 }
 
-function writers(): Array<{ name: string; base: { prototype: object }; stack: boolean; make: (log: string) => { complete: Function; stream: Function } }> {
+/** Each writer, with a request its own summary throws on: Anthropic's reads
+ *  the message count, and Bedrock's the last message's blocks. */
+function writers(): Array<{ name: string; base: { prototype: object }; stack: boolean; hostile: ProviderRequest; make: (log: string) => { complete: Function; stream: Function } }> {
   return [
-    { name: 'anthropic', base: AnthropicAdapter, stack: true, make: (log) => new LoggingAnthropicAdapter({ apiKey: 'test' }, log) as never },
-    { name: 'bedrock', base: BedrockAdapter, stack: false, make: (log) => new LoggingBedrockAdapter({ region: 'us-east-1', accessKeyId: 'test', secretAccessKey: 'test' } as never, log) as never },
+    {
+      name: 'anthropic', base: AnthropicAdapter, stack: true,
+      hostile: { ...request, messages: undefined } as unknown as ProviderRequest,
+      make: (log) => new LoggingAnthropicAdapter({ apiKey: 'test' }, log) as never,
+    },
+    {
+      name: 'bedrock', base: BedrockAdapter, stack: false,
+      hostile: { ...request, messages: [{ role: 'user', content: [null] }] } as unknown as ProviderRequest,
+      make: (log) => new LoggingBedrockAdapter({ region: 'us-east-1', accessKeyId: 'test', secretAccessKey: 'test' } as never, log) as never,
+    },
   ];
 }
 
@@ -107,6 +117,22 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
         await expect(call).rejects.toBe(proxy);
         const [record] = records(log);
         expect(record!.error).toBe('[error could not be read]');
+      });
+    }
+  }
+
+  // Nothing in a failed call's logging can replace the provider's error:
+  // not the error's reading, and not the request's summary either.
+  for (const w of writers()) {
+    for (const kind of ['complete', 'stream'] as const) {
+      test(`${w.name} ${kind}: a request whose summary throws still gets the provider's error`, async () => {
+        const dir = mkdtempSync(join(tmpdir(), 'llm-native-errors-'));
+        dirs.push(dir);
+        const log = join(dir, 'llm-calls.jsonl');
+        const thrown = new Error('overloaded');
+        failWith(w.base, thrown);
+        const adapter = w.make(log);
+        await expect(kind === 'complete' ? adapter.complete(w.hostile) : adapter.stream(w.hostile, {})).rejects.toBe(thrown);
       });
     }
   }

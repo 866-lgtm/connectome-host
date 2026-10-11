@@ -104,13 +104,15 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
       });
       return response;
     } catch (error) {
-      this.log({
-        type: 'error', kind: 'complete', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        rawRequest,
-        ...describeErrorObject(error, false),
-      });
+      try {
+        this.log({
+          type: 'error', kind: 'complete', timestamp: new Date(started).toISOString(),
+          durationMs: Date.now() - started,
+          requestSummary: summarizeRequest(request),
+          rawRequest,
+          ...describeErrorObject(error, false),
+        });
+      } catch { /* logging never replaces the provider's error */ }
       throw error;
     }
   }
@@ -136,13 +138,15 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
       });
       return response;
     } catch (error) {
-      this.log({
-        type: 'error', kind: 'stream', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        rawRequest,
-        ...describeErrorObject(error, false),
-      });
+      try {
+        this.log({
+          type: 'error', kind: 'stream', timestamp: new Date(started).toISOString(),
+          durationMs: Date.now() - started,
+          requestSummary: summarizeRequest(request),
+          rawRequest,
+          ...describeErrorObject(error, false),
+        });
+      } catch { /* logging never replaces the provider's error */ }
       throw error;
     }
   }
