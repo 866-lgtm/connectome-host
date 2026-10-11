@@ -4,7 +4,7 @@
  * Reads/writes `mcpl-servers.json` (CC `.mcp.json` shape), keyed by server ID.
  */
 
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, renameSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import { namesEnvReference, type RecipeToolLifecycle } from './recipe.js';
@@ -203,71 +203,161 @@ export interface AgentOverlayFile {
 }
 
 /**
- * Read the agent overlay file. Returns empty object if it doesn't exist.
+ * Read the agent overlay file: its entries by id, and the root's keys other
+ * than `mcplServers`. A missing file, a root without `mcplServers`, and
+ * `mcplServers: null` read as no entries, as main read them. The startup
+ * warnings name a root that has other keys but no `mcplServers`, since a
+ * misspelled key would otherwise drop the agent's tombstones without a word.
  *
- * A file that can't be parsed, or isn't `{ "mcplServers": { … } }`, throws
- * an error naming the file, rather than any one entry being skipped: the
- * file carries the agent's tombstones, so reading past it would load servers
- * the agent unloaded. The boot stops with that error until the file is fixed
- * or moved aside (Nell-1783's haiku probe of #228). The error never quotes
- * the file, which can hold credentials.
+ * A file that can't be parsed, a root that isn't an object, or an
+ * `mcplServers` that isn't a map of entries by id throws an error naming the
+ * file, rather than any one entry being skipped: the file carries the
+ * agent's tombstones, so reading past it would load servers the agent
+ * unloaded. The boot stops with that error until the file is fixed (Nell-1783's
+ * haiku probe of #228). No writer produces those shapes; saveAgentOverlay
+ * always writes `{ "mcplServers": { … } }`. The error never quotes the file,
+ * which can hold credentials.
  */
-export function readAgentOverlay(overlayPath: string): Record<string, AgentOverlayEntry> {
-  if (!existsSync(overlayPath)) return {};
+export function readAgentOverlayFile(overlayPath: string): { servers: Record<string, AgentOverlayEntry>; otherKeys: string[] } {
+  if (!existsSync(overlayPath)) return { servers: {}, otherKeys: [] };
   const raw = readFileSync(overlayPath, 'utf-8');
+  const fixIt = 'fix it: moving it aside would load every server the agent unloaded and drop its deployments';
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error(`the agent overlay ${overlayPath} isn't valid JSON: fix it, or move it aside (it holds the agent's tombstones, so it isn't skipped)`);
+    throw new Error(`the agent overlay ${overlayPath} isn't valid JSON: ${fixIt}`);
   }
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    throw new Error(`the agent overlay ${overlayPath} isn't an object with mcplServers: fix it, or move it aside`);
+    throw new Error(`the agent overlay ${overlayPath} isn't an object with mcplServers: ${fixIt}`);
   }
+  const otherKeys = Object.keys(parsed).filter((k) => k !== 'mcplServers');
   const servers = (parsed as { mcplServers?: unknown }).mcplServers;
-  if (servers === undefined) return {};
-  if (servers === null || typeof servers !== 'object' || Array.isArray(servers)) {
-    throw new Error(`the agent overlay ${overlayPath} has an mcplServers that isn't a map of entries by id: fix it, or move it aside`);
+  if (servers === undefined || servers === null) return { servers: {}, otherKeys };
+  if (typeof servers !== 'object' || Array.isArray(servers)) {
+    throw new Error(`the agent overlay ${overlayPath} has an mcplServers that isn't a map of entries by id: ${fixIt}`);
   }
-  return servers as Record<string, AgentOverlayEntry>;
+  return { servers: servers as Record<string, AgentOverlayEntry>, otherKeys };
 }
+
+/** The agent overlay's entries by id (readAgentOverlayFile). */
+export function readAgentOverlay(overlayPath: string): Record<string, AgentOverlayEntry> {
+  return readAgentOverlayFile(overlayPath).servers;
+}
+
+/** Name lists, where one name given as a string reads as a list of one. */
+const OVERLAY_NAME_LIST_FIELDS = [
+  'enabledFeatureSets',
+  'disabledFeatureSets',
+  'enabledTools',
+  'disabledTools',
+  'disabledCapabilities',
+] as const;
+
+/** An overlay entry as the boot reads it: well formed, with `notes` on what
+ *  was read differently from how it's written; or why it's malformed. */
+export type OverlayEntryReading =
+  | { entry: AgentOverlayEntry; notes: string[]; problem?: undefined }
+  | { problem: string; entry?: undefined; notes?: undefined };
 
 /**
- * Why an agent overlay entry is malformed, or null when it's well-formed.
- * The overlay is the agent's hand-editable file, so an entry can be any
- * JSON: one that isn't an object, or has a field of the wrong kind, is
- * skipped by the boot (applyAgentOverlay, resolveOverlayEntry) and by every
- * reader that says what the boot loaded (overlayEntryReplaces,
- * overlayWarnings, mcpl_list), so they all agree, and none throws on it. A
- * malformed entry is neither a tombstone nor a replacement: the operator's
- * definition, if any, stays (Nell-1783's haiku review of #228).
+ * Read one agent overlay entry as the boot reads it. Every reader takes this
+ * reading (the boot, the startup warnings, mcpl_list, mcpl_restart's note,
+ * mcpl_unload), so they agree on what the boot loaded, and none throws on a
+ * shape.
+ *
+ * The overlay is the agent's hand-editable file, and main loaded more shapes
+ * than a strict reading would. A shape main loaded loads the same way, so a
+ * file that worked keeps working (the review of #228, sw-ch228):
+ * - `disabled: true` is a tombstone, whatever else the entry holds: the
+ *   agent's unload wins;
+ * - `null` in a field reads as the field absent;
+ * - a `transport` other than stdio or websocket reads as absent, as the
+ *   framework reads it (isWebSocketTransport);
+ * - an env value that isn't text, a number or true/false passes on as its
+ *   text, as main passed it, and an empty list as env (strict function
+ *   calling's "unspecified") reads as no env;
+ * - a number `toolPrefix` reads as its text, and a name list given as one
+ *   string reads as a list of one, which main iterated character by character.
+ * Each such reading is named in `notes`, which the startup warnings log.
+ *
+ * Malformed, so the boot skips it and the operator's definition, if any,
+ * stays: an entry that isn't an object; `disabled` that's neither true nor
+ * false; `command`, `url`, `token` or `access` that isn't text; `args` that
+ * aren't a list of text, numbers or true/false (main threw on those); an env
+ * or name list of the wrong kind; or an entry for which the framework would
+ * open nothing: websocket without a url, stdio without a command, or neither.
+ *
+ * `strict` is for new writes (mcpl_deploy): what a model writes now is held
+ * to the plain shapes, so an env value that isn't text, a number or
+ * true/false, a transport other than stdio or websocket, and a `toolPrefix`
+ * that isn't text are refused rather than read leniently.
  */
-export function overlayEntryProblem(entry: unknown): string | null {
-  if (entry === null || typeof entry !== 'object' || Array.isArray(entry)) return 'it isn\'t an object';
-  const e = entry as Record<string, unknown>;
-  const text = (k: string) => e[k] !== undefined && typeof e[k] !== 'string';
-  // An arg or env value is text, or a number or true/false, whose text is
-  // unambiguous and which the boot passes on as that text (resolveOverlayEntry).
-  // main's own mcpl_deploy saved env values as given, so an entry it wrote
-  // with { PORT: 3101 } loads; refusing it would have #228 break files the
-  // house's tool wrote (Nell-1783's reading of abbae35). null, a list or an
-  // object stays refused: main passed them on as "null" or "[object Object]",
-  // which nobody means, so the boot skips the entry with its reason named.
+export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}): OverlayEntryReading {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { problem: 'it isn\'t an object' };
+  const e: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
+  if (e.disabled === true) return { entry: { disabled: true }, notes: [] };
+  if (e.disabled !== undefined && e.disabled !== null && e.disabled !== false) {
+    return { problem: 'its disabled is neither true nor false' };
+  }
+  delete e.disabled;
+  for (const k of Object.keys(e)) if (e[k] === null) delete e[k];
+  const notes: string[] = [];
   const plain = (v: unknown) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
-  if (e.disabled !== undefined && typeof e.disabled !== 'boolean') return 'its disabled is neither true nor false';
-  for (const k of ['command', 'url', 'token', 'access', 'toolPrefix']) if (text(k)) return `its ${k} isn't text`;
-  if (e.transport !== undefined && e.transport !== 'stdio' && e.transport !== 'websocket') return 'its transport is neither stdio nor websocket';
-  if (e.args !== undefined && !(Array.isArray(e.args) && e.args.every(plain))) return 'its args aren\'t a list of text, numbers or true/false';
-  if (e.env !== undefined && !(e.env !== null && typeof e.env === 'object' && !Array.isArray(e.env)
-    && Object.values(e.env as Record<string, unknown>).every(plain))) return 'its env isn\'t a map of text, numbers or true/false';
-  // Neither a tombstone nor a server: the boot would skip it without a word.
-  if (e.disabled !== true && !e.command && !e.url) return 'it names nothing to run or dial';
-  return null;
+  for (const k of ['command', 'url', 'token', 'access']) {
+    if (e[k] !== undefined && typeof e[k] !== 'string') return { problem: `its ${k} isn't text` };
+  }
+  if (e.toolPrefix !== undefined && typeof e.toolPrefix !== 'string') {
+    if (opts.strict || typeof e.toolPrefix !== 'number') return { problem: 'its toolPrefix isn\'t text' };
+    e.toolPrefix = String(e.toolPrefix);
+    notes.push(`its toolPrefix ${e.toolPrefix} is a number, read as its text`);
+  }
+  if (e.transport !== undefined && e.transport !== 'stdio' && e.transport !== 'websocket') {
+    if (opts.strict) return { problem: 'its transport is neither stdio nor websocket' };
+    notes.push(`its transport ${JSON.stringify(e.transport)} is neither stdio nor websocket, so it's read as absent, as the framework reads it`);
+    delete e.transport;
+  }
+  if (e.args !== undefined) {
+    if (!Array.isArray(e.args) || !e.args.every(plain)) return { problem: 'its args aren\'t a list of text, numbers or true/false' };
+    e.args = e.args.map(String);
+  }
+  if (e.env !== undefined) {
+    if (Array.isArray(e.env) && e.env.length === 0) {
+      delete e.env;
+    } else if (typeof e.env !== 'object' || Array.isArray(e.env)) {
+      return { problem: 'its env isn\'t a map of names to values' };
+    } else {
+      const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !plain(v)).map(([k]) => k);
+      if (odd.length > 0) {
+        if (opts.strict) return { problem: `its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false` };
+        notes.push(`its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false, and pass${odd.length === 1 ? 'es' : ''} on as text, as before`);
+      }
+      e.env = Object.fromEntries(Object.entries(e.env as Record<string, unknown>).map(([k, v]) => [k, String(v)]));
+    }
+  }
+  for (const k of OVERLAY_NAME_LIST_FIELDS) {
+    if (e[k] === undefined) continue;
+    if (typeof e[k] === 'string') {
+      e[k] = [e[k]];
+      notes.push(`its ${k} is one name, read as a list of one`);
+    } else if (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string')) {
+      return { problem: `its ${k} isn't a list of names` };
+    }
+  }
+  if (e.transport === 'websocket' && !e.url) return { problem: 'its transport is websocket, but it has no url' };
+  if (e.transport === 'stdio' && !e.command) return { problem: 'its transport is stdio, but it has no command' };
+  if (!e.command && !e.url) return { problem: 'it names nothing to run or dial' };
+  return { entry: e as AgentOverlayEntry, notes };
 }
 
-/** A well-formed tombstone: `disabled: true`, the one rule every reader uses. */
+/** Why an agent overlay entry is malformed, or null when it's read (readOverlayEntry). */
+export function overlayEntryProblem(entry: unknown, opts: { strict?: boolean } = {}): string | null {
+  return readOverlayEntry(entry, opts).problem ?? null;
+}
+
+/** A tombstone: `disabled: true`, the one rule every reader uses, whatever else the entry holds. */
 export function overlayEntryTombstones(entry: unknown): boolean {
-  return overlayEntryProblem(entry) === null && (entry as AgentOverlayEntry).disabled === true;
+  return readOverlayEntry(entry).entry?.disabled === true;
 }
 
 /** Write the agent overlay file. */
@@ -276,7 +366,11 @@ export function saveAgentOverlay(
   servers: Record<string, AgentOverlayEntry>,
 ): void {
   const data: AgentOverlayFile = { mcplServers: servers };
-  writeFileSync(overlayPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  // Written whole or not at all: a crash mid-write would leave a truncated
+  // file, which stops the next boot (readAgentOverlayFile).
+  const tmp = `${overlayPath}.${process.pid}.tmp`;
+  writeFileSync(tmp, JSON.stringify(data, null, 2) + '\n', 'utf-8');
+  renameSync(tmp, overlayPath);
 }
 
 /**
@@ -354,22 +448,16 @@ export function resolveOverlayEntry(
   entry: AgentOverlayEntry,
   overlayPath: string,
 ): ({ id: string; command?: string; url?: string } & Record<string, unknown>) | null {
-  if (overlayEntryProblem(entry) !== null) return null;
-  if (entry.disabled === true) return null;
-  if (!entry.command && !entry.url) return null;
+  const read = readOverlayEntry(entry).entry;
+  if (!read || read.disabled === true) return null;
   const overlayDir = dirname(resolve(overlayPath));
-  const { disabled: _d, ...fields } = entry;
+  const { disabled: _d, ...fields } = read;
   const rec = fields as Record<string, unknown>;
   for (const k of OVERLAY_LIST_FIELDS) {
     if (Array.isArray(rec[k]) && (rec[k] as unknown[]).length === 0) delete rec[k];
   }
   delete rec.enabledCapabilities;
-  // A number or true/false in args or env is passed on as its text (see
-  // overlayEntryProblem).
-  if (Array.isArray(rec.args)) rec.args = (rec.args as unknown[]).map(String);
-  if (rec.env && typeof rec.env === 'object') {
-    rec.env = Object.fromEntries(Object.entries(rec.env as Record<string, unknown>).map(([k, v]) => [k, String(v)]));
-  }
+  // Args and env values arrive as text already (readOverlayEntry).
   // Same boundary for MCPL tool lifecycle: in the framework a toolLifecycle
   // block IS the grant, so the agent's own file never carries one (the deny
   // above already masks the paths; this keeps the overlay honest too).
@@ -388,7 +476,10 @@ export function resolveOverlayEntry(
   // unless the entry explicitly says false. Stdio entries keep the old
   // default: reconnect does not respawn a dead child anyway (mcpl_restart
   // is that path), so `true` there would promise something it can't do.
-  if (entry.url && rec.reconnect === undefined) rec.reconnect = true;
+  // By the connection the framework opens (dialsUrl), not by a url's
+  // presence: a spawned entry that also names a url would otherwise be
+  // respawned on exit.
+  if (dialsUrl(read) && rec.reconnect === undefined) rec.reconnect = true;
   const denied = new Set<string>([
     ...AGENT_DEPLOY_DENIED_CAPABILITIES,
     ...(Array.isArray(rec.disabledCapabilities) ? (rec.disabledCapabilities as unknown[]).map(String) : []),
@@ -450,7 +541,10 @@ export interface ServerProvisions {
 
 export function serverProvisions(definition: Record<string, unknown>): ServerProvisions {
   const env = definition.env && typeof definition.env === 'object' ? Object.keys(definition.env) : [];
-  const access = typeof definition.access === 'string' ? definition.access.trim() : '';
+  // As the boot dials it: the operator's grant isn't trimmed, so a grant
+  // that differs only by spaces is another audience, and the comparison
+  // (lostByReplacement) says so.
+  const access = typeof definition.access === 'string' ? definition.access : '';
   return {
     env: env.sort(),
     token: typeof definition.token === 'string' && definition.token !== '',
@@ -474,18 +568,21 @@ const envOf = (entry: AgentOverlayEntry): Record<string, unknown> =>
  *  package doesn't export: an explicit `transport` decides, and otherwise a
  *  `url` with no `command`. The readers here choose their branch by it, so
  *  what they name is what the connection the framework opens would carry. */
-const dialsUrl = (entry: AgentOverlayEntry): boolean =>
+export const dialsUrl = (entry: { transport?: unknown; url?: unknown; command?: unknown }): boolean =>
   entry.transport === 'websocket' || (entry.transport !== 'stdio' && Boolean(entry.url) && !entry.command);
 
 /**
  * The parts of an agent overlay entry that name a host variable (`${VAR}`),
  * as labels for a receipt: `command`, `args` and `env NAME` for an entry the
- * framework spawns, `url` and `token` for one it dials (dialsUrl). Only a
- * recipe substitutes those (substituteEnvVars); from an overlay entry the
- * server gets the text as written. Labels only, never values.
+ * framework spawns, `url`, `token` and `access` for one it dials (dialsUrl).
+ * Only a recipe substitutes those (substituteEnvVars); from an overlay entry
+ * the server gets the text as written. Labels only, never values. The entry
+ * is read as the boot reads it (readOverlayEntry); a malformed one names none.
  */
-export function hostVariableReferences(entry: AgentOverlayEntry): string[] {
+export function hostVariableReferences(raw: AgentOverlayEntry): string[] {
   const refs: string[] = [];
+  const entry = readOverlayEntry(raw).entry;
+  if (!entry) return refs;
   if (entry.command && !dialsUrl(entry)) {
     if (namesHostVariable(entry.command)) refs.push('command');
     if (Array.isArray(entry.args) && entry.args.some(namesHostVariable)) refs.push('args');
@@ -527,8 +624,10 @@ export function hostVariableReferences(entry: AgentOverlayEntry): string[] {
  * token and an access grant count only for one that dials a URL, as the
  * framework chooses between them (dialsUrl).
  */
-export function lostByReplacement(operator: ServerProvisions, entry: AgentOverlayEntry): string | null {
+export function lostByReplacement(operator: ServerProvisions, raw: AgentOverlayEntry): string | null {
   const lost: string[] = [];
+  const entry = readOverlayEntry(raw).entry;
+  if (!entry || entry.disabled === true) return null;
   if (entry.command && !dialsUrl(entry)) {
     const declared = new Set(
       Object.entries(envOf(entry)).filter(([, value]) => !namesHostVariable(value)).map(([name]) => name),
@@ -540,7 +639,8 @@ export function lostByReplacement(operator: ServerProvisions, entry: AgentOverla
     const token = typeof entry.token === 'string' && entry.token !== '' && !namesHostVariable(entry.token);
     if (operator.token && !token) lost.push('token');
     // A grant is a name, not a credential: another name is another grant.
-    // Trimmed, as resolveOverlayEntry resolves it for the dial.
+    // Each side as it's dialled: the replacement's trimmed, as
+    // resolveOverlayEntry resolves it, the operator's as written.
     const access = typeof entry.access === 'string' ? entry.access.trim() : '';
     if (operator.access && access !== operator.access) lost.push(`access grant "${operator.access}"`);
   }
@@ -560,9 +660,8 @@ function hostSetsOverServer(name: string): boolean {
  *  being skipped: the entries applyAgentOverlay puts in a server's place. A
  *  malformed one (overlayEntryProblem) never does. */
 export function overlayEntryReplaces(entry: unknown): entry is AgentOverlayEntry {
-  return entry !== undefined && overlayEntryProblem(entry) === null
-    && (entry as AgentOverlayEntry).disabled !== true
-    && Boolean((entry as AgentOverlayEntry).command || (entry as AgentOverlayEntry).url);
+  const read = entry === undefined ? undefined : readOverlayEntry(entry).entry;
+  return read !== undefined && read.disabled !== true;
 }
 
 /**
@@ -578,14 +677,24 @@ export function overlayWarnings(
 ): string[] {
   const operatorById = new Map(operatorServers.map((server) => [server.id, server]));
   const lines: string[] = [];
-  for (const [id, entry] of Object.entries(readAgentOverlay(overlayPath))) {
-    const problem = overlayEntryProblem(entry);
-    if (problem !== null) {
+  const { servers, otherKeys } = readAgentOverlayFile(overlayPath);
+  if (Object.keys(servers).length === 0 && otherKeys.length > 0) {
+    lines.push(
+      `[mcpl] the agent overlay (${overlayPath}) has no mcplServers, only ${otherKeys.map((k) => JSON.stringify(k)).join(', ')}, ` +
+      'so it holds no entries and no tombstones: a misspelled key would drop the agent\'s tombstones',
+    );
+  }
+  for (const [id, entry] of Object.entries(servers)) {
+    const reading = readOverlayEntry(entry);
+    if (reading.problem !== undefined) {
       lines.push(
-        `[mcpl] server "${id}": the agent overlay (${overlayPath}) entry is malformed (${problem}), so the boot skips it` +
+        `[mcpl] server "${id}": the agent overlay (${overlayPath}) entry is malformed (${reading.problem}), so the boot skips it` +
         (operatorById.has(id) ? ' and the operator\'s definition loads' : ''),
       );
       continue;
+    }
+    for (const note of reading.notes) {
+      lines.push(`[mcpl] server "${id}": the agent overlay (${overlayPath}) entry loads, but ${note}`);
     }
     if (!overlayEntryReplaces(entry)) continue;
     const operator = operatorById.get(id);
