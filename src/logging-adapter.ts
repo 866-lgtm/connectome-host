@@ -294,11 +294,11 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * part the summary couldn't read leaves the model empty or the count 0,
    * in both. Without a raw request it could read, the live row's cache
    * summary is unknown, and so is the restored row's, unless the raw request
-   * a failure's record keeps can be summarized there: one that reads
-   * differently from how it serializes (a toJSON, a throwing getter that
-   * isn't an own enumerable property), which membrane's built request never
-   * does. The tokens, stop reason and cache-write fields come from
-   * membrane's own response.
+   * the record keeps (a failure's, a refusal's, or any call's with full
+   * payloads) can be summarized there: one that reads differently from how
+   * it serializes (a toJSON, a throwing getter that isn't an own enumerable
+   * property), which membrane's built request never does. The tokens, stop
+   * reason and cache-write fields come from membrane's own response.
    */
   private observeCall(
     kind: 'complete' | 'stream',
