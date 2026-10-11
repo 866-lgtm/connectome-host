@@ -91,8 +91,15 @@ describe('LoggingProviderAdapter error records', () => {
     const written = records(path);
     expect(written.length).toBe(positions.length);
     for (const record of written) {
-      expect((record.error as string).length).toBeLessThanOrEqual(4_000);
-      expect(loneSurrogate.test(record.error as string)).toBe(false);
+      const kept = record.error as string;
+      expect(kept.length).toBeLessThanOrEqual(4_000);
+      expect(loneSurrogate.test(kept)).toBe(false);
+      // The stated count is what the cuts actually removed, after any step
+      // a cut took to keep a pair whole.
+      const m = / …\[(\d+) of (\d+) characters omitted\]… /.exec(kept)!;
+      const [omitted, total] = [Number(m[1]), Number(m[2])];
+      expect(total).toBe(n);
+      expect(kept.length - m[0].length + omitted).toBe(n);
     }
   });
 
@@ -157,5 +164,121 @@ describe('LoggingProviderAdapter error records', () => {
     expect(record!.error).toBe('Error: zz the actual provider diagnostic');
     expect(record).toMatchObject({ errorType: 'server', retryable: true });
     expect('providerErrorCode' in record!).toBe(false);
+  });
+  function succeeding(response: ProviderResponse): ProviderAdapter {
+    return {
+      name: 'ok-fixture',
+      usageCacheConvention: 'cache-excluded',
+      requiresNativeResponsesInput: false,
+      supportsModel: () => true,
+      complete: async () => response,
+      stream: async () => response,
+    } as ProviderAdapter;
+  }
+
+  for (const kind of ['complete', 'stream'] as const) {
+    test(`${kind}: a successful call whose record can't be built still returns the response, and is recorded as a call (sw-ch216 I1)`, async () => {
+      const path = logFile();
+      const response = { stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } } as unknown as ProviderResponse;
+      Object.defineProperty(response, 'content', { get() { throw new Error('zz content getter failed'); } });
+      const wrapped = new LoggingProviderAdapter(succeeding(response), path);
+      const got = kind === 'complete' ? await wrapped.complete(request) : await wrapped.stream(request, {} as never);
+      expect(got).toBe(response);
+      const written = records(path);
+      expect(written.length).toBe(1);
+      expect(written[0]).toMatchObject({ type: 'call', provider: 'ok-fixture', kind, summaryUnavailable: true });
+      expect('error' in written[0]!).toBe(false);
+    });
+
+    test(`${kind}: null blocks and tools are summarized, not thrown on (sw-ch216 I1)`, async () => {
+      const path = logFile();
+      const odd = { model: 'zz-model', messages: [{ role: 'user', content: [null, { type: 'text', text: 'zz' }] }], tools: [null, { name: 'zz-tool' }] } as unknown as ProviderRequest;
+      const response = { content: [null, { type: 'text', text: 'zz-reply' }], stopReason: 'end_turn' } as unknown as ProviderResponse;
+      const wrapped = new LoggingProviderAdapter(succeeding(response), path);
+      const got = kind === 'complete' ? await wrapped.complete(odd) : await wrapped.stream(odd, {} as never);
+      expect(got).toBe(response);
+      const [record] = records(path);
+      expect(record).toMatchObject({ type: 'call', requestSummary: { toolNames: [null, 'zz-tool'] } });
+      expect((record!.response as { blocks: unknown[] }).blocks.length).toBe(2);
+    });
+
+    test(`${kind}: a rejection with undefined is recorded as an error and rethrown (sw-ch216 I2)`, async () => {
+      const path = logFile();
+      const wrapped = new LoggingProviderAdapter(failing(undefined), path);
+      let thrown: unknown = 'not thrown';
+      try { kind === 'complete' ? await wrapped.complete(request) : await wrapped.stream(request, {} as never); } catch (e) { thrown = e; }
+      expect(thrown).toBeUndefined();
+      const [record] = records(path);
+      expect(record).toMatchObject({ type: 'error', error: 'undefined' });
+    });
+
+    test(`${kind}: a failure whose request can't be summarized is still recorded, and the provider's error rethrown (sw-ch216 I4, I7)`, async () => {
+      const path = logFile();
+      const hostile = {} as ProviderRequest;
+      Object.defineProperty(hostile, 'messages', { get() { throw new Error('zz messages getter failed'); } });
+      const error = membraneLike('zz the actual provider diagnostic');
+      const wrapped = new LoggingProviderAdapter(failing(error), path);
+      const call = kind === 'complete' ? wrapped.complete(hostile) : wrapped.stream(hostile, {} as never);
+      await expect(call).rejects.toBe(error);
+      const [record] = records(path);
+      expect(record).toMatchObject({
+        type: 'error', kind, summaryUnavailable: true,
+        error: 'MembraneError: zz the actual provider diagnostic', errorType: 'invalid_request', httpStatus: 400,
+      });
+      expect('rawRequest' in record!).toBe(false);
+    });
+  }
+
+  test('each classification field is read on its own: a throwing getter or a wrong type loses only that field (sw-ch216 I5)', async () => {
+    const all = { type: 'invalid_request', httpStatus: 400, providerErrorCode: 'invalid_request_error', retryable: false };
+    const recordField = { type: 'errorType', httpStatus: 'httpStatus', providerErrorCode: 'providerErrorCode', retryable: 'retryable' } as const;
+    const wrongType = { type: 42, httpStatus: '429', providerErrorCode: null, retryable: 'yes' } as const;
+    for (const field of Object.keys(recordField) as Array<keyof typeof recordField>) {
+      for (const how of ['throws', 'wrong type'] as const) {
+        const path = logFile();
+        const error = Object.assign(new Error('zz the actual provider diagnostic'), { name: 'MembraneError' }, all) as Error & Record<string, unknown>;
+        if (how === 'throws') Object.defineProperty(error, field, { get() { throw new Error('getter failed'); } });
+        else Object.defineProperty(error, field, { value: wrongType[field] });
+        await expect(new LoggingProviderAdapter(failing(error), path).complete(request)).rejects.toBe(error);
+        const [record] = records(path);
+        expect(record!.error).toBe('MembraneError: zz the actual provider diagnostic');
+        expect(recordField[field] in record!).toBe(false);
+        for (const other of Object.keys(recordField) as Array<keyof typeof recordField>) {
+          if (other !== field) expect(record![recordField[other]]).toEqual(all[other]);
+        }
+      }
+    }
+    // An unreadable name falls back to "Error"; the message and fields stay.
+    const path = logFile();
+    const error = Object.assign(new Error('zz diagnostic'), all);
+    Object.defineProperty(error, 'name', { get() { throw new Error('getter failed'); } });
+    await expect(new LoggingProviderAdapter(failing(error), path).complete(request)).rejects.toBe(error);
+    const [record] = records(path);
+    expect(record).toMatchObject({ error: 'Error: zz diagnostic', errorType: 'invalid_request', httpStatus: 400 });
+  });
+
+  test('a record over the 16 MiB guard drops the raw bodies and keeps the bounded error and its classification (sw-ch216 I19)', async () => {
+    const path = logFile();
+    const huge = { model: 'zz-model', maxTokens: 16, messages: [{ role: 'user', content: `zz ${'h'.repeat(17 * 1024 * 1024)}` }] } as unknown as ProviderRequest;
+    const error = membraneLike(`Bad request: ${echo}`);
+    await expect(new LoggingProviderAdapter(failing(error), path).complete(huge)).rejects.toBe(error);
+    const [record] = records(path);
+    expect('rawRequest' in record!).toBe(false);
+    expect(record!.truncated).toBe('raw bodies dropped (record exceeded size guard)');
+    expect((record!.error as string).length).toBeLessThanOrEqual(4_000);
+    expect(record!.errorChars).toBe(`MembraneError: Bad request: ${echo}`.length);
+    expect(record).toMatchObject({ type: 'error', errorType: 'invalid_request', httpStatus: 400, retryable: false });
+  });
+
+  test('a request that cannot be serialized drops the raw bodies and keeps the record (sw-ch216 I16)', async () => {
+    const path = logFile();
+    const cyclic = { model: 'zz-model', maxTokens: 16, messages: [{ role: 'user', content: 'zz' }] } as Record<string, unknown>;
+    cyclic.self = cyclic;
+    const error = membraneLike('zz the actual provider diagnostic');
+    await expect(new LoggingProviderAdapter(failing(error), path).complete(cyclic as unknown as ProviderRequest)).rejects.toBe(error);
+    const [record] = records(path);
+    expect('rawRequest' in record!).toBe(false);
+    expect(record!.truncated).toBe('raw bodies dropped (they could not be serialized)');
+    expect(record).toMatchObject({ type: 'error', error: 'MembraneError: zz the actual provider diagnostic', requestSummary: { model: 'zz-model' } });
   });
 });

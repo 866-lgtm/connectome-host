@@ -25,14 +25,19 @@
 // each membrane-level call logs exactly once.
 //
 // Each line: { type: 'call'|'error', provider, kind: 'complete'|'stream',
-//   timestamp, durationMs, requestSummary, response?, rawRequest?,
+//   timestamp, durationMs, requestSummary?, response?, rawRequest?,
 //   rawResponse?, error?, errorType?, httpStatus?, providerErrorCode?,
-//   retryable?, errorChars?, truncated? }
+//   retryable?, errorChars?, truncated?, summaryUnavailable? }
+// A record whose request or response couldn't be summarized keeps only the
+// head fields and, for a failure, the error (summaryUnavailable: true).
 //
 // The error text is bounded (MAX_ERROR_CHARS): a provider can echo the whole
 // rejected request in its error body, and that text would otherwise sit in
 // the record beside the request it echoes. The size guard below drops raw
 // bodies, never the error string, so the error string bounds itself.
+//
+// Logging never changes what the caller gets: a successful call's record is
+// written after the provider call's try, and every write is guarded.
 
 import type {
   ProviderAdapter,
@@ -116,8 +121,8 @@ function summarizeRequest(request: ProviderRequest): Record<string, unknown> {
   const lastPreview = typeof last?.content === 'string'
     ? last.content.slice(0, 200)
     : Array.isArray(last?.content)
-      ? (last.content as Array<{ type?: string; text?: string }>)
-          .map((b) => (b.type === 'text' ? (b.text ?? '').slice(0, 120) : `[${b.type}]`))
+      ? (last.content as Array<{ type?: string; text?: string } | null>)
+          .map((b) => (b?.type === 'text' ? (b.text ?? '').slice(0, 120) : `[${b?.type}]`))
           .join(' | ').slice(0, 300)
       : undefined;
   return {
@@ -129,7 +134,7 @@ function summarizeRequest(request: ProviderRequest): Record<string, unknown> {
       : Array.isArray(request.system)
         ? JSON.stringify(request.system).length
         : 0,
-    toolNames: (request.tools as Array<{ name?: string }> | undefined)?.map((t) => t.name) ?? null,
+    toolNames: (request.tools as Array<{ name?: string } | null> | undefined)?.map((t) => t?.name) ?? null,
     toolCount: (request.tools as unknown[] | undefined)?.length ?? 0,
     lastMessageRole: last?.role,
     lastMessagePreview: lastPreview,
@@ -137,16 +142,18 @@ function summarizeRequest(request: ProviderRequest): Record<string, unknown> {
 }
 
 function summarizeResponse(response: ProviderResponse, convention: ProviderAdapter['usageCacheConvention']): Record<string, unknown> {
-  const content = (response.content ?? []) as Array<{ type?: string; text?: string; name?: string }>;
+  // Read defensively: a null block or tool costs only its own entry. What
+  // can't be read at all makes record() fall back to a minimal record.
+  const content = (response.content ?? []) as Array<{ type?: string; text?: string; name?: string } | null>;
   return {
     stopReason: response.stopReason
       ?? (response.raw as { stop_reason?: string } | undefined)?.stop_reason
       ?? null,
     usage: response.usage ? { ...response.usage, cacheConvention: response.usage.cacheConvention ?? convention ?? 'unknown' } : null,
     blocks: content.map((b) => ({
-      type: b.type,
-      ...(b.type === 'text' ? { chars: (b.text ?? '').length, text: b.text } : {}),
-      ...(b.type === 'tool_use' ? { name: b.name } : {}),
+      type: b?.type,
+      ...(b?.type === 'text' ? { chars: (b.text ?? '').length, text: b.text } : {}),
+      ...(b?.type === 'tool_use' ? { name: b.name } : {}),
     })),
   };
 }
@@ -181,12 +188,27 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     return this.inner.supportsModel(modelId);
   }
 
+  /**
+   * Append one record. When it can't be serialized whole (a cycle or a
+   * BigInt in a raw body), or it's over the size guard, the raw bodies are
+   * dropped and the rest kept, so the error text survives either way.
+   */
   private log(record: Record<string, unknown>): void {
     try {
-      let line = JSON.stringify(record);
-      if (line.length > MAX_RECORD_BYTES) {
+      let line: string | undefined;
+      try {
+        line = JSON.stringify(record);
+      } catch {
+        line = undefined;
+      }
+      if (line === undefined || line.length > MAX_RECORD_BYTES) {
         const { rawRequest: _rq, rawResponse: _rr, ...rest } = record;
-        line = JSON.stringify({ ...rest, truncated: 'raw bodies dropped (record exceeded size guard)' });
+        line = JSON.stringify({
+          ...rest,
+          truncated: line === undefined
+            ? 'raw bodies dropped (they could not be serialized)'
+            : 'raw bodies dropped (record exceeded size guard)',
+        });
       }
       appendFileSync(this.logPath, line + '\n');
     } catch {
@@ -194,34 +216,55 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     }
   }
 
+  /**
+   * Record one call's outcome. A call failed exactly when `outcome` carries
+   * `error`, whatever its value: a rejection with undefined is a failure too.
+   * If the request or response can't be summarized (a value the summaries
+   * can't read), a minimal record is written instead, so a call is never
+   * silent: its provider, kind, timing and, for a failure, the bounded error.
+   */
   private record(
     kind: 'complete' | 'stream',
     request: ProviderRequest,
     started: number,
-    response?: ProviderResponse,
-    error?: unknown,
+    outcome: { response: ProviderResponse } | { error: unknown },
   ): void {
-    this.log({
-      type: error === undefined ? 'call' : 'error',
+    const failed = 'error' in outcome;
+    const head = {
+      type: failed ? 'error' : 'call',
       provider: this.name,
       kind,
       timestamp: new Date(started).toISOString(),
       durationMs: Date.now() - started,
-      requestSummary: summarizeRequest(request),
-      rawRequest: request,
-      ...(response !== undefined
-        ? { response: summarizeResponse(response, this.usageCacheConvention), rawResponse: response.raw ?? null }
-        : {}),
-      ...(error !== undefined ? describeError(error) : {}),
-    });
+    };
+    let record: Record<string, unknown>;
+    try {
+      record = {
+        ...head,
+        requestSummary: summarizeRequest(request),
+        rawRequest: request,
+        ...('response' in outcome
+          ? { response: summarizeResponse(outcome.response, this.usageCacheConvention), rawResponse: outcome.response.raw ?? null }
+          : {}),
+        ...(failed ? describeError(outcome.error) : {}),
+      };
+    } catch {
+      record = { ...head, summaryUnavailable: true, ...(failed ? describeError(outcome.error) : {}) };
+    }
+    this.log(record);
   }
 
-  /** Log a failed call; nothing here may replace the provider's error. */
-  private recordFailure(kind: 'complete' | 'stream', request: ProviderRequest, started: number, error: unknown): void {
+  /** Record a call; nothing here may replace the provider's response or its error. */
+  private recordSafely(
+    kind: 'complete' | 'stream',
+    request: ProviderRequest,
+    started: number,
+    outcome: { response: ProviderResponse } | { error: unknown },
+  ): void {
     try {
-      this.record(kind, request, started, undefined, error);
+      this.record(kind, request, started, outcome);
     } catch {
-      // Logging must never break inference, nor change what it throws.
+      // Logging must never break inference, nor change what it returns or throws.
     }
   }
 
@@ -230,14 +273,16 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const started = Date.now();
+    let response: ProviderResponse;
     try {
-      const response = await this.inner.complete(request, options);
-      this.record('complete', request, started, response);
-      return response;
+      response = await this.inner.complete(request, options);
     } catch (error) {
-      this.recordFailure('complete', request, started, error);
+      this.recordSafely('complete', request, started, { error });
       throw error;
     }
+    // Outside the try: a logging failure can't be taken for the provider's.
+    this.recordSafely('complete', request, started, { response });
+    return response;
   }
 
   async stream(
@@ -246,13 +291,14 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const started = Date.now();
+    let response: ProviderResponse;
     try {
-      const response = await this.inner.stream(request, callbacks, options);
-      this.record('stream', request, started, response);
-      return response;
+      response = await this.inner.stream(request, callbacks, options);
     } catch (error) {
-      this.recordFailure('stream', request, started, error);
+      this.recordSafely('stream', request, started, { error });
       throw error;
     }
+    this.recordSafely('stream', request, started, { response });
+    return response;
   }
 }
