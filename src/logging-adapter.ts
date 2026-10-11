@@ -375,9 +375,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, response);
       return response;
     } catch (err) {
+      const timestamp = new Date().toISOString();
+      const durationMs = Date.now() - t0;
+      // Each in its own try: a record that can't be built costs only the
+      // record, and the observers (the credential monitor's tap first) still
+      // hear of the failure. Neither ever replaces the provider's error.
       try {
-        const timestamp = new Date().toISOString();
-        const durationMs = Date.now() - t0;
         this.log({
           type: 'error', kind: 'complete',
           timestamp, durationMs,
@@ -385,8 +388,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
           rawRequest: sink.rawRequest,
           ...describeErrorObject(err, true),
         });
+      } catch { /* the record is lost, nothing else */ }
+      try {
         this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, undefined, err);
-      } catch { /* logging never replaces the provider's error */ }
+      } catch { /* observers never affect provider traffic */ }
       throw err;
     }
   }
@@ -414,9 +419,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, response);
       return response;
     } catch (err) {
+      const timestamp = new Date().toISOString();
+      const durationMs = Date.now() - t0;
+      // Each in its own try: a record that can't be built costs only the
+      // record, and the observers (the credential monitor's tap first) still
+      // hear of the failure. Neither ever replaces the provider's error.
       try {
-        const timestamp = new Date().toISOString();
-        const durationMs = Date.now() - t0;
         this.log({
           type: 'error', kind: 'stream',
           timestamp, durationMs,
@@ -424,8 +432,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
           rawRequest: sink.rawRequest,
           ...describeErrorObject(err, true),
         });
+      } catch { /* the record is lost, nothing else */ }
+      try {
         this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, undefined, err);
-      } catch { /* logging never replaces the provider's error */ }
+      } catch { /* observers never affect provider traffic */ }
       throw err;
     }
   }

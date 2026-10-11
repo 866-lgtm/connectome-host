@@ -132,7 +132,11 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
         const thrown = new Error('overloaded');
         failWith(w.base, thrown);
         const adapter = w.make(log);
+        // The credential monitor's tap still hears of the failure (Anthropic).
+        const heard: unknown[] = [];
+        (adapter as { onProviderError?: (error: unknown) => void }).onProviderError = (error) => { heard.push(error); };
         await expect(kind === 'complete' ? adapter.complete(w.hostile) : adapter.stream(w.hostile, {})).rejects.toBe(thrown);
+        if (w.name === 'anthropic') expect(heard).toEqual([thrown]);
       });
     }
   }
