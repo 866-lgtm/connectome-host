@@ -208,7 +208,7 @@ export interface AgentOverlayFile {
  * written, which the startup warnings log.
  *
  * Main read `parsed.mcplServers ?? {}`, and this reads every file the same
- * way (the review of #228, sw-ch228b I2):
+ * way:
  * - a missing file, a root without `mcplServers`, and `mcplServers: null`
  *   hold no entries;
  * - a root that isn't an object (a list, text, a number, true/false) holds
@@ -222,7 +222,7 @@ export interface AgentOverlayFile {
  * A file that isn't valid JSON, or whose root is `null`, throws an error
  * naming the file, as main threw on both. The boot stops on it until the
  * file is fixed: the file carries the agent's tombstones, so reading past it
- * would load servers the agent unloaded (Nell-1783's haiku probe of #228).
+ * would load servers the agent unloaded.
  * No writer produces those shapes; saveAgentOverlay always writes
  * `{ "mcplServers": { … } }`. The error never quotes the file, which can
  * hold credentials.
@@ -298,8 +298,8 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  * The overlay is the agent's hand-editable file. The boot passes each entry
  * to agent-framework as main passed it, so a file that worked keeps working
  * the same way, nulls, env values and wrong kinds included: the framework
- * starts each server on its own and logs one that fails (the review of #228,
- * sw-ch228b). The reading differs from main's only where main's own handling
+ * starts each server on its own and logs one that fails. The reading differs
+ * from main's only where main's own handling
  * broke, and `notes` names each such reading, which the startup warnings log:
  * - `args` holding numbers or true/false read as their text, where main
  *   stopped the start (`arg.startsWith`);
@@ -380,19 +380,19 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
     e.toolPrefix = String(e.toolPrefix);
   } else if (e.toolPrefix !== null && typeof e.toolPrefix === 'object') {
     // An object or a list isn't text either, so main mis-routed these
-    // calls too (sw-ch228c I22): the default prefix routes them.
+    // calls too: the default prefix routes them.
     notes.push('its toolPrefix isn\'t text, so its tools take the default prefix, which calls to them reach');
     delete e.toolPrefix;
   }
   if (Array.isArray(e.disabledCapabilities) && e.disabledCapabilities.some((c) => { try { String(c); return false; } catch { return true; } })) {
-    // main's String() stopped the start on such an item (sw-ch228c I12).
+    // main's String() stopped the start on such an item.
     notes.push('its disabledCapabilities holds an item that can\'t be read as text, which denies nothing, where the host used to stop the start');
   }
   if (e.transport !== undefined && e.transport !== null && e.transport !== 'stdio' && e.transport !== 'websocket') {
     notes.push('its transport is neither stdio nor websocket, so the framework ignores it');
   }
   // Passed on as main passed them, and named: such an entry replaces any
-  // operator definition with one the framework fails to open (sw-ch228c I1).
+  // operator definition with one the framework fails to open.
   if (e.transport === 'websocket' && !e.url && e.command) notes.push('its transport is websocket, with no url to dial, so the framework can\'t open it');
   if (e.transport === 'stdio' && !e.command && e.url) notes.push('its transport is stdio, with no command to spawn, so the framework can\'t open it');
   if (!e.command && !e.url) return { problem: 'it names nothing to run or dial' };
@@ -413,9 +413,9 @@ export function overlayEntryTombstones(entry: unknown): boolean {
  * Write the agent overlay file, in place, as saveMcplServers writes its file.
  * Writing through the existing file keeps its mode (it can hold tokens), a
  * symlink at its path, and a single-file bind mount; a new file renamed over
- * it would lose all three, and the rename fails outright on such a mount
- * (sw-ch228b I1). A crash in the middle of this small write can still leave
- * the file truncated, so the next boot stops on it, as it always could.
+ * it would lose all three, and the rename fails outright on such a mount.
+ * A crash in the middle of this small write can still leave the file
+ * truncated, so the next boot stops on it, as it always could.
  */
 export function saveAgentOverlay(
   overlayPath: string,
@@ -527,15 +527,15 @@ export function resolveOverlayEntry(
   // main read it, since the framework reads it as off. The default keys on a
   // url's presence, as main keyed it, so an entry that names a url and a
   // command with no transport, which the framework spawns, gets it too: the
-  // framework then spawns its child again when it exits, as it did on main
-  // (sw-ch228b I16). An entry with only a command keeps no default.
+  // framework then spawns its child again when it exits, as it did on main.
+  // An entry with only a command keeps no default.
   if (read.url && rec.reconnect === undefined) rec.reconnect = true;
   const denied = new Set<string>([
     ...AGENT_DEPLOY_DENIED_CAPABILITIES,
     // Each item as main's String() read it, so a nested list such as
-    // [["channels"]] still denies "channels" (Nell-1783's review of
-    // ef84ab1). String() throws on a parsed object whose own toString isn't
-    // a function, and such an item names nothing.
+    // [["channels"]] still denies "channels". String() throws on a parsed
+    // object whose own toString isn't a function, and such an item names
+    // nothing.
     ...(Array.isArray(rec.disabledCapabilities)
       ? (rec.disabledCapabilities as unknown[]).flatMap((c) => { try { return [String(c)]; } catch { return []; } })
       : []),
@@ -604,7 +604,7 @@ export function serverProvisions(definition: Record<string, unknown>): ServerPro
   return {
     env: env.sort(),
     // As the framework sends it: any truthy token goes on the dial, as
-    // lostByReplacement reads the replacement's (sw-ch228c I14).
+    // lostByReplacement reads the replacement's.
     token: Boolean(definition.token),
     access: access || null,
     inheritEnv: definition.inheritEnv === true,
@@ -746,7 +746,7 @@ export function overlayWarnings(
   const { servers, otherKeys, notes } = readAgentOverlayFile(overlayPath);
   for (const note of notes) lines.push(`[mcpl] the agent overlay (${overlayPath}) ${note}`);
   // Whether or not mcplServers holds entries: a tombstone under a misspelled
-  // key is dropped either way (sw-ch228b I19).
+  // key is dropped either way.
   if (otherKeys.length > 0) {
     lines.push(
       `[mcpl] the agent overlay (${overlayPath}) has keys besides mcplServers, ${otherKeys.map((k) => JSON.stringify(k)).join(', ')}, ` +

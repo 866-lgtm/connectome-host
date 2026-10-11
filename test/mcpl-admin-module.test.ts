@@ -142,7 +142,7 @@ describe('mcpl_deploy', () => {
     expect(readAgentOverlay(overlayPath).mytool).toEqual({ command: 'bun' });
   });
 
-  // Nell-1783's reading of abbae35: an env value the boot would skip was
+  // An env value the boot would skip was
   // saved, then resolveOverlayEntry returned null and the deploy threw. A
   // new write is held to the plain shapes, and a number passes on as main
   // passed it: the child gets its text when it's spawned.
@@ -165,7 +165,7 @@ describe('mcpl_deploy', () => {
     expect(envs).toEqual([expect.objectContaining({ PORT: 3101 })]);
     expect(readAgentOverlay(overlayPath).door).toEqual({ command: 'node', env: { PORT: 3101 } });
 
-    // An empty list is strict function calling's "unspecified": no env, and nothing refused (sw-ch228 I7).
+    // An empty list is strict function calling's "unspecified": no env, and nothing refused.
     const strictModel = await call(mod, 'mcpl_deploy', { id: 'quiet', command: 'node', env: [] });
     expect(strictModel.success).toBe(true);
     expect(readAgentOverlay(overlayPath).quiet).toEqual({ command: 'node' });
@@ -238,12 +238,12 @@ describe('mcpl_unload', () => {
     const { stub } = makeStubFramework();
     const mod = makeModule(stub);
     expect((await call(mod, 'mcpl_unload', { id: 'nope' })).success).toBe(false);
-    // An inherited key isn't an entry: nothing is tombstoned for it (sw-ch228 I26).
+    // An inherited key isn't an entry: nothing is tombstoned for it.
     expect((await call(mod, 'mcpl_unload', { id: 'constructor' })).success).toBe(false);
     expect(readAgentOverlay(overlayPath)).toEqual({});
   });
 
-  test('an entry a concurrent mcpl_deploy writes during the disconnect is kept (sw-ch228 I22)', async () => {
+  test('an entry a concurrent mcpl_deploy writes during the disconnect is kept', async () => {
     const { stub } = makeStubFramework();
     await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
       .connectMcplServer({ id: 'discord', command: 'node' });
@@ -264,7 +264,7 @@ describe('mcpl_list labels', () => {
   // agent-framework's listMcplServers carries a server's command and url but
   // not its transport, so the label is the command, else the url, as main
   // labelled it; for a definition naming both it can't say which the
-  // framework opened (sw-ch228 I10, sw-ch228b I3).
+  // framework opened.
   test('a server is labelled by its command, else its url, from the status the framework reports', async () => {
     const { stub } = makeStubFramework();
     const connect = (stub as unknown as { connectMcplServer: (c: { id: string; command?: string; url?: string; transport?: string }) => Promise<void> })
@@ -337,8 +337,7 @@ describe('mcpl_list', () => {
     expect(text).toContain("discord: MALFORMED in your overlay (its args aren't a list of text, numbers or true/false), so the boot skips it");
     expect(text).toContain("stray: MALFORMED in your overlay (it isn't an object), so the boot skips it");
     // A restart reads the same file without throwing: it succeeds, and its
-    // receipt says the entry is malformed and what the next start does
-    // (sw-ch228 I13, I25).
+    // receipt says the entry is malformed and what the next start does.
     mod.setOperatorServers([{ id: 'discord', command: 'node' }]);
     const restarted = await call(mod, 'mcpl_restart', { id: 'discord' });
     expect(restarted.success).toBe(true);
@@ -349,10 +348,10 @@ describe('mcpl_list', () => {
       'mcpl_unload would tombstone the operator\'s definition, so it stays unloaded.',
     );
     expect(String(restarted.data)).not.toContain("couldn't be read");
-    // A skipped entry takes no effect, so the last-connect sentence isn't said (sw-ch228c I9).
+    // A skipped entry takes no effect, so the last-connect sentence isn't said.
     expect(String(restarted.data)).not.toContain('last connect');
     // The advice says what mcpl_unload does for an id the operator defines,
-    // and stays plain for one it doesn't (sw-ch228b I11).
+    // and stays plain for one it doesn't.
     const listed = String((await call(mod, 'mcpl_list')).data);
     expect(listed).toContain(
       'discord: MALFORMED in your overlay (its args aren\'t a list of text, numbers or true/false), so the boot skips it ' +
@@ -367,7 +366,7 @@ describe('mcpl_list', () => {
 
   // A tombstone that carries other fields is a tombstone: mcpl_list says
   // so, and a restart says the overlay keeps the server unloaded at the next
-  // start (sw-ch228b I15, I32).
+  // start.
   test('a tombstone, junk fields and all, is listed as unloaded, and a restart of it says why', async () => {
     const { stub } = makeStubFramework();
     const mod = makeModule(stub);
@@ -375,7 +374,7 @@ describe('mcpl_list', () => {
     writeFileSync(overlayPath, JSON.stringify({ mcplServers: { discord: { disabled: true, command: 5, args: 'x', env: 'y' } } }));
     const listed = String((await call(mod, 'mcpl_list')).data);
     // For an id the operator defines, no tool brings its definition back:
-    // only removing the tombstone does (sw-ch228c I31).
+    // only removing the tombstone does.
     const advice = 'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file ' +
       'loads the operator\'s definition again';
     expect(listed).toContain(`discord: UNLOADED (tombstoned in your overlay — ${advice})`);
@@ -384,7 +383,7 @@ describe('mcpl_list', () => {
     expect(restarted.success).toBe(false);
     expect(restarted.error).toContain('mcpl_restart failed: MCPL server "discord" is not configured.');
     expect(restarted.error).toContain(`Your overlay tombstones "discord", so the next host start leaves it unloaded; ${advice}.`);
-    // Nothing is left to reconnect with, so the last-connect sentence isn't said (sw-ch228c I23).
+    // Nothing is left to reconnect with, so the last-connect sentence isn't said.
     expect(restarted.error).not.toContain('last connect');
     // An id nothing else defines is the agent's own, which a deploy restores.
     writeFileSync(overlayPath, JSON.stringify({ mcplServers: { mine: { disabled: true } } }));
@@ -392,7 +391,7 @@ describe('mcpl_list', () => {
   });
 
   // A tombstone written while its server runs leaves it connected for this
-  // session, and the list says so rather than UNLOADED (sw-ch228c I7).
+  // session, and the list says so rather than UNLOADED.
   test('a tombstone for a server still connected is listed as tombstoned, not as unloaded', async () => {
     const { stub } = makeStubFramework();
     await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
@@ -496,8 +495,7 @@ describe('an overlay entry that replaces the operator definition', () => {
     expect(text).toContain('mcpl_unload "shell"');
     expect(text).toContain('the operator\'s loads again at the next host start');
     // The restart reconnects with the last connect's configuration; the note
-    // reads the file, so an edit made before that connect is already in it
-    // (sw-ch228b I20).
+    // reads the file, so an edit made before that connect is already in it.
     expect(text).toContain(
       'That describes your overlay file as it is now. The restart reconnects with the configuration of the server\'s ' +
       'last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then takes effect ' +
