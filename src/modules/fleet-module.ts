@@ -1578,9 +1578,14 @@ export class FleetModule implements Module {
         clearTimeout(timer);
         child.socket = sock;
         sock.on('data', (chunk: Buffer) => this.handleChildData(child, chunk));
-        sock.on('end', () => {
+        // The child is gone at the socket's 'end' or its 'close'. A reset
+        // (a child that died with our commands unread) gets no 'end' where
+        // sockets behave as in Node (Bun 1.4.2), only an error and 'close'.
+        const release = (): void => {
           if (child.socket === sock) child.socket = null;
-        });
+        };
+        sock.on('end', release);
+        sock.on('close', release);
         sock.on('error', () => {
           // Errors get reflected in status via process exit; don't crash parent.
         });
