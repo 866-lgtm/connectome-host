@@ -6,7 +6,7 @@ import { AnthropicAdapter, BedrockAdapter, MembraneError } from '@animalabs/memb
 import type { ProviderRequest, ProviderResponse } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from '../src/logging-adapter.js';
 import { LoggingBedrockAdapter } from '../src/logging-bedrock-adapter.js';
-import type { ProviderCallRecord } from '../src/call-ledger.js';
+import { CallLedger, type ProviderCallRecord } from '../src/call-ledger.js';
 
 // The Anthropic and Bedrock writers keep their records' `error` shape
 // ({ name, message } for an Error, Anthropic's with `stack`), but bound its
@@ -71,11 +71,12 @@ function records(log: string): Array<Record<string, unknown>> {
   return readFileSync(log, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
 }
 
-/** A fresh log, the writer's adapter on it, and what its observers hear. */
+/** A fresh log, the writer's adapter on it, and what its observers hear.
+ *  The log is named as index.ts names it, so a ledger can restore from it. */
 function setup(w: ReturnType<typeof writers>[number]) {
   const dir = mkdtempSync(join(tmpdir(), 'llm-native-errors-'));
   dirs.push(dir);
-  const log = join(dir, 'llm-calls.jsonl');
+  const log = join(dir, 'llm-calls.test.jsonl');
   const calls: ProviderCallRecord[] = [];
   const adapter = w.make(log, calls);
   const errors: unknown[] = [];
@@ -84,7 +85,15 @@ function setup(w: ReturnType<typeof writers>[number]) {
   adapter.onProviderSuccess = () => { successes++; };
   const call = (kind: 'complete' | 'stream', req: ProviderRequest = request) =>
     kind === 'complete' ? adapter.complete(req) : adapter.stream(req, {});
-  return { log, calls, errors, successes: () => successes, call };
+  return { dir, log, calls, errors, successes: () => successes, call };
+}
+
+/** The call ledger's rows for what its observer heard (live), and for the
+ *  log after a restart (restored). */
+function ledgerRows(dir: string, calls: ProviderCallRecord[]) {
+  const live = new CallLedger({ hydrate: false });
+  for (const call of calls) live.record(call);
+  return { live: live.snapshot().rows, restored: new CallLedger({ dataDir: dir }).snapshot().rows };
 }
 
 describe('the Anthropic and Bedrock writers\' error records', () => {
@@ -156,7 +165,7 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
         }
       });
 
-      test(`${w.name} ${kind}: a rejection with undefined is recorded and observed as the failure it is`, async () => {
+      test(`${w.name} ${kind}: a rejection with undefined is recorded as the failure it is, and on anthropic observed as one`, async () => {
         const { log, calls, errors, successes, call } = setup(w);
         failWith(w.base, undefined);
         await expect(call(kind)).rejects.toBeUndefined();
@@ -219,30 +228,40 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
 
   // Nothing in a call's logging can replace the provider's error or its
   // response: not the error's reading, and not the request's summary either.
-  // A record that can't be summarized is written minimal instead.
+  // Anthropic's summary leaves out only the part it can't read, and the
+  // ledger's live row takes the summary's parts, so the row a restart restores
+  // from the record reads the same. Bedrock's summary, which no ledger reads,
+  // is all or nothing: a request it can't read makes the record minimal.
   for (const w of writers()) {
     for (const kind of ['complete', 'stream'] as const) {
-      test(`${w.name} ${kind}: a failed call whose request the summary can't read is still recorded and observed`, async () => {
-        const { log, calls, errors, call } = setup(w);
+      test(`${w.name} ${kind}: a failed call whose request the summary can't fully read is still recorded and observed`, async () => {
+        const { dir, log, calls, errors, call } = setup(w);
         const thrown = Object.assign(new Error('overloaded'), { type: 'overloaded', retryable: true });
         failWith(w.base, thrown);
         await expect(call(kind, w.hostile)).rejects.toBe(thrown);
         const [record] = records(log);
         expect(record).toMatchObject({
-          type: 'error', kind, summaryUnavailable: true,
-          error: { name: 'Error', message: 'overloaded' }, errorType: 'overloaded', retryable: true,
+          type: 'error', kind, error: { name: 'Error', message: 'overloaded' }, errorType: 'overloaded', retryable: true,
         });
-        expect('requestSummary' in record!).toBe(false);
         if (w.name === 'anthropic') {
+          // The message count can't be read, so the summary leaves it out; the rest stands.
+          expect(record!.requestSummary).toEqual({ model: 'claude-opus-4-6', maxTokens: 16, tools: 0 });
+          expect('summaryUnavailable' in record!).toBe(false);
           expect(errors).toHaveLength(1);
           expect(errors[0]).toBe(thrown);
           expect(calls).toHaveLength(1);
-          expect(calls[0]).toMatchObject({ kind, messages: 0, error: 'overloaded' });
+          expect(calls[0]).toMatchObject({ kind, model: 'claude-opus-4-6', messages: 0, error: 'overloaded' });
+          const { live, restored } = ledgerRows(dir, calls);
+          expect(live[0]).toMatchObject({ verdict: 'ERROR', cause: 'overloaded', messages: 0 });
+          expect(restored).toEqual(live);
+        } else {
+          expect(record).toMatchObject({ summaryUnavailable: true });
+          expect('requestSummary' in record!).toBe(false);
         }
       });
 
-      test(`${w.name} ${kind}: a successful call whose request the summary can't read still returns its response`, async () => {
-        const { log, calls, errors, successes, call } = setup(w);
+      test(`${w.name} ${kind}: a successful call whose request the summary can't fully read still returns its response`, async () => {
+        const { dir, log, calls, errors, successes, call } = setup(w);
         const response = {
           content: [{ type: 'text', text: 'hello' }],
           stopReason: 'end_turn',
@@ -252,15 +271,123 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
         succeedWith(w.base, response);
         await expect(call(kind, w.hostile)).resolves.toBe(response);
         const [record] = records(log);
-        expect(record).toMatchObject({ type: 'call', kind, summaryUnavailable: true });
+        expect(record).toMatchObject({ type: 'call', kind });
         if (w.name === 'anthropic') {
+          // The record keeps the response, and with it the call's usage and stop reason.
+          expect(record!.requestSummary).toEqual({ model: 'claude-opus-4-6', maxTokens: 16, tools: 0 });
+          expect(record!.rawResponse).toEqual({ stop_reason: 'end_turn', usage: { input_tokens: 3, output_tokens: 2 } });
           expect(successes()).toBe(1);
           expect(errors).toHaveLength(0);
           expect(calls).toHaveLength(1);
           expect(calls[0]!.error).toBeUndefined();
+          const { live, restored } = ledgerRows(dir, calls);
+          expect(live[0]).toMatchObject({ tokens: { input: 3, output: 2 }, stopReason: 'end_turn', messages: 0 });
+          expect(restored).toEqual(live);
+        } else {
+          expect(record).toMatchObject({ summaryUnavailable: true });
         }
       });
     }
+  }
+
+  for (const kind of ['complete', 'stream'] as const) {
+    // A failure is a failure whatever its text: the ledger used to read an
+    // empty one as a success, pricing the call and giving no ERROR.
+    test(`anthropic ${kind}: a failure whose text is empty is an ERROR in the ledger, live and restored`, async () => {
+      for (const thrown of [new Error(''), '']) {
+        const { dir, log, calls, call } = setup(writers()[0]!);
+        failWith(AnthropicAdapter, thrown);
+        await expect(call(kind)).rejects.toBe(thrown);
+        const [record] = records(log);
+        expect(record!.error).toEqual(typeof thrown === 'string' ? '' : { name: 'Error', message: '', stack: expect.any(String) });
+        expect(calls[0]!.error).toBe('');
+        const { live, restored } = ledgerRows(dir, calls);
+        expect(live[0]).toMatchObject({ verdict: 'ERROR', cause: 'the error carried no text', error: '' });
+        expect('cost' in live[0]!).toBe(false);
+        expect(restored).toEqual(live);
+        for (const restore of restores.splice(0)) restore();
+      }
+    });
+
+    // The cache summary is read from the raw request the provider hands
+    // onRequest; one it can't read leaves the cache summary unknown, in the
+    // record and both rows, where the live row used to claim no cache flags.
+    test(`anthropic ${kind}: a raw request whose cache summary can't be read costs only that summary`, async () => {
+      const { dir, log, calls, call } = setup(writers()[0]!);
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      const response = {
+        content: [],
+        stopReason: 'end_turn',
+        usage: { inputTokens: 5, outputTokens: 1, cacheReadTokens: 4 },
+        raw: { stop_reason: 'end_turn', usage: { input_tokens: 5, output_tokens: 1, cache_read_input_tokens: 4 } },
+      } as unknown as ProviderResponse;
+      const proto = AnthropicAdapter.prototype as unknown as Record<string, unknown>;
+      const { complete, stream } = proto;
+      const deliver = async (_request: unknown, a?: unknown, b?: unknown) => {
+        const options = (kind === 'complete' ? a : b) as { onRequest?: (raw: unknown) => void } | undefined;
+        options?.onRequest?.({ model: 'claude-opus-4-6', messages: [proxy] });
+        return response;
+      };
+      proto.complete = deliver;
+      proto.stream = deliver;
+      restores.push(() => { proto.complete = complete; proto.stream = stream; });
+      await expect(call(kind)).resolves.toBe(response);
+      const [record] = records(log);
+      expect(record!.requestSummary).toEqual({ model: 'claude-opus-4-6', maxTokens: 16, messages: 0, tools: 0 });
+      expect(calls).toHaveLength(1);
+      expect(calls[0]!.cacheBreakpoints).toBeUndefined();
+      const { live, restored } = ledgerRows(dir, calls);
+      expect(live[0]).toMatchObject({ verdict: 'HIT', tokens: { input: 5, output: 1, cacheRead: 4 } });
+      expect(restored).toEqual(live);
+    });
+
+    // A response that can't be read is the one record left to write minimal,
+    // and it costs the live row too, so the ledger has no row either way.
+    test(`anthropic ${kind}: a successful call whose response can't be read is recorded minimal, with no ledger row`, async () => {
+      const { dir, log, calls, successes, call } = setup(writers()[0]!);
+      const response = { content: [], stopReason: 'end_turn', usage: { inputTokens: 1, outputTokens: 1 } } as Record<string, unknown>;
+      Object.defineProperty(response, 'raw', { get() { throw new Error('raw getter failed'); } });
+      succeedWith(AnthropicAdapter, response as unknown as ProviderResponse);
+      await expect(call(kind)).resolves.toBe(response as unknown as ProviderResponse);
+      const [record] = records(log);
+      expect(record).toEqual({ type: 'call', kind, timestamp: expect.any(String), durationMs: expect.any(Number), summaryUnavailable: true });
+      expect(successes()).toBe(1);
+      expect(calls).toHaveLength(0);
+      expect(ledgerRows(dir, calls).restored).toEqual([]);
+    });
+  }
+
+  // A failure's error fields are read once, for the record and the ledger alike.
+  test('anthropic: a message that changes on each read is read once, and the record and the ledger agree', async () => {
+    const { log, calls, call } = setup(writers()[0]!);
+    const thrown = new Error('placeholder');
+    let reads = 0;
+    Object.defineProperty(thrown, 'message', { get() { reads++; return `read ${reads}`; } });
+    failWith(AnthropicAdapter, thrown);
+    await expect(call('complete')).rejects.toBe(thrown);
+    expect(reads).toBe(1);
+    expect((records(log)[0]!.error as { message: string }).message).toBe('read 1');
+    expect(calls[0]!.error).toBe('read 1');
+  });
+
+  for (const w of writers()) {
+    test(`${w.name}: a long error type and provider code are bounded like the name`, async () => {
+      const { log, call } = setup(w);
+      const thrown = Object.assign(new Error('short'), {
+        type: `type_${'t'.repeat(10_000)}`, providerErrorCode: `code_${'c'.repeat(10_000)}`,
+      });
+      failWith(w.base, thrown);
+      await expect(call('complete')).rejects.toBe(thrown);
+      const [record] = records(log);
+      for (const field of ['errorType', 'providerErrorCode'] as const) {
+        const value = record![field] as string;
+        expect(value.length).toBeLessThanOrEqual(128);
+        expect(value).toContain('characters omitted]');
+      }
+      expect(record!.errorType as string).toStartWith('type_ttt');
+      expect(record!.providerErrorCode as string).toStartWith('code_ccc');
+    });
   }
 
   // The stack's header is rewritten only when it is the error's own
@@ -291,6 +418,16 @@ describe('the Anthropic and Bedrock writers\' error records', () => {
     await expect(adapter.complete(request)).rejects.toBe(thrown);
     const stack = (records(log)[0]!.error as { stack: string }).stack;
     expect(stack).toStartWith('Error: [the message above]\n    at ');
+  });
+
+  test('anthropic: a stack that is only the header line names the message above', async () => {
+    const { log } = setup(writers()[0]!);
+    const thrown = new Error('abc');
+    Object.defineProperty(thrown, 'stack', { value: 'Error: abc' });
+    failWith(AnthropicAdapter, thrown);
+    const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, log);
+    await expect(adapter.complete(request)).rejects.toBe(thrown);
+    expect((records(log)[0]!.error as { stack: string }).stack).toBe('Error: [the message above]');
   });
 
   test('anthropic: a stack whose first line only begins with the header is kept as it is', async () => {

@@ -23,10 +23,12 @@
 //     requestSummary, rawRequest?, rawResponse, error?, errorType?,
 //     httpStatus?, providerErrorCode?, retryable?, errorChars? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
-// a non-Error's text (logging-error-fields.ts). A record whose request or
-// response couldn't be summarized keeps only the head fields and, for a
-// failure, the error (summaryUnavailable: true). Logging never changes what
-// the caller gets: it runs after the provider call, outside its try.
+// a non-Error's text (logging-error-fields.ts). The request summary leaves
+// out only the parts it can't read; a record whose response can't be read
+// keeps only the head fields (summaryUnavailable: true). Logging never
+// changes what the caller gets, with one older exception: the capture hook
+// keeps an error thrown by a caller's own onRequest hook from failing the
+// call. Logging runs after the provider call, outside its try.
 
 import { AnthropicAdapter } from '@animalabs/membrane';
 import type {
@@ -242,14 +244,17 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
   }
 
-  private requestSummary(request: ProviderRequest, rawRequest?: unknown): Record<string, unknown> {
-    const cache = rawRequest ? summarizeCacheControls(rawRequest) : undefined;
-    const effort = (rawRequest as { output_config?: { effort?: unknown } } | null | undefined)?.output_config?.effort;
+  /** The request's summary, each part read on its own: a part that can't be
+   *  read is undefined, which the record leaves out, and costs only itself.
+   *  Built once per call, for the record and the ledger's live row alike. */
+  private requestSummary(request: ProviderRequest, rawRequest: unknown): Record<string, unknown> {
+    const cache = rawRequest ? guarded(() => summarizeCacheControls(rawRequest)) : undefined;
+    const effort = guarded(() => (rawRequest as { output_config?: { effort?: unknown } } | null | undefined)?.output_config?.effort);
     return {
-      model: request.model,
-      maxTokens: request.maxTokens,
-      messages: request.messages.length,
-      tools: request.tools?.length ?? 0,
+      model: guarded(() => request.model),
+      maxTokens: guarded(() => request.maxTokens),
+      messages: guarded(() => request.messages.length),
+      tools: guarded(() => request.tools?.length ?? 0),
       ...(typeof effort === 'string' ? { effort } : {}),
       ...(cache ? { cacheBreakpoints: cache.count, cacheTtls: cache.ttls } : {}),
     };
@@ -282,19 +287,21 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   /**
    * Tell the observers about one call. A call failed exactly when `outcome`
    * carries `error`, whatever its value: a rejection with undefined is a
-   * failure too. The ledger's error text is the record's own, bounded
-   * (`errorText`), so a live row reads as it will once restored from the
-   * record after a restart. The request's message count and the raw
-   * request's cache summary are each read on their own, so a request the
-   * record's summary can't read costs the row only those fields; the rest of
-   * the row comes from the request's model and membrane's own response.
+   * failure, and so is an error whose text is empty. The ledger row's error
+   * text is the record's own, bounded (`errorText`), and its model, message
+   * count and cache summary are the record's request summary's (`summary`),
+   * so a row restored from the record after a restart reads the same. A
+   * part the summary couldn't read leaves the model empty or the count 0,
+   * and with no raw request read the cache summary is unknown, in both. The
+   * tokens, stop reason and cache-write fields come from membrane's own
+   * response.
    */
   private observeCall(
     kind: 'complete' | 'stream',
     timestamp: string,
     durationMs: number,
     request: ProviderRequest,
-    rawRequest: unknown,
+    summary: Record<string, unknown>,
     outcome: { response: ProviderResponse } | { error: unknown },
     errorText: string | undefined,
   ): void {
@@ -316,8 +323,6 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       } catch { /* observers never affect provider traffic */ }
     }
     if (!this.onCall) return;
-    const cache = guarded(() => summarizeCacheControls(rawRequest)) ?? { count: 0, ttls: [] };
-    const messages = guarded(() => request.messages.length) ?? 0;
     const raw = (response as { raw?: Record<string, unknown> } | undefined)?.raw;
     const rawUsage = raw?.usage as Record<string, unknown> | undefined;
     const cacheCreation = rawUsage?.cache_creation as Record<string, unknown> | undefined;
@@ -330,8 +335,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         timestamp,
         kind,
         durationMs,
-        model: request.model,
-        messages,
+        // As the ledger's restore reads them from the record.
+        model: typeof summary.model === 'string' ? summary.model : '',
+        messages: typeof summary.messages === 'number' ? summary.messages : 0,
         inputTokens: response?.usage.inputTokens ?? 0,
         outputTokens: response?.usage.outputTokens ?? 0,
         cacheReadTokens: response?.usage.cacheReadTokens ?? 0,
@@ -341,8 +347,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         cacheWriteBucketsAuthoritative: cacheCreation !== undefined,
         inferenceGeo: text(rawUsage?.inference_geo) ?? text(raw?.inference_geo),
         serviceTier: text(rawUsage?.service_tier) ?? text(raw?.service_tier),
-        cacheBreakpoints: cache.count,
-        cacheTtls: cache.ttls,
+        cacheBreakpoints: summary.cacheBreakpoints as number | undefined,
+        cacheTtls: summary.cacheTtls as string[] | undefined,
         stopReason: response?.stopReason,
         error: errorText,
       });
@@ -376,10 +382,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   /**
    * Record one call's outcome and tell the observers. A call failed exactly
    * when `outcome` carries `error`, whatever its value. Nothing here can
-   * replace the provider's response or its error. A record whose request or
-   * response can't be summarized is written minimal instead
-   * (`summaryUnavailable: true`), with its timing and, for a failure, the
-   * bounded error, so no call goes unrecorded; and the observers hear of the
+   * replace the provider's response or its error. The error's fields and the
+   * request's summary are each read once, part by part, for the record and
+   * the ledger alike, so a part that can't be read costs only itself. A
+   * record that can't be built even so (a response that can't be read) is
+   * written minimal instead (`summaryUnavailable: true`), with its kind and
+   * timing, so the call still has a record. The credential taps hear of the
    * call whatever became of its record.
    */
   private recordCall(
@@ -394,17 +402,18 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       const durationMs = Date.now() - t0;
       // Read once, for the record and the ledger alike; reading never throws.
       const errorFields = 'error' in outcome ? describeErrorObject(outcome.error, true) : undefined;
+      const summary = this.requestSummary(request, rawRequest);
       const head = { type: errorFields ? 'error' : 'call', kind, timestamp, durationMs };
       let record: Record<string, unknown>;
       try {
         record = 'response' in outcome
           ? {
               ...head,
-              requestSummary: this.requestSummary(request, rawRequest),
+              requestSummary: summary,
               rawRequest: this.refusalRawRequest(outcome.response, rawRequest),
               rawResponse: (outcome.response as { raw?: unknown }).raw ?? null,
             }
-          : { ...head, requestSummary: this.requestSummary(request, rawRequest), rawRequest, ...errorFields };
+          : { ...head, requestSummary: summary, rawRequest, ...errorFields };
       } catch {
         record = { ...head, summaryUnavailable: true, ...errorFields };
       }
@@ -413,7 +422,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         const error = errorFields?.error;
         const errorText = error === undefined ? undefined
           : typeof error === 'string' ? error : (error as { message: string }).message;
-        this.observeCall(kind, timestamp, durationMs, request, rawRequest, outcome, errorText);
+        this.observeCall(kind, timestamp, durationMs, request, summary, outcome, errorText);
       } catch { /* observers never affect provider traffic */ }
     } catch {
       // Logging must never break inference, nor change what it returns or throws.

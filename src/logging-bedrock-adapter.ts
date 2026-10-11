@@ -92,8 +92,8 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
    * `error`, whatever its value: a rejection with undefined is a failure too.
    * A record whose request or response can't be summarized is written
    * minimal instead (`summaryUnavailable: true`), with its timing and, for a
-   * failure, the bounded error, so no call goes unrecorded. Nothing here can
-   * replace the provider's response or its error.
+   * failure, the bounded error, so the call still has a record. Nothing here
+   * can replace the provider's response or its error.
    */
   private recordCall(
     kind: 'complete' | 'stream',

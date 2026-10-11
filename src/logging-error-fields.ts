@@ -10,8 +10,10 @@
 //
 // `errorChars`, set when the text was cut, is the whole length of the one text
 // that was cut: the generic record's `error` ("Name: message"), or the other
-// records' `error.message`. Lengths here, the omission marker's included, are
-// JavaScript string lengths (UTF-16 code units).
+// records' `error.message`, or, for a thrown value that isn't an Error, their
+// `error` text itself. A cut stack states its own length only in its omission
+// marker. Lengths here, the omission marker's included, are JavaScript string
+// lengths (UTF-16 code units).
 //
 // Reading a hostile error never throws: logging must never break inference,
 // and a throw inside a writer's catch block would replace the provider's
