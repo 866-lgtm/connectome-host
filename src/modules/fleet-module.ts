@@ -208,14 +208,14 @@ interface FleetChild {
   /** Pending replacement of this generation, cancelled by manual control. */
   restartTimer?: ReturnType<typeof setTimeout>;
   /** Kills acknowledged on this generation. A launch replacing it refuses if
-   *  one lands during the launch's awaits (sw-ch181 I13). Not persisted. */
+   *  one lands during the launch's awaits. Not persisted. */
   killAcks?: number;
   /** Why automatic restarts stopped for this generation (the flap cap), shown
-   *  by fleet status until a manual launch or restart (sw-ch181 I17). Kept in
+   *  by fleet status until a manual launch or restart. Kept in
    *  memory, like the retry history, not persisted. */
   autoRestartStopped?: string;
   /** A failed launch's reason, kept so the exit, whenever it's recorded,
-   *  carries it beside the exit itself (sw-ch181 I9, I10, I14). */
+   *  carries it beside the exit itself. */
   launchFailure?: string;
   /** Runtime-only env overrides for restart. Recovered from current config on adoption. */
   env?: Record<string, string>;
@@ -680,7 +680,7 @@ export class FleetModule implements Module {
     child.restartAttempts = child.restartAttempts.filter((t) => now - t < this.restartFlapWindowMs);
     if (child.restartAttempts.length >= this.restartFlapCap) {
       // Recorded on the generation, so fleet status shows it until a manual
-      // launch or restart replaces it (sw-ch181 I17).
+      // launch or restart replaces it.
       child.autoRestartStopped =
         `${this.restartFlapCap} restarts within ${this.restartFlapWindowMs / 1000}s; ` +
         'fleet restart or launch starts it again, with a fresh retry budget';
@@ -718,6 +718,11 @@ export class FleetModule implements Module {
         .then((res) => {
           if (!res.success) {
             console.error(`[fleet] autoRestart "${child.name}" failed: ${res.error}`);
+            // Refused before spawning, the replacement left this generation
+            // in place, and nothing will restart it: the record says why.
+            if (this.children.get(child.name) === child) {
+              child.autoRestartStopped ??= `its automatic restart was refused: ${res.error}`;
+            }
           }
         })
         .catch((err: unknown) => {
@@ -999,7 +1004,7 @@ export class FleetModule implements Module {
 
   private async handleLaunch(
     input: LaunchInput,
-    opts: { viaAutoStart: boolean; autoRestartOf?: FleetChild } = { viaAutoStart: false },
+    opts: { viaAutoStart: boolean; autoRestartOf?: FleetChild; killsAtStart?: number } = { viaAutoStart: false },
   ): Promise<ToolResult> {
     if (!input.name || typeof input.name !== 'string') {
       return { success: false, isError: true, error: 'launch requires "name" string' };
@@ -1042,27 +1047,32 @@ export class FleetModule implements Module {
       input = { ...input, env: undefined };
     }
 
+    if (this.stopping) {
+      return { success: false, isError: true, error: `Child '${input.name}' wasn't launched: the host is stopping.` };
+    }
     const existing = this.children.get(input.name);
-    const killsAtStart = existing?.killAcks ?? 0;
+    // A restart counts kills from its own start, before its kill wait, so a
+    // kill acknowledged during that wait still refuses the relaunch.
+    const killsAtStart = opts.killsAtStart ?? existing?.killAcks ?? 0;
     // Recipe loading and ownership reconciliation both yield. Afterward every
     // launch, manual or automatic, must still replace the generation it began
-    // from, the host must not be stopping (sw-ch181 I1), and no kill may have
-    // been acknowledged on that generation meanwhile (I13). An automatic retry
-    // must also find its generation uncancelled. The refusal names which
-    // (I22).
-    const staleReason = (): ((stage: string) => string) | null => {
-      if (this.stopping) return (stage) => `the host began stopping during ${stage}`;
+    // from, the host must not have begun stopping, and no kill may have been
+    // acknowledged on that generation meanwhile. An automatic retry must also
+    // find its generation uncancelled. The refusal names which.
+    type Stale = { cause: 'stopping' | 'replaced' | 'killed' | 'cancelled'; why: (stage: string) => string };
+    const staleReason = (): Stale | null => {
+      if (this.stopping) return { cause: 'stopping', why: (stage) => `the host began stopping during ${stage}` };
       if (this.children.get(input.name) !== existing) {
-        return (stage) => `another launch replaced it during ${stage}; reconcile before retrying`;
+        return { cause: 'replaced', why: (stage) => `another launch replaced it during ${stage}; reconcile before retrying` };
       }
-      if ((existing?.killAcks ?? 0) !== killsAtStart) return (stage) => `it was killed during ${stage}`;
+      if ((existing?.killAcks ?? 0) !== killsAtStart) return { cause: 'killed', why: (stage) => `it was killed during ${stage}` };
       if (opts.autoRestartOf && (existing !== opts.autoRestartOf || existing.killRequested)) {
-        return (stage) => `its automatic restart was cancelled during ${stage}`;
+        return { cause: 'cancelled', why: (stage) => `its automatic restart was cancelled during ${stage}` };
       }
       return null;
     };
-    const staleRefusal = (stage: string, why: (stage: string) => string): ToolResult => ({
-      success: false, isError: true, error: `Child '${input.name}' wasn't launched: ${why(stage)}.`,
+    const staleRefusal = (stage: string, stale: Stale): ToolResult => ({
+      success: false, isError: true, error: `Child '${input.name}' wasn't launched: ${stale.why(stage)}.`,
     });
     if (existing && (existing.process || existing.adopted) &&
         (existing.status === 'starting' || existing.status === 'ready')) {
@@ -1073,11 +1083,17 @@ export class FleetModule implements Module {
       };
     }
     // A manual launch or restart takes over from automatic replacement now,
-    // before its own awaits: a pending timer is cancelled (sw-ch181 I4), and
-    // one that already fired finds its generation cancelled at its next
-    // check, as a restart's does (Nell-1783's review). On a stopped
-    // generation the flag only ends automatic restarts.
+    // before its own awaits: a pending timer is cancelled, and an automatic
+    // launch already past its timer finds its generation cancelled at its
+    // next check, as it does for a restart. On a stopped generation the flag
+    // only ends automatic restarts, and the record says so, so a launch
+    // refused later leaves a record that tells the truth; a launch that
+    // succeeds replaces the record.
     if (existing && !opts.autoRestartOf) {
+      if (existing.autoRestart && existing.status === 'crashed') {
+        existing.autoRestartStopped ??= 'a manual launch or restart took over; ' +
+          'until one succeeds, nothing restarts this child';
+      }
       this.cancelAutoRestart(existing);
       existing.killRequested = true;
     }
@@ -1133,6 +1149,16 @@ export class FleetModule implements Module {
           });
           const staleAtAdoption = staleReason();
           if (staleAtAdoption) {
+            // The process was just confirmed as this child, and nothing else
+            // owns it. An acknowledged kill means it should stop, and so does
+            // a shutdown, unless the host is detaching to leave its children
+            // for a later parent. Another launch that replaced the generation
+            // owns the name, so then only let go of it.
+            if (staleAtAdoption.cause === 'killed' || (staleAtAdoption.cause === 'stopping' && !this.detachMode)) {
+              try { await this.killChild(adopted); } catch (err) {
+                console.error(`[fleet] could not stop "${input.name}" after its refused adoption: ${String(err)}`);
+              }
+            }
             adopted.socket?.destroy();
             return staleRefusal('adoption', staleAtAdoption);
           }
@@ -1374,13 +1400,17 @@ export class FleetModule implements Module {
     if (!c) return { success: false, isError: true, error: `Unknown child: ${input.name}` };
     this.cancelAutoRestart(c);
     c.killRequested = true;
-    // A launch replacing this generation, still in its awaits, sees the kill
-    // and doesn't start (sw-ch181 I13).
-    c.killAcks = (c.killAcks ?? 0) + 1;
+    // A launch replacing this generation, still in its awaits, sees each
+    // acknowledged kill and doesn't start. Only an acknowledged kill counts:
+    // one that throws (not attached, death unconfirmed) reports an error and
+    // refuses nothing. The count only grows, so a launch can never see a kill
+    // appear and then vanish.
     if (c.status === 'exited' || c.status === 'crashed') {
+      c.killAcks = (c.killAcks ?? 0) + 1;
       return { success: true, data: { name: c.name, status: c.status, note: 'already stopped' } };
     }
     await this.killChild(c);
+    c.killAcks = (c.killAcks ?? 0) + 1;
     return {
       success: true,
       data: { name: c.name, status: c.status, exitCode: c.exitCode, exitReason: c.exitReason },
@@ -1398,6 +1428,9 @@ export class FleetModule implements Module {
       autoRestart: c.autoRestart,
     };
     if (c.env !== undefined) relaunch.env = { ...c.env };
+    // Kills are counted from the restart's start, so one acknowledged while
+    // the restart waits for its own kill still refuses the relaunch.
+    const killsAtStart = c.killAcks ?? 0;
     this.cancelAutoRestart(c);
     c.killRequested = true;
     if ((c.process || c.adopted) && (c.status === 'starting' || c.status === 'ready')) {
@@ -1405,7 +1438,7 @@ export class FleetModule implements Module {
     }
     // Restart is implicitly allowed — we're using the exact recipe the child
     // was originally launched with (which already passed the allowlist check).
-    return await this.handleLaunch(relaunch, { viaAutoStart: true });
+    return await this.handleLaunch(relaunch, { viaAutoStart: true, killsAtStart });
   }
 
   /**
@@ -1628,11 +1661,13 @@ export class FleetModule implements Module {
     while (Date.now() < deadline) {
       if (child.process && (child.process.exitCode !== null || child.process.signalCode !== null)) {
         const exit = `code=${child.process.exitCode}, signal=${child.process.signalCode}`;
-        // A refused connect means the socket had appeared: the child died
-        // after binding it, and the refusal says what went wrong (sw-ch181 I18).
-        if (lastRefusal !== undefined) {
-          const refusal = lastRefusal instanceof Error ? lastRefusal.message : String(lastRefusal);
-          throw new Error(`child exited (${exit}) after its socket appeared; the last connect failed: ${refusal}`);
+        // A socket file, or a refused connect, doesn't show this child bound:
+        // the file may be one a killed predecessor left. So the message says
+        // only what is known, with the refusal when there was one.
+        if (lastRefusal !== undefined || existsSync(child.socketPath)) {
+          const refusal = lastRefusal === undefined ? ''
+            : `; the last connect failed: ${lastRefusal instanceof Error ? lastRefusal.message : String(lastRefusal)}`;
+          throw new Error(`child exited (${exit}) before the parent could connect${refusal}`);
         }
         throw new Error(`child exited (${exit}) before socket appeared`);
       }
@@ -1929,7 +1964,7 @@ export class FleetModule implements Module {
   private async failLaunch(child: FleetChild, reason: string): Promise<ToolResult> {
     const proc = child.process;
     // The exit handler records the failure beside the exit, whenever the exit
-    // is observed (sw-ch181 I10, I14).
+    // is observed.
     child.launchFailure = reason;
     if (proc && proc.exitCode === null && proc.signalCode === null) {
       // SIGKILL exits are already excluded from autoRestart. Leave the manual
@@ -1945,10 +1980,18 @@ export class FleetModule implements Module {
         this.persistState();
         return { success: false, isError: true, error: child.exitReason };
       }
+      // A signal exit is never retried, so a start the parent had to stop
+      // ends automatic restarts; say so, unless a natural exit won the race
+      // and its retry is pending.
+      if (child.autoRestart && proc.signalCode !== null && child.restartTimer === undefined) {
+        child.autoRestartStopped ??= 'its start failed and the parent stopped it, which is not retried; ' +
+          'fleet restart or launch starts it again';
+        this.persistState();
+      }
     } else if (proc && child.exitedAt === null) {
       // The process shows its exit, but its 'exit' event hasn't run: record
-      // the exit now, so the launch can't stay 'starting' (sw-ch181 I9). The
-      // event, when it comes, records the same and may still retry.
+      // the exit now, so the launch can't stay 'starting'. The event, when it
+      // comes, records the same and may still retry.
       child.exitedAt = Date.now();
       child.exitCode = proc.exitCode;
       child.status = proc.exitCode === 0 ? 'exited' : 'crashed';
