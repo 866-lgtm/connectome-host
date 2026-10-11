@@ -284,8 +284,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * carries `error`, whatever its value: a rejection with undefined is a
    * failure too. The ledger's error text is the record's own, bounded
    * (`errorText`), so a live row reads as it will once restored from the
-   * record after a restart. Each part of the ledger's row is read on its own:
-   * one that can't be read costs only itself, and the row is still recorded.
+   * record after a restart. The request's message count and the raw
+   * request's cache summary are each read on their own, so a request the
+   * record's summary can't read costs the row only those fields; the rest of
+   * the row comes from the request's model and membrane's own response.
    */
   private observeCall(
     kind: 'complete' | 'stream',
