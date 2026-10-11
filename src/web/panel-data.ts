@@ -1208,40 +1208,75 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
 }
 
 /**
- * Whether the curve's plan fits, from the framework's feasibility preview: the
- * same accounting the settings panel reports. A dry compile plots an
- * over-budget plan instead of throwing, so without this the plot of a context
- * that won't fit looks like a healthy one. null when the preview is
- * unavailable (no previewContextSettings, or a strategy without a fold plan).
+ * A feasibility preview's verdict, against the budget an operator asked for.
+ * context-manager's `budgetTokens` is the REJECTION budget, (requested -
+ * reserve) * (1 + overBudgetGraceRatio), the threshold above which a compile
+ * throws; its `fits` therefore means "would not hard-fail", not "fits the
+ * budget you asked for". The settings panel and the context curve both
+ * report this, so they can't disagree.
+ */
+function previewAccounting(result: unknown, budget: number, reserve: number) {
+  const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
+  const effectiveBudget = Math.max(0, budget - reserve);
+  const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
+  const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
+  const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
+    ? finalTokens <= r.budgetTokens
+    : undefined;
+  return {
+    requestedBudgetTokens: budget,
+    reserveForResponseTokens: reserve,
+    /** The picker's planned total, when the preview reports one. */
+    plannedTokens: Number.isFinite(finalTokens) ? finalTokens : null,
+    /** What the picker actually targets. */
+    effectiveBudgetTokens: effectiveBudget,
+    /** Hard-fail ceiling — requested minus reserve, plus grace. */
+    rejectionBudgetTokens: r.budgetTokens,
+    /** Fits the budget the operator asked for. */
+    fitsRequested,
+    /** Merely tolerated by the grace margin — over budget, but no throw. */
+    withinGrace,
+    /** Exhausted AND over the request => this budget is UNREACHABLE. */
+    unreachable: r.exhausted === true && !fitsRequested,
+  };
+}
+
+/**
+ * Whether the curve's plan fits, from the framework's feasibility preview, with
+ * the settings panel's accounting. A dry compile plots an over-budget plan
+ * instead of throwing, so without this the plot of a context that won't fit
+ * looks like a healthy one. null when the preview is unavailable (no
+ * previewContextSettings, or a strategy without a fold plan) or throws.
+ *
+ * During a paced budget descent (`transition` other than `stable`), the
+ * runtime settings report the descent's target, while compiles run at the
+ * live budget, which no accessor reports yet. The curve and its verdict are
+ * then at the target, `atDescentTarget` says so, and the page doesn't claim
+ * what the next real compile will do.
  */
 function curveVerdict(
   app: PanelAppRef,
   agentName: string,
   maxTokens: number,
   reserveForResponse: number,
+  transition: string | undefined,
 ): Record<string, unknown> | null {
   try {
     const fw = app.framework as unknown as {
       previewContextSettings?: (name: string, budget: number) => unknown;
     };
-    const r = fw.previewContextSettings?.(agentName, maxTokens) as
-      | { finalTokens?: number; budgetTokens?: number; exhausted?: boolean }
-      | null
-      | undefined;
+    const r = fw.previewContextSettings?.(agentName, maxTokens);
     if (!r) return null;
-    const effectiveBudgetTokens = Math.max(0, maxTokens - reserveForResponse);
-    const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
-    const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudgetTokens;
-    const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
-      ? finalTokens <= r.budgetTokens
-      : undefined;
+    const { plannedTokens, effectiveBudgetTokens, rejectionBudgetTokens, fitsRequested, withinGrace, unreachable } =
+      previewAccounting(r, maxTokens, reserveForResponse);
     return {
-      plannedTokens: Number.isFinite(finalTokens) ? finalTokens : null,
+      plannedTokens,
       effectiveBudgetTokens,
-      rejectionBudgetTokens: r.budgetTokens ?? null,
+      rejectionBudgetTokens: rejectionBudgetTokens ?? null,
       fitsRequested,
       withinGrace,
-      unreachable: r.exhausted === true && !fitsRequested,
+      unreachable,
+      atDescentTarget: transition !== undefined && transition !== 'stable',
     };
   } catch {
     return null;
@@ -1254,23 +1289,29 @@ function curveVerdict(
  * token estimate, the raw-history tokens it covers (leaf messages,
  * recursively through the summary tree), date span, and full text.
  *
- * The budget is the agent's live context budget (runtime settings, else the
- * recipe) with the recipe's response reserve. That's close to, but not
+ * The budget is the agent's context budget from its runtime settings (else
+ * the recipe), with the recipe's response reserve. That's close to, but not
  * exactly, what the agent's next turn compiles at: the framework's compile
- * budget can also hold back room for a pending tool batch.
+ * budget can also hold back room for a pending tool batch, and during a paced
+ * descent the runtime settings report the descent's target while compiles
+ * run at the live budget (the verdict's atDescentTarget says so).
+ *
+ * A render runs two dry selects, the curve's compile and the verdict's
+ * preview, and each one pauses the agent while it runs. That's the intended
+ * cost of a debug page opened on demand, so the settings preview's cooldown
+ * isn't applied here.
  *
  * The compile is a dry run: shown, never sent, so its select commits no fold
  * resolutions and queues no compression from the plan. Once context-manager's
  * thinking binding (#160) is released, a committed compile that's never sent
  * would also fence the replies the resident is streaming; a dry run won't.
- * With context-manager 0.13 a dry compile isn't free of every effect:
- * - the adaptive select still records its estimate and arms calibration, and
- *   overwrites the frontier, the transition status and the render stats that
- *   the Context panel reads, until the next real compile (context-manager
- *   #161 restores them after a dry select);
- * - compile() releases a compression hold past its deadline before selecting,
- *   which can start compression work a moment early (#161 will skip that for
- *   a dry compile).
+ * With context-manager 0.13 a dry compile isn't free of every effect: the
+ * adaptive select still records its estimate and arms calibration, and
+ * overwrites the frontier, the transition status and the render stats that
+ * the Context panel reads, until the next real compile (context-manager #161
+ * restores them after a dry select). Like any hold query, a dry compile also
+ * releases a compression hold whose deadline has passed, never one that
+ * hasn't: that release, and the work it sets off, was already due.
  *
  * A plan over budget at the plan check is plotted rather than thrown, and the
  * response carries a verdict from the framework's feasibility preview, the
@@ -1288,11 +1329,14 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // ever been changed at runtime. Fall back to the recipe only if the live
   // read is unavailable.
   let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+  let transition: string | undefined;
   try {
-    const live = (app.framework as unknown as {
-      getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number };
-    }).getAgentRuntimeSettings?.(agentName)?.contextBudgetTokens;
+    const settings = (app.framework as unknown as {
+      getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number; transition?: string };
+    }).getAgentRuntimeSettings?.(agentName);
+    const live = settings?.contextBudgetTokens;
     if (typeof live === 'number' && live > 0) maxTokens = live;
+    transition = settings?.transition;
   } catch { /* keep the recipe fallback */ }
   const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
   // A dry run: this compile is shown, never sent. Committing would rewrite
@@ -1301,7 +1345,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // case), and once thinking binding lands it would fence the replies the
   // resident is streaming (Ada-1017, context-manager #155).
   const compiled = await cm.compile({ maxTokens, reserveForResponse }, undefined, { dryRun: true });
-  const verdict = curveVerdict(app, agentName, maxTokens, reserveForResponse);
+  const verdict = curveVerdict(app, agentName, maxTokens, reserveForResponse, transition);
 
   // Curve inspection only needs text and source metadata. Resolving every
   // historical blob here re-inlines all base64 media and can expand a
@@ -1516,32 +1560,12 @@ export function runContextPreview(
     // REJECTION budget: (requested - reserve) * (1 + overBudgetGraceRatio),
     // i.e. the threshold above which a compile throws. Its `fits` therefore
     // means "would not hard-fail", NOT "fits the budget you asked for".
-    const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
     const reserve = app.recipe.agent.maxTokens ?? 16_384;
-    const effectiveBudget = Math.max(0, budget - reserve);
-    const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
-    const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
-    const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
-      ? finalTokens <= r.budgetTokens
-      : undefined;
     return {
       agent: agentName,
       budget,
       ...(overrides as object),
-      accounting: {
-        requestedBudgetTokens: budget,
-        reserveForResponseTokens: reserve,
-        /** What the picker actually targets. */
-        effectiveBudgetTokens: effectiveBudget,
-        /** Hard-fail ceiling — requested minus reserve, plus grace. */
-        rejectionBudgetTokens: r.budgetTokens,
-        /** Fits the budget the operator asked for. */
-        fitsRequested,
-        /** Merely tolerated by the grace margin — over budget, but no throw. */
-        withinGrace,
-        /** Exhausted AND over the request => this budget is UNREACHABLE. */
-        unreachable: r.exhausted === true && !fitsRequested,
-      },
+      accounting: previewAccounting(result, budget, reserve),
       /** How long the agent was blocked, so the operator sees the real cost. */
       elapsedMs: Date.now() - startedAt,
       preview: wantRender ? projectDryEntries(result) : result,

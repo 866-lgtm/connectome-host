@@ -131,9 +131,12 @@ document.getElementById('meta').textContent =
   'Z · budget ' + Math.round(payload.budget.maxTokens / 1000) + 'k (hard ' +
   Math.round((payload.budget.maxTokens - payload.budget.reserveForResponse) / 1000) + 'k)' +
   // A dry compile plots a plan that won't fit instead of failing, so say so.
-  (V && V.fitsRequested === false
-    ? ' · OVER BUDGET: plan ' + Math.round(V.plannedTokens / 1000) + 'k > ' + Math.round(V.effectiveBudgetTokens / 1000) + 'k' +
-      (V.withinGrace === false ? ', past the grace margin: the next real compile will refuse it' : ', within the grace margin')
+  (V && V.fitsRequested === false && typeof V.plannedTokens === 'number'
+    ? ' · OVER BUDGET' + (V.atDescentTarget ? ' at the descent\'s target' : '') + ': plan ' +
+      Math.round(V.plannedTokens / 1000) + 'k > ' + Math.round(V.effectiveBudgetTokens / 1000) + 'k' +
+      (V.atDescentTarget ? ' (compiles run at the live budget until the descent completes)'
+        : V.withinGrace === false ? ', past the grace margin: the next real compile will refuse it'
+        : V.withinGrace === true ? ', within the grace margin' : '')
     : '');
 
 let cx = 0, cy = 0;

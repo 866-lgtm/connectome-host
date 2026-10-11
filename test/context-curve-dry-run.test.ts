@@ -59,6 +59,7 @@ describe('the context curve', () => {
       const curve = await buildContextCurve(app, 'scout');
       expect(curve.verdict).toEqual({
         plannedTokens: finalTokens, effectiveBudgetTokens: 142_000, rejectionBudgetTokens: 155_000, ...expected,
+        atDescentTarget: false,
       });
     }
     // Asked at the curve's own budget, the live one.
@@ -67,6 +68,17 @@ describe('the context curve', () => {
     for (const preview of [() => { throw new Error('zz'); }, () => null]) {
       const curve = await buildContextCurve(appWith(compile, preview), 'scout');
       expect(curve.verdict).toBeNull();
+    }
+  });
+
+  test('during a paced descent the verdict says it is at the descent\'s target (Ada-1017, room-543 #70622)', async () => {
+    const compile = async () => ({ messages: [] });
+    for (const [transition, atTarget] of [['converging', true], ['blocked', true], ['stable', false]] as const) {
+      const app = appWith(compile, () => ({ finalTokens: 150_000, budgetTokens: 155_000, exhausted: false }));
+      (app.framework as unknown as { getAgentRuntimeSettings: () => unknown }).getAgentRuntimeSettings =
+        () => ({ contextBudgetTokens: 150_000, transition });
+      const curve = await buildContextCurve(app, 'scout');
+      expect((curve.verdict as { atDescentTarget: boolean }).atDescentTarget).toBe(atTarget);
     }
   });
 });
