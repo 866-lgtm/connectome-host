@@ -232,6 +232,9 @@ describe('mcpl_deploy', () => {
       [{ env: '' }, "its env isn't a map of names to values"],
       [{ toolPrefix: [] }, "its toolPrefix isn't text"],
       [{ enabledTools: '' }, "its enabledTools isn't a list of names"],
+      // An empty name matches nothing: an allow-list of one is deny-all.
+      [{ enabledTools: [''] }, 'its enabledTools holds an empty name, which matches nothing'],
+      [{ disabledFeatureSets: ['a.b', '  '] }, 'its disabledFeatureSets holds an empty name, which matches nothing'],
     ];
     for (const [fields, problem] of cases) {
       const result = await call(mod, 'mcpl_deploy', { id: 'odd', command: 'node', ...fields });
@@ -246,11 +249,37 @@ describe('mcpl_deploy', () => {
     const mod = makeModule(stub);
     const result = await call(mod, 'mcpl_deploy', {
       id: 'plain', command: 'node', args: ['--port', 3101, true], env: null,
-      token: '', access: '', toolPrefix: '', url: '', enabledTools: [], disabledFeatureSets: [],
+      token: '', access: '   ', toolPrefix: '  ', url: '', enabledTools: [], disabledFeatureSets: [],
     });
     expect(result.success).toBe(true);
-    // An empty toolPrefix would have been kept by the framework in place of its default prefix.
+    // An empty or blank toolPrefix would have been kept by the framework in place of its default prefix.
     expect(readAgentOverlay(overlayPath).plain).toEqual({ command: 'node', args: ['--port', '3101', 'true'] });
+  });
+
+  test('saves what it is given of each kind: reconnect false, and the four name lists with numbers as text', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    const result = await call(mod, 'mcpl_deploy', {
+      id: 'shaped', url: 'ws://localhost:3101', reconnect: false,
+      enabledFeatureSets: ['chat.*', 7], disabledFeatureSets: ['chat.admin'], enabledTools: ['say', true], disabledTools: ['*'],
+    });
+    expect(result.success).toBe(true);
+    expect(readAgentOverlay(overlayPath).shaped).toEqual({
+      url: 'ws://localhost:3101', transport: 'websocket', reconnect: false,
+      enabledFeatureSets: ['chat.*', '7'], disabledFeatureSets: ['chat.admin'], enabledTools: ['say', 'true'], disabledTools: ['*'],
+    });
+  });
+
+  test("names a host-managed access grant only where there's an identity, saving it trimmed", async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    const refused = await call(mod, 'mcpl_deploy', { id: 'world', url: 'ws://localhost:3101', access: 'eidoverse' });
+    expect(refused.error).toStartWith('`access` names a host-managed access grant, but this deployment has no identity configured');
+    expect(calls).toEqual([]);
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+    mod.setIdentity({ accessFor: async () => 'grant-token' });
+    expect((await call(mod, 'mcpl_deploy', { id: 'world', url: 'ws://localhost:3101', access: '  eidoverse  ' })).success).toBe(true);
+    expect(readAgentOverlay(overlayPath).world).toEqual({ url: 'ws://localhost:3101', transport: 'websocket', access: 'eidoverse' });
   });
 
   test('refuses the id __proto__, which would never be saved, and takes any other name as an id', async () => {
@@ -382,19 +411,58 @@ describe('mcpl_unload', () => {
       async () => { throw new Error('stuck'); };
     for (const id of ['discord', 'mytool']) {
       expect((await call(mod, 'mcpl_unload', { id })).error)
-        .toBe(`Server "${id}" couldn't be disconnected: stuck. It may still be loaded in this session, and your overlay is unchanged.`);
+        .toBe(`Server "${id}" couldn't be disconnected: stuck. It may still be loaded in this session, and this unload changed nothing in your overlay.`);
     }
     (stub as unknown as { disconnectMcplServer: () => Promise<void> }).disconnectMcplServer =
       async () => { throw 'socket wedged'; };
     expect((await call(mod, 'mcpl_unload', { id: 'discord', persist: false })).error)
-      .toBe('Server "discord" couldn\'t be disconnected: socket wedged. It may still be loaded in this session, and your overlay is unchanged.');
+      .toBe('Server "discord" couldn\'t be disconnected: socket wedged. It may still be loaded in this session, and this unload changed nothing in your overlay.');
     expect(readFileSync(overlayPath, 'utf-8')).toBe(before);
+  });
+
+  // Once the server is gone, a failure to record the unload says so, and an
+  // operator's server that isn't loaded can be unloaded again to record it.
+  test('an overlay that fails after the disconnect says the server is gone and nothing was recorded, and a retry records it', async () => {
+    const { stub, servers } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'discord', command: 'node' });
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'discord', command: 'node' }]);
+    const disconnect = (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer;
+    (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer = async (id) => {
+      await disconnect(id);
+      writeFileSync(overlayPath, '{ not json');
+    };
+    const failed = await call(mod, 'mcpl_unload', { id: 'discord' });
+    expect(failed.error).toStartWith(
+      'Unloaded server "discord" — its tools are gone from your toolset. But your overlay couldn\'t be updated (the agent overlay ',
+    );
+    expect(failed.error).toEndWith(
+      'so nothing was recorded: the operator\'s definition loads it again at the next host start. ' +
+      'mcpl_unload "discord" again records it once the file can be read and written.',
+    );
+    expect(servers.has('discord')).toBe(false);
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: {} }));
+    expect((await call(mod, 'mcpl_unload', { id: 'discord' })).data).toBe(
+      'Server "discord" wasn\'t loaded in this session. Tombstoned in your overlay — it stays unloaded across host restarts; ' +
+      'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file loads the ' +
+      'operator\'s definition again.',
+    );
+    expect(readAgentOverlay(overlayPath).discord).toEqual({ disabled: true });
+  });
+
+  test('refuses the id __proto__, whose tombstone would never be saved', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: '__proto__', command: 'node' }]);
+    expect((await call(mod, 'mcpl_unload', { id: '__proto__' })).error)
+      .toBe("`id` can't be __proto__, which JavaScript reads as an object's prototype rather than a name.");
   });
 
   test('an id the overlay alone names is not disconnected: its entry is removed, or its tombstone kept', async () => {
     const { stub, calls } = makeStubFramework();
-    (stub as unknown as { disconnectMcplServer: () => Promise<void> }).disconnectMcplServer =
-      async () => { throw new Error('MCPL subsystem is not initialized'); };
+    (stub as unknown as { disconnectMcplServer: (id: string) => Promise<void> }).disconnectMcplServer =
+      async (id) => { calls.push(`disconnect:${id}`); throw new Error('MCPL subsystem is not initialized'); };
     saveAgentOverlay(overlayPath, { stale: { command: 'node' }, gone: { disabled: true } });
     const mod = makeModule(stub);
     mod.setOperatorServers([{ id: 'gone', command: 'node' }]);
@@ -431,6 +499,8 @@ describe('mcpl_unload', () => {
     mod.setOperatorServers([{ id: 'discord', command: 'node' }, { id: 'heartbeat', command: 'node' }]);
     await call(mod, 'mcpl_deploy', { id: 'mine', command: 'bun' });
     saveAgentOverlay(overlayPath, { ...readAgentOverlay(overlayPath), heartbeat: { disabled: true } });
+    // An operator id the agent's entry replaces loads that entry, not the operator's definition.
+    mod.setOperatorServers([{ id: 'discord', command: 'node' }, { id: 'heartbeat', command: 'node' }, { id: 'mine', command: 'node' }]);
     const unload = async (id: string) => String((await call(mod, 'mcpl_unload', { id, persist: false })).data);
     const head = (id: string) => `Unloaded server "${id}" — its tools are gone from your toolset. Session-only: `;
     expect(await unload('discord')).toBe(`${head('discord')}the operator's definition loads it again at the next host start.`);

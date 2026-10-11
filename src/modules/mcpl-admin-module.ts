@@ -121,7 +121,7 @@ export class McplAdminModule implements Module {
    * can't name host variables, so what it lacks the server runs without.
    */
   private replacement(id: string, overlay: Record<string, AgentOverlayEntry>): { lost: string | null } | null {
-    const entry = overlay[id];
+    const entry = entryOf(overlay, id);
     const operator = this.operatorServers.get(id);
     if (!operator || !overlayEntryReplaces(entry)) return null;
     return { lost: lostByReplacement(operator, entry) };
@@ -386,7 +386,7 @@ export class McplAdminModule implements Module {
       const overlaySource = replacement
         ? `agent-overlay (replaces the operator's definition${replacement.lost ? `; lacks its ${replacement.lost}` : ''})`
         : 'agent-overlay';
-      const source = overlayEntryReplaces(overlay[s.id])
+      const source = overlayEntryReplaces(entryOf(overlay, s.id))
         ? overlaySource
         : Object.hasOwn(fileServers, s.id) ? 'file/recipe' : 'recipe';
       // The command, else the url, as main labelled it. The framework's status
@@ -455,17 +455,18 @@ export class McplAdminModule implements Module {
     // below, rather than dropped or coerced into shape first, so a wrong kind
     // is refused instead of vanishing. A field is unspecified when it's left
     // out, null, or what strict function calling sends for its own kind when
-    // every field is required: "" for a text field, [] for a list (env
-    // included, as before). Anything else is given, so "" for a list or for
-    // reconnect, which has no unspecified value, is a wrong kind, not a
-    // default. A persisted empty enabledFeatureSets would be deny-all under
-    // the §5.3 pin (Mica's silently eventless eidoverse, 2026-08-04);
-    // deny-all is disabledTools: ["*"] for tools, and for feature sets, where
-    // `*` matches one dot-separated segment, a pattern per depth (see
-    // resolveOverlayEntry). Numbers and true/false in a list are read as
-    // their text, as the boot reads args.
+    // every field is required: "" (or only spaces) for a text field, [] for
+    // a list (env included, as before). Anything else is given, so "" for a
+    // list or for reconnect, which has no unspecified value, is a wrong kind,
+    // not a default. A persisted empty enabledFeatureSets would be deny-all
+    // under the §5.3 pin (Mica's silently eventless eidoverse, 2026-08-04),
+    // and so would a name list holding an empty name, which the strict
+    // reading refuses; deny-all is disabledTools: ["*"] for tools, and for
+    // feature sets, where `*` matches one dot-separated segment, a pattern
+    // per depth (see resolveOverlayEntry). Numbers and true/false in a list
+    // are read as their text, as the boot reads args.
     const given = (v: unknown): boolean => v !== undefined && v !== null;
-    const givenText = (v: unknown): boolean => given(v) && v !== '';
+    const givenText = (v: unknown): boolean => given(v) && !(typeof v === 'string' && v.trim() === '');
     const givenList = (v: unknown): boolean => given(v) && !(Array.isArray(v) && v.length === 0);
     const list = (v: unknown): unknown =>
       Array.isArray(v) ? v.map((x) => (typeof x === 'number' || typeof x === 'boolean' ? String(x) : x)) : v;
@@ -613,13 +614,20 @@ export class McplAdminModule implements Module {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
     if (!id) return fail('mcpl_unload requires `id`.');
+    // As for mcpl_deploy: `overlay["__proto__"] = …` would set the prototype,
+    // so a tombstone for it would never be saved.
+    if (id === '__proto__') return fail('`id` can\'t be __proto__, which JavaScript reads as an object\'s prototype rather than a name.');
     const persist = input.persist !== false;
 
     const known = framework.listMcplServers().some(s => s.id === id);
+    const operator = this.operatorServers.has(id);
     // Read before anything changes: a file the boot would stop on refuses
-    // the unload here, with the server still loaded.
+    // the unload here, with the server still loaded. An operator's server
+    // that isn't loaded can still be unloaded, so that it stays unloaded at
+    // the next start: one that failed to start, or one whose earlier unload
+    // disconnected it but couldn't save.
     const overlay = readAgentOverlay(this.overlayPath);
-    if (!known && entryOf(overlay, id) === undefined) {
+    if (!known && !operator && entryOf(overlay, id) === undefined) {
       return fail(`Server "${id}" is not loaded and not in your overlay.`);
     }
 
@@ -632,37 +640,45 @@ export class McplAdminModule implements Module {
       } catch (error) {
         return fail(
           `Server "${id}" couldn't be disconnected: ${error instanceof Error ? error.message : String(error)}. ` +
-          'It may still be loaded in this session, and your overlay is unchanged.',
+          'It may still be loaded in this session, and this unload changed nothing in your overlay.',
         );
       }
     }
     const head = known
       ? `Unloaded server "${id}" — its tools are gone from your toolset.`
       : `Server "${id}" wasn't loaded in this session.`;
+    if (!persist) return ok(`${head} Session-only: ${this.nextStart(id, overlay)}`);
 
     // Read again after the disconnect and saved with nothing awaited between,
     // so a write for another id that landed meanwhile (its deploy, say) is
-    // kept. No call for this id can land meanwhile (forServer).
-    const current = known ? readAgentOverlay(this.overlayPath) : overlay;
-    if (!persist) return ok(`${head} Session-only: ${this.nextStart(id, current)}`);
-    const entry = entryOf(current, id);
-    // An agent-deployed entry is removed, and so is a malformed one for an
-    // id the operator doesn't define, which loads nothing. Otherwise a
-    // tombstone keeps it unloaded: the operator's server, a malformed entry
-    // the boot would skip for the operator's, or a server whose definition
-    // this module can't see.
-    const operator = this.operatorServers.has(id);
-    if (overlayEntryReplaces(entry) || (entry !== undefined && !operator && overlayEntryProblem(entry) !== null)) {
-      const restores = operator && overlayEntryReplaces(entry);
-      delete current[id];
+    // kept. No call for this id can land meanwhile (forServer). The server
+    // is already gone if this fails, so the receipt says so, and what the
+    // next start loads; an unload of it again records it.
+    try {
+      const current = known ? readAgentOverlay(this.overlayPath) : overlay;
+      const entry = entryOf(current, id);
+      // An agent-deployed entry is removed, and so is a malformed one for an
+      // id the operator doesn't define, which loads nothing. Otherwise a
+      // tombstone keeps it unloaded: the operator's server, a malformed entry
+      // the boot would skip for the operator's, or a server whose definition
+      // this module can't see.
+      if (overlayEntryReplaces(entry) || (entry !== undefined && !operator && overlayEntryProblem(entry) !== null)) {
+        const restores = operator && overlayEntryReplaces(entry);
+        delete current[id];
+        saveAgentOverlay(this.overlayPath, current);
+        return ok(`${head} ${restores
+          ? `Removed from your agent overlay; the operator's definition of "${id}" loads again at the next host start.`
+          : 'Removed from your agent overlay.'}`);
+      }
+      current[id] = { disabled: true };
       saveAgentOverlay(this.overlayPath, current);
-      return ok(`${head} ${restores
-        ? `Removed from your agent overlay; the operator's definition of "${id}" loads again at the next host start.`
-        : 'Removed from your agent overlay.'}`);
+      return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
+    } catch (error) {
+      return fail(
+        `${head} But your overlay couldn't be updated (${error instanceof Error ? error.message : String(error)}), ` +
+        `so nothing was recorded: ${this.nextStart(id, overlay)} mcpl_unload "${id}" again records it once the file can be read and written.`,
+      );
     }
-    current[id] = { disabled: true };
-    saveAgentOverlay(this.overlayPath, current);
-    return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
   }
 }
 
