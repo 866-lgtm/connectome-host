@@ -1339,9 +1339,10 @@ export class WebUiModule implements Module {
 
   /**
    * Context curve (GET /debug/context/curve[?agent=<name>]): per-entry
-   * provenance of the live compiled window. Same side-effect class as
-   * previewActivation / makeup: the compile may commit resolution updates,
-   * exactly as the agent's own next turn would. No inference, no writes.
+   * provenance of the live compiled window, with a feasibility verdict. The
+   * compile is a dry run, so it commits no fold resolutions; its remaining
+   * effects with context-manager 0.13 are listed on buildContextCurve. No
+   * inference, no message writes.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
     const app = this.panelApp();
