@@ -297,17 +297,19 @@ const PROSE_ROUTING_EFFECT: Record<ProseRouting, string> = {
   disabled: 'plain text is never published, even with a prefix; only explicit send tools reach a channel',
 };
 
+/** How long a launch waits for a concurrency slot before it ends with an error. */
+const SLOT_TIMEOUT_MS = 120_000;
+
 /**
  * What a forked or spawned stream is launched with, resolved once at the
- * call. The stream is created from exactly these inputs, and both the
+ * call. The stream is created from these inputs, except its tool rules,
+ * which filterToolNames applies when the stream is created, as it always
+ * has, so a requested tool registered during a slot wait is usable. Both the
  * caller's receipt and the stream's own first context render them, so the
  * two can't describe different launches. The parent's values are as they
  * were at the call; a value the parent doesn't report stays undefined and
  * is said to be uncompared, never assumed equal.
  */
-/** How long a launch waits for a concurrency slot before it ends with an error. */
-const SLOT_TIMEOUT_MS = 120_000;
-
 export interface SubagentLaunch {
   kind: 'fork' | 'spawn';
   name: string;
@@ -415,8 +417,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   } else if (fork) {
     lines.push(
       `- Lineage: forked from stream "${p.stream}"; depth ${launch.depth} of ${launch.maxDepth}. ` +
-        "A fork inherits the parent's compiled context: through this call's exchange if the call is still " +
-        'in that context when the fork starts, and otherwise all of it as it is then.',
+        "If that stream is still registered when the fork starts, the fork inherits its compiled context: " +
+        "through this call's exchange if the call is in that context then, and otherwise all of it as it is then. " +
+        'If it is gone by then, the fork inherits nothing.',
     );
   } else {
     lines.push(
@@ -447,8 +450,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   if (p) {
     const same = launch.model === p.model;
     settings.push({ name: 'model', same, line: `- Model: ${launch.model}${same ? `, the same as ${them}'s` : ` (${them}'s: ${p.model})`}.` });
-    // One membrane adapter serves every stream in the process.
-    settings.push({ name: 'provider connection', same: true, line: `- Provider: ${launch.provider ?? 'not stated by the host'}, ${them}'s own connection.` });
+    // One membrane adapter serves every stream in the process, so the
+    // connection is the same by construction (sw-ch213 I3, I27).
+    settings.push({ name: 'provider connection', same: true, line: `- Provider: ${launch.provider ?? 'not stated by the host'}, on the same connection as ${them}'s.` });
   } else {
     settings.push({ name: 'model', line: `- Model: ${launch.model}.` });
     settings.push({ name: 'provider connection', line: `- Provider: ${launch.provider ?? 'not stated by the host'}.` });
@@ -456,7 +460,8 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
 
   const promptText: Record<SubagentLaunch['systemPromptSource'], string> = {
     parent: "- System prompt: the parent's.",
-    override: '- System prompt: overridden for this fork.',
+    // A fork with no parent has no prompt to override (sw-ch213 I34).
+    override: p ? '- System prompt: overridden for this fork.' : '- System prompt: set for this fork.',
     caller: '- System prompt: supplied by the caller for this spawn.',
     default: '- System prompt: the default research-assistant prompt.',
   };
@@ -524,12 +529,24 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     // What the list grants, not the list: subagent--return named once, and
     // a name the process doesn't offer here named as dropped.
     const granted = launch.tools.granted ?? [...new Set([...requested, 'subagent--return'])];
-    const dropped = [...new Set(requested)].filter((name) => !granted.includes(name));
+    // Explicit prose routing shows prose_help whatever the list says
+    // (agentToolSurface), so a listed one isn't dropped (sw-ch213 I7).
+    const explicitHelp = launch.proseRouting === 'explicit';
+    const dropped = [...new Set(requested)].filter((name) => !granted.includes(name) && !(explicitHelp && name === 'prose_help'));
+    // At the depth limit, filterToolNames removes every subagent tool the
+    // process offers, so those are dropped by the depth (sw-ch213 I12).
+    const byDepth = launch.tools.depthLimited ? dropped.filter((name) => name.startsWith('subagent--')) : [];
+    const notOffered = dropped.filter((name) => !byDepth.includes(name));
+    // The grant is the board at the call; the stream applies the caller's
+    // list when it's created, and its own Tools line says what it's shown
+    // then (sw-ch213 I2).
     toolRule = granted.length === 1
       ? `only subagent--return${requested.length === 0 ? ': the caller listed no tools' : ''}`
-      : `only these ${granted.length} from the caller's list: ${joinAll(granted)}, subagent--return among them`;
-    if (dropped.length > 0) toolRule += `; the caller also listed ${joinAll(dropped)}, which ${dropped.length === 1 ? 'isn\'t' : 'aren\'t'} offered to it at the call`;
+      : `only these ${granted.length} from the caller's list, as the process offered them at the call: ${joinAll(granted)}, subagent--return among them`;
+    if (notOffered.length > 0) toolRule += `; the caller also listed ${joinAll(notOffered)}, which ${notOffered.length === 1 ? 'isn\'t' : 'aren\'t'} offered to it at the call`;
+    if (byDepth.length > 0) toolRule += `; it also listed ${joinAll(byDepth)}, which this depth removes`;
     if (launch.tools.depthLimited) toolRule += ', and none of the other subagent tools at this depth';
+    if (explicitHelp && !granted.includes('prose_help')) toolRule += '; explicit prose routing shows it prose_help too, whatever the list says';
   } else if (launch.tools.depthLimited) {
     toolRule = 'every tool the process offers except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
   } else {
@@ -539,7 +556,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     const same = requested === undefined && !launch.tools.depthLimited && p.allowedTools === 'all';
     const theirs = p.allowedTools === 'all'
       ? `${them} has no restriction`
-      : `${them} is restricted to ${p.allowedTools.length}: ${joinAll(p.allowedTools)}`;
+      : p.allowedTools.length === 0
+        ? `${them} is restricted to no tools` // sw-ch213 I22
+        : `${them} is restricted to ${p.allowedTools.length}: ${joinAll(p.allowedTools)}`;
     settings.push({ name: 'tool rules', same, line: `- Tool rules: ${toolRule}${same ? `, the same as ${them}` : `; ${theirs}`}.` });
   } else {
     settings.push({ name: 'tool rules', line: `- Tool rules: ${toolRule}.` });
@@ -562,6 +581,14 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     lines.push(`- Against the parent at the call: ${parts.join(' ')}`);
   }
   for (const x of settings) lines.push(x.line);
+  // The stream's agent is built from the launch alone (ephemeralAgentConfig),
+  // so the agent-level settings a host can give an agent aren't carried from
+  // the parent, and the framework's defaults apply (sw-ch213 I8).
+  lines.push(
+    '- Not set for this stream: thinking, temperature, prompt caching and its TTL, provider parameters such as ' +
+      `reasoning effort, refusal handling and the tool-result guard${p ? `, whatever ${them} uses` : ''}; ` +
+      "the framework's defaults apply.",
+  );
   return lines.join('\n');
 }
 
@@ -585,16 +612,22 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
     // assistant message; that message and its result message with their
     // other blocks; nothing else after the call.
     lines.push(
+      // As the parent's compiled context had them when this stream started,
+      // which for a queued fork is after the slot wait; addMsg drops an exact
+      // repeat, as it always has (sw-ch213 I10, I15).
       "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
-        "are kept as they were. The call's assistant message and its result message keep their other blocks, " +
+        'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
+        "message is dropped. The call's assistant message and its result message keep their other blocks, " +
         "with sibling fork calls and their results removed and this call's result rewritten as this message. " +
         'No other message after the call is included.',
     );
   } else if (inh.kind === 'compiled-at-start') {
     lines.push(
       "- Inherited: the parent's whole compiled context as it was when this stream started, because " +
-        (inh.reason === 'no-call-id' ? 'the fork call had no id to cut at' : 'the fork call was no longer in that context') +
-        '. It can include turns that came after the call.',
+        // A sync fork's call, or one whose round isn't stored yet, was never
+        // in that context (sw-ch213 I16).
+        (inh.reason === 'no-call-id' ? 'the fork call had no id to cut at' : "the fork call wasn't in that context") +
+        '. It can include turns that came after the call. An exact repeat of an earlier message is dropped.',
     );
   } else if (inh.reason === 'parent-gone') {
     lines.push(`- Inherited: nothing; the parent stream "${p?.stream}" was no longer registered when this stream started.`);
@@ -2443,6 +2476,10 @@ export class SubagentModule implements Module {
       // found no parent at the call stays without one: a parent registered
       // while it waited for a slot isn't used, since the receipt and the
       // stream's orientation were resolved at the call and would be false.
+      // A parent found at the call is looked up by name: an ephemeral
+      // parent's name can't be taken again (createEphemeralAgent refuses a
+      // used name), and a resident registered again under its name is the
+      // same resident (sw-ch213 I28).
       const parentAgent = launch.parent ? framework.getAgent(launch.parent.stream) : null;
       let lastError: Error | null = null;
 

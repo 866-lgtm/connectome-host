@@ -31,6 +31,13 @@ interface Run {
   proseRouting: string;
   maxTokens: number;
   systemPrompt: string;
+  /** The model, stream budget, strategy message cap and tool rules it was
+   *  created with (sw-ch213 I14). The strategy's windows have no public
+   *  reader. */
+  model: string;
+  maxStreamTokens: number;
+  maxMessageTokens: number | undefined;
+  allowedTools: 'all' | string[];
   /** Text of the child's last message: the fork's tool_result, or the
    *  spawn's / parentless fork's task message. */
   firstContext: string;
@@ -105,7 +112,11 @@ async function makeHarness(opts: {
   const holds: Array<() => void> = [];
   let holdNext: (() => void) | null = null;
   fw.runEphemeralToCompletion = async (agent: unknown, cm: unknown) => {
-    const a = agent as { name: string; proseRouting: string; maxTokens: number; systemPrompt: string };
+    const a = agent as {
+      name: string; proseRouting: string; maxTokens: number; systemPrompt: string;
+      model: string; maxStreamTokens: number; allowedTools: 'all' | string[];
+      getContextManager(): { getStrategy(): unknown };
+    };
     fw.agents.set(a.name, agent); // what the real run does at its start
     try {
       const { messages } = (cm as { queryMessages(q: object): { messages: Array<{ content: unknown }> } })
@@ -115,6 +126,10 @@ async function makeHarness(opts: {
         proseRouting: a.proseRouting,
         maxTokens: a.maxTokens,
         systemPrompt: a.systemPrompt,
+        model: a.model,
+        maxStreamTokens: a.maxStreamTokens,
+        maxMessageTokens: (a.getContextManager().getStrategy() as { maxMessageTokens?: number }).maxMessageTokens,
+        allowedTools: a.allowedTools,
         firstContext: textOf(messages[messages.length - 1]?.content),
         allText: messages.map((m) => textOf(m.content)).join('\n'),
         surface: framework.listToolClasses(a.name).map((t) => t.tool),
@@ -167,7 +182,8 @@ function seedForkCall(framework: AgentFramework, id: string, input: Record<strin
 /** The structural path's inheritance, as materialiseStructuralFork does it. */
 const CUT_AT_EXCHANGE =
   "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
-  "are kept as they were. The call's assistant message and its result message keep their other blocks, " +
+  'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
+  "message is dropped. The call's assistant message and its result message keep their other blocks, " +
   "with sibling fork calls and their results removed and this call's result rewritten as this message. " +
   'No other message after the call is included.';
 
@@ -216,7 +232,7 @@ describe('fork orientation', () => {
       const block = launchBlock(receipt);
       expect(block).toContain("Launch of fork 'scout', as resolved at its subagent--fork call (toolu_fork_1):");
       // The receipt describes the intended lineage, not which path will run.
-      expect(block).toContain('- Lineage: forked from stream "parent"; depth 1 of 3. A fork inherits the parent\'s compiled context: through this call\'s exchange if the call is still in that context when the fork starts, and otherwise all of it as it is then.');
+      expect(block).toContain('- Lineage: forked from stream "parent"; depth 1 of 3. If that stream is still registered when the fork starts, the fork inherits its compiled context: through this call\'s exchange if the call is in that context then, and otherwise all of it as it is then. If it is gone by then, the fork inherits nothing.');
       // The harness parent runs passthrough: no windows or cap to compare.
       expect(line(block, '- Against the parent at the call')).toBe(
         '- Against the parent at the call: Differs in model, strategy type and stream budget. ' +
@@ -225,7 +241,7 @@ describe('fork orientation', () => {
         'and context budget (set when the stream starts).',
       );
       expect(block).toContain("- Model: mock-alt (the parent's: mock).");
-      expect(block).toContain("- Provider: mock, the parent's own connection.");
+      expect(block).toContain("- Provider: mock, on the same connection as the parent's.");
       expect(block).toContain("- Recent window: 80,000 tokens (the parent's isn't reported).");
       expect(block).toContain("- Output limit: 256 tokens, the same as the parent's.");
       // The harness parent sets no mode, so it runs the framework's default.
@@ -367,12 +383,14 @@ describe('fork orientation', () => {
       expect(start).toContain(`- Tools: ${run.surface.length} available to this stream: `);
       for (const name of run.surface) expect(start).toContain(name);
 
-      // Its own prompt overrides the default.
+      // Its own prompt replaces the default; with no parent there's no prompt
+      // it overrides (sw-ch213 I34).
       const own = await h.subagent.handleToolCall(
         call('fork', 'toolu_fork_5b', { name: 'stray', task: 'list them again', systemPrompt: 'you list files' }, null),
       );
       await h.asyncPromise('stray');
-      expect(launchBlock(own.data as string)).toContain('- System prompt: overridden for this fork.');
+      expect(launchBlock(own.data as string)).toContain('- System prompt: set for this fork.');
+      expect(launchBlock(own.data as string)).not.toContain('overridden');
       expect(h.runs.find((r) => r.name.startsWith('stray-'))!.systemPrompt).toBe('you list files');
     } finally {
       await h.cleanup();
@@ -432,13 +450,16 @@ describe('fork orientation', () => {
       expect(data.launch).toContain("Launch of fork 'quick'");
       expect(h.runs[0]!.firstContext).toContain(data.launch);
 
-      void h.holdNextRun();
+      const held = h.holdNextRun();
       const slowInput = { name: 'slow', task: 'a long thing', sync: true, timeoutMs: 50 };
       seedForkCall(h.framework, 'toolu_fork_7', slowInput);
       const detached = await h.subagent.handleToolCall(call('fork', 'toolu_fork_7', slowInput));
       expect(detached.success).toBe(true);
       const text = detached.data as string;
       expect(text).toStartWith("Subagent 'slow' moved to background.");
+      // The detach fires on its timer, whether or not the run has reached the
+      // stub yet, so wait for the run itself (sw-ch213 I9).
+      await held;
       expect(h.runs[1]!.firstContext).toContain(launchBlock(text));
       h.releaseHeld();
       await h.asyncPromise('slow');
@@ -499,8 +520,8 @@ describe('spawn orientation', () => {
 });
 
 describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe)", () => {
-  async function ruleFor(tools: string[], module: Partial<SubagentModuleConfig> = {}) {
-    const h = await makeHarness({ module, modules: [toolModule('probe', 1)] });
+  async function ruleFor(tools: string[], module: Partial<SubagentModuleConfig> = {}, parent: Partial<AgentConfig> = {}) {
+    const h = await makeHarness({ parent, module, modules: [toolModule('probe', 1)] });
     try {
       const res = await h.subagent.handleToolCall(call('spawn', `toolu_${tools.length}`, { name: 'probe', systemPrompt: 'p', task: 't', tools }));
       expect(res.success).toBe(true);
@@ -512,12 +533,12 @@ describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe
   }
 
   test('names subagent--return once, even when the caller listed it', async () => {
-    expect(await ruleFor(['probe--t1', 'subagent--return'])).toStartWith("- Tool rules: only these 2 from the caller's list: probe--t1 and subagent--return, subagent--return among them");
+    expect(await ruleFor(['probe--t1', 'subagent--return'])).toStartWith("- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them");
   });
 
   test("names a listed tool the process doesn't offer as not offered, below the depth limit too", async () => {
     expect(await ruleFor(['probe--t1', 'no-such-tool'])).toStartWith(
-      "- Tool rules: only these 2 from the caller's list: probe--t1 and subagent--return, subagent--return among them; the caller also listed no-such-tool, which isn't offered to it at the call",
+      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them; the caller also listed no-such-tool, which isn't offered to it at the call",
     );
   });
 
@@ -530,6 +551,57 @@ describe("a spawn's tool rule says what the list grants (Nell-1783's haiku probe
       "- Tool rules: only subagent--return; the caller also listed time--now, which isn't offered to it at the call, and none of the other subagent tools at this depth",
     );
   });
+
+  // The process offers subagent--fork; the depth removes it (sw-ch213 I12).
+  test('at the depth limit, names a listed subagent tool as removed by the depth, not as not offered', async () => {
+    const rule = await ruleFor(['probe--t1', 'subagent--fork'], { maxDepth: 1 });
+    expect(rule).toContain('; it also listed subagent--fork, which this depth removes');
+    expect(rule).not.toContain("subagent--fork, which isn't offered");
+  });
+
+  // agentToolSurface adds prose_help under explicit routing, whatever the
+  // list says (sw-ch213 I7).
+  test('under explicit prose routing, a listed prose_help is not dropped, and the rule says the routing shows it', async () => {
+    const rule = await ruleFor(['probe--t1', 'prose_help'], {}, { proseRouting: 'explicit' });
+    expect(rule).not.toContain("prose_help, which isn't offered");
+    expect(rule).toContain('; explicit prose routing shows it prose_help too, whatever the list says');
+    expect(await ruleFor(['probe--t1'])).not.toContain('prose_help');
+  });
+});
+
+describe('what a launch block says beyond the settings it compares', () => {
+  // sw-ch213 I22: an empty list is no tools, not "0: ".
+  test('a parent restricted to no tools is said to be', async () => {
+    const h = await makeHarness({ parent: { allowedTools: [] } });
+    try {
+      const input = { name: 'bare', task: 't' };
+      seedForkCall(h.framework, 'toolu_bare_fork', input);
+      const res = await h.subagent.handleToolCall(call('fork', 'toolu_bare_fork', input));
+      await h.asyncPromise('bare');
+      const rule = line(launchBlock(res.data as string), '- Tool rules');
+      expect(rule).toEndWith('; the parent is restricted to no tools.');
+      expect(rule).not.toContain('0: ');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  // The stream's agent is built from the launch alone, so these take the
+  // framework's defaults (sw-ch213 I8).
+  test('names the agent settings the stream is not given', async () => {
+    const h = await makeHarness({});
+    try {
+      const input = { name: 'plain', systemPrompt: 'p', task: 't' };
+      const res = await h.subagent.handleToolCall(call('spawn', 'toolu_plain', input));
+      await h.asyncPromise('plain');
+      expect(line(launchBlock(res.data as string), '- Not set for this stream')).toBe(
+        '- Not set for this stream: thinking, temperature, prompt caching and its TTL, provider parameters such as ' +
+          "reasoning effort, refusal handling and the tool-result guard, whatever the caller uses; the framework's defaults apply.",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe('a host that states no provider', () => {
@@ -541,7 +613,7 @@ describe('a host that states no provider', () => {
         const res = await h.subagent.handleToolCall(call('spawn', 'toolu_np', input, parent === null ? null : 'parent'));
         await h.asyncPromise('probe');
         expect(line(launchBlock(res.data as string), '- Provider')).toBe(
-          parent === null ? '- Provider: not stated by the host.' : "- Provider: not stated by the host, the caller's own connection.",
+          parent === null ? '- Provider: not stated by the host.' : "- Provider: not stated by the host, on the same connection as the caller's.",
         );
       } finally {
         await h.cleanup();
@@ -555,9 +627,10 @@ describe('a module without its framework yet', () => {
     const bare = new SubagentModule();
     const res = await bare.handleToolCall(call('spawn', 'toolu_bare', { name: 'early', systemPrompt: 'p', task: 't' }));
     expect(res.success).toBe(false);
-    expect(String(res.error)).toStartWith("Couldn't spawn 'early': ");
+    // The missing framework is the reason, not any error (sw-ch213 I32).
+    expect(String(res.error)).toStartWith("Couldn't spawn 'early': SubagentModule: framework not set.");
     const forked = await bare.handleToolCall(call('fork', 'toolu_bare_fork', { name: 'early-fork', task: 't' }));
-    expect(String(forked.error)).toStartWith("Couldn't fork 'early-fork': ");
+    expect(String(forked.error)).toStartWith("Couldn't fork 'early-fork': SubagentModule: framework not set.");
   });
 });
 
@@ -569,13 +642,12 @@ describe('a queued launch', () => {
     strategy: new KnowledgeStrategy({ headWindowTokens: 19_000, recentWindowTokens: 41_000, maxMessageTokens: 17_000 }),
   };
 
-  async function queueBehindAHeldFork(h: Awaited<ReturnType<typeof makeHarness>>, caller = 'parent') {
+  async function queueBehindAHeldFork(h: Awaited<ReturnType<typeof makeHarness>>) {
     const held = h.holdNextRun();
     const first = { name: 'first', task: 'hold the slot' };
     seedForkCall(h.framework, 'toolu_first', first);
     await h.subagent.handleToolCall(call('fork', 'toolu_first', first));
     await held;
-    void caller;
   }
 
   test('structural: keeps the call\'s inputs, cuts at the call, and states the budget as created', async () => {
@@ -675,7 +747,7 @@ describe('a queued launch', () => {
       expect(run.firstContext).toContain(block);
       expect(run.allText).toContain('POST_CALL_ARRIVAL');
       expect(startSection(run.firstContext)).toContain(
-        "- Inherited: the parent's whole compiled context as it was when this stream started, because the fork call was no longer in that context. It can include turns that came after the call.",
+        "- Inherited: the parent's whole compiled context as it was when this stream started, because the fork call wasn't in that context. It can include turns that came after the call. An exact repeat of an earlier message is dropped.",
       );
     } finally {
       await h.cleanup();
@@ -693,10 +765,14 @@ describe('a queued launch', () => {
       const spawnReceipt = (await h.subagent.handleToolCall(call('spawn', 'toolu_third', spawn))).data as string;
 
       // While both wait, the values their launches took from the parent change.
-      const parent = h.framework.getAgent('parent')! as unknown as { maxTokens: number; proseRouting: string; systemPrompt: string };
+      const parent = h.framework.getAgent('parent')! as unknown as {
+        maxTokens: number; proseRouting: string; systemPrompt: string; model: string; maxStreamTokens: number;
+      };
       parent.maxTokens = 999;
       parent.proseRouting = 'disabled';
       parent.systemPrompt = 'changed prompt';
+      parent.model = 'changed-model';
+      parent.maxStreamTokens = 777_000;
 
       h.releaseHeld();
       await h.asyncPromise('first');
@@ -708,6 +784,11 @@ describe('a queued launch', () => {
         expect(launchBlock(receipt)).toContain('- Output limit: 256 tokens, the same as ');
         expect(run.maxTokens).toBe(256);
         expect(run.proseRouting).toBe('hybrid');
+        // The rest of the launch, too (sw-ch213 I14).
+        expect(run.model).toBe('mock');
+        expect(run.maxStreamTokens).toBe(500_000);
+        expect(run.maxMessageTokens).toBe(10_000);
+        expect(run.allowedTools).toBe('all');
       }
       expect(h.runs.find((r) => r.name.startsWith('second-'))!.systemPrompt).toBe('parent prompt');
     } finally {
@@ -807,6 +888,29 @@ describe('the first request a fork actually sends', () => {
       expect(wire).toContain(sent(
         `- Tools: ${toolNames.length} available to this stream. Compared with what the parent stream has now, ${parts.join(', and ')}.`,
       ));
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // A spawn's Tools line lists its surface in full, and the request it sends
+  // must carry exactly those, prose_help under explicit routing included
+  // (sw-ch213 I11).
+  test('a spawn with a tool the board offers sends exactly the tools its orientation lists', async () => {
+    const { adapter, subagent, cleanup } = await realHarness({ parent: { proseRouting: 'explicit' } });
+    try {
+      const input = { name: 'worker', systemPrompt: 'p', task: 'say done', model: 'mock-spawn', sync: true, tools: ['extra--t1'] };
+      const res = await subagent.handleToolCall(call('spawn', 'toolu_worker', input));
+      expect(res.success).toBe(true);
+      const request = adapter.getRequestLog().map((r) => r.request).find((r) => r.model === 'mock-spawn');
+      expect(request).toBeDefined();
+      const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
+      expect([...toolNames].sort()).toEqual(['extra--t1', 'prose_help', 'subagent--return']);
+      const wire = JSON.stringify(request!.messages);
+      const toolsLine = wire.split('\\n').find((l) => l.startsWith('- Tools: '));
+      expect(toolsLine).toBeDefined();
+      expect(toolsLine).toStartWith(`- Tools: ${toolNames.length} available to this stream: `);
+      for (const name of toolNames) expect(toolsLine).toContain(name);
     } finally {
       await cleanup();
     }
