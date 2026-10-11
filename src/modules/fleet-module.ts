@@ -211,7 +211,8 @@ interface FleetChild {
    *  one lands during the launch's awaits (sw-ch181 I13). Not persisted. */
   killAcks?: number;
   /** Why automatic restarts stopped for this generation (the flap cap), shown
-   *  by fleet status until a manual launch or restart (sw-ch181 I17). */
+   *  by fleet status until a manual launch or restart (sw-ch181 I17). Kept in
+   *  memory, like the retry history, not persisted. */
   autoRestartStopped?: string;
   /** A failed launch's reason, kept so the exit, whenever it's recorded,
    *  carries it beside the exit itself (sw-ch181 I9, I10, I14). */
@@ -686,7 +687,6 @@ export class FleetModule implements Module {
       console.error(
         `[fleet] autoRestart disabled for "${child.name}" — ${this.restartFlapCap} crashes in ${this.restartFlapWindowMs / 1000}s`,
       );
-      this.persistState();
       return;
     }
     child.restartAttempts.push(now);
@@ -1043,10 +1043,6 @@ export class FleetModule implements Module {
     }
 
     const existing = this.children.get(input.name);
-    // A manual launch or restart takes over from any pending automatic
-    // replacement now, before its own awaits, so that timer can't fire and
-    // pre-empt it (sw-ch181 I4).
-    if (existing && !opts.autoRestartOf) this.cancelAutoRestart(existing);
     const killsAtStart = existing?.killAcks ?? 0;
     // Recipe loading and ownership reconciliation both yield. Afterward every
     // launch, manual or automatic, must still replace the generation it began
@@ -1075,6 +1071,15 @@ export class FleetModule implements Module {
         isError: true,
         error: `Child '${input.name}' is already ${existing.status}`,
       };
+    }
+    // A manual launch or restart takes over from automatic replacement now,
+    // before its own awaits: a pending timer is cancelled (sw-ch181 I4), and
+    // one that already fired finds its generation cancelled at its next
+    // check, as a restart's does (Nell-1783's review). On a stopped
+    // generation the flag only ends automatic restarts.
+    if (existing && !opts.autoRestartOf) {
+      this.cancelAutoRestart(existing);
+      existing.killRequested = true;
     }
 
     const recipePath = isUrlOrAbsolute(input.recipe)

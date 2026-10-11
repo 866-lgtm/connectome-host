@@ -310,7 +310,7 @@ never when the child was asked to stop or the parent is shutting down. Backoff
 is roughly 1 s, 3 s, 10 s plus jitter; after 3 attempts within 60 s,
 restarting is disabled for that child.
 
-Attempt history carries across automatic replacements, so a crash loop advances the backoff and reaches the cap. When the cap stops automatic restarts, `fleet--status` says so in `autoRestartStopped`, beside `autoRestart`. `fleet--kill`, `fleet--restart`, a `fleet--launch` of the same name and parent shutdown cancel a pending restart, and `fleet--restart` and `fleet--launch` start a fresh budget. A replacement that fails to start ends automatic restarts until one of those (§4.3). The history is kept in the parent's memory, not persisted, so a child adopted by a new parent process starts with a fresh budget.
+Attempt history carries across automatic replacements, so a crash loop advances the backoff and reaches the cap. When the cap stops automatic restarts, `fleet--status` says so in `autoRestartStopped`, beside `autoRestart`. `fleet--kill`, `fleet--restart`, a `fleet--launch` of the same name and parent shutdown cancel a pending restart, and `fleet--restart` and `fleet--launch` start a fresh budget. A replacement that fails to start ends automatic restarts until one of those (§4.3). The history and `autoRestartStopped` are kept in the parent's memory, not persisted, so a child adopted by a new parent process starts with a fresh budget. A manual launch or restart also cancels an automatic replacement that is already under way.
 
 ### 4.7 The unified tree
 

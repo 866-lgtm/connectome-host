@@ -666,6 +666,35 @@ describe('FleetModule lifecycle: every launch answers to stop, kill and newer la
     expect(launches(input)).toHaveLength(2);
   });
 
+  // Nell-1783's review: an automatic launch already past its timer, still in
+  // its awaits, yields to a manual launch started meanwhile, as it yields to
+  // a restart, whichever reaches the end of its awaits first.
+  test('a manual launch wins over an automatic launch already in its awaits', async () => {
+    const { fleet, input } = fixture();
+    const clock = controlRestarts(fleet);
+    expect((await internal(fleet).handleLaunch({ ...input, autoRestart: true }, { viaAutoStart: true })).success).toBe(true);
+    await crash(fleet, fleet.getChildren().get('leaf')!);
+    const api = internal(fleet);
+    const cleanup = api.cleanupStaleChildFiles.bind(fleet);
+    const gates: Array<() => void> = [];
+    api.cleanupStaleChildFiles = async (existing) => {
+      await new Promise<void>(resolve => gates.push(resolve));
+      await cleanup(existing);
+    };
+    clock.release(0);
+    await until(() => gates.length === 1, 'automatic launch reconciling');
+    const manual = api.handleLaunch({ ...input, autoRestart: true }, { viaAutoStart: true });
+    await until(() => gates.length === 2, 'manual launch reconciling');
+    gates[0]!(); // the automatic launch reaches the end of its awaits first
+    await until(() => clock.completed.length === 2, 'automatic launch settled');
+    expect(clock.completed[1]!.result.error).toBe(
+      "Child 'leaf' wasn't launched: its automatic restart was cancelled during reconciliation.",
+    );
+    gates[1]!();
+    expect((await manual).success).toBe(true);
+    expect(launches(input)).toHaveLength(2);
+  });
+
   // I6: a signal before the socket is reported as the signal, not as a timeout.
   test('a child killed by a signal before its socket appears is reported as that signal', async () => {
     const { fleet, input } = fixture({ noSocket: true }, { socketWaitTimeoutMs: 3_000 });
