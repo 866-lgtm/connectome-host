@@ -8,6 +8,11 @@
 // drops raw bodies, never the error, so the error bounds itself; the Anthropic
 // and Bedrock writers have no such guard, and keep the raw request whole.
 //
+// `errorChars`, set when the text was cut, is the whole length of the one text
+// that was cut: the generic record's `error` ("Name: message"), or the other
+// records' `error.message`. Lengths here, the omission marker's included, are
+// JavaScript string lengths (UTF-16 code units).
+//
 // Reading a hostile error never throws: logging must never break inference,
 // and a throw inside a writer's catch block would replace the provider's
 // error with its own.
@@ -60,8 +65,8 @@ interface ReadError {
 
 /** Reads each part of a thrown value on its own: a part whose getter throws
  *  loses only itself, never the provider's text or the rest. The stack is
- *  read only when asked for: V8 formats it on first read, which repeats a
- *  huge message, and a custom getter may do anything. */
+ *  read only when asked for: the runtime formats it on first read, which
+ *  repeats a huge message, and a custom getter may do anything. */
 function readError(error: unknown, withStack: boolean): ReadError {
   // Even the type test is guarded: a revoked Proxy or a throwing
   // getPrototypeOf trap makes `instanceof` itself throw.
@@ -107,10 +112,13 @@ export function describeError(error: unknown): Record<string, unknown> {
  * The Anthropic and Bedrock writers' error fields, keeping the shape their
  * records have always had: `error` is `{ name, message }` for an Error (with
  * `stack` where the writer keeps one), or the text of anything else. The
- * message and stack are bounded like the generic decorator's text, and a
- * stack that opens with the message doesn't repeat it, so its frames survive
- * whole. Beside it come the same classification fields, and `errorChars`,
- * the whole message's length, when it was cut.
+ * message and stack are bounded like the generic decorator's text, and the
+ * name like a classification code. A stack whose header is the error's own
+ * "Name: message" line, as the runtime formats it, names the message above
+ * instead of repeating it, so the bound goes to its frames; any other stack
+ * is kept as it is, within the same bound. Beside `error` come the same
+ * classification fields, and `errorChars`, the whole message's length, when
+ * it was cut.
  */
 export function describeErrorObject(error: unknown, withStack: boolean): Record<string, unknown> {
   const e = readError(error, withStack);
@@ -120,12 +128,16 @@ export function describeErrorObject(error: unknown, withStack: boolean): Record<
   }
   const message = e.message === undefined ? '[message could not be read]' : e.message;
   const bounded = boundText(message, MAX_ERROR_CHARS);
-  const fields: Record<string, unknown> = { name: e.name, message: bounded };
+  const name = boundText(e.name, MAX_CODE_CHARS);
+  const fields: Record<string, unknown> = { name, message: bounded };
   if (e.stack !== undefined) {
+    // The header must be the whole first line (or lines, for a multi-line
+    // message): a stack formatted from a longer message would otherwise be
+    // spliced mid-line.
     const header = `${e.name}: ${message}`;
-    const stack = e.message !== undefined && e.stack.startsWith(header)
-      ? `${e.name}: [the message above]${e.stack.slice(header.length)}`
-      : e.stack;
+    const opens = e.message !== undefined && e.stack.startsWith(header)
+      && (e.stack.length === header.length || e.stack[header.length] === '\n');
+    const stack = opens ? `${name}: [the message above]${e.stack.slice(header.length)}` : e.stack;
     fields.stack = boundText(stack, MAX_ERROR_CHARS);
   }
   return { error: fields, ...e.classification, ...(bounded !== message ? { errorChars: message.length } : {}) };

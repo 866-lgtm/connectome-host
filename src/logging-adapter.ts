@@ -23,7 +23,10 @@
 //     requestSummary, rawRequest?, rawResponse, error?, errorType?,
 //     httpStatus?, providerErrorCode?, retryable?, errorChars? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
-// a non-Error's text (logging-error-fields.ts).
+// a non-Error's text (logging-error-fields.ts). A record whose request or
+// response couldn't be summarized keeps only the head fields and, for a
+// failure, the error (summaryUnavailable: true). Logging never changes what
+// the caller gets: it runs after the provider call, outside its try.
 
 import { AnthropicAdapter } from '@animalabs/membrane';
 import type {
@@ -81,6 +84,11 @@ export type ProviderCallObserver = (record: ProviderCallRecord) => void;
  *  persona blocks is accepted (the mechanism the Agent SDK's
  *  system-prompt-append uses). */
 const OAUTH_SYSTEM_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+/** Calls `get`, giving undefined where it throws. */
+function guarded<T>(get: () => T): T | undefined {
+  try { return get(); } catch { return undefined; }
+}
 
 /** Truthy env-flag parse: unset/''/'0'/'false' (any case) are off. */
 function envFlag(value: string | undefined, name = 'LLM_CALLS_FULL_PAYLOADS'): boolean {
@@ -271,19 +279,28 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   onProviderError?: (error: unknown, kind: 'complete' | 'stream') => void;
   onProviderSuccess?: (kind: 'complete' | 'stream') => void;
 
+  /**
+   * Tell the observers about one call. A call failed exactly when `outcome`
+   * carries `error`, whatever its value: a rejection with undefined is a
+   * failure too. The ledger's error text is the record's own, bounded
+   * (`errorText`), so a live row reads as it will once restored from the
+   * record after a restart. Each part of the ledger's row is read on its own:
+   * one that can't be read costs only itself, and the row is still recorded.
+   */
   private observeCall(
     kind: 'complete' | 'stream',
     timestamp: string,
     durationMs: number,
     request: ProviderRequest,
     rawRequest: unknown,
-    response?: ProviderResponse,
-    error?: unknown,
+    outcome: { response: ProviderResponse } | { error: unknown },
+    errorText: string | undefined,
   ): void {
     try {
-      if (error !== undefined) this.onProviderError?.(error, kind);
+      if ('error' in outcome) this.onProviderError?.(outcome.error, kind);
       else this.onProviderSuccess?.(kind);
     } catch { /* observers never affect provider traffic */ }
+    const response = 'response' in outcome ? outcome.response : undefined;
     const raw0 = (response as { raw?: { stop_reason?: string; stop_details?: { category?: string } } } | undefined)?.raw;
     if (kind === 'complete' && raw0?.stop_reason === 'refusal' && this.onRefusal) {
       try {
@@ -297,7 +314,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       } catch { /* observers never affect provider traffic */ }
     }
     if (!this.onCall) return;
-    const cache = summarizeCacheControls(rawRequest);
+    const cache = guarded(() => summarizeCacheControls(rawRequest)) ?? { count: 0, ttls: [] };
+    const messages = guarded(() => request.messages.length) ?? 0;
     const raw = (response as { raw?: Record<string, unknown> } | undefined)?.raw;
     const rawUsage = raw?.usage as Record<string, unknown> | undefined;
     const cacheCreation = rawUsage?.cache_creation as Record<string, unknown> | undefined;
@@ -311,7 +329,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         kind,
         durationMs,
         model: request.model,
-        messages: request.messages.length,
+        messages,
         inputTokens: response?.usage.inputTokens ?? 0,
         outputTokens: response?.usage.outputTokens ?? 0,
         cacheReadTokens: response?.usage.cacheReadTokens ?? 0,
@@ -324,7 +342,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         cacheBreakpoints: cache.count,
         cacheTtls: cache.ttls,
         stopReason: response?.stopReason,
-        error: error instanceof Error ? error.message : error ? String(error) : undefined,
+        error: errorText,
       });
     } catch {
       // A dashboard observer is never allowed to affect provider traffic.
@@ -353,6 +371,53 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     } as ProviderRequestOptions;
   }
 
+  /**
+   * Record one call's outcome and tell the observers. A call failed exactly
+   * when `outcome` carries `error`, whatever its value. Nothing here can
+   * replace the provider's response or its error. A record whose request or
+   * response can't be summarized is written minimal instead
+   * (`summaryUnavailable: true`), with its timing and, for a failure, the
+   * bounded error, so no call goes unrecorded; and the observers hear of the
+   * call whatever became of its record.
+   */
+  private recordCall(
+    kind: 'complete' | 'stream',
+    request: ProviderRequest,
+    t0: number,
+    rawRequest: unknown,
+    outcome: { response: ProviderResponse } | { error: unknown },
+  ): void {
+    try {
+      const timestamp = new Date().toISOString();
+      const durationMs = Date.now() - t0;
+      // Read once, for the record and the ledger alike; reading never throws.
+      const errorFields = 'error' in outcome ? describeErrorObject(outcome.error, true) : undefined;
+      const head = { type: errorFields ? 'error' : 'call', kind, timestamp, durationMs };
+      let record: Record<string, unknown>;
+      try {
+        record = 'response' in outcome
+          ? {
+              ...head,
+              requestSummary: this.requestSummary(request, rawRequest),
+              rawRequest: this.refusalRawRequest(outcome.response, rawRequest),
+              rawResponse: (outcome.response as { raw?: unknown }).raw ?? null,
+            }
+          : { ...head, requestSummary: this.requestSummary(request, rawRequest), rawRequest, ...errorFields };
+      } catch {
+        record = { ...head, summaryUnavailable: true, ...errorFields };
+      }
+      this.log(record);
+      try {
+        const error = errorFields?.error;
+        const errorText = error === undefined ? undefined
+          : typeof error === 'string' ? error : (error as { message: string }).message;
+        this.observeCall(kind, timestamp, durationMs, request, rawRequest, outcome, errorText);
+      } catch { /* observers never affect provider traffic */ }
+    } catch {
+      // Logging must never break inference, nor change what it returns or throws.
+    }
+  }
+
   override async complete(
     request: ProviderRequest,
     options?: ProviderRequestOptions,
@@ -361,39 +426,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const effective = this.withOAuthIdentity(this.withReasoning(request));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
+    let response: ProviderResponse;
     try {
-      const response = await super.complete(effective, wrapped);
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      this.log({
-        type: 'call', kind: 'complete',
-        timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
-        rawRequest: this.refusalRawRequest(response, sink.rawRequest),
-        rawResponse: (response as { raw?: unknown }).raw ?? null,
-      });
-      this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, response);
-      return response;
+      response = await super.complete(effective, wrapped);
     } catch (err) {
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      // Each in its own try: a record that can't be built costs only the
-      // record, and the observers (the credential monitor's tap first) still
-      // hear of the failure. Neither ever replaces the provider's error.
-      try {
-        this.log({
-          type: 'error', kind: 'complete',
-          timestamp, durationMs,
-          requestSummary: this.requestSummary(request, sink.rawRequest),
-          rawRequest: sink.rawRequest,
-          ...describeErrorObject(err, true),
-        });
-      } catch { /* the record is lost, nothing else */ }
-      try {
-        this.observeCall('complete', timestamp, durationMs, request, sink.rawRequest, undefined, err);
-      } catch { /* observers never affect provider traffic */ }
+      this.recordCall('complete', request, t0, sink.rawRequest, { error: err });
       throw err;
     }
+    // Outside the try: a logging failure can't be taken for the provider's.
+    this.recordCall('complete', request, t0, sink.rawRequest, { response });
+    return response;
   }
 
   override async stream(
@@ -405,38 +447,15 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const effective = this.withOAuthIdentity(this.withEffort(this.withReasoning(request)));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
+    let response: ProviderResponse;
     try {
-      const response = await super.stream(effective, callbacks, wrapped);
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      this.log({
-        type: 'call', kind: 'stream',
-        timestamp, durationMs,
-        requestSummary: this.requestSummary(request, sink.rawRequest),
-        rawRequest: this.refusalRawRequest(response, sink.rawRequest),
-        rawResponse: (response as { raw?: unknown }).raw ?? null,
-      });
-      this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, response);
-      return response;
+      response = await super.stream(effective, callbacks, wrapped);
     } catch (err) {
-      const timestamp = new Date().toISOString();
-      const durationMs = Date.now() - t0;
-      // Each in its own try: a record that can't be built costs only the
-      // record, and the observers (the credential monitor's tap first) still
-      // hear of the failure. Neither ever replaces the provider's error.
-      try {
-        this.log({
-          type: 'error', kind: 'stream',
-          timestamp, durationMs,
-          requestSummary: this.requestSummary(request, sink.rawRequest),
-          rawRequest: sink.rawRequest,
-          ...describeErrorObject(err, true),
-        });
-      } catch { /* the record is lost, nothing else */ }
-      try {
-        this.observeCall('stream', timestamp, durationMs, request, sink.rawRequest, undefined, err);
-      } catch { /* observers never affect provider traffic */ }
+      this.recordCall('stream', request, t0, sink.rawRequest, { error: err });
       throw err;
     }
+    // Outside the try: a logging failure can't be taken for the provider's.
+    this.recordCall('stream', request, t0, sink.rawRequest, { response });
+    return response;
   }
 }
