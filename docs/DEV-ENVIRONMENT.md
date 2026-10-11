@@ -202,10 +202,15 @@ HEARTBEAT_CONFIG_FILE=<abs>/data/heartbeat-config.json
 The host reads `.env`, but stdio MCPL servers see only what their recipe entry
 maps in `env` (plus a small system allowlist), e.g.
 `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`. A variable left only in `.env` is
-unset for the server.
+unset for the server, unless its entry sets `inheritEnv: true`, which passes
+the host's whole environment, `.env` included.
 
-**Run the host (headless), supervised:**
+**Run the host (headless), supervised,** from `<agent>-cm/`: Bun loads `.env`
+from the working directory, and `data/` is `./data` there unless `DATA_DIR`
+says otherwise. A supervisor sets that directory itself (launchd's
+`WorkingDirectory`, systemd's `WorkingDirectory=`).
 ```bash
+cd ~/connectome-local/<agent>-cm
 bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
   ~/connectome-local/<agent>-cm/recipes/<agent>.json --headless
 ```
@@ -251,7 +256,7 @@ bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
   original design for host-owned output routing (why stickiness/`think` live in
   the framework, not in a surface adapter); kept verbatim as history.
 - Output routing: `agent-framework/src/framework.ts` (turn completion →
-  `ChannelRegistry.routeSpeech`), `src/mcpl/channel-registry.ts`.
+  `ChannelRegistry.routeSpeech`), `agent-framework/src/mcpl/channel-registry.ts`.
 - Wake gate: `agent-framework/src/gate/event-gate.ts` (+ recipe `modules.wake`).
 - Discord surface signals (`isExplicitMention` / `isReplyToBot` / `isBot`):
   `discord-mcpl/src/server.ts`.
