@@ -1,5 +1,5 @@
 import { describe, test, expect } from 'bun:test';
-import { NativeFormatter } from '@animalabs/membrane';
+import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
 import type { NormalizedMessage } from '@animalabs/membrane';
 import { buildCountTokensPayload } from '../src/web/panel-data.js';
 
@@ -16,7 +16,7 @@ const blocksOf = (m: unknown) => (m as { content: Block[] }).content;
 const roleOf = (m: unknown) => (m as { role: string }).role;
 
 describe('buildCountTokensPayload', () => {
-  test('is byte-identical to the NativeFormatter build inference would send', () => {
+  test('is byte-identical to the NativeFormatter build, with prompt caching off as the count sends it', () => {
     const messages: NormalizedMessage[] = [
       { participant: 'Lari', content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] },
       { participant: 'agent', content: [
@@ -100,5 +100,88 @@ describe('buildCountTokensPayload', () => {
     expect(blocksOf(payload.messages[0]).map((b) => b.text)).toEqual(['Lari: one', 'Antra: two']);
     expect(payload.tools).toBeUndefined();
     expect(payload.system).toBeUndefined();
+  });
+
+  // An anthropic-xml agent's count takes that formatter's path, prefill or
+  // not (buildContextMakeup), and the whole payload must equal its own build:
+  // system, messages and tools. The formatter sends the prefill first, in
+  // place of its default opener, whenever its request would otherwise open
+  // with the assistant's turn (the transcript), and so must the count; an
+  // image goes in a user turn of its own, so an image-first request gets none.
+  const xmlOptions = {
+    participantMode: 'multiuser' as const, assistantParticipant: 'agent', toolMode: 'xml' as const,
+    promptCaching: false, cacheMarkers: 'membrane-system' as const,
+  };
+  const xmlReference = (messages: NormalizedMessage[], extra: Record<string, unknown> = {}) => {
+    const built = new AnthropicXmlFormatter().buildMessages(messages, { ...xmlOptions, ...extra });
+    return { system: built.systemContent, messages: built.messages, tools: built.nativeTools };
+  };
+  const payloadParts = (payload: { system?: unknown; messages: unknown[]; tools?: unknown[] }) =>
+    ({ system: payload.system, messages: payload.messages, tools: payload.tools });
+
+  test('an anthropic-xml count is that formatter\'s build, with the prefill first', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const withPrefill = buildCountTokensPayload(
+      { messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(withPrefill)).toEqual(xmlReference(messages, { prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(withPrefill.messages[0])).toContain('PREFILL SCAFFOLD');
+    // Without a prefill, the formatter's own default opener leads instead.
+    const without = buildCountTokensPayload({ messages }, 'agent', new AnthropicXmlFormatter(), 'xml');
+    expect(payloadParts(without)).toEqual(xmlReference(messages) as never);
+    expect(JSON.stringify(without)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  test('an anthropic-xml count with a system prompt and a prefill matches the formatter', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const payload = buildCountTokensPayload(
+      { system: 'sys', messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(payload)).toEqual(xmlReference(messages, { systemPrompt: 'sys', prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(payload.messages[0])).toContain('PREFILL SCAFFOLD');
+  });
+
+  test('a request that opens with a user turn (an image) gets no prefill, in the count as in the formatter', () => {
+    const png = 'iVBORw0KGgo=';
+    const messages: NormalizedMessage[] = [
+      { participant: 'Lari', content: [
+        { type: 'text', text: 'look' },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: png } } as never,
+      ] },
+      { participant: 'agent', content: [{ type: 'text', text: 'reply' }] },
+    ];
+    const payload = buildCountTokensPayload(
+      { messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(payload)).toEqual(xmlReference(messages, { prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(payload)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  test('a native agent\'s count ignores a prefill, as the native formatter does', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const withPrefill = buildCountTokensPayload({ messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent');
+    expect(withPrefill).toEqual(buildCountTokensPayload({ messages }, 'agent'));
+    expect(JSON.stringify(withPrefill)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  // An empty system, as text or as a list, and an empty tool list send
+  // neither field.
+  test('an empty system and an empty tool list leave both out of the payload', () => {
+    for (const system of ['', [] as never]) {
+      const payload = buildCountTokensPayload({
+        system, tools: [], messages: [{ participant: 'Lari', content: [{ type: 'text', text: 'hi' }] }],
+      }, 'agent');
+      expect('system' in payload).toBe(false);
+      expect('tools' in payload).toBe(false);
+    }
   });
 });
