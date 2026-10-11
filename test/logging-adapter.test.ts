@@ -215,7 +215,8 @@ describe('LoggingAnthropicAdapter request logging', () => {
         durationMs: number,
         request: ProviderRequest,
         rawRequest: unknown,
-        response: ProviderResponse,
+        outcome: { response: ProviderResponse },
+        errorText: undefined,
       ): void;
     };
     const response = {
@@ -232,7 +233,7 @@ describe('LoggingAnthropicAdapter request logging', () => {
       },
     } as unknown as ProviderResponse;
 
-    observed.observeCall('stream', '2026-07-13T00:00:00Z', 10, baseRequest, {}, response);
+    observed.observeCall('stream', '2026-07-13T00:00:00Z', 10, baseRequest, {}, { response }, undefined);
     expect(calls[0]).toMatchObject({
       cacheWriteTokens: 100,
       cacheWrite5mTokens: 25,
