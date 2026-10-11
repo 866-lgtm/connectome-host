@@ -75,6 +75,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   // passing (chunk, cb) or (chunk, encoding, cb) for backpressure /
   // flush confirmation don't have their callbacks silently swallowed.
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' });
+  // Where this run's lines begin, as the TUI marks its error log: /bug reads
+  // only the current session's (bug-report.ts).
+  logStream.write(`\n--- session ${new Date().toISOString()} ---\n`);
   type StdWrite = typeof process.stdout.write;
   const makeRedirect = (): StdWrite => {
     const redirect = function (

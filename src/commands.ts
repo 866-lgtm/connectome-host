@@ -22,16 +22,18 @@
  *   /newtopic      — Reset head window (auto-summarize or with user context)
  *   /export        — Export lessons to ./output/ (JSON + markdown)
  *   /usage         — Show session token usage and costs
+ *   /bug <text>    — Assemble a bug report to file on GitHub (nothing is sent)
  *   /help          — List commands
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { AgentFramework } from '@animalabs/agent-framework';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import type { CredentialActionId, CredentialState } from './credential-state.js';
-import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH, type ServerFileEntry } from './mcpl-config.js';
+import { buildBugReport, gatherBugReportFacts, runtimeMode } from './bug-report.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
 import { type FleetModule, formatChildRow } from './modules/fleet-module.js';
@@ -218,6 +220,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
           { text: '  /recipe                Show current recipe info', style: 'system' },
           { text: '  /newtopic [context]    Reset head window (auto-summarize if empty)', style: 'system' },
           { text: '  /usage                 Show session token usage and costs', style: 'system' },
+          { text: '  /bug <text>            Assemble a bug report to file on GitHub: shown first, nothing sent', style: 'system' },
           { text: '  /fleet                 Show / peek / stop / restart cross-process children', style: 'system' },
           { text: '                         (subcommands: list | status [name] | view | peek <name> | stop <name> | restart <name>)', style: 'system' },
         ],
@@ -300,6 +303,9 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
 
     case 'newtopic':
       return inFlightGuard(app, cmd) ?? handleNewTopic(app, args);
+
+    case 'bug':
+      return handleBug(command, app);
 
     case 'usage':
       return handleUsage(app);
@@ -606,6 +612,67 @@ function handleRecipe(app: AppContext): CommandResult {
 // ---------------------------------------------------------------------------
 // /usage — session token usage and cost breakdown
 // ---------------------------------------------------------------------------
+
+/**
+ * `/bug <text>`: assemble a report for connectome-host's public issues
+ * (bug-report.ts), show it, save it under DATA_DIR, and give the link that
+ * opens GitHub's new-issue form with it filled in. Nothing is sent: the
+ * reporter reads it in the form and submits it themselves.
+ */
+function handleBug(command: string, app: AppContext): CommandResult {
+  const text = command.trim().replace(/^\/bug\b/, '').trim();
+  if (text === '') {
+    return {
+      lines: [
+        { text: 'Usage: /bug <what happened, in your own words>', style: 'system' },
+        { text: '  Assembles a report for connectome-host\'s public issues: your words, the versions, the setup', style: 'system' },
+        { text: '  as structure, and errors as kinds and code locations. It shows you the report and a link', style: 'system' },
+        { text: '  that opens it on GitHub; nothing is sent until you submit it there.', style: 'system' },
+      ],
+    };
+  }
+  const dataDir = resolve(process.env.DATA_DIR || './data');
+  let fileServers: Record<string, ServerFileEntry> = {};
+  try {
+    fileServers = readMcplServersFile(DEFAULT_CONFIG_PATH);
+  } catch {
+    // An unreadable servers file gives no configurations; its servers are
+    // then reported as of unknown kind.
+  }
+  const facts = gatherBugReportFacts({
+    mode: runtimeMode(),
+    dataDir,
+    recipe: app.recipe,
+    liveServers: app.framework.listMcplServers(),
+    serverConfig: (id) => app.recipe.mcpServers?.[id] ?? fileServers[id],
+  });
+  const { full, url, cut } = buildBugReport(text, facts);
+  const path = join(dataDir, `bug-report-${facts.now.toISOString().replace(/[:.]/g, '-')}.txt`);
+  let saved: string;
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(path, `${full.title}\n\nWhat happened:\n${full.what}\n\nReport:\n${full.report}\n\nFile it here:\n${url}\n`);
+    saved = `Saved to ${path}`;
+  } catch (err) {
+    saved = `Couldn't save it to a file (${err instanceof Error ? err.message : String(err)}); the link below still holds it.`;
+  }
+  const lines: Line[] = [
+    { text: '--- Bug report: nothing has been sent ---', style: 'system' },
+    { text: `Title: ${full.title}`, style: 'system' },
+    { text: 'What happened (your words):', style: 'system' },
+    ...full.what.split('\n').map((line) => ({ text: `  ${line}`, style: 'system' as const })),
+    { text: '', style: 'system' },
+    ...full.report.split('\n').map((line) => ({ text: line, style: 'system' as const })),
+    { text: '', style: 'system' },
+  ];
+  if (cut.length > 0) {
+    lines.push({ text: `To fit the link, it leaves out ${cut.join(' and ')}. The file holds everything.`, style: 'system' });
+  }
+  lines.push({ text: saved, style: 'system' });
+  lines.push({ text: 'To file it, open this link, read the report there, and submit it on GitHub:', style: 'system' });
+  lines.push({ text: url, style: 'system' });
+  return { lines };
+}
 
 function handleUsage(app: AppContext): CommandResult {
   const snapshot = app.framework.getSessionUsage();
