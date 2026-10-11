@@ -342,10 +342,12 @@ COUNT_TOKENS_MODEL=<a live model id>     # optional override; makeup counts with
 ```
 
 Stdio MCPL servers see only what their entry declares in `env` (plus a small
-system allowlist — see the README's MCP section). Map every variable a server
-reads, as in the skeleton above. A variable left only in `.env` is unset for
-the server — and an unset `DISCORD_GUILD_ID` means every channel the bot is
-invited to (§7).
+system allowlist — see the README's MCP section — and the host's
+`AGENT_TIMEZONE` and `DISCORD_SUPPRESSED_REACTIONS_BASELINE`). Map every
+variable a server reads, as in the skeleton above. A variable left only in
+`.env` is unset for the server, unless its entry sets `inheritEnv: true`, which
+passes every secret in the host's environment — and an unset
+`DISCORD_GUILD_ID` means every channel the bot is invited to (§7).
 
 ## 5b. Folding solver — `kv-stable` (default) vs `kv-unified` (opt-in)
 
@@ -536,8 +538,10 @@ Two `systemd --user` units in `~/.config/systemd/user/`:
 1. **`terminal-sessions.service`** — the shell daemon, `--host localhost --headless --token
    ${SESSION_SERVER_TOKEN}`, env `SESSION_SERVER_PORT`. `enable` + `start` it first.
 2. **`<agent>-agent.service`** — `bun .../connectome-host/src/index.ts
-   .../recipes/<agent>.json --headless`, `EnvironmentFile=...env`, `Environment=PATH=<node bin>:<bun bin>:...`,
-   `After=/Wants=terminal-sessions.service`, `Restart=always`.
+   .../recipes/<agent>.json --headless`, `WorkingDirectory=<agent>-cm` (the host reads
+   `mcpl-servers.json` and the agent's overlay from it), `EnvironmentFile=...env`,
+   `Environment=PATH=<node bin>:<bun bin>:...`, `After=/Wants=terminal-sessions.service`,
+   `Restart=always`.
 
 Set explicit `PATH` in the units (login-shell PATH isn't loaded for services).
 
