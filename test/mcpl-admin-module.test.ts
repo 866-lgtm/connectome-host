@@ -282,6 +282,42 @@ describe('mcpl_deploy', () => {
     expect(readAgentOverlay(overlayPath).world).toEqual({ url: 'ws://localhost:3101', transport: 'websocket', access: 'eidoverse' });
   });
 
+  test('refuses a credential over ws:// to another machine, in a field or in the url, saving nothing, and takes wss:// or this machine', async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    mod.setIdentity({ accessFor: async () => 'grant-token' });
+    const byToken = await call(mod, 'mcpl_deploy', { id: 'tools', url: 'ws://tools.example:3101/mcpl', token: 't' });
+    expect(byToken.error).toBe(
+      'mcpl_deploy refused: its token would go to tools.example:3101 over unencrypted ws://, ' +
+      'where anyone on the network between can read it. Use a wss:// url, or, if that network is private, ask your ' +
+      'operator to add the server to the recipe. Nothing was saved.',
+    );
+    const byGrant = await call(mod, 'mcpl_deploy', { id: 'world', url: 'ws://10.0.0.7/mcpl', access: 'eidoverse' });
+    expect(byGrant.error).toStartWith('mcpl_deploy refused: the credential of its access grant "eidoverse" would go to 10.0.0.7 over unencrypted ws://');
+    for (const url of ['ws://tools.example/mcpl?token=abc', 'ws://user:pass@tools.example/mcpl']) {
+      const byUrl = await call(mod, 'mcpl_deploy', { id: 'pasted', url });
+      expect(byUrl.error).toStartWith('mcpl_deploy refused: the user, password or token parameter in its url would go to tools.example over unencrypted ws://');
+    }
+    // A grant that isn't text is malformed, whatever the url: it names no grant to refuse.
+    expect((await call(mod, 'mcpl_deploy', { id: 'odd', url: 'ws://tools.example', access: 5 })).error)
+      .toBe("mcpl_deploy refused: the entry would be malformed (its access isn't text), so nothing was saved.");
+    expect(calls).toEqual([]);
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+    expect((await call(mod, 'mcpl_deploy', { id: 'tools', url: 'wss://tools.example:3101/mcpl', token: 't' })).success).toBe(true);
+    expect((await call(mod, 'mcpl_deploy', { id: 'local', url: 'ws://127.0.0.1:3101', token: 't' })).success).toBe(true);
+    expect((await call(mod, 'mcpl_deploy', { id: 'open', url: 'ws://tools.example:3102' })).success).toBe(true);
+    expect(Object.keys(readAgentOverlay(overlayPath)).sort()).toEqual(['local', 'open', 'tools']);
+  });
+
+  test('says a configured server is unchanged when a redeploy of it is refused for a credential over ws://', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    expect((await call(mod, 'mcpl_deploy', { id: 'tools', url: 'wss://tools.example/mcpl', token: 't' })).success).toBe(true);
+    const refused = await call(mod, 'mcpl_deploy', { id: 'tools', url: 'ws://tools.example/mcpl', token: 't' });
+    expect(refused.error).toEndWith('Nothing was saved. The server already configured as "tools" is unchanged.');
+    expect(readAgentOverlay(overlayPath).tools).toEqual({ url: 'wss://tools.example/mcpl', transport: 'websocket', token: 't' });
+  });
+
   test('refuses the id __proto__, which would never be saved, and takes any other name as an id', async () => {
     const { stub, calls } = makeStubFramework();
     const mod = makeModule(stub);
