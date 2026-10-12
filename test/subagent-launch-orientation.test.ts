@@ -21,8 +21,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework, KnowledgeStrategy } from '@animalabs/agent-framework';
 import type { Module, ToolCall, AgentConfig } from '@animalabs/agent-framework';
-import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
-import { SubagentModule, type SubagentModuleConfig } from '../src/modules/subagent-module.js';
+import { AnthropicXmlFormatter, Membrane, MockAdapter, NativeFormatter, OpenAIResponsesFormatter } from '@animalabs/membrane';
+import { SubagentModule, type SubagentModuleConfig, toolDifferences, undeliveredLaunchParts } from '../src/modules/subagent-module.js';
 
 interface Run {
   name: string;
@@ -38,8 +38,10 @@ interface Run {
   maxStreamTokens: number;
   maxMessageTokens: number | undefined;
   allowedTools: 'all' | string[];
-  /** Text of the child's last message: the fork's tool_result, or the
-   *  spawn's / parentless fork's task message. */
+  /** The text the launch composed, as stored (before the message cap): a
+   *  fork's tool_result message, or a spawn's or parentless fork's own
+   *  messages (its orientation, then its task). Tests of what arrives read
+   *  the provider's request instead. */
   firstContext: string;
   /** All of the child's context, for inheritance checks. */
   allText: string;
@@ -130,7 +132,7 @@ async function makeHarness(opts: {
         maxStreamTokens: a.maxStreamTokens,
         maxMessageTokens: (a.getContextManager().getStrategy() as { maxMessageTokens?: number }).maxMessageTokens,
         allowedTools: a.allowedTools,
-        firstContext: textOf(messages[messages.length - 1]?.content),
+        firstContext: launchText(messages),
         allText: messages.map((m) => textOf(m.content)).join('\n'),
         surface: framework.listToolClasses(a.name).map((t) => t.tool),
       });
@@ -167,6 +169,14 @@ async function makeHarness(opts: {
   };
 }
 
+/** What the launch composed: a fork's result message, or a spawn's or
+ *  parentless fork's own messages (its orientation, then its task). */
+function launchText(messages: Array<{ content: unknown }>): string {
+  const last = messages[messages.length - 1]?.content;
+  const isResult = Array.isArray(last) && (last as Array<{ type?: string }>).some((b) => b.type === 'tool_result');
+  return isResult ? textOf(last) : messages.map((m) => textOf(m.content)).join('\n');
+}
+
 function call(name: 'fork' | 'spawn', id: string, input: Record<string, unknown>, caller: string | null = 'parent'): ToolCall {
   return { id, name, input, ...(caller !== null ? { callerAgentName: caller } : {}) } as unknown as ToolCall;
 }
@@ -184,7 +194,8 @@ const CUT_AT_EXCHANGE =
   "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
   'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
   "message is dropped. The call's assistant message and its result message keep their other blocks, " +
-  "with sibling fork calls and their results removed and this call's result rewritten as this message. " +
+  "with sibling fork calls and their results removed and this call's result rewritten as this message, " +
+  "which comes first in its message, so if that message is over the cap, what's cut is text after it. " +
   'No other message after the call is included.';
 
 /** What the orientation says each prose-routing mode does with plain text. */
@@ -340,7 +351,7 @@ describe('fork orientation', () => {
     }
   });
 
-  test('tool differences and a parent restriction are named in full, however many there are', async () => {
+  test("a fork's extra tools are named up to ten and the rest counted; a short parent restriction is named whole", async () => {
     const h = await makeHarness({ parent: { allowedTools: ['agent_settings'] }, modules: [toolModule('wide', 15)] });
     try {
       const input = { name: 'wide', task: 'use everything' };
@@ -354,8 +365,10 @@ describe('fork orientation', () => {
       const extra = run.surface.filter((n) => !parentTools.includes(n));
       expect(extra.length).toBeGreaterThan(15);
       const tools = line(startSection(run.firstContext), '- Tools:');
-      for (const name of extra) expect(tools).toContain(name);
-      expect(tools).not.toContain('more');
+      // Only the stream's own tools are named in full: tools it has beyond
+      // its parent's are named up to ten, and the rest counted.
+      for (const name of extra.slice(0, 10)) expect(tools).toContain(name);
+      expect(tools).toContain(` and ${extra.length - 10} more`);
     } finally {
       await h.cleanup();
     }
@@ -374,7 +387,11 @@ describe('fork orientation', () => {
       expect(block).not.toContain('Against the parent');
       const run = h.runs[0]!;
       // Before this change a parentless fork started with an empty context.
-      expect(run.firstContext).toStartWith('Your intention for this stream: list the files');
+      // The orientation comes first and the task last: the stream's message
+      // cap keeps a message's start, and the orientation is usually short.
+      expect(run.firstContext).toStartWith("Launch of fork 'orphan'");
+      expect(run.firstContext).toContain('When this intention is complete, return your findings via subagent--return. Your intention for this stream follows.\n');
+      expect(run.firstContext).toEndWith('\nlist the files');
       expect(run.firstContext).toContain(block);
       const start = startSection(run.firstContext);
       expect(start).toContain('- Inherited: nothing; there is no parent stream.');
@@ -507,7 +524,8 @@ describe('spawn orientation', () => {
       expect(input.tools).toEqual(['time--now']); // the caller's array is not mutated
       const run = h.runs[0]!;
       expect(run.proseRouting).toBe('disabled');
-      expect(run.firstContext).toStartWith('probe the harness\n');
+      expect(run.firstContext).toStartWith("Launch of spawn 'probe'");
+      expect(run.firstContext).toEndWith('\nprobe the harness');
       expect(run.firstContext).toContain(block);
       const start = startSection(run.firstContext);
       expect(start).toContain('- Inherited: nothing; a spawn starts from its task.');
@@ -840,7 +858,8 @@ describe('a queued launch', () => {
       await h.asyncPromise('child');
 
       const run = h.runs.find((r) => r.name.startsWith('child-'))!;
-      expect(run.firstContext).toStartWith('Your intention for this stream: outlive the caller');
+      expect(run.firstContext).toStartWith("Launch of fork 'child'");
+      expect(run.firstContext).toEndWith('Your intention for this stream follows.\noutlive the caller');
       expect(run.firstContext).toContain(block);
       expect(run.allText).not.toContain('please look into it');
       const start = startSection(run.firstContext);
@@ -965,5 +984,484 @@ describe('the first request a fork actually sends', () => {
     } finally {
       await cleanup();
     }
+  });
+});
+
+describe('what a stream first reads is what its launch promises', () => {
+  /** The real framework and a mock provider, so a test reads the request
+   *  the provider actually receives. `tools` adds that many tools to the
+   *  board, for an orientation longer than one message. */
+  async function realHarness(opts: {
+    parentless?: boolean;
+    tools?: number;
+    maxPromptTokens?: number;
+    maxRetries?: number;
+    formatter?: 'anthropic-xml' | 'openai-responses';
+  } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-delivered-'));
+    const adapter = new MockAdapter({ defaultResponse: 'done' });
+    const subagent = new SubagentModule({
+      provider: 'mock', defaultModel: 'mock', maxRetries: opts.maxRetries ?? 0,
+      ...(opts.parentless ? {} : { parentAgentName: 'parent' }),
+      ...(opts.maxPromptTokens !== undefined ? { maxPromptTokens: opts.maxPromptTokens } : {}),
+    });
+    const bulk: Module = {
+      name: 'bulk',
+      getTools: () => Array.from({ length: opts.tools ?? 0 }, (_, i) => ({
+        name: bulkName(i),
+        description: 'x',
+        inputSchema: { type: 'object' as const, properties: {} },
+      })),
+      start: async () => {},
+      stop: async () => {},
+      handleToolCall: async () => ({ success: false, error: 'no' }),
+      onProcess: async () => ({}),
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new Membrane(adapter, {
+        formatter: opts.formatter === 'anthropic-xml'
+          ? new AnthropicXmlFormatter()
+          : opts.formatter === 'openai-responses' ? new OpenAIResponsesFormatter() : new NativeFormatter(),
+      }),
+      agents: [{ name: 'parent', model: 'mock', systemPrompt: 'p', maxTokens: 256 }],
+      modules: [subagent as never, ...(opts.tools ? [bulk] : [])],
+    });
+    subagent.setFramework(framework);
+    framework.start();
+    const requestFor = (model: string) => adapter.getRequestLog().map((r) => r.request).find((r) => r.model === model);
+    return {
+      framework, subagent, requestFor,
+      cleanup: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); },
+    };
+  }
+
+  // Longer than one message holds (10,000 tokens; the cap keeps a message's start).
+  const LONG_TASK = 'Inspect this supplied work item. '.repeat(3000);
+  const bulkName = (i: number) => `bulk--a-tool-with-a-long-enough-name-to-fill-an-orientation-${i}`;
+
+  test('a long task: a spawn and a parentless fork are refused, saying why and what to do, and nothing is sent', async () => {
+    for (const kind of ['spawn', 'parentless'] as const) {
+      const h = await realHarness({ parentless: kind === 'parentless' });
+      try {
+        const model = `mock-${kind}`;
+        const result = await h.subagent.handleToolCall({
+          id: 'call-1', name: kind === 'spawn' ? 'spawn' : 'fork',
+          input: { name: `long-${kind}`, task: LONG_TASK, model, sync: true, ...(kind === 'spawn' ? { systemPrompt: 'p' } : {}) },
+          ...(kind === 'spawn' ? { callerAgentName: 'parent' } : {}),
+        } as never);
+        expect(result.success).toBe(false);
+        expect(String(result.error)).toBe(
+          `Subagent long-${kind} wasn't launched: its task is longer than one message holds (10,000 tokens): ` +
+          `shorten or split it, or put the detail in a file, ${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path.`,
+        );
+        expect(h.requestFor(model)).toBeUndefined();
+      } finally {
+        await h.cleanup();
+      }
+    }
+  });
+
+  test('a long task: a structural fork launches, its first request carrying its orientation whole and its task in its fork call', async () => {
+    const h = await realHarness();
+    try {
+      const input = { name: 'long-structural', task: LONG_TASK, model: 'mock-structural', sync: true };
+      const cm = h.framework.getAgent('parent')!.getContextManager();
+      cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+      cm.addMessage('parent', [{ type: 'tool_use', id: 'fork-point', name: 'subagent--fork', input }] as never);
+      const result = await h.subagent.handleToolCall({ id: 'fork-point', name: 'fork', input, callerAgentName: 'parent' } as never);
+      expect(result.success).toBe(true);
+      const wire = JSON.stringify(h.requestFor('mock-structural')!.messages);
+      expect(wire).toContain("Launch of fork 'long-structural'");
+      expect(wire).toContain('At the start of this stream:');
+      expect(wire).toContain('When this intention is complete, return your findings via subagent--return');
+      // The whole task rides in the inherited fork call.
+      expect(wire).toContain(JSON.stringify(LONG_TASK).slice(1, -1));
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test('an orientation longer than one message: refused for it, a spawn told to shorten its list and a fork to spawn with one', async () => {
+    // A spawn names its whole surface, and so does a fork with no parent
+    // stream to compare against (one with a parent names only differences).
+    const h = await realHarness({ tools: 900 });
+    try {
+      const spawn = await h.subagent.handleToolCall({
+        id: 'call-s', name: 'spawn', callerAgentName: 'parent',
+        input: { name: 'wide-spawn', task: 'short', systemPrompt: 'p', model: 'mock-wide-spawn', sync: true },
+      } as never);
+      expect(spawn.success).toBe(false);
+      // The short task is its own message, so it arrives, and only the orientation is named.
+      expect(String(spawn.error)).toBe(
+        "Subagent wide-spawn wasn't launched: its orientation, which names the spawn's tools in full, is longer than one message holds (10,000 tokens): give the spawn a shorter tools list.",
+      );
+      expect(h.requestFor('mock-wide-spawn')).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+    const p = await realHarness({ parentless: true, tools: 900 });
+    try {
+      const fork = await p.subagent.handleToolCall({
+        id: 'call-f', name: 'fork',
+        input: { name: 'wide-fork', task: 'short', model: 'mock-wide-fork', sync: true },
+      } as never);
+      expect(fork.success).toBe(false);
+      // With no parent there is no context to lose by spawning instead.
+      expect(String(fork.error)).toBe(
+        "Subagent wide-fork wasn't launched: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn with a short tools list instead.",
+      );
+      expect(p.requestFor('mock-wide-fork')).toBeUndefined();
+    } finally {
+      await p.cleanup();
+    }
+  });
+
+  test('a fork whose surface matches its parent\'s says so in a line, so a wide board still launches', async () => {
+    const h = await realHarness({ tools: 900 });
+    try {
+      const result = await h.subagent.handleToolCall({
+        id: 'call-p', name: 'fork', callerAgentName: 'parent',
+        input: { name: 'wide-parented', task: 'short', model: 'mock-wide-parented', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      expect(JSON.stringify(h.requestFor('mock-wide-parented')!.messages)).toContain('the same set the parent stream has now');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  // A size refusal is the launch's outcome too, so it's never retried. Its
+  // text holds the subagent's name, and the retry gate reads that name's
+  // "idle" as transient.
+  for (const kind of ['spawn', 'fork'] as const) {
+    test(`a ${kind}'s size check refuses a launch over the limit once, without a retry`, async () => {
+      const h = await realHarness({ maxPromptTokens: 1, maxRetries: 2 });
+      const attempts = countAttempts(h.framework);
+      try {
+        const input = { name: `sized-idle-${kind}`, task: 'short', model: `mock-sized-idle-${kind}`, sync: true, ...(kind === 'spawn' ? { systemPrompt: 'p' } : {}) };
+        if (kind === 'fork') {
+          const cm = h.framework.getAgent('parent')!.getContextManager();
+          cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+          cm.addMessage('parent', [{ type: 'tool_use', id: 'fork-point', name: 'subagent--fork', input }] as never);
+        }
+        const result = await h.subagent.handleToolCall({ id: 'fork-point', name: kind, input, callerAgentName: 'parent' } as never);
+        expect(result.success).toBe(false);
+        expect(String(result.error)).toContain(`Prompt too large for subagent sized-idle-${kind}: ~`);
+        expect(String(result.error)).toContain('its orientation included (limit: 1)');
+        expect(attempts.count).toBe(1);
+      } finally {
+        await h.cleanup();
+      }
+    });
+  }
+
+  test("a long task: a fallback fork launches, its own result's head whole and its whole task in its own call", async () => {
+    const h = await realHarness();
+    try {
+      // The call isn't in the parent's context, so the fork takes the fallback path.
+      const result = await h.subagent.handleToolCall({
+        id: 'not-in-context', name: 'fork', callerAgentName: 'parent',
+        input: { name: 'long-fallback', task: LONG_TASK, model: 'mock-fallback', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      const messages = h.requestFor('mock-fallback')!.messages as unknown as Array<{ content: unknown }>;
+      const wire = JSON.stringify(messages);
+      expect(wire).toContain("Launch of fork 'long-fallback'");
+      expect(wire).toContain('When this intention is complete, return your findings via subagent--return');
+      const call = messages.flatMap((m) => (Array.isArray(m.content) ? m.content : []) as Array<{ type?: string; name?: string; input?: { task?: string } }>)
+        .find((b) => b.type === 'tool_use' && b.name === 'subagent--fork');
+      expect(call?.input?.task).toBe(LONG_TASK);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("a structural fork whose turn returned a long result before its own: its result leads the message, so it launches oriented", async () => {
+    const h = await realHarness();
+    try {
+      const input = { name: 'after-a-read', task: 'short', model: 'mock-after-a-read', sync: true };
+      const cm = h.framework.getAgent('parent')!.getContextManager();
+      cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+      cm.addMessage('parent', [
+        { type: 'tool_use', id: 'read-1', name: 'files--read', input: { path: 'big' } },
+        { type: 'tool_use', id: 'fork-point', name: 'subagent--fork', input },
+      ] as never);
+      cm.addMessage('user', [
+        { type: 'tool_result', toolUseId: 'read-1', content: 'x'.repeat(45_000) },
+        { type: 'tool_result', toolUseId: 'fork-point', content: 'forked' },
+      ] as never);
+      const result = await h.subagent.handleToolCall({ id: 'fork-point', name: 'fork', input, callerAgentName: 'parent' } as never);
+      expect(result.success).toBe(true);
+      const wire = JSON.stringify(h.requestFor('mock-after-a-read')!.messages);
+      expect(wire).toContain("Launch of fork 'after-a-read'");
+      expect(wire).toContain('Your intention for this stream: short');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test('an async launch answers with its receipt, and a refusal reaches the caller afterwards as its failure notice', async () => {
+    const h = await realHarness();
+    try {
+      const failures: Array<{ name: string; message: string }> = [];
+      let delivered!: () => void;
+      const notice = new Promise<void>((resolve) => { delivered = resolve; });
+      const internals = h.subagent as unknown as {
+        deliverAsyncError(name: string, err: unknown, parent: string): void;
+      };
+      const deliver = internals.deliverAsyncError.bind(h.subagent);
+      internals.deliverAsyncError = (name, err, parent) => {
+        failures.push({ name, message: err instanceof Error ? err.message : String(err) });
+        deliver(name, err, parent);
+        delivered();
+      };
+      const result = await h.subagent.handleToolCall({
+        id: 'call-async', name: 'spawn', callerAgentName: 'parent',
+        input: { name: 'long-async', task: LONG_TASK, systemPrompt: 'p', model: 'mock-long-async' },
+      } as never);
+      expect(result.success).toBe(true);
+      await notice;
+      expect(failures).toEqual([{
+        name: 'long-async',
+        message: "Subagent long-async wasn't launched: its task is longer than one message holds (10,000 tokens): " +
+          'shorten or split it, or put the detail in a file, give the spawn a tool that can read it, and pass the path.',
+      }]);
+      expect(h.requestFor('mock-long-async')).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  /** Counts the streams a launch creates: one per attempt. */
+  const countAttempts = (framework: AgentFramework) => {
+    const fw = framework as unknown as { createEphemeralAgent: (...args: unknown[]) => Promise<unknown> };
+    const create = fw.createEphemeralAgent.bind(framework);
+    const attempts = { count: 0 };
+    fw.createEphemeralAgent = (...args: unknown[]) => { attempts.count++; return create(...args); };
+    return attempts;
+  };
+
+  test("a refusal is never retried, even when its text holds a word the retry gate reads as transient", async () => {
+    const h = await realHarness({ maxRetries: 2 });
+    try {
+      const attempts = countAttempts(h.framework);
+      const result = await h.subagent.handleToolCall({
+        id: 'call-idle', name: 'spawn', callerAgentName: 'parent',
+        input: { name: 'idle-network-503', task: LONG_TASK, systemPrompt: 'p', model: 'mock-idle', sync: true },
+      } as never);
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toStartWith("Subagent idle-network-503 wasn't launched: its task is longer");
+      expect(attempts.count).toBe(1);
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test('an orientation and a task that each fit a message launch together, each in its own message', async () => {
+    // An orientation of 30,036 characters (25,888 of them tool names) and
+    // a 20,761-character task: each under the 40,000-character cap,
+    // together over it.
+    const h = await realHarness({ tools: 400 });
+    try {
+      const task = `${'Read the supplied notes. '.repeat(830)}END-OF-TASK`;
+      const result = await h.subagent.handleToolCall({
+        id: 'call-both', name: 'spawn', callerAgentName: 'parent',
+        input: { name: 'both-fit', task, systemPrompt: 'p', model: 'mock-both-fit', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      const wire = JSON.stringify(h.requestFor('mock-both-fit')!.messages);
+      expect(wire).toContain("Launch of spawn 'both-fit'");
+      expect(wire).toContain(bulkName(399));
+      expect(wire).toContain('END-OF-TASK');
+      expect(wire).not.toContain('[truncated');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test('a parentless fork\'s orientation and task each fit a message and launch together, each in its own message', async () => {
+    const h = await realHarness({ parentless: true, tools: 400 });
+    try {
+      const task = `${'Read the supplied notes. '.repeat(830)}END-OF-TASK`;
+      const result = await h.subagent.handleToolCall({
+        id: 'call-both-fork', name: 'fork',
+        input: { name: 'both-fit-fork', task, model: 'mock-both-fit-fork', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      const wire = JSON.stringify(h.requestFor('mock-both-fit-fork')!.messages);
+      expect(wire).toContain("Launch of fork 'both-fit-fork'");
+      expect(wire).toContain(bulkName(399));
+      expect(wire).toContain('Your intention for this stream follows.');
+      expect(wire).toContain('END-OF-TASK');
+      expect(wire).not.toContain('[truncated');
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  // The native formatter merges the two messages into one user turn; these
+  // two formatters send them as two consecutive user turns. Either way the
+  // stream reads both whole.
+  for (const formatter of ['anthropic-xml', 'openai-responses'] as const) {
+    test(`under the ${formatter} formatter, a spawn's orientation and task both reach the provider whole`, async () => {
+      const h = await realHarness({ tools: 400, formatter });
+      try {
+        const task = `${'Read the supplied notes. '.repeat(830)}END-OF-TASK`;
+        const result = await h.subagent.handleToolCall({
+          id: 'call-fmt', name: 'spawn', callerAgentName: 'parent',
+          input: { name: 'formatted', task, systemPrompt: 'p', model: 'mock-formatted', sync: true },
+        } as never);
+        expect(result.success).toBe(true);
+        const wire = JSON.stringify(h.requestFor('mock-formatted'));
+        expect(wire).toContain("Launch of spawn 'formatted'");
+        expect(wire).toContain(bulkName(399));
+        expect(wire).toContain('END-OF-TASK');
+        expect(wire).not.toContain('[truncated');
+      } finally {
+        await h.cleanup();
+      }
+    });
+  }
+
+  test("a fork with a call, which would inherit its parent's context, is told that a spawn inherits none of it", () => {
+    const subagent = new SubagentModule({ provider: 'mock', defaultModel: 'mock' });
+    const refuse = (subagent as unknown as {
+      launchRefusal(kind: 'spawn' | 'fork', name: string, cut: string[], delivery: unknown): Error;
+    }).launchRefusal.bind(subagent);
+    const withCall = { kind: 'fork-result', callId: 'c', head: 'HEAD', task: 'TASK' };
+    const ownMessages = { kind: 'message', orientation: 'ORIENT', taskBlock: 'TASK' };
+    expect(refuse('fork', 'f', ['orientation'], ownMessages).message).toBe(
+      "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
+      'launch it as subagent--spawn with a short tools list instead.',
+    );
+    expect(refuse('fork', 'f', ['orientation'], withCall).message).toBe(
+      "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
+      'launch it as subagent--spawn with a short tools list instead, though a spawn inherits none of this context.',
+    );
+    expect(refuse('fork', 'f', ['call'], withCall).message).toBe(
+      "Subagent f wasn't launched: the fork call that carries its task isn't in the context it would start from: " +
+      'launch it as subagent--spawn with the task instead.',
+    );
+    expect(refuse('spawn', 's', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
+  });
+
+  test('a short task and a modest surface launch as before, the orientation first and the task last', async () => {
+    const h = await realHarness();
+    try {
+      const result = await h.subagent.handleToolCall({
+        id: 'call-ok', name: 'spawn', callerAgentName: 'parent',
+        input: { name: 'fine', task: 'list the files', systemPrompt: 'p', model: 'mock-fine', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      const first = h.requestFor('mock-fine')!.messages.find((m) => JSON.stringify(m).includes('list the files'))!;
+      const text = JSON.stringify(first);
+      expect(text.indexOf("Launch of spawn 'fine'")).toBeGreaterThanOrEqual(0);
+      expect(text.indexOf("Launch of spawn 'fine'")).toBeLessThan(text.indexOf('list the files'));
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe('lists about another stream are named in part, so only the stream\'s own tools can make its orientation long', () => {
+  async function harness(parentAllowed: string[]) {
+    const dir = mkdtempSync(join(tmpdir(), 'launch-lists-'));
+    const names = Array.from({ length: 900 }, (_, i) => `bulk--a-tool-with-a-long-enough-name-to-fill-an-orientation-${i}`);
+    const adapter = new MockAdapter({ defaultResponse: 'done' });
+    const subagent = new SubagentModule({ provider: 'mock', defaultModel: 'mock', parentAgentName: 'parent', maxRetries: 0 });
+    const bulk: Module = {
+      name: 'bulk',
+      getTools: () => names.map((name) => ({ name, description: 'x', inputSchema: { type: 'object' as const, properties: {} } })),
+      start: async () => {},
+      stop: async () => {},
+      handleToolCall: async () => ({ success: false, error: 'no' }),
+      onProcess: async () => ({}),
+    };
+    const framework = await AgentFramework.create({
+      storePath: join(dir, 'store'),
+      membrane: new Membrane(adapter, { formatter: new NativeFormatter() }),
+      agents: [{ name: 'parent', model: 'mock', systemPrompt: 'p', maxTokens: 256, allowedTools: parentAllowed === undefined ? undefined : [...parentAllowed] } as AgentConfig],
+      modules: [subagent as never, bulk],
+    });
+    subagent.setFramework(framework);
+    framework.start();
+    const requestFor = (model: string) => adapter.getRequestLog().map((r) => r.request).find((r) => r.model === model);
+    return { names, subagent, requestFor, cleanup: async () => { await framework.stop(); rmSync(dir, { recursive: true, force: true }); } };
+  }
+
+  test("a caller restricted to 902 tools: a spawn with a short list launches, its orientation counting the rest of the caller's list", async () => {
+    const all = Array.from({ length: 900 }, (_, i) => `bulk--a-tool-with-a-long-enough-name-to-fill-an-orientation-${i}`);
+    const h = await harness([...all, 'subagent--spawn', 'subagent--fork']);
+    try {
+      for (const tools of [['subagent--return'], []]) {
+        const name = tools.length ? 'single' : 'empty';
+        const result = await h.subagent.handleToolCall({
+          id: name, name: 'spawn', callerAgentName: 'parent',
+          input: { name, model: `mock-${name}`, systemPrompt: 'p', task: 't', sync: true, tools },
+        } as never);
+        expect(result.success).toBe(true);
+        const wire = JSON.stringify(h.requestFor(`mock-${name}`)!.messages);
+        expect(wire).toContain('the caller is restricted to 902: bulk--a-tool-with-a-long-enough-name-to-fill-an-orientation-0, ');
+        expect(wire).toContain(' and 892 more');
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("a fork of a restricted parent has the whole board: its orientation names how it differs in part, and it launches", async () => {
+    const h = await harness(['subagent--fork', 'subagent--return']);
+    try {
+      const result = await h.subagent.handleToolCall({
+        id: 'call-r', name: 'fork', callerAgentName: 'parent',
+        input: { name: 'from-narrow', task: 'short', model: 'mock-from-narrow', sync: true },
+      } as never);
+      expect(result.success).toBe(true);
+      const wire = JSON.stringify(h.requestFor('mock-from-narrow')!.messages);
+      expect(wire).toMatch(/it also has [^"]* and \d+ more/);
+    } finally {
+      await h.cleanup();
+    }
+  });
+});
+
+describe('what counts as delivered: each shape\'s own carriers, whole', () => {
+  const text = (t: string) => ({ type: 'text', text: t });
+  const msgs = (...content: unknown[]) => [{ content: content as never }];
+
+  test('a spawn or parentless fork: the orientation and the task text, each whole', () => {
+    const delivery = { kind: 'message' as const, orientation: 'ORIENT', taskBlock: 'TASK' };
+    expect(undeliveredLaunchParts([...msgs(text('ORIENT')), ...msgs(text('TASK'))], delivery)).toEqual([]);
+    expect(undeliveredLaunchParts([...msgs(text('ORI\n\n[truncated]')), ...msgs(text('TASK'))], delivery)).toEqual(['orientation']);
+    expect(undeliveredLaunchParts([...msgs(text('ORIENT')), ...msgs(text('TA\n\n[truncated]'))], delivery)).toEqual(['task']);
+    expect(undeliveredLaunchParts([...msgs(text('ORI[truncated]')), ...msgs(text('TA[truncated]'))], delivery)).toEqual(['orientation', 'task']);
+    // The task's words elsewhere aren't its text.
+    expect(undeliveredLaunchParts(msgs(text('ORIENT mentions TASK')), { ...delivery, orientation: 'ORIENT mentions TASK' })).toEqual(['task']);
+  });
+
+  test("a fork: its own result's head, and the whole task in its own call, found by the call's id", () => {
+    const delivery = { kind: 'fork-result' as const, callId: 'c1', head: 'HEAD', task: 'TASK' };
+    const call = (id: string, task: string) => ({ type: 'tool_use', id, name: 'subagent--fork', input: { task } });
+    const result = (id: string, content: string) => ({ type: 'tool_result', toolUseId: id, content });
+    expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('c1', 'HEAD\n\nYour intention for this stream: TA[truncated]'))], delivery)).toEqual([]);
+    expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('c1', 'HE[truncated]'))], delivery)).toEqual(['orientation']);
+    // Another call carrying the same task isn't this fork's call.
+    expect(undeliveredLaunchParts([...msgs(call('other', 'TASK')), ...msgs(result('c1', 'HEAD'))], delivery)).toEqual(['call']);
+    // Another result's head isn't this fork's result.
+    expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('other', 'HEAD'))], delivery)).toEqual(['orientation']);
+  });
+});
+
+describe("a fork's tools set against its parent's", () => {
+  const names = (prefix: string, n: number) => Array.from({ length: n }, (_, i) => `${prefix}-${i}`);
+
+  test('every tool it lacks is named, however many; the tools it has beyond the parent\'s are named up to ten', () => {
+    const text = toolDifferences(names('extra', 15), names('lacks', 15));
+    for (const name of names('extra', 10)) expect(text).toContain(name);
+    expect(text).not.toContain('extra-10');
+    expect(text).toContain('extra-9 and 5 more');
+    for (const name of names('lacks', 15)) expect(text).toContain(name);
+    expect(text).toEndWith('lacks-13 and lacks-14');
   });
 });

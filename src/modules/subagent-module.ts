@@ -113,6 +113,18 @@ interface DetachableHandle {
 }
 
 /**
+ * A launch refused before its stream sends anything: its stream wouldn't
+ * read what the launch promises, or its prompt is over the size limit. It's
+ * the launch's outcome, not a provider failure, so it's never retried.
+ */
+export class SubagentLaunchRefused extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'SubagentLaunchRefused';
+  }
+}
+
+/**
  * Non-retryable termination of a subagent. All abnormal-but-expected exits
  * (user cancel, zombie reclaim, depth limit, etc.) use this so the catch
  * path can distinguish "killed" from "transient network error".
@@ -251,6 +263,23 @@ export function buildIntentionFramedForkResult(
    *  stated before its first inference. */
   orientation?: string,
 ): string {
+  return `${intentionFramedHead(depth, maxDepth, orientation)}\n\nYour intention for this stream: ${task}`;
+}
+
+/**
+ * Everything in a fork's intention-framed result before the restated
+ * intention: the dual-stream framing, the depth, the orientation and the
+ * return instruction. A stream's message cap keeps a message's beginning,
+ * so this part leads the result, and it must reach the stream whole: a cut
+ * anywhere in it refuses the launch. Only the restated intention can be cut
+ * without that, since the fork's own call (a tool call, which the cap
+ * passes whole) carries all of it.
+ */
+export function intentionFramedHead(
+  depth: number,
+  maxDepth: number,
+  orientation?: string,
+): string {
   const depthLine = depth < maxDepth
     ? `You are at depth ${depth} of ${maxDepth} (${maxDepth - depth} sub-fork levels remaining).`
     : `You are at depth ${depth} of ${maxDepth} — at max depth, you cannot sub-fork.`;
@@ -258,7 +287,7 @@ export function buildIntentionFramedForkResult(
     `Two parallel streams of you continue from this point, both inheriting everything you've done so far. ` +
     `An instance of you still runs as the parent stream, carrying on the broader agenda; ` +
     `the self reading this is the fork — set aside that broader agenda and focus exclusively on the intention ` +
-    `you set for this stream: ${task}\n\n` +
+    `you set for this stream in your subagent--fork call, restated at the end of this result.\n\n` +
     `${depthLine}\n\n` +
     (orientation ? `${orientation}\n\n` : '') +
     `When this intention is complete, return your findings via subagent--return so the parent stream can integrate them.`
@@ -279,6 +308,68 @@ const SUBAGENT_STRATEGY = {
   maxMessageTokens: 10_000,
 } as const;
 const SUBAGENT_STREAM_TOKENS = 500_000;
+
+/**
+ * What a launch must deliver to its stream, in the shape it composed it.
+ * Each message in a stream's context is capped alone (SUBAGENT_STRATEGY's
+ * maxMessageTokens): the cap counts its text and string tool results and
+ * keeps its beginning; past the budget it cuts or drops text, and cuts a
+ * string tool result or replaces it with an omission notice, while tool
+ * calls and structured results pass whole. So what was stored can still be
+ * missing from what the stream reads. A launch's check compiles the stream's
+ * context as its first inference will: the launch sets no context budget,
+ * so both use the context manager's default, and both cap and select the
+ * stored messages before any injection is added.
+ */
+export type LaunchDelivery =
+  /** A spawn's or a parentless fork's own first messages: the orientation,
+   *  then the text that carries the task, each its own message and whole. */
+  | { kind: 'message'; orientation: string; taskBlock: string }
+  /** A fork's intention-framed result, found by its call's id: it begins
+   *  with its head (framing, orientation and return instruction) whole, and
+   *  that call carries the whole task. */
+  | { kind: 'fork-result'; callId: string; head: string; task: string };
+
+/**
+ * What a launch promises that a stream's compiled first context lacks:
+ * 'orientation' when the orientation (and, for a fork, the rest of its
+ * result's head) isn't there whole; 'task' when a spawn's or parentless
+ * fork's task text isn't; 'call' when a fork's own call, which carries its
+ * whole task, isn't there with that task. Empty when everything arrived.
+ */
+export function undeliveredLaunchParts(
+  messages: ReadonlyArray<{ content: ContentBlock[] }>,
+  delivery: LaunchDelivery,
+): Array<'orientation' | 'task' | 'call'> {
+  const blocks = messages.flatMap((message) => message.content as unknown[]);
+  const cut: Array<'orientation' | 'task' | 'call'> = [];
+  if (delivery.kind === 'message') {
+    const texts = blocks.flatMap((b) => {
+      const block = b as { type?: unknown; text?: unknown };
+      return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [];
+    });
+    if (!texts.includes(delivery.orientation)) cut.push('orientation');
+    if (!texts.includes(delivery.taskBlock)) cut.push('task');
+    return cut;
+  }
+  const result = blocks.find((b) => {
+    const block = b as { type?: unknown; toolUseId?: unknown };
+    return block.type === 'tool_result' && block.toolUseId === delivery.callId;
+  }) as { content?: unknown } | undefined;
+  const resultText = typeof result?.content === 'string'
+    ? result.content
+    : Array.isArray(result?.content)
+      ? (result.content as Array<{ type?: unknown; text?: unknown }>)
+          .map((c) => (c.type === 'text' && typeof c.text === 'string' ? c.text : '')).join('')
+      : '';
+  if (!resultText.startsWith(delivery.head)) cut.push('orientation');
+  const call = blocks.find((b) => {
+    const block = b as { type?: unknown; id?: unknown };
+    return block.type === 'tool_use' && block.id === delivery.callId;
+  }) as { input?: { task?: unknown } } | undefined;
+  if (call?.input?.task !== delivery.task) cut.push('call');
+  return cut;
+}
 const FALLBACK_SUBAGENT_MODEL = 'claude-haiku-4-5-20251001';
 const NO_PARENT_SYSTEM_PROMPT = 'You are a research assistant.';
 
@@ -434,6 +525,30 @@ const formatTokens = (n: number): string => `${n.toLocaleString('en-US')} tokens
 function joinAll(items: readonly string[]): string {
   if (items.length <= 1) return items.join('');
   return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+/** A partial list: up to SOME_NAMES named and the rest counted ("a, b, …
+ *  and 890 more"). It's for the caller's restriction, which describes
+ *  another stream, and for the tools a fork has beyond its parent's, which
+ *  its request defines in full anyway. Everything else an orientation lists
+ *  is named in full with joinAll: a spawn's or parentless fork's whole
+ *  surface, the names a spawn's caller listed, and the parent's tools a
+ *  fork lacks. So a spawn's long orientation comes from its own tools, and
+ *  a shorter tools list shortens it. */
+const SOME_NAMES = 10;
+function joinSome(items: readonly string[]): string {
+  if (items.length <= SOME_NAMES) return joinAll(items);
+  return `${items.slice(0, SOME_NAMES).join(', ')} and ${items.length - SOME_NAMES} more`;
+}
+
+/** How a fork's tools differ from its parent's: every tool it lacks, since
+ *  its inherited context may show the parent using them, and the tools it
+ *  has beyond the parent's in part, since its request defines them all. */
+export function toolDifferences(extra: readonly string[], missing: readonly string[]): string {
+  const parts: string[] = [];
+  if (extra.length > 0) parts.push(`it also has ${joinSome(extra)}`);
+  if (missing.length > 0) parts.push(`it doesn't have ${joinAll(missing)}`);
+  return parts.join(', and ');
 }
 
 /**
@@ -601,7 +716,7 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
       ? `${them} has no restriction`
       : p.allowedTools.length === 0
         ? `${them} is restricted to no tools`
-        : `${them} is restricted to ${p.allowedTools.length}: ${joinAll(p.allowedTools)}`;
+        : `${them} is restricted to ${p.allowedTools.length}: ${joinSome(p.allowedTools)}`;
     settings.push({ name: 'tool rules', same, line: `- Tool rules: ${toolRule}${same ? `, the same as ${them}` : `; ${theirs}`}.` });
   } else {
     settings.push({ name: 'tool rules', line: `- Tool rules: ${toolRule}.` });
@@ -653,7 +768,8 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
       "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
         'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
         "message is dropped. The call's assistant message and its result message keep their other blocks, " +
-        "with sibling fork calls and their results removed and this call's result rewritten as this message. " +
+        "with sibling fork calls and their results removed and this call's result rewritten as this message, " +
+        "which comes first in its message, so if that message is over the cap, what's cut is text after it. " +
         'No other message after the call is included.',
     );
   } else if (inh.kind === 'compiled-at-start') {
@@ -716,10 +832,7 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
   if (extra.length === 0 && missing.length === 0) {
     lines.push(`- Tools: ${mine.length} available to this stream, the same set ${them} has now.`);
   } else {
-    const parts: string[] = [];
-    if (extra.length > 0) parts.push(`it also has ${joinAll(extra)}`);
-    if (missing.length > 0) parts.push(`it doesn't have ${joinAll(missing)}`);
-    lines.push(`- Tools: ${mine.length} available to this stream. Compared with what ${them} has now, ${parts.join(', and ')}.`);
+    lines.push(`- Tools: ${mine.length} available to this stream. Compared with what ${them} has now, ${toolDifferences(extra, missing)}.`);
   }
   return lines.join('\n');
 }
@@ -809,28 +922,18 @@ export function materialiseStructuralFork(
   const intentionFramed = buildIntentionFramedForkResult(forkName, forkTask, depth, maxDepth, orientation);
   if (matchingResultIdx >= 0) {
     const matchingMsg = compiled[matchingResultIdx];
-    const trimmedResultContent: ContentBlock[] = [];
+    // The fork's own result leads its message, ahead of the turn's other
+    // results: every message is capped and the cap keeps a message's
+    // beginning, so a sibling's length can't push out the framed result's
+    // head (its orientation).
+    const trimmedResultContent: ContentBlock[] = [{
+      type: 'tool_result',
+      toolUseId: callToolUseId,
+      content: intentionFramed,
+    }];
     for (const b of matchingMsg.content) {
-      if (isToolResultContent(b)) {
-        if (siblingForkIds.has(b.toolUseId)) continue;
-        if (b.toolUseId === callToolUseId) {
-          trimmedResultContent.push({
-            type: 'tool_result',
-            toolUseId: callToolUseId,
-            content: intentionFramed,
-          });
-          continue;
-        }
-      }
+      if (isToolResultContent(b) && (siblingForkIds.has(b.toolUseId) || b.toolUseId === callToolUseId)) continue;
       trimmedResultContent.push(b);
-    }
-    if (trimmedResultContent.length === 0) {
-      // All siblings, nothing else — synthesise the matching result alone.
-      trimmedResultContent.push({
-        type: 'tool_result',
-        toolUseId: callToolUseId,
-        content: intentionFramed,
-      });
     }
     out.push({ participant: matchingMsg.participant, content: trimmedResultContent });
   } else {
@@ -1553,6 +1656,7 @@ export class SubagentModule implements Module {
 
   /** Transient = worth retrying the whole subagent from scratch. */
   private isTransientError(err: Error): boolean {
+    if (err instanceof SubagentLaunchRefused) return false;
     const msg = err.message.toLowerCase();
     return (
       msg.includes('timeout') ||
@@ -2052,6 +2156,35 @@ export class SubagentModule implements Module {
     return names;
   }
 
+  /** Why a launch is refused when its stream wouldn't read what it
+   *  promises: each part that was cut, and the way out for it. A fork takes
+   *  no tools list, so its way out for a long orientation is a spawn with
+   *  one, which inherits nothing: worth saying when the fork would have
+   *  inherited its parent's context, as a fork with a call does. */
+  private launchRefusal(
+    kind: 'spawn' | 'fork',
+    name: string,
+    cut: ReadonlyArray<'orientation' | 'task' | 'call'>,
+    delivery: LaunchDelivery,
+  ): SubagentLaunchRefused {
+    const inheritsContext = delivery.kind === 'fork-result';
+    const cap = formatTokens(SUBAGENT_STRATEGY.maxMessageTokens);
+    const reasons = cut.map((part) => {
+      if (part === 'orientation') {
+        return kind === 'spawn'
+          ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
+          : `its orientation is longer than one message holds (${cap}): launch it as subagent--spawn with a short tools list instead` +
+            (inheritsContext ? ', though a spawn inherits none of this context' : '');
+      }
+      if (part === 'task') {
+        return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
+          `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
+      }
+      return "the fork call that carries its task isn't in the context it would start from: launch it as subagent--spawn with the task instead";
+    });
+    return new SubagentLaunchRefused(`Subagent ${name} wasn't launched: ${reasons.join('; and ')}.`);
+  }
+
   /** The stream's own orientation: the launch block as resolved at the
    *  call, then what happened when the stream was created. */
   private orientationFor(
@@ -2407,19 +2540,29 @@ export class SubagentModule implements Module {
         this.registerLive(input.name, agentName, launch.systemPrompt, contextManager);
 
         try {
-          // The task, then what this stream runs on: the launch as resolved
-          // at the call, and the tool surface it actually has now.
-          contextManager.addMessage('user', [
-            { type: 'text', text: input.task },
-            { type: 'text', text: this.orientationFor(launch, agent, { kind: 'none', reason: 'spawn' }) },
-          ]);
+          // What this stream runs on (the launch as resolved at the call,
+          // and the tool surface it actually has now), then the task, each
+          // its own message: the cap applies to each message alone, so each
+          // has all of it. The native formatter merges the two into one user
+          // turn after the cap; the anthropic-xml and openai-responses
+          // formatters send them as two consecutive user turns. The delivery
+          // check below refuses a stream that wouldn't read either whole.
+          const orientation = this.orientationFor(launch, agent, { kind: 'none', reason: 'spawn' });
+          contextManager.addMessage('user', [{ type: 'text', text: orientation }]);
+          contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
+
+          // The stream must read what the launch promises: refuse it when
+          // its orientation or its whole task isn't in its first context.
+          const { messages } = await contextManager.compile();
+          const delivery: LaunchDelivery = { kind: 'message', orientation, taskBlock: input.task };
+          const cut = undeliveredLaunchParts(messages, delivery);
+          if (cut.length > 0) throw this.launchRefusal('spawn', input.name, cut, delivery);
 
           // Pre-validate prompt size
-          const { messages } = await contextManager.compile();
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
+            throw new SubagentLaunchRefused(
               `Prompt too large for subagent ${input.name}: ~${est} tokens, its orientation included ` +
               `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
             );
@@ -2564,8 +2707,10 @@ export class SubagentModule implements Module {
           // What this stream runs on, stated before its first inference: the
           // launch as resolved at the call, then what actually happened here
           // (which inheritance path ran, budget as created, tools now).
-          const orient = (inherited: SubagentStart['inherited']) =>
+          const orient = (inherited: SubagentStart['inherited']): string =>
             this.orientationFor(launch, agent, inherited);
+          // Each branch says what its stream must read, in the shape it composed.
+          let delivery: LaunchDelivery;
           // Materialise the fork's inherited context structurally:
           //  - locate the parent's matching subagent--fork tool_use by id
           //  - strip sibling fork tool_use blocks (and their tool_results) from
@@ -2581,6 +2726,7 @@ export class SubagentModule implements Module {
           if (parentAgent) {
             const parentCM = parentAgent.getContextManager();
             const { messages: compiled } = await parentCM.compile();
+            const cutAtCall = orient({ kind: 'cut-at-call' });
             const transformed = callToolUseId
               ? materialiseStructuralFork(
                   compiled,
@@ -2589,7 +2735,7 @@ export class SubagentModule implements Module {
                   input.task,
                   childDepth,
                   this.maxDepth,
-                  orient({ kind: 'cut-at-call' }),
+                  cutAtCall,
                 )
               : null;
 
@@ -2604,6 +2750,12 @@ export class SubagentModule implements Module {
 
             if (transformed) {
               for (const msg of transformed) addMsg(msg);
+              delivery = {
+                kind: 'fork-result',
+                callId: callToolUseId!,
+                head: intentionFramedHead(childDepth, this.maxDepth, cutAtCall),
+                task: input.task,
+              };
             } else {
               // Fallback path: matching tool_use not located (parent compressed it
               // away, or no callToolUseId). Wholesale copy is safe here because
@@ -2614,6 +2766,7 @@ export class SubagentModule implements Module {
               for (const msg of compiled) addMsg(msg);
 
               const fallbackForkId = `fork-${input.name}-${crypto.randomUUID()}`;
+              const atStart = orient({ kind: 'compiled-at-start', reason: callToolUseId ? 'call-not-in-context' : 'no-call-id' });
               contextManager.addMessage(agentName, [{
                 type: 'tool_use',
                 id: fallbackForkId,
@@ -2623,31 +2776,42 @@ export class SubagentModule implements Module {
               contextManager.addMessage('user', [{
                 type: 'tool_result',
                 toolUseId: fallbackForkId,
-                content: buildIntentionFramedForkResult(
-                  input.name, input.task, childDepth, this.maxDepth,
-                  orient({ kind: 'compiled-at-start', reason: callToolUseId ? 'call-not-in-context' : 'no-call-id' }),
-                ),
+                content: buildIntentionFramedForkResult(input.name, input.task, childDepth, this.maxDepth, atStart),
               }] as ContentBlock[]);
+              delivery = {
+                kind: 'fork-result',
+                callId: fallbackForkId,
+                head: intentionFramedHead(childDepth, this.maxDepth, atStart),
+                task: input.task,
+              };
             }
           } else {
             // No parent stream: nothing to inherit, and no fork call to
             // answer. The stream still gets its intention and its
             // orientation as its first message, rather than starting with an
             // empty context and no task at all.
-            contextManager.addMessage('user', [{
-              type: 'text',
-              text: `Your intention for this stream: ${input.task}\n\n` +
-                `${orient({ kind: 'none', reason: launch.parent ? 'parent-gone' : 'no-parent' })}\n\n` +
-                'When this intention is complete, return your findings via subagent--return.',
-            }]);
+            // The orientation and the return instruction, then the task alone,
+            // each its own message, as for a spawn, so each has the whole cap
+            // and the task check measures the task itself.
+            const orientation = `${orient({ kind: 'none', reason: launch.parent ? 'parent-gone' : 'no-parent' })}\n\n` +
+              'When this intention is complete, return your findings via subagent--return. Your intention for this stream follows.';
+            contextManager.addMessage('user', [{ type: 'text', text: orientation }]);
+            contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
+            delivery = { kind: 'message', orientation, taskBlock: input.task };
           }
 
-          // Pre-validate prompt size
+          // The stream must read what the launch promises: refuse it when
+          // its orientation or its whole task isn't in its first context. A
+          // fork with a call reads its whole task in that call.
           const { messages } = await contextManager.compile();
+          const cut = undeliveredLaunchParts(messages, delivery);
+          if (cut.length > 0) throw this.launchRefusal('fork', input.name, cut, delivery);
+
+          // Pre-validate prompt size
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
+            throw new SubagentLaunchRefused(
               `Prompt too large for subagent ${input.name}: ~${est} tokens, its orientation included ` +
               `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
             );

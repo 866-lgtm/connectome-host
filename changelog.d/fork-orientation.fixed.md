@@ -1,2 +1,3 @@
 - A fork with no parent stream at its start (no caller and no configured parent agent, or a parent no longer registered when a queued fork starts) started with an empty context: no task and no framing. It now starts with its intention and its orientation.
 - `subagent--spawn` no longer appends `subagent--return` to the caller's own `tools` array; the stream gets a copy.
+- A "Prompt too large" refusal for a subagent whose name contains a word such as `idle`, `network`, `timeout` or `503` was retried with backoff, as though the provider had failed, because the retry gate reads the error's text. It's now reported at once.
