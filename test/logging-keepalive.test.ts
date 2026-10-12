@@ -25,6 +25,8 @@ async function exercise(options: {
   usage?: KeepaliveUsage; fail?: boolean; pokes?: number;
   /** The failing poke's HTTP status: 400 (invalid request) unless given. */
   failStatus?: 400 | 401;
+  /** The failing 400's message: 'fixture rejection' unless given. */
+  failMessage?: string;
   /** A successful poke's stop_reason: max_tokens unless given. */
   pokeStopReason?: string;
   /** Each successful poke's stop_reason in turn, in place of pokeStopReason. */
@@ -66,7 +68,7 @@ async function exercise(options: {
       if (poke && options.fail) {
         return options.failStatus === 401
           ? Response.json({ type: 'error', error: { type: 'authentication_error', message: 'fixture credential rejected' } }, { status: 401 })
-          : Response.json({ type: 'error', error: { type: 'invalid_request_error', message: 'fixture rejection' } }, { status: 400 });
+          : Response.json({ type: 'error', error: { type: 'invalid_request_error', message: options.failMessage ?? 'fixture rejection' } }, { status: 400 });
       }
       const stopReason = poke
         ? options.pokeStopReasons?.[pokesAnswered++] ?? options.pokeStopReason ?? 'max_tokens'
@@ -201,6 +203,19 @@ describe('keepalive calls reach the normal logs and spend ledger', () => {
     expect(result.credential.map(c => c.kind)).toEqual(['complete', 'keepalive']);
     expect((result.credential[1].error as Error).message).toContain('fixture rejection');
     expect(isAuthFailure(result.credential[1].error)).toBe(false);
+  });
+
+  test("a failed poke's error is bounded as a complete or stream call's is, in the row and the ledger alike", async () => {
+    // A provider can echo the whole rejected request in its error body.
+    const result = await exercise({ fail: true, failMessage: `fixture rejection ${'x'.repeat(10_000)}` });
+    const row = result.logs[1];
+    expect(row).toMatchObject({ kind: 'keepalive', type: 'error', error: { name: expect.any(String) } });
+    expect(row.error.message).toContain('fixture rejection');
+    expect(row.error.message).toContain('characters omitted');
+    expect(row.error.message.length).toBeLessThanOrEqual(4_000);
+    expect(row.errorChars).toBeGreaterThan(10_000);
+    expect(result.live.rows[1].error).toBe(row.error.message);
+    expect(result.reloaded).toEqual(result.live);
   });
 
   test('a refused poke logs its request, as a refused turn does', async () => {

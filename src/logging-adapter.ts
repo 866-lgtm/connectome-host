@@ -275,7 +275,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const raw = call.request;
     const cache = summarizeCacheControls(raw);
     const response = call.outcome === 'success' ? call.response : undefined;
-    const error = call.outcome === 'error' ? call.error : undefined;
+    // A failed poke's error takes the shape complete and stream rows give
+    // theirs: bounded text, with the classification a membrane error carries.
+    const errorFields = call.outcome === 'error' ? describeErrorObject(call.error, true) : undefined;
     const effort = (raw.output_config as { effort?: unknown } | undefined)?.effort;
     const record: Record<string, unknown> = {
       type: call.outcome === 'success' ? 'call' : 'error',
@@ -295,11 +297,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       rawRequest: this.fullPayloads || call.outcome === 'error' || response?.stop_reason === 'refusal'
         ? raw : undefined,
       ...(response ? { rawResponse: response } : {}),
-      ...(call.outcome === 'error' ? {
-        error: error instanceof Error
-          ? { name: error.name, message: error.message, stack: error.stack }
-          : String(error),
-      } : {}),
+      ...errorFields,
     };
     this.log(record);
     // A poke spends the same credential as a turn, so the credential monitor
