@@ -19,12 +19,17 @@
  *                         Point it at a COPY, never at ~/.claude/.credentials.json.
  *   ANTHROPIC_OAUTH_AUTO_REFRESH - 1/true: rotate on a 401 without asking
  *                         (default: alert + operator action)
- *   LLM_PROVIDER        - anthropic (default) or openai-compatible
- *   ANTHROPIC_API_KEY   - Required for Anthropic unless ANTHROPIC_AUTH_TOKEN is set
- *   OPENAI_BASE_URL     - Required for openai-compatible
- *   OPENAI_API_KEY      - Optional key for openai-compatible
+ *   OPENAI_COMPATIBLE_API_KEY - Key for recipe provider "openai-compatible"; the
+ *                         endpoint is the recipe's agent.baseUrl. Deliberately
+ *                         no OPENAI_API_KEY fallback. Omit for keyless local servers.
+ *   OPENAI_API_KEY      - Recipe provider "openai-responses" (OPENAI_BASE_URL optional)
+ *   COMPRESSION_OPENAI_BASE_URL - Optional: run memory compression on its own
+ *                         OpenAI-compatible endpoint (a separate membrane)
+ *   COMPRESSION_OPENAI_API_KEY  - Key for that endpoint (falls back to OPENAI_API_KEY)
  *   MODEL               - Override model (default: from recipe or claude-opus-4-6)
  *   DATA_DIR            - Data directory for sessions (default: ./data)
+ *
+ * The provider is the recipe's agent.provider (default anthropic); see README.
  */
 
 import {

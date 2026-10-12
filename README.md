@@ -552,6 +552,8 @@ bun install      # or npm install; the postinstall step builds the web UI
 | `ANTHROPIC_BASE_URL` | Anthropic API | Route Anthropic calls through a gateway |
 | `OPENAI_API_KEY`, `OPENAI_BASE_URL` | — | `openai-responses` recipes |
 | `OPENAI_COMPATIBLE_API_KEY` | — | Key for `openai-compatible` recipes (no `OPENAI_API_KEY` fallback by design); omit for local servers |
+| `COMPRESSION_OPENAI_BASE_URL` | — | Run memory compression on its own OpenAI-compatible endpoint (a separate membrane, tagged `compression` in the llm-calls log). The model is `agent.strategy.compressionModel` (default: the agent's model) |
+| `COMPRESSION_OPENAI_API_KEY` | `OPENAI_API_KEY` | Key for `COMPRESSION_OPENAI_BASE_URL` |
 | `OPENROUTER_API_KEY` | — | `openrouter` recipes |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | region `us-west-2` | `bedrock` recipes |
 | `BEDROCK_BASE_URL` | — | Route Bedrock calls through a gateway |
@@ -574,14 +576,26 @@ Recipes may reference any further variables they need as `${VAR}` (for
 example `WEBUI_USERNAME` / `WEBUI_PASSWORD`, `ZULIP_CHANNEL`, `GITLAB_TOKEN`
 in the shipped recipes).
 
-OpenAI-compatible mode uses the Chat Completions protocol (`POST /chat/completions`):
+OpenAI-compatible mode uses the Chat Completions protocol (`POST /chat/completions`).
+The recipe selects it and names the endpoint; the key comes from the
+environment ([above](#openai-compatible-endpoints-ollama-vllm-together-groq-nanogpt-)):
+
+```json
+{
+  "agent": {
+    "provider": "openai-compatible",
+    "baseUrl": "https://api.openai.com/v1",
+    "model": "gpt-5.1"
+  }
+}
+```
 
 ```bash
-export LLM_PROVIDER=openai-compatible
-export OPENAI_BASE_URL=https://api.example.com/v1
-export OPENAI_API_KEY=...
-export MODEL=provider/model-name
-bun src/index.ts
+export OPENAI_COMPATIBLE_API_KEY=...
+# optional: memory compression on a separate endpoint
+export COMPRESSION_OPENAI_BASE_URL=https://api.example.com/v1
+export COMPRESSION_OPENAI_API_KEY=...
+bun src/index.ts my-recipe.json
 ```
 
 If an OpenAI-compatible endpoint does not expose token counting, the WebUI
