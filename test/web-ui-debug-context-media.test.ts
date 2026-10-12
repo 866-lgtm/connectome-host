@@ -21,7 +21,7 @@ const request = {
   system: 'sys',
   messages: [
     {
-      participant: 'helen',
+      participant: 'user',
       content: [
         { type: 'text', text: 'look at this' },
         { type: 'image', source: { type: 'base64', data: BIG_B64, mediaType: 'image/png' } },
@@ -29,7 +29,7 @@ const request = {
       ],
     },
     {
-      participant: 'Polaris',
+      participant: 'Agent',
       content: [
         {
           type: 'tool_result',
@@ -57,12 +57,12 @@ beforeAll(async () => {
     framework: {
       getAllAgents: () => [],
       getAllModules: () => [],
-      getAgent: (name: string) => (name === 'Polaris' ? { name } : undefined),
+      getAgent: (name: string) => (name === 'Agent' ? { name } : undefined),
       previewActivation: async () => structuredClone(request),
       onTrace: () => {},
     },
     sessionManager: { getActiveSession: () => ({ id: 's', name: 's', manuallyNamed: true }) },
-    recipe: { name: 'recipe', agent: { name: 'Polaris' } },
+    recipe: { name: 'recipe', agent: { name: 'Agent' } },
   } as never);
 });
 
@@ -81,7 +81,7 @@ describe('/debug/context?media=0', () => {
     expect(raw).not.toContain('A'.repeat(4096));
 
     const body = JSON.parse(raw) as { agent: string; request: typeof request };
-    expect(body.agent).toBe('Polaris');
+    expect(body.agent).toBe('Agent');
     const [user, assistant] = body.request.messages;
     const big = user!.content[1] as { source: { data: string; mediaType: string } };
     expect(big.source.data).toBe('[base64 stripped 300kb]');
@@ -107,7 +107,7 @@ describe('/debug/context?media=0', () => {
   test('pretty=1 composes with media=0', async () => {
     const res = await fetch(`http://127.0.0.1:${port}/debug/context?media=0&pretty=1`);
     const raw = await res.text();
-    expect(raw).toContain('\n  "agent": "Polaris"');
+    expect(raw).toContain('\n  "agent": "Agent"');
     expect(raw).toContain('[base64 stripped 300kb]');
   });
 });

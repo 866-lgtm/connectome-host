@@ -37,7 +37,7 @@ describe('framework FKM composition', () => {
       cacheTtl: '24h',
       responses: {
         reasoningEffort: 'high',
-        promptCacheKey: 'connectome:polaris:main',
+        promptCacheKey: 'agent:main',
       },
     }));
 
@@ -45,7 +45,7 @@ describe('framework FKM composition', () => {
       cacheTtl: '24h',
       providerParams: {
         reasoning: { effort: 'high' },
-        prompt_cache_key: 'connectome:polaris:main',
+        prompt_cache_key: 'agent:main',
       },
     });
   });

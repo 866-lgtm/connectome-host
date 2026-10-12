@@ -172,14 +172,14 @@ export interface RecipeStrategy {
   summaryParticipant?: string;
   summarySystemPrompt?: string;
   /** Operator system prompt on memory-write (compression) requests, which
-   *  otherwise run bare. Carries deployment permission/register into the
-   *  summarizer so it inherits the live agent's operator context (e.g.
-   *  mature-content permission + non-graphic register). The adaptive
-   *  autobiographical path ignores summarySystemPrompt — use THIS. */
+   *  otherwise run bare. Carries deployment-specific memory-write
+   *  instructions into the summarizer so it inherits the live agent's
+   *  operator context. The adaptive autobiographical path ignores
+   *  summarySystemPrompt — use THIS. */
   compressionSystemPrompt?: string;
-  /** Heavier system prompt applied ONLY to retry a REFUSED memory-write
-   *  (content_filter). Baseline stays light; escalation (full permission +
-   *  non-graphic register + why) fires only on the rare refusal. */
+  /** A stronger operator prompt for retries after a refusal: applied ONLY
+   *  to retry a REFUSED memory-write (content_filter). Baseline stays light;
+   *  the escalation prompt fires only on the rare refusal. */
   compressionRefusalSystemPrompt?: string;
   summaryUserPrompt?: string;
   summaryContextLabel?: string;

@@ -24,10 +24,10 @@
 // body falls back to the ProviderRequest (`rawRequestSource` says which).
 // `normalizedRequest` is always the ProviderRequest the adapter was handed and
 // `normalizedResponse` the ProviderResponse it returned, so a reader can diff
-// the two representations (connectome-cm tools/check-dropped-text.py checks
-// every normalized text block survives onto the wire). `wireParams` repeats
-// the wire body's small top-level scalars/objects so they survive the size
-// guard below when the raw bodies don't.
+// the two representations (e.g. check that every normalized text block
+// survives onto the wire). `wireParams` repeats the wire body's small
+// top-level scalars/objects so they survive the size guard below when the
+// raw bodies don't.
 //
 // OOM note (learned on the Anthropic path, which once logged raw+normalized+
 // summary and contributed to production OOMs): we serialize the record ONCE,

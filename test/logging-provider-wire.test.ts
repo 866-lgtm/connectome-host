@@ -6,11 +6,10 @@
  *
  * Wire-level fields (prompt_cache_key, prompt_cache_retention,
  * reasoning_effort, a forced think tool_choice) exist only in the wire body,
- * and connectome-cm's tools/check-dropped-text.py diffs
- * normalizedRequest.messages against rawRequest.messages to catch text an
- * adapter silently drops. Exercised here through the real OpenAI-compatible
- * adapter against a local fake endpoint, so the wire body is what membrane
- * actually builds.
+ * and a dropped-text check can diff normalizedRequest.messages against
+ * rawRequest.messages to catch text an adapter silently drops. Exercised
+ * here through the real OpenAI-compatible adapter against a local fake
+ * endpoint, so the wire body is what membrane actually builds.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -77,9 +76,9 @@ function records(path: string): Array<Record<string, any>> {
   return readFileSync(path, 'utf-8').trim().split('\n').map((line) => JSON.parse(line));
 }
 
-/** A Polaris-shaped request: text + image, a tool round, and a mixed
+/** A representative agent request: text + image, a tool round, and a mixed
  *  tool_result+text envelope (the shape the dropped-text bug lost). */
-function polarisRequest(): ProviderRequest {
+function agentRequest(): ProviderRequest {
   return {
     model: 'gpt-5.1',
     maxTokens: 512,
@@ -93,7 +92,7 @@ function polarisRequest(): ProviderRequest {
       {
         role: 'user',
         content: [
-          { type: 'text', text: 'zz-helen: look at this picture' },
+          { type: 'text', text: 'zz-user: look at this picture' },
           { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: BIG_B64 } },
         ],
       },
@@ -105,10 +104,10 @@ function polarisRequest(): ProviderRequest {
           { type: 'text', text: 'zz-injected: a message that arrived mid-turn' },
         ],
       },
-      { role: 'user', content: [{ type: 'text', text: 'zz-helen: and now?' }] },
+      { role: 'user', content: [{ type: 'text', text: 'zz-user: and now?' }] },
     ],
     extra: {
-      prompt_cache_key: 'zz-polaris',
+      prompt_cache_key: 'zz-agent',
       reasoning: { effort: 'high' },
       force_think_first: true,
     },
@@ -121,7 +120,7 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
       const path = logFile();
       const seen: unknown[] = [];
       const wrapped = new LoggingProviderAdapter(new OpenAICompatibleAdapter({ baseURL, apiKey: 'zz' }), path);
-      const request = polarisRequest();
+      const request = agentRequest();
       const options = { onRequest: (req: unknown) => { seen.push(req); } };
       const response = kind === 'complete'
         ? await wrapped.complete(request, options)
@@ -139,7 +138,7 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
       // Wire body: what the endpoint received, base64 stripped.
       const wire = record!.rawRequest;
       expect(wire.model).toBe('gpt-5.1');
-      expect(wire.prompt_cache_key).toBe('zz-polaris');
+      expect(wire.prompt_cache_key).toBe('zz-agent');
       expect(wire.prompt_cache_retention).toBe('24h');
       expect(wire.reasoning_effort).toBe('high');
       expect(wire.reasoning).toBeUndefined();
@@ -157,7 +156,7 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
 
       // Small top-level params repeated outside the raw bodies; arrays are not.
       expect(record!.wireParams).toMatchObject({
-        model: 'gpt-5.1', prompt_cache_key: 'zz-polaris', prompt_cache_retention: '24h',
+        model: 'gpt-5.1', prompt_cache_key: 'zz-agent', prompt_cache_retention: '24h',
         reasoning_effort: 'high', tool_choice: { type: 'function', function: { name: 'think' } },
       });
       expect(record!.wireParams.messages).toBeUndefined();
@@ -165,7 +164,7 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
 
       // Normalized request: the ProviderRequest, base64 stripped too.
       const normalized = record!.normalizedRequest;
-      expect(normalized.extra).toEqual({ prompt_cache_key: 'zz-polaris', reasoning: { effort: 'high' }, force_think_first: true });
+      expect(normalized.extra).toEqual({ prompt_cache_key: 'zz-agent', reasoning: { effort: 'high' }, force_think_first: true });
       expect(normalized.messages[0].content[1].source.data).toBe('[base64 stripped 64kb]');
       expect(normalized.messages[2].content[1].text).toBe('zz-injected: a message that arrived mid-turn');
 
@@ -187,11 +186,11 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
     const path = logFile();
     const wrapped = new LoggingProviderAdapter(new OpenAICompatibleAdapter({ baseURL, apiKey: 'zz' }), path);
     failNext = true;
-    await expect(wrapped.complete(polarisRequest())).rejects.toBeDefined();
+    await expect(wrapped.complete(agentRequest())).rejects.toBeDefined();
     const [record] = records(path);
     expect(record!.type).toBe('error');
     expect(record!.rawRequestSource).toBe('wire');
-    expect(record!.rawRequest.prompt_cache_key).toBe('zz-polaris');
+    expect(record!.rawRequest.prompt_cache_key).toBe('zz-agent');
     expect(record!.normalizedRequest.model).toBe('gpt-5.1');
     expect('normalizedResponse' in record!).toBe(false);
   });
@@ -201,16 +200,16 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
     const wrapped = new LoggingProviderAdapter(
       new OpenAICompatibleAdapter({ baseURL, apiKey: 'zz' }), path, () => ({ enabled: false }) as never,
     );
-    await wrapped.complete(polarisRequest());
+    await wrapped.complete(agentRequest());
     const [record] = records(path);
     expect(record!.rawRequest.reasoning_effort).toBeUndefined();
     expect(record!.normalizedRequest.extra.reasoning).toBeUndefined();
   });
 
-  test('records satisfy check-dropped-text.py: every normalized text block is found on the wire', async () => {
+  test('records satisfy a dropped-text check: every normalized text block is found on the wire', async () => {
     const path = logFile();
-    await new LoggingProviderAdapter(new OpenAICompatibleAdapter({ baseURL, apiKey: 'zz' }), path).complete(polarisRequest());
-    // Same logic as connectome-cm tools/check-dropped-text.py.
+    await new LoggingProviderAdapter(new OpenAICompatibleAdapter({ baseURL, apiKey: 'zz' }), path).complete(agentRequest());
+    // Text-block containment: each normalized text block's prefix must appear in the wire messages.
     let checked = 0;
     let dropped = 0;
     for (const rec of records(path)) {
