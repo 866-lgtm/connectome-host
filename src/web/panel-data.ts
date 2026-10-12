@@ -20,7 +20,7 @@
 
 import type { AgentFramework } from '@animalabs/agent-framework';
 import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
-import type { ContentBlock, NormalizedMessage, ToolDefinition } from '@animalabs/membrane';
+import type { ContentBlock, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
 import type { Recipe } from '../recipe.js';
 import type { CallLedger } from '../call-ledger.js';
 import type { QuotaMeter } from '../quota-meter.js';
@@ -1055,6 +1055,10 @@ export interface CountablePreview {
   messages?: NormalizedMessage[];
   tools?: ToolDefinition[];
   config?: { thinking?: { enabled: boolean; budgetTokens?: number } };
+  /** The agent's prefill scaffold message, which the activation request
+   *  carries when the agent has one. Typed by membrane's own request, so a
+   *  rename there fails the build instead of silently dropping it here. */
+  prefillUserMessage?: NormalizedRequest['prefillUserMessage'];
 }
 
 /** Anthropic count_tokens payload (everything but `model`). */
@@ -1070,11 +1074,16 @@ export type CountFormatter = Pick<NativeFormatter, 'buildMessages'>;
 /**
  * Build the count_tokens payload by running the previewed activation through
  * the SAME formatter path inference uses (`buildMessages`, multiuser, the
- * agent as assistant, native tools): participant prefixes land per text block
- * exactly as on the wire, non-text-only messages get no name block, tool
- * pairs are normalized and same-role runs merged by the formatter itself, and
- * every block the provider will be sent — signed `thinking` /
- * `redacted_thinking`, `tool_use`, `tool_result`, images — is counted.
+ * agent as assistant, the tool mode the caller passes): participant prefixes
+ * land on the text blocks the formatter prefixes, exactly as on the wire,
+ * non-text-only messages get no name block, and the agent's prefill message
+ * goes where the formatter puts it (anthropic-xml sends it first, in place of
+ * its default opener, whenever its request would otherwise open with the
+ * assistant's turn, as a prefill transcript usually does).
+ * Tool pairs are normalized and same-role runs merged by the formatter
+ * itself, and every block the formatter sends is counted: for the native
+ * formatter that includes signed `thinking` / `redacted_thinking`,
+ * `tool_use`, `tool_result` and images.
  *
  * The previous version flattened each message to its text blocks and sent no
  * tool definitions: on a keep-all model (Opus >= 4.5, Sonnet >= 4.6, Fable)
@@ -1099,13 +1108,19 @@ export function buildCountTokensPayload(
     toolMode,
     thinking: preview.config?.thinking,
     systemPrompt: preview.system,
+    // Inference passes the agent's prefill message to the formatter, which
+    // for anthropic-xml sends it first, in place of its default opener,
+    // whenever the request would otherwise open with the assistant's turn;
+    // without it the count had that default in its place.
+    ...(preview.prefillUserMessage ? { prefillUserMessage: preview.prefillUserMessage } : {}),
     promptCaching: false,
     cacheMarkers: 'membrane-system',
   });
   const tools = Array.isArray(built.nativeTools) ? built.nativeTools : undefined;
+  const system = built.systemContent;
   return {
-    ...(built.systemContent !== undefined && built.systemContent !== null && built.systemContent !== ''
-      ? { system: built.systemContent }
+    ...(system !== undefined && system !== null && system !== '' && !(Array.isArray(system) && system.length === 0)
+      ? { system }
       : {}),
     messages: built.messages as unknown[],
     ...(tools && tools.length > 0 ? { tools } : {}),
@@ -1149,8 +1164,9 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
   const cm = (agent as unknown as { getContextManager: () => { getRenderStats: () => unknown } }).getContextManager();
   const stats = cm.getRenderStats();
 
-  // Count through the formatter the agent actually runs on (prefill agents
-  // render the XML scaffold; everyone else the native shape).
+  // Count through the formatter the agent's recipe names: an anthropic-xml
+  // agent's count takes the XML scaffold, prefill or not; everyone else the
+  // native shape.
   const xml = app.recipe.agent.formatter === 'anthropic-xml';
   const payload = buildCountTokensPayload(
     request as unknown as CountablePreview,
@@ -1208,14 +1224,116 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
 }
 
 /**
+ * A feasibility preview's verdict, against the budget an operator asked for.
+ * context-manager's `budgetTokens` is the REJECTION budget, (requested -
+ * reserve) * (1 + overBudgetGraceRatio), the threshold above which a compile
+ * throws; its `fits` therefore means "would not hard-fail", not "fits the
+ * budget you asked for". The settings panel and the context curve both
+ * report this, so they can't disagree.
+ */
+function previewAccounting(result: unknown, budget: number, reserve: number) {
+  const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
+  const effectiveBudget = Math.max(0, budget - reserve);
+  const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
+  const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
+  const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
+    ? finalTokens <= r.budgetTokens
+    : undefined;
+  return {
+    requestedBudgetTokens: budget,
+    reserveForResponseTokens: reserve,
+    /** The picker's planned total, when the preview reports one. */
+    plannedTokens: Number.isFinite(finalTokens) ? finalTokens : null,
+    /** What the picker actually targets. */
+    effectiveBudgetTokens: effectiveBudget,
+    /** Hard-fail ceiling — requested minus reserve, plus grace. */
+    rejectionBudgetTokens: r.budgetTokens,
+    /** Fits the budget the operator asked for. */
+    fitsRequested,
+    /** Merely tolerated by the grace margin — over budget, but no throw. */
+    withinGrace,
+    /** Exhausted AND over the request => this budget is UNREACHABLE. */
+    unreachable: r.exhausted === true && !fitsRequested,
+  };
+}
+
+/**
+ * Whether the curve's plan fits, from the framework's feasibility preview, with
+ * the settings panel's accounting. A dry compile plots an over-budget plan
+ * instead of throwing, so without this the plot of a context that won't fit
+ * looks like a healthy one. null when the preview is unavailable (no
+ * previewContextSettings, or a strategy without a fold plan) or throws.
+ *
+ * During a paced budget descent (`transition` other than `stable`), the
+ * runtime settings report the descent's target, while compiles run at the
+ * live budget, which no accessor reports yet. The curve and its verdict are
+ * then at the target, `atDescentTarget` says so, and the page doesn't claim
+ * what the next real compile will do.
+ */
+function curveVerdict(
+  app: PanelAppRef,
+  agentName: string,
+  maxTokens: number,
+  reserveForResponse: number,
+  transition: string | undefined,
+): Record<string, unknown> | null {
+  try {
+    const fw = app.framework as unknown as {
+      previewContextSettings?: (name: string, budget: number) => unknown;
+    };
+    const r = fw.previewContextSettings?.(agentName, maxTokens);
+    if (!r) return null;
+    const { plannedTokens, effectiveBudgetTokens, rejectionBudgetTokens, fitsRequested, withinGrace, unreachable } =
+      previewAccounting(r, maxTokens, reserveForResponse);
+    return {
+      plannedTokens,
+      effectiveBudgetTokens,
+      rejectionBudgetTokens: rejectionBudgetTokens ?? null,
+      fitsRequested,
+      withinGrace,
+      unreachable,
+      atDescentTarget: transition !== undefined && transition !== 'stable',
+    };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Context curve: compile the agent's window and return one record per
  * compiled entry with its provenance — kind (raw / L1..Ln summary), rendered
  * token estimate, the raw-history tokens it covers (leaf messages,
  * recursively through the summary tree), date span, and full text.
  *
- * Same side-effect class as previewActivation / makeup: the compile may
- * commit resolution updates, exactly as the agent's own next turn would.
- * No inference, no message writes.
+ * The budget is the agent's context budget from its runtime settings (else
+ * the recipe), with the recipe's response reserve. That's close to, but not
+ * exactly, what the agent's next turn compiles at: the framework's compile
+ * budget can also hold back room for a pending tool batch, and during a paced
+ * descent the runtime settings report the descent's target while compiles
+ * run at the live budget (the verdict's atDescentTarget says so).
+ *
+ * A render runs two dry selects, the curve's compile and the verdict's
+ * preview, and each one pauses the agent while it runs. That's the intended
+ * cost of a debug page opened on demand, so the settings preview's cooldown
+ * isn't applied here.
+ *
+ * The compile is a dry run: shown, never sent, so its select commits no fold
+ * resolutions and queues no compression from the plan. Once context-manager's
+ * thinking binding (#160) is released, a committed compile that's never sent
+ * would also fence the replies the resident is streaming; a dry run won't.
+ * With context-manager 0.13 a dry compile isn't free of every effect: the
+ * adaptive select still records its estimate and arms calibration, and
+ * overwrites the frontier, the transition status and the render stats that
+ * the Context panel reads, until the next real compile (context-manager #161
+ * restores them after a dry select). Like any hold query, a dry compile also
+ * releases a compression hold whose deadline has passed, never one that
+ * hasn't: that release, and the work it sets off, was already due.
+ *
+ * A plan over budget at the plan check is plotted rather than thrown, and the
+ * response carries a verdict from the framework's feasibility preview, the
+ * one the settings panel reports, so the plot says it won't fit. The
+ * head/tail reservation check and the emission check still throw on a budget
+ * that can't fit, as for a real compile. No inference, no message writes.
  */
 export async function buildContextCurve(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
   requireAgent(app, agentName);
@@ -1227,14 +1345,23 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // ever been changed at runtime. Fall back to the recipe only if the live
   // read is unavailable.
   let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+  let transition: string | undefined;
   try {
-    const live = (app.framework as unknown as {
-      getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number };
-    }).getAgentRuntimeSettings?.(agentName)?.contextBudgetTokens;
+    const settings = (app.framework as unknown as {
+      getAgentRuntimeSettings?: (n: string) => { contextBudgetTokens?: number; transition?: string };
+    }).getAgentRuntimeSettings?.(agentName);
+    const live = settings?.contextBudgetTokens;
     if (typeof live === 'number' && live > 0) maxTokens = live;
+    transition = settings?.transition;
   } catch { /* keep the recipe fallback */ }
   const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
-  const compiled = await cm.compile({ maxTokens, reserveForResponse });
+  // A dry run: this compile is shown, never sent. Committing would rewrite
+  // the resident's fold plan and queue compression work on every render,
+  // mid-stream included (context-manager's SelectOptions.dryRun names this
+  // case), and once thinking binding lands it would fence the replies the
+  // resident is streaming (Ada-1017, context-manager #155).
+  const compiled = await cm.compile({ maxTokens, reserveForResponse }, undefined, { dryRun: true });
+  const verdict = curveVerdict(app, agentName, maxTokens, reserveForResponse, transition);
 
   // Curve inspection only needs text and source metadata. Resolving every
   // historical blob here re-inlines all base64 media and can expand a
@@ -1308,6 +1435,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     generatedAt: new Date().toISOString(),
     branch: cm.currentBranch().name,
     budget: { maxTokens, reserveForResponse },
+    verdict,
     totals: {
       entries: entries.length,
       rendered: entries.reduce((a, e) => a + e.rendered, 0),
@@ -1448,32 +1576,12 @@ export function runContextPreview(
     // REJECTION budget: (requested - reserve) * (1 + overBudgetGraceRatio),
     // i.e. the threshold above which a compile throws. Its `fits` therefore
     // means "would not hard-fail", NOT "fits the budget you asked for".
-    const r = result as { finalTokens?: number; budgetTokens?: number; exhausted?: boolean };
     const reserve = app.recipe.agent.maxTokens ?? 16_384;
-    const effectiveBudget = Math.max(0, budget - reserve);
-    const finalTokens = typeof r.finalTokens === 'number' ? r.finalTokens : NaN;
-    const fitsRequested = Number.isFinite(finalTokens) && finalTokens <= effectiveBudget;
-    const withinGrace = Number.isFinite(finalTokens) && typeof r.budgetTokens === 'number'
-      ? finalTokens <= r.budgetTokens
-      : undefined;
     return {
       agent: agentName,
       budget,
       ...(overrides as object),
-      accounting: {
-        requestedBudgetTokens: budget,
-        reserveForResponseTokens: reserve,
-        /** What the picker actually targets. */
-        effectiveBudgetTokens: effectiveBudget,
-        /** Hard-fail ceiling — requested minus reserve, plus grace. */
-        rejectionBudgetTokens: r.budgetTokens,
-        /** Fits the budget the operator asked for. */
-        fitsRequested,
-        /** Merely tolerated by the grace margin — over budget, but no throw. */
-        withinGrace,
-        /** Exhausted AND over the request => this budget is UNREACHABLE. */
-        unreachable: r.exhausted === true && !fitsRequested,
-      },
+      accounting: previewAccounting(result, budget, reserve),
       /** How long the agent was blocked, so the operator sees the real cost. */
       elapsedMs: Date.now() - startedAt,
       preview: wantRender ? projectDryEntries(result) : result,
