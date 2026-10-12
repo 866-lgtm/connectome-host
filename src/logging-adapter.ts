@@ -126,8 +126,9 @@ const LINEAGES_REMEMBERED = 16;
  * Per keepalive lineage, the replayed request something was last recorded
  * for: a refusal the dragnet heard, or a row that kept the request whole.
  * One request per lineage, as membrane replays one. Bounded, the lineage
- * noted longest ago forgotten first; a lineage still replaying its request
- * is noted again at each of its failed or refused pokes.
+ * noted longest ago forgotten first. A lineage is noted again each time its
+ * memory is used: the refusal memory at each refused poke of the lineage,
+ * the kept requests at each failed or refused row of it that is written.
  */
 class LineageRequests {
   private readonly requests = new Map<string, string>();

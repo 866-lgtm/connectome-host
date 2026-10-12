@@ -247,7 +247,9 @@ def err_text(err):
 
 llm_ts = None
 llm_detail = ""
-llm_window_from = None  # the oldest row's time, when no model call was found
+turn_ts = None          # the agent's last turn (a stream call) in the window
+llm_window_from = None  # the oldest row's time, when the window holds no turn
+llm_unsure = False      # an unreadable or incomplete row may be a turn
 LLM_WINDOW = 30_000_000
 llm_files = sorted(
     (f for f in os.listdir(data_dir) if f.startswith("llm-calls.")),
@@ -255,6 +257,8 @@ llm_files = sorted(
 )
 if llm_files:
     newest = os.path.join(data_dir, llm_files[-1])
+    size = os.path.getsize(newest)
+    where = "the newest file's last 30 MB" if size > LLM_WINDOW else "the newest file"
     # The file's tail, split at newlines only: splitlines() also splits at
     # U+2028, U+2029 and U+0085, which JSON.stringify leaves unescaped inside
     # a row. One byte more than the window is read, so where the window cuts
@@ -262,16 +266,24 @@ if llm_files:
     # the cut falls between rows, and is dropped either way.
     raw = tail_bytes(newest, LLM_WINDOW + 1).decode("utf-8", "replace")
     lines = raw.split("\n")
-    if os.path.getsize(newest) > LLM_WINDOW + 1:
+    if size > LLM_WINDOW + 1:
         lines = lines[1:]
     # A last row with no newline after it is being written now, or was cut
-    # off when its process stopped.
-    incomplete = lines.pop().strip() != "" if lines else False
+    # off when its process stopped; it counts as a row only if it parses.
+    last = lines.pop() if lines else ""
+    incomplete = False
+    if last.strip():
+        try:
+            json.loads(last)
+            lines.append(last)
+        except Exception:
+            incomplete = True
     call = None        # the newest model call: the row reported
     refused = None     # the newest refused keepalive poke since the last turn
     failed = None      # the newest failed keepalive poke since the last turn
+    answered = {}      # per lineage, its newest answered poke seen so far
     pokes = 0
-    unreadable = 0     # rows newer than the call reported that couldn't be parsed
+    unreadable = 0     # rows since the last turn that couldn't be parsed
     for ln in reversed(lines):
         ln = ln.strip()
         if not ln.startswith("{"):
@@ -279,8 +291,7 @@ if llm_files:
         try:
             r = json.loads(ln)
         except Exception:
-            if call is None:
-                unreadable += 1
+            unreadable += 1
             continue
         llm_window_from = parse_iso(str(r.get("timestamp", ""))) or llm_window_from
         # Cache keepalive pokes write rows here too, while the agent is idle,
@@ -289,20 +300,24 @@ if llm_files:
         # A poke replays a turn's request (the host keeps only the turns'
         # lane warm), so the scan goes on past other calls to the last turn,
         # gathering the pokes since: a refused one means a turn sending the
-        # context it replays would likely be refused too.
+        # context it replays may be refused too.
         if r.get("kind") == "keepalive":
             pokes += 1
+            key = (r.get("keepalive") or {}).get("key")
             if r.get("type") == "error":
-                failed = failed or r
+                failed = failed or (r, answered.get(key))
             elif ((r.get("rawResponse") or {}).get("stop_reason")) == "refusal":
-                refused = refused or r
+                refused = refused or (r, answered.get(key))
+            else:
+                answered.setdefault(key, r)
             continue
         if call is None:
             call = r
         if r.get("kind") == "stream":
+            turn_ts = parse_iso(str(r.get("timestamp", "")))
+            llm_window_from = None
             break
     if call is not None:
-        llm_window_from = None
         llm_ts = parse_iso(str(call.get("timestamp", "")))
         resp = call.get("rawResponse") or {}
         resp = resp.get("response") or resp
@@ -316,20 +331,32 @@ if llm_files:
             warn("last model response was a REFUSAL — check context contamination "
                  "(see project_mythos: contextBudgetTokens fix)")
     else:
-        llm_detail = "no readable model call in the newest file's last 30 MB" + (
+        llm_detail = f"no readable model call in {where}" + (
             f": {pokes} keepalive poke(s)" if pokes else "")
     if unreadable:
-        llm_detail += f"  {C_YEL}{unreadable} {'newer ' if call else ''}row(s) unreadable{C_OFF}"
+        llm_detail += f"  {C_YEL}{unreadable} row(s){' since the last turn' if turn_ts else ''} unreadable{C_OFF}"
     if incomplete:
         llm_detail += f"  {C_YEL}last row incomplete (being written, or cut off){C_OFF}"
+    llm_unsure = bool(unreadable or incomplete)
+
+    def poke_when(row, later):
+        when = hhmm(parse_iso(str(row.get("timestamp", ""))))
+        if later is not None:
+            when += f", answered again {hhmm(parse_iso(str(later.get('timestamp', ''))))}"
+        return when
+
     if refused is not None:
-        llm_detail += f"  {C_RED}keepalive poke {hhmm(parse_iso(str(refused.get('timestamp', ''))))} REFUSED{C_OFF}"
-        warn("a cache keepalive poke since the agent's last turn was REFUSED: a turn "
-             "sending the context it replays would likely be refused too (see "
+        r, later = refused
+        llm_detail += f"  {C_RED}keepalive poke {poke_when(r, later)} REFUSED{C_OFF}"
+        warn("a cache keepalive poke since the agent's last turn was REFUSED"
+             + (", though a later poke of its lineage was answered" if later is not None else "")
+             + ": a turn sending the context it replays may be refused too (see "
              "project_mythos: contextBudgetTokens fix)")
     if failed is not None:
-        f_text = err_text(failed.get("error"))[:80] or "(no text)"
-        llm_detail += f"  {C_RED}keepalive poke {hhmm(parse_iso(str(failed.get('timestamp', ''))))} failed: {f_text}{C_OFF}"
+        r, later = failed
+        f_text = err_text(r.get("error"))[:80] or (
+            f"status {r.get('httpStatus')}" if r.get("httpStatus") else "(no text)")
+        llm_detail += f"  {C_RED}keepalive poke {poke_when(r, later)} failed: {f_text}{C_OFF}"
 stages.append(("inference (llm call)", llm_ts, llm_detail))
 
 # 4d. delivery: last routeSpeech in agent log
@@ -363,11 +390,15 @@ for name, ts, detail in stages:
     if ts:
         prev_ts = ts
 
-# triggered ingest but no inference since -> the tonight signature. With no
-# model call in the window, that holds only if the window reaches back past
-# the ingest.
-inference_unknown = llm_ts is None and llm_window_from is not None and rec_ts is not None and rec_ts < llm_window_from
-if globals().get("_last_ingest_triggered") and rec_ts and not inference_unknown and (llm_ts is None or llm_ts < rec_ts - 120):
+# triggered ingest but no inference since -> the tonight signature.
+# The turn is what follows an ingest; a compression call is not one. With no
+# llm-calls file there was no inference at all. With one, an unreadable or
+# incomplete row might be the turn, and with no turn in the window, no turn
+# followed only if the window reaches back past the ingest.
+no_turn_after = turn_ts is None or (rec_ts is not None and turn_ts < rec_ts - 120)
+turn_unknown = bool(llm_files) and (llm_unsure or (turn_ts is None and (
+    llm_window_from is None or (rec_ts is not None and rec_ts < llm_window_from))))
+if globals().get("_last_ingest_triggered") and rec_ts and no_turn_after and not turn_unknown:
     warn("a gate-TRIGGERED event was ingested but NO inference followed — "
          "events are dying between the gate and the model (check inference "
          "policy drops / budget failures / [diagnostics] dump below)")

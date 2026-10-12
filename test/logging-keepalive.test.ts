@@ -431,6 +431,47 @@ describe('the keepalive refusal dragnet and request retention, poke by poke', ()
     }
   });
 
+  test("a failed poke keeps its lineage's kept request fresh, but not the refusal it was last heard for", () => {
+    withAdapter(({ log, refusals, rows }) => {
+      for (let i = 0; i < 16; i++) log(receipt(`L${i}`, 1, 'refusal'));
+      // L0's same request fails: the kept requests count that as use, the refusal memory doesn't.
+      log(receipt('L0', 1, 'error'));
+      log(receipt('L16', 1, 'refusal'));
+      expect(refusals).toHaveLength(17);
+      log(receipt('L0', 1, 'refusal'));
+      // Forgotten by the refusal memory, so heard again; still kept, so named only.
+      expect(refusals).toHaveLength(18);
+      expect(rows().at(-1)!.rawRequest).toBeUndefined();
+    });
+  });
+
+  test("a row that couldn't be serialized leaves the file's lines as they were, and an append that wrote nothing leaves one blank line", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logging-keepalive-lines-'));
+    const later = join(dir, 'later');
+    const path = join(later, 'llm-calls.unit.jsonl');
+    try {
+      const adapter = new LoggingAnthropicAdapter({ apiKey: 'fixture-key', cacheKeepalive: { enabled: false } }, path);
+      adapter.onRefusal = () => {};
+      const log = (call: KeepaliveCall) => (adapter as unknown as { logKeepaliveCall(call: KeepaliveCall): void }).logKeepaliveCall(call);
+      mkdirSync(later);
+      // A BigInt can't be serialized: no row, and the file isn't marked torn.
+      log(receipt('A', 1, 'max_tokens', { ...readUsage, input_tokens: 1n as unknown as number }));
+      log(receipt('A', 1, 'max_tokens'));
+      expect(readFileSync(path, 'utf8').split('\n')).toHaveLength(2);
+      // An append that throws before writing anything leaves one blank line before the next row.
+      rmSync(later, { recursive: true, force: true });
+      log(receipt('A', 1, 'max_tokens'));
+      mkdirSync(later);
+      log(receipt('A', 1, 'max_tokens'));
+      const lines = readFileSync(path, 'utf8').split('\n');
+      expect(lines).toHaveLength(3);
+      expect(lines[0]).toBe('');
+      expect(JSON.parse(lines[1]!).kind).toBe('keepalive');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('each lineage is heard and kept on its own', () => {
     withAdapter(({ log, refusals, rows }) => {
       for (const key of ['A', 'B', 'A', 'B']) log(receipt(key, 1, 'refusal'));
