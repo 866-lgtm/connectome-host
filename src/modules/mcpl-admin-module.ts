@@ -44,6 +44,8 @@ import {
   serverProvisions,
   lostByReplacement,
   composeMcplChildEnv,
+  cleartextCredential,
+  cleartextCarrierText,
   overlayEntryProblem,
   overlayEntryReplaces,
   overlayEntryTombstones,
@@ -245,9 +247,9 @@ export class McplAdminModule implements Module {
             command: { type: 'string', description: 'Executable to spawn (stdio transport). Mutually exclusive with url.' },
             args: { type: 'array', items: { type: 'string' }, description: 'Arguments for the command.' },
             env: { type: 'object', description: 'Environment variables for the spawned process.' },
-            url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command.' },
-            token: { type: 'string', description: 'Bearer token for WebSocket auth (only when the operator hands you one — prefer `access`).' },
-            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle.' },
+            url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command. A user, password or `token` parameter in it is a credential, which mcpl_deploy takes only over wss://, or ws:// to this machine.' },
+            token: { type: 'string', description: 'Token for WebSocket auth, sent as the url\'s `token` parameter (only when the operator hands you one — prefer `access`). mcpl_deploy takes it only with a wss:// url, or ws:// to this machine.' },
+            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle. mcpl_deploy takes it only with a wss:// url, or ws:// to this machine.' },
             toolPrefix: { type: 'string', description: 'Tool namespace prefix. Default: mcpl--<id>.' },
             reconnect: { type: 'boolean', description: 'Auto-reconnect on transport failure. Default: true for websocket URLs (a bounced server comes back on its own), false for stdio. Note: does NOT respawn a crashed child — use mcpl_restart for that.' },
             enabledFeatureSets: { type: 'array', items: { type: 'string' }, description: 'Feature-set allowlist (* wildcard). Omit or pass [] for all offered.' },
@@ -495,6 +497,22 @@ export class McplAdminModule implements Module {
     if (given(input.reconnect)) fields.reconnect = input.reconnect;
     for (const k of ['enabledFeatureSets', 'disabledFeatureSets', 'enabledTools', 'disabledTools']) {
       if (givenList(input[k])) fields[k] = list(input[k]);
+    }
+
+    // A credential sent over ws:// to another machine (cleartextCredential
+    // names the carriers it recognizes) can be read by anyone on the network
+    // between. A deploy doesn't send one there. An operator who knows that
+    // network is private can put the server in the recipe, where it loads
+    // with a warning.
+    const cleartext = cleartextCredential(fields);
+    if (cleartext) {
+      const running = framework.listMcplServers().some(s => s.id === id);
+      return fail(
+        `mcpl_deploy refused: ${cleartextCarrierText(cleartext.carrier, fields.access)} would go to ${cleartext.host} ` +
+        'over unencrypted ws://, where anyone on the network between can read it. Use a wss:// url, or, if that ' +
+        'network is private, ask your operator to add the server to the recipe. Nothing was saved.' +
+        (running ? ` The server already running as "${id}" is unchanged.` : ''),
+      );
     }
 
     // Never save an entry the boot would skip: what loads now must be what

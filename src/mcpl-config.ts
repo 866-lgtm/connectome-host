@@ -409,6 +409,78 @@ export function overlayEntryProblem(entry: unknown, opts: { strict?: boolean } =
   return readOverlayEntry(entry, opts).problem ?? null;
 }
 
+/**
+ * Whether a URL's hostname, as the WHATWG parser gives it (lowercased, an
+ * IPv6 address in brackets), names this machine: `localhost`, 127.0.0.0/8,
+ * `::1` and IPv4-mapped 127.0.0.0/8 addresses, which are loopback addresses,
+ * and the unspecified `0.0.0.0` and `::`, which aren't, but which Linux and
+ * macOS connect to locally. A trailing dot names the same host. Other names under
+ * `.localhost` aren't trusted to resolve here.
+ */
+export function isLoopbackHost(hostname: string): boolean {
+  const host = hostname.replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
+  return host === 'localhost' || host === '::1' || host === '0.0.0.0' || host === '::'
+    || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
+    || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(host);
+}
+
+/**
+ * The credential a server entry would send unencrypted, if any, and where.
+ * It recognizes four carriers: the entry's `access` grant (pass it only when
+ * an identity attaches the grant's credential), its `token`, a user or
+ * password in the url, and the url's own `token` parameter, the one
+ * agent-framework's transport sends. No other query parameter is
+ * recognized. It counts only an entry the framework dials (dialsUrl) on a
+ * `ws://` url to a host other than this machine, where anyone on the
+ * network between can read the url and the headers. The grant is named
+ * first, since the framework sends its credential in place of the token
+ * whenever it resolves.
+ */
+export function cleartextCredential(
+  entry: { url?: unknown; token?: unknown; access?: unknown; command?: unknown; transport?: unknown },
+): { carrier: 'access' | 'token' | 'url'; host: string } | undefined {
+  if (!dialsUrl(entry)) return undefined;
+  // Parsed as the transport parses it: an older overlay entry read leniently
+  // can hold a url that isn't a string, which the URL constructor coerces.
+  let url: URL;
+  try {
+    url = new URL(entry.url as string);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== 'ws:' || isLoopbackHost(url.hostname)) return undefined;
+  // As the transport reads them: any value it would send but a blank one.
+  const given = (v: unknown): boolean => (typeof v === 'string' ? v.trim() !== '' : Boolean(v));
+  const carrier = given(entry.access) ? 'access'
+    : given(entry.token) ? 'token'
+    : url.username !== '' || url.password !== '' || url.searchParams.has('token') ? 'url'
+    : undefined;
+  return carrier ? { carrier, host: url.host } : undefined;
+}
+
+/** What a cleartext carrier sends, for a refusal or a warning. */
+export function cleartextCarrierText(carrier: 'access' | 'token' | 'url', access?: unknown): string {
+  if (carrier === 'access') return `the credential of its access grant "${String(access).trim()}"`;
+  if (carrier === 'token') return 'its token';
+  return "the user, password or token parameter in its url";
+}
+
+/**
+ * The startup warning for a server whose credential would go unencrypted
+ * (cleartextCredential), if any. mcpl_deploy refuses such an entry; an
+ * operator's recipe may know the network between is private, and an overlay
+ * entry saved before that refusal still loads.
+ */
+export function cleartextCredentialWarning(
+  id: string,
+  entry: { url?: unknown; token?: unknown; access?: unknown; command?: unknown; transport?: unknown },
+): string | undefined {
+  const cleartext = cleartextCredential(entry);
+  if (!cleartext) return undefined;
+  return `[mcpl] server "${id}": ${cleartextCarrierText(cleartext.carrier, entry.access)} goes to ${cleartext.host} ` +
+    'over unencrypted ws://, where anyone on the network between can read it; use wss:// unless that network is private';
+}
+
 /** A tombstone: `disabled: true`, the one rule every reader uses, whatever else the entry holds. */
 export function overlayEntryTombstones(entry: unknown): boolean {
   return readOverlayEntry(entry).entry?.disabled === true;
