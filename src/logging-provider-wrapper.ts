@@ -15,6 +15,20 @@
 // raw provider response. Retention/rotation/S3 shipping is the host box's
 // llm-logs sync job's problem — this file just writes lines.
 //
+// Wire vs normalized request: `rawRequest` is the body the adapter actually
+// sent, captured through membrane's `onRequest` hook — e.g. the Chat
+// Completions JSON for openai-compatible, the only place wire-level fields
+// (prompt_cache_key, prompt_cache_retention, reasoning_effort, a forced
+// tool_choice, stream_options) are visible. This matches what the Anthropic
+// and Bedrock writers log as `rawRequest`. An adapter that never reports its
+// body falls back to the ProviderRequest (`rawRequestSource` says which).
+// `normalizedRequest` is always the ProviderRequest the adapter was handed and
+// `normalizedResponse` the ProviderResponse it returned, so a reader can diff
+// the two representations (connectome-cm tools/check-dropped-text.py checks
+// every normalized text block survives onto the wire). `wireParams` repeats
+// the wire body's small top-level scalars/objects so they survive the size
+// guard below when the raw bodies don't.
+//
 // OOM note (learned on the Anthropic path, which once logged raw+normalized+
 // summary and contributed to production OOMs): we serialize the record ONCE,
 // and a size guard drops the raw bodies for pathological payloads (giant
@@ -25,8 +39,9 @@
 // each membrane-level call logs exactly once.
 //
 // Each line: { type: 'call'|'error', provider, tag?, kind: 'complete'|'stream',
-//   timestamp, durationMs, requestSummary?, response?, rawRequest?,
-//   rawResponse?, error?, errorType?, httpStatus?, providerErrorCode?,
+//   timestamp, durationMs, requestSummary?, wireParams?, response?,
+//   rawRequest?, rawRequestSource?, normalizedRequest?, rawResponse?,
+//   normalizedResponse?, error?, errorType?, httpStatus?, providerErrorCode?,
 //   retryable?, errorChars?, truncated?, summaryUnavailable? }
 // A record whose request or response couldn't be summarized keeps only the
 // head fields and, for a failure, the error (summaryUnavailable: true).
@@ -66,6 +81,31 @@ function stripInlineMedia(_key: string, value: unknown): unknown {
 
 /** Above this many serialized bytes, drop raw bodies and keep summaries. */
 const MAX_RECORD_BYTES = 16 * 1024 * 1024;
+
+/** The full-body fields the size/serialization guard drops. */
+const RAW_BODY_FIELDS = ['rawRequest', 'rawResponse', 'normalizedRequest', 'normalizedResponse'] as const;
+
+/** A wire param larger than this (serialized) is left to rawRequest. */
+const MAX_WIRE_PARAM_CHARS = 1024;
+
+/**
+ * The wire body's small top-level params (model, max_tokens, reasoning_effort,
+ * prompt_cache_key, tool_choice, stream_options, ...): every non-array value
+ * that serializes to at most MAX_WIRE_PARAM_CHARS. Arrays (messages, tools,
+ * input) and large strings (system/instructions) stay in rawRequest only.
+ */
+function summarizeWireParams(wire: unknown): Record<string, unknown> | undefined {
+  if (!wire || typeof wire !== 'object' || Array.isArray(wire)) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(wire as Record<string, unknown>)) {
+    if (value === undefined || Array.isArray(value)) continue;
+    try {
+      const json = JSON.stringify(value);
+      if (json !== undefined && json.length <= MAX_WIRE_PARAM_CHARS) out[key] = value;
+    } catch { /* unserializable: rawRequest's guard handles it */ }
+  }
+  return out;
+}
 
 function summarizeRequest(request: ProviderRequest): Record<string, unknown> {
   const msgs = (request.messages ?? []) as Array<{ role?: string; content?: unknown }>;
@@ -108,6 +148,16 @@ function summarizeResponse(response: ProviderResponse, convention: ProviderAdapt
       ...(b?.type === 'tool_use' ? { name: b.name } : {}),
     })),
   };
+}
+
+/** The body an adapter reported through `onRequest` (the last one, if several). */
+interface WireCapture { captured: boolean; body: unknown }
+
+/** The ProviderResponse minus its raw bodies (`raw` is logged as rawResponse,
+ *  `rawRequest` as rawRequest), so neither is written twice. */
+function withoutRawBodies(response: ProviderResponse): Record<string, unknown> {
+  const { raw: _raw, rawRequest: _rawRequest, ...rest } = response as ProviderResponse & { raw?: unknown; rawRequest?: unknown };
+  return rest;
 }
 
 export class LoggingProviderAdapter implements ProviderAdapter {
@@ -174,7 +224,9 @@ export class LoggingProviderAdapter implements ProviderAdapter {
         line = undefined;
       }
       if (line === undefined || line.length > MAX_RECORD_BYTES) {
-        const { rawRequest: _rq, rawResponse: _rr, ...rest } = record;
+        const rest = Object.fromEntries(
+          Object.entries(record).filter(([k]) => !(RAW_BODY_FIELDS as readonly string[]).includes(k)),
+        );
         try {
           line = JSON.stringify({
             ...rest,
@@ -210,6 +262,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     kind: 'complete' | 'stream',
     request: ProviderRequest,
     started: number,
+    wire: WireCapture,
     outcome: { response: ProviderResponse } | { error: unknown },
   ): void {
     const failed = 'error' in outcome;
@@ -230,12 +283,27 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     };
     let record: Record<string, unknown>;
     try {
+      // The wire body: from onRequest, else from the response's own
+      // rawRequest (adapters that report it only there), else none.
+      const responseWire = 'response' in outcome
+        ? (outcome.response as { rawRequest?: unknown }).rawRequest
+        : undefined;
+      const hasWire = wire.captured || (responseWire !== undefined && responseWire !== null);
+      const wireBody = wire.captured ? wire.body : responseWire;
+      const wireParams = hasWire ? summarizeWireParams(wireBody) : undefined;
       record = {
         ...head,
         requestSummary: summarizeRequest(request),
-        rawRequest: request,
+        ...(wireParams ? { wireParams } : {}),
+        rawRequest: hasWire ? wireBody : request,
+        rawRequestSource: hasWire ? 'wire' : 'provider-request',
+        normalizedRequest: request,
         ...('response' in outcome
-          ? { response: summarizeResponse(outcome.response, this.usageCacheConvention), rawResponse: outcome.response.raw ?? null }
+          ? {
+              response: summarizeResponse(outcome.response, this.usageCacheConvention),
+              rawResponse: outcome.response.raw ?? null,
+              normalizedResponse: withoutRawBodies(outcome.response),
+            }
           : {}),
         ...(failed ? describeError(outcome.error) : {}),
       };
@@ -250,13 +318,32 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     kind: 'complete' | 'stream',
     request: ProviderRequest,
     started: number,
+    wire: WireCapture,
     outcome: { response: ProviderResponse } | { error: unknown },
   ): void {
     try {
-      this.record(kind, request, started, outcome);
+      this.record(kind, request, started, wire, outcome);
     } catch {
       // Logging must never break inference, nor change what it returns or throws.
     }
+  }
+
+  /**
+   * Options whose `onRequest` captures the wire body into `wire`, then chains
+   * to the caller's hook (membrane's own: raw-request bookkeeping and wire
+   * cache receipts). A throwing caller hook propagates exactly as it would
+   * unwrapped; the capture itself never throws.
+   */
+  private captureWire(options: ProviderRequestOptions | undefined, wire: WireCapture): ProviderRequestOptions {
+    const callerOnRequest = options?.onRequest;
+    return {
+      ...options,
+      onRequest: (req: unknown) => {
+        wire.captured = true;
+        wire.body = req;
+        callerOnRequest?.(req);
+      },
+    };
   }
 
   async complete(
@@ -265,15 +352,16 @@ export class LoggingProviderAdapter implements ProviderAdapter {
   ): Promise<ProviderResponse> {
     request = this.withReasoning(request);
     const started = Date.now();
+    const wire: WireCapture = { captured: false, body: undefined };
     let response: ProviderResponse;
     try {
-      response = await this.inner.complete(request, options);
+      response = await this.inner.complete(request, this.captureWire(options, wire));
     } catch (error) {
-      this.recordSafely('complete', request, started, { error });
+      this.recordSafely('complete', request, started, wire, { error });
       throw error;
     }
     // Outside the try: a logging failure can't be taken for the provider's.
-    this.recordSafely('complete', request, started, { response });
+    this.recordSafely('complete', request, started, wire, { response });
     return response;
   }
 
@@ -284,14 +372,15 @@ export class LoggingProviderAdapter implements ProviderAdapter {
   ): Promise<ProviderResponse> {
     request = this.withReasoning(request);
     const started = Date.now();
+    const wire: WireCapture = { captured: false, body: undefined };
     let response: ProviderResponse;
     try {
-      response = await this.inner.stream(request, callbacks, options);
+      response = await this.inner.stream(request, callbacks, this.captureWire(options, wire));
     } catch (error) {
-      this.recordSafely('stream', request, started, { error });
+      this.recordSafely('stream', request, started, wire, { error });
       throw error;
     }
-    this.recordSafely('stream', request, started, { response });
+    this.recordSafely('stream', request, started, wire, { response });
     return response;
   }
 }
