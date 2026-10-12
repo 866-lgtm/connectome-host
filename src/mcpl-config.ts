@@ -411,15 +411,17 @@ export function overlayEntryProblem(entry: unknown, opts: { strict?: boolean } =
 
 /**
  * Whether a URL's hostname, as the WHATWG parser gives it (lowercased, an
- * IPv6 address in brackets), names this machine: `localhost`, 127.0.0.0/8,
- * `::1` and IPv4-mapped 127.0.0.0/8 addresses, which are loopback addresses,
- * and the unspecified `0.0.0.0` and `::`, which aren't, but which Linux and
- * macOS connect to locally. A trailing dot names the same host. Other names under
- * `.localhost` aren't trusted to resolve here.
+ * IPv6 address in brackets, an IPv4 address without a trailing dot), names
+ * this machine: `localhost`, 127.0.0.0/8, `::1` and IPv4-mapped 127.0.0.0/8
+ * addresses, which are loopback addresses, and the unspecified `0.0.0.0`,
+ * `::` and `::ffff:0.0.0.0`, which aren't, but which Linux and macOS connect
+ * to locally. Any other name, `localhost.` and names under `.localhost`
+ * included, goes to a resolver that may not answer with this machine.
  */
 export function isLoopbackHost(hostname: string): boolean {
-  const host = hostname.replace(/^\[(.*)\]$/, '$1').replace(/\.$/, '');
+  const host = hostname.replace(/^\[(.*)\]$/, '$1');
   return host === 'localhost' || host === '::1' || host === '0.0.0.0' || host === '::'
+    || host === '::ffff:0:0'
     || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host)
     || /^::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}$/.test(host);
 }
@@ -449,18 +451,22 @@ export function cleartextCredential(
     return undefined;
   }
   if (url.protocol !== 'ws:' || isLoopbackHost(url.hostname)) return undefined;
-  // As the transport reads them: any value it would send but a blank one.
+  // A token counts as any value the transport would send but a blank one,
+  // which holds no secret (the transport sends a token of spaces, and an
+  // empty parameter). A grant counts whenever it's given, since its name,
+  // even a blank one, says nothing about the credential it resolves to.
   const given = (v: unknown): boolean => (typeof v === 'string' ? v.trim() !== '' : Boolean(v));
-  const carrier = given(entry.access) ? 'access'
+  const granted = typeof entry.access === 'string' ? entry.access !== '' : Boolean(entry.access);
+  const carrier = granted ? 'access'
     : given(entry.token) ? 'token'
-    : url.username !== '' || url.password !== '' || url.searchParams.has('token') ? 'url'
+    : url.username !== '' || url.password !== '' || url.searchParams.getAll('token').some(given) ? 'url'
     : undefined;
   return carrier ? { carrier, host: url.host } : undefined;
 }
 
 /** What a cleartext carrier sends, for a refusal or a warning. */
 export function cleartextCarrierText(carrier: 'access' | 'token' | 'url', access?: unknown): string {
-  if (carrier === 'access') return `the credential of its access grant "${String(access).trim()}"`;
+  if (carrier === 'access') return `the credential of its access grant ${JSON.stringify(String(access))}`;
   if (carrier === 'token') return 'its token';
   return "the user, password or token parameter in its url";
 }

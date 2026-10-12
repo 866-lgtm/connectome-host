@@ -298,6 +298,9 @@ describe('mcpl_deploy', () => {
       const byUrl = await call(mod, 'mcpl_deploy', { id: 'pasted', url });
       expect(byUrl.error).toStartWith('mcpl_deploy refused: the user, password or token parameter in its url would go to tools.example over unencrypted ws://');
     }
+    // A grant that isn't text is malformed, whatever the url: it names no grant to refuse.
+    expect((await call(mod, 'mcpl_deploy', { id: 'odd', url: 'ws://tools.example', access: 5 })).error)
+      .toBe("mcpl_deploy refused: the entry would be malformed (its access isn't text), so nothing was saved.");
     expect(calls).toEqual([]);
     expect(readAgentOverlay(overlayPath)).toEqual({});
     expect((await call(mod, 'mcpl_deploy', { id: 'tools', url: 'wss://tools.example:3101/mcpl', token: 't' })).success).toBe(true);
@@ -306,12 +309,12 @@ describe('mcpl_deploy', () => {
     expect(Object.keys(readAgentOverlay(overlayPath)).sort()).toEqual(['local', 'open', 'tools']);
   });
 
-  test('says a running server is unchanged when a redeploy of it is refused for a credential over ws://', async () => {
+  test('says a configured server is unchanged when a redeploy of it is refused for a credential over ws://', async () => {
     const { stub } = makeStubFramework();
     const mod = makeModule(stub);
     expect((await call(mod, 'mcpl_deploy', { id: 'tools', url: 'wss://tools.example/mcpl', token: 't' })).success).toBe(true);
     const refused = await call(mod, 'mcpl_deploy', { id: 'tools', url: 'ws://tools.example/mcpl', token: 't' });
-    expect(refused.error).toEndWith('Nothing was saved. The server already running as "tools" is unchanged.');
+    expect(refused.error).toEndWith('Nothing was saved. The server already configured as "tools" is unchanged.');
     expect(readAgentOverlay(overlayPath).tools).toEqual({ url: 'wss://tools.example/mcpl', transport: 'websocket', token: 't' });
   });
 
