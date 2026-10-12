@@ -29,6 +29,7 @@ import {
   stripAnsiSequences,
 } from '@opentui/core';
 import { createWriteStream, mkdirSync } from 'node:fs';
+import { sessionMarker } from './bug-report.js';
 import type { AgentFramework, SessionUsage } from '@animalabs/agent-framework';
 import type { AutobiographicalStrategy } from '@animalabs/context-manager';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
@@ -280,7 +281,7 @@ export async function runTui(app: AppContext): Promise<void> {
   mkdirSync(logDir, { recursive: true });
   const logPath = `${logDir}/tui-error.log`;
   const logStream = createWriteStream(logPath, { flags: 'a' });
-  logStream.write(`\n--- session ${new Date().toISOString()} ---\n`);
+  logStream.write(`\n${sessionMarker(new Date())}\n`);
   // The recipe was validated before the TUI took the terminal: its warnings go into this log.
   for (const warning of takeRecipeWarnings()) logStream.write(`warning: ${warning}\n`);
   const origStderrWrite = process.stderr.write.bind(process.stderr);

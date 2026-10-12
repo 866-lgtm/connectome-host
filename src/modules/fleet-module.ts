@@ -1404,6 +1404,15 @@ export class FleetModule implements Module {
   }
 
   private handleCommand(input: { name: string; command: string }): ToolResult {
+    if (typeof input.command === 'string' && /^\/bug(?:\s|$)/.test(input.command.trim())) {
+      // A /bug report's only free text is the words of the person filing it
+      // (bug-report.ts), so a session never runs it, here or in a child.
+      return {
+        success: false,
+        isError: true,
+        error: '/bug is for a person to run in a console: its report carries their own words, never a session\'s. Ask the user to run /bug themselves.',
+      };
+    }
     const ok = this.requireRunning(input.name);
     if (!('child' in ok)) return ok;
     if (typeof input.command !== 'string') {

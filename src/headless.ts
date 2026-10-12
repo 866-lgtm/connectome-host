@@ -21,6 +21,7 @@
 
 import { createServer, type Socket, type Server } from 'node:net';
 import { createWriteStream, mkdirSync, existsSync, unlinkSync, writeFileSync, type WriteStream } from 'node:fs';
+import { sessionMarker } from './bug-report.js';
 import { join, resolve } from 'node:path';
 import type { AppContext } from './index.js';
 import { type IncomingCommand, matchesSubscription } from './modules/fleet-types.js';
@@ -77,7 +78,7 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' });
   // Where this run's lines begin, as the TUI marks its error log: /bug reads
   // only the current session's (bug-report.ts).
-  logStream.write(`\n--- session ${new Date().toISOString()} ---\n`);
+  logStream.write(`\n${sessionMarker(new Date())}\n`);
   type StdWrite = typeof process.stdout.write;
   const makeRedirect = (): StdWrite => {
     const redirect = function (

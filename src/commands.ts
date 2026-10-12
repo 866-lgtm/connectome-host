@@ -33,10 +33,10 @@ import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import type { CredentialActionId, CredentialState } from './credential-state.js';
 import {
-  readMcplServersFile, saveMcplServers, readAgentOverlay, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH,
-  type AgentOverlayEntry, type ServerFileEntry,
+  readMcplServersFile, saveMcplServers, readAgentOverlay, DEFAULT_CONFIG_PATH,
+  DEFAULT_AGENT_OVERLAY_PATH, type AgentOverlayEntry, type ServerFileEntry,
 } from './mcpl-config.js';
-import { buildBugReport, gatherBugReportFacts, runtimeMode } from './bug-report.js';
+import { buildBugReport, composeServerConfig, gatherBugReportFacts, runtimeMode } from './bug-report.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
 import { type FleetModule, formatChildRow } from './modules/fleet-module.js';
@@ -635,26 +635,33 @@ function handleBug(command: string, app: AppContext): CommandResult {
     };
   }
   const dataDir = resolve(process.env.DATA_DIR || './data');
-  // Each server's configuration as the host composed it: the recipe's, the
-  // servers file's over it, and the agent overlay's over both (an
-  // agent-deployed server is only there). An unreadable file adds nothing.
+  // Each server's configuration as the host composes it
+  // (composeServerConfig). A file that can't be read is named in the
+  // report, without its path.
+  const configNotes: string[] = [];
   let fileServers: Record<string, ServerFileEntry> = {};
   let overlay: Record<string, AgentOverlayEntry> = {};
   try {
     fileServers = readMcplServersFile(DEFAULT_CONFIG_PATH);
-  } catch { /* no configurations from it */ }
+  } catch {
+    configNotes.push("the servers file couldn't be read");
+  }
   try {
     overlay = readAgentOverlay(DEFAULT_AGENT_OVERLAY_PATH);
-  } catch { /* no configurations from it */ }
+  } catch {
+    configNotes.push("the agent overlay couldn't be read");
+  }
   const facts = gatherBugReportFacts({
     mode: runtimeMode(),
     dataDir,
     recipe: app.recipe,
     liveServers: app.framework.listMcplServers(),
-    serverConfig: (id) => {
-      const layers = [app.recipe.mcpServers?.[id], fileServers[id], overlay[id]].filter((layer) => layer !== undefined);
-      return layers.length > 0 ? Object.assign({}, ...layers) : undefined;
-    },
+    serverConfig: (id) => composeServerConfig({
+      recipe: app.recipe.mcpServers?.[id],
+      file: Object.hasOwn(fileServers, id) ? fileServers[id] : undefined,
+      overlay: Object.hasOwn(overlay, id) ? overlay[id] : undefined,
+    }),
+    configNotes,
   });
   const { full, url, cut } = buildBugReport(text, facts);
   const path = join(dataDir, `bug-report-${facts.now.toISOString().replace(/[:.]/g, '-')}.txt`);
@@ -676,7 +683,7 @@ function handleBug(command: string, app: AppContext): CommandResult {
     { text: '', style: 'system' },
   ];
   if (cut.length > 0) {
-    lines.push({ text: `To fit the link, it leaves out ${cut.join(' and ')}. The file holds everything.`, style: 'system' });
+    lines.push({ text: `To fit the link, it leaves out ${cut.join(' and ')}. The file holds the full report.`, style: 'system' });
   }
   lines.push({ text: saved, style: 'system' });
   lines.push({ text: 'To file it, open this link, read the report there, and submit it on GitHub:', style: 'system' });

@@ -34,6 +34,7 @@ import { dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
+import { overlayEntryReplaces } from './mcpl-config.js';
 
 // ---------------------------------------------------------------------------
 // Where reports go, and what they're called
@@ -141,22 +142,23 @@ const ERROR_CLASSES = new Set([
  * named; every other tag is counted as "other".
  */
 export const HOST_LOG_TAGS = new Set([
-  'agent-settings', 'anthropic-credentials', 'autobiographical', 'budget-preflight', 'channel', 'cm-cache',
-  'coalescing', 'compression-quarantine', 'context-maintenance', 'credential', 'credential-monitor', 'deprecated',
-  'diagnostics', 'discord', 'discord-awareness', 'estimator-calibration', 'fleet', 'framework', 'gate',
-  'gate-telemetry', 'heartbeat', 'host-command', 'host-mode', 'identity',
-  'inference-dropped', 'inference-failed', 'inference-hard-down', 'inference-refusal', 'inference-rewind',
-  'inference-stale', 'kv-continuity-relaxation', 'kv-diag', 'kv-escalation', 'kv-overlap', 'kv-timing',
-  'kv-unified', 'liveness-watchdog', 'llm-calls', 'mcp', 'mcpl', 'membrane', 'membrane-oversize',
-  'membrane:bedrock', 'membrane:content', 'membrane:cost', 'membrane:gemini', 'membrane:normalize-tool-pairs',
+  'agent-settings', 'anthropic-credentials', 'autobiographical', 'batch', 'budget-preflight',
+  'cache-keepalive', 'channel', 'cm-cache', 'coalescing', 'compression-quarantine', 'context-maintenance',
+  'credential', 'credential-monitor', 'deprecated', 'diagnostics', 'discord', 'discord-awareness', 'echo',
+  'estimator-calibration', 'fleet', 'framework', 'gate', 'gate-telemetry', 'heartbeat', 'host', 'host-command',
+  'host-mode', 'host-notice', 'identity', 'image', 'inference-dropped', 'inference-failed',
+  'inference-hard-down', 'inference-refusal', 'inference-rewind', 'inference-stale',
+  'kv-continuity-relaxation', 'kv-diag', 'kv-escalation', 'kv-overlap', 'kv-timing', 'kv-unified',
+  'liveness-watchdog', 'llm-calls', 'mcp', 'mcpl', 'membrane', 'membrane-oversize', 'membrane:bedrock',
+  'membrane:content', 'membrane:cost', 'membrane:gemini', 'membrane:normalize-tool-pairs',
   'membrane:openrouter', 'membrane:usage', 'merge-quarantine', 'merge-topology', 'message-store',
   'mint-preimage', 'notices', 'nudge', 'openai-codex', 'operator', 'operator-log', 'ops-alert',
   'picker-config-drift', 'picker-dead-ids', 'picker-unrealizable', 'prose', 'provider-admission',
   'provider-cooldown', 'puppet', 'push-event-rejected', 'reasoning', 'reasoning-effort', 'refusal-retry',
-  'refusal-rewind', 'rfc005',
-  'routespeech', 'routing', 'self-wake', 'settings', 'shutdown', 'sleep', 'spill', 'store-topology',
-  'subagent', 'tool', 'tool-boundary', 'tool-result-guard', 'tts-relay', 'unstick', 'webui',
-  'webui-observers', 'windowed-passthrough', 'workspace',
+  'refusal-rewind', 'rfc005', 'routespeech', 'routing', 'section', 'self-wake', 'settings', 'shutdown',
+  'sleep', 'spill', 'store-topology', 'subagent', 'subscription-gc', 'thinking', 'tool', 'tool-boundary',
+  'tool-result-guard', 'tool_result', 'tools', 'tts-relay', 'unstick', 'voice', 'webui', 'webui-observers',
+  'windowed-passthrough', 'workspace',
 ]);
 
 /** The directories a package's own code lives in: frames elsewhere aren't named. */
@@ -189,6 +191,8 @@ export interface BugReportFacts {
     customModules: number;
   };
   servers: ServerRow[];
+  /** Why some server configurations are missing, without paths. */
+  configNotes: string[];
   /** Null when this process keeps no provider-call log. */
   providerCalls: ProviderCallSummary | null;
   /** Null when this mode keeps no error log (readline and batch print to the terminal). */
@@ -198,7 +202,7 @@ export interface BugReportFacts {
 export interface ServerRow {
   kind: string;
   transport: 'stdio' | 'websocket' | 'http' | 'unknown';
-  family: 'legacy' | 'modern';
+  family: 'legacy' | 'modern' | 'unknown';
   connected: boolean;
   retrying: boolean;
   refused: boolean;
@@ -218,7 +222,15 @@ export interface ProviderFailure {
 export interface ProviderCallSummary {
   calls: number;
   failed: number;
+  /** Newest first. */
   recent: ProviderFailure[];
+  /** Failures older than the newest kept. */
+  omitted: number;
+  /** Records that couldn't be read: not JSON, no valid time, or a time ahead of now. */
+  skipped: number;
+  /** Whether only the file's last part was read. */
+  truncated: boolean;
+  readable: boolean;
 }
 
 export interface HostErrorShape {
@@ -230,6 +242,9 @@ export interface HostErrorShape {
 
 export interface HostErrorSummary {
   log: 'tui-error.log' | 'headless.log';
+  readable: boolean;
+  /** Whether only the log's last part was read. */
+  truncated: boolean;
   tags: Array<[string, number]>;
   otherTags: number;
   errors: HostErrorShape[];
@@ -305,7 +320,11 @@ export interface LiveServerLike {
   url?: unknown;
 }
 
-const OUR_PACKAGE_SPEC = /^@animalabs\/[a-z0-9][a-z0-9-]{0,60}@[0-9][0-9A-Za-z.+-]{0,40}$/;
+/** Our own MCP server packages: a spec names one only when it is one of
+ *  these, at a numeric version. Any other name under the scope is still a
+ *  name someone chose. */
+const OUR_SERVER_PACKAGES = ['discord-mcpl', 'slack-mcpl', 'heartbeat-mcpl', 'portal-mcpl', 'mcpl-harness'];
+const OUR_PACKAGE_SPEC = new RegExp(`^@animalabs/(?:${OUR_SERVER_PACKAGES.join('|')})@\\d{1,6}(?:\\.\\d{1,6}){2}$`);
 
 export function setupFacts(recipe: RecipeLike): BugReportFacts['setup'] {
   const agent = recipe.agent ?? {};
@@ -332,6 +351,18 @@ export function setupFacts(recipe: RecipeLike): BugReportFacts['setup'] {
   };
 }
 
+/**
+ * A server's configuration as the host composes it (index.ts): the
+ * recipe's, the servers file's over it, and an agent overlay entry in
+ * place of both when it replaces the server (overlayEntryReplaces). An
+ * agent-deployed server has only its overlay entry.
+ */
+export function composeServerConfig(layers: { recipe?: object; file?: object; overlay?: unknown }): ServerConfigLike | undefined {
+  if (overlayEntryReplaces(layers.overlay)) return layers.overlay as ServerConfigLike;
+  const below = [layers.recipe, layers.file].filter((layer): layer is object => layer !== undefined);
+  return below.length > 0 ? Object.assign({}, ...below) as ServerConfigLike : undefined;
+}
+
 /** Each live server by ordinal: no id, command, argument or url, since a
  *  name the user chose can say what they're doing. */
 export function serverRows(
@@ -355,13 +386,17 @@ export function serverRows(
     // The framework's own reading when it gives one (a newer framework dials
     // an https url as modern MCP over HTTP); otherwise the configuration's,
     // as an older framework reads it: any url is a WebSocket.
+    // A framework that gives the field but leaves it null (agent-framework
+    // #262, for a refused server) means it has no usable value: unknown.
     const transport: ServerRow['transport'] = server.transport === 'stdio' || server.transport === 'websocket' || server.transport === 'http'
       ? server.transport
+      : Object.hasOwn(server, 'transport') ? 'unknown'
       : config.transport === 'websocket' || (hasUrl && config.transport !== 'stdio')
         ? 'websocket'
         : config.transport === 'stdio' || hasCommand ? 'stdio' : 'unknown';
     const family: ServerRow['family'] = server.family === 'legacy' || server.family === 'modern'
       ? server.family
+      : Object.hasOwn(server, 'family') ? 'unknown'
       : config.protocol === 'modern' ? 'modern' : 'legacy';
     return {
       kind,
@@ -369,8 +404,9 @@ export function serverRows(
       family,
       connected: server.connected === true,
       retrying: server.retrying === true,
-      // `refused` is a sentence naming the server and its url: only whether
-      // there is one goes in.
+      // `refused` (agent-framework #262's listMcplServers; older frameworks
+      // list no refused server) is a sentence naming the server and its url:
+      // only whether there is one goes in.
       refused: server.refused !== undefined && server.refused !== null && server.refused !== false,
       toolCount: count(server.toolCount) ?? 0,
     };
@@ -384,33 +420,47 @@ export function serverRows(
 /**
  * The last hour's provider calls, as counts and classifications. A record's
  * request, response and error text are never read into the report.
+ * `fallbackProvider` names the provider of records that carry none: the
+ * Anthropic and Bedrock writers write no `provider` key, the generic one does.
  */
-export function summarizeProviderCalls(lines: readonly string[], now: Date, recentMax = 10): ProviderCallSummary {
+export function summarizeProviderCalls(
+  lines: readonly string[],
+  now: Date,
+  opts: { recentMax?: number; fallbackProvider?: string | null } = {},
+): Omit<ProviderCallSummary, 'truncated' | 'readable'> {
+  const recentMax = opts.recentMax ?? 50;
   const since = now.getTime() - 60 * 60 * 1000;
   let calls = 0;
   let failed = 0;
+  let skipped = 0;
   const failures: ProviderFailure[] = [];
   for (const line of lines) {
+    if (line.trim() === '') continue;
     let record: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(line);
-      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) continue;
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { skipped++; continue; }
       record = parsed as Record<string, unknown>;
     } catch {
+      skipped++;
       continue;
     }
     const at = typeof record.timestamp === 'string' && ISO.test(record.timestamp) ? record.timestamp : null;
-    if (!at || Date.parse(at) < since || Date.parse(at) > now.getTime() + 60_000) continue;
+    if (!at || Date.parse(at) > now.getTime() + 60_000) { skipped++; continue; }
+    if (Date.parse(at) < since) continue;
     if (record.type !== 'call' && record.type !== 'error') continue;
     calls++;
     if (record.type !== 'error') continue;
     failed++;
     const status = typeof record.httpStatus === 'number' && Number.isInteger(record.httpStatus)
       && record.httpStatus >= 100 && record.httpStatus <= 599 ? record.httpStatus : null;
+    const provider = typeof record.provider === 'string'
+      ? PROVIDERS.has(record.provider) ? record.provider : null
+      : opts.fallbackProvider ?? null;
     failures.push({
       at: at.replace(/\.\d+Z$/, 'Z'),
       kind: record.kind === 'complete' || record.kind === 'stream' ? record.kind : null,
-      provider: typeof record.provider === 'string' && PROVIDERS.has(record.provider) ? record.provider : null,
+      provider,
       status,
       type: typeof record.errorType === 'string' && MEMBRANE_ERROR_TYPES.has(record.errorType) ? record.errorType : null,
       retryable: typeof record.retryable === 'boolean' ? record.retryable : null,
@@ -419,23 +469,52 @@ export function summarizeProviderCalls(lines: readonly string[], now: Date, rece
         : null,
     });
   }
-  return { calls, failed, recent: failures.slice(-recentMax).reverse() };
+  const recent = failures.slice(-recentMax).reverse();
+  return { calls, failed, skipped, recent, omitted: failures.length - recent.length };
 }
 
 // ---------------------------------------------------------------------------
 // Host errors, from the error log, as shapes
 // ---------------------------------------------------------------------------
 
+/** The line that marks where a run's error log begins (the TUI's and
+ *  headless's own logs both write it). */
+export function sessionMarker(now: Date): string {
+  return `--- session ${now.toISOString()} ---`;
+}
+
 const SESSION_MARKER = /^--- session \d{4}-\d{2}-\d{2}T[\d:.]+Z ---$/;
 const LEADING_STAMP = /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]\s*/;
 const TAG = /^\[([A-Za-z0-9:_./-]{1,40})\]/;
-const FRAME = /^\s+at\s+(?:.*?\()?((?:file:\/\/)?\/[^():\s]+?\.(?:ts|tsx|js|mjs|cjs)):(\d+)(?::\d+)?\)?\s*$/;
+const FRAME_LINE = /^\s+at\s+/;
+const ERROR_HEADER = /(?:^|[\s(\[])((?:[A-Z][A-Za-z0-9]*)?Error)(?::|\s*$)/;
+/** Lines between an error's header and its frames (a multi-line message). */
+const CONTINUATION_LINES = 5;
+
+/** A frame line's file and line number, read from its end: the last
+ *  parenthesised location, or what follows "at". A path may hold spaces
+ *  or parentheses; it must be absolute. */
+export function frameLocation(line: string): { path: string; line: string } | null {
+  if (!FRAME_LINE.test(line)) return null;
+  const trimmed = line.trim();
+  // `at name (location)`: the location opens at the first parenthesis
+  // followed by an absolute path, and runs to the line's last character.
+  const open = trimmed.search(/ \((?:\/|file:\/\/\/)/);
+  const location = open >= 0 && trimmed.endsWith(')')
+    ? trimmed.slice(open + 2, -1)
+    : trimmed.replace(/^at\s+/, '');
+  const match = /^(.*?):(\d{1,7})(?::\d{1,7})?$/.exec(location);
+  if (!match) return null;
+  const path = match[1]!;
+  if (!path.startsWith('/') && !path.startsWith('file:///')) return null;
+  return { path, line: match[2]! };
+}
 
 /** A frame's location inside our own code, `package/path:line`, or null
- *  for any other frame: connectome-host's files under `root` (wherever it
- *  is installed), and our dependencies under node_modules/@animalabs.
- *  `exists` confirms the file is real, so a line that only looks like a
- *  frame can't bring in a made-up path. */
+ *  for any other frame: connectome-host's code directories under `root`
+ *  (wherever it is installed), and our dependencies' under
+ *  node_modules/@animalabs. `exists` confirms the file is real, so a line
+ *  that only looks like a frame can't bring in a made-up path. */
 export function ourFrame(path: string, line: string, root: string, exists: (file: string) => boolean): string | null {
   let file: string;
   try {
@@ -466,7 +545,7 @@ export function ourFrame(path: string, line: string, root: string, exists: (file
   return `${located}:${line}`;
 }
 
-/** The error-log text of this session: after its last session marker. */
+/** The error-log text of this run: after its last session marker. */
 export function currentSession(text: string): string {
   const lines = text.split('\n');
   for (let i = lines.length - 1; i >= 0; i--) {
@@ -488,11 +567,12 @@ export function parseErrorLog(
   const tags = new Map<string, number>();
   let otherTags = 0;
   const shapes = new Map<string, HostErrorShape>();
-  let current: { className: string; frames: string[] } | null = null;
+  // The error being read: its class (empty when no header named one), its
+  // frames in our code, and how many non-frame lines followed its header.
+  let current: { className: string; frames: string[]; between: number; framed: boolean } | null = null;
   const close = (): void => {
-    if (!current) return;
-    if (current.className !== '' || current.frames.length > 0) {
-      const className = current.className || 'Error';
+    if (current && (current.className !== '' || current.frames.length > 0)) {
+      const className = current.className || 'an unnamed error';
       const key = `${className}|${current.frames.join('|')}`;
       const seen = shapes.get(key);
       if (seen) seen.count++;
@@ -501,27 +581,34 @@ export function parseErrorLog(
     current = null;
   };
   for (const raw of text.split('\n')) {
-    const frame = FRAME.exec(raw);
+    const frame = frameLocation(raw);
     if (frame) {
-      if (!current) current = { className: '', frames: [] };
+      if (!current) current = { className: '', frames: [], between: 0, framed: true };
+      current.framed = true;
       if (current.frames.length < 3) {
-        const where = ourFrame(frame[1]!, frame[2]!, root, exists);
+        const where = ourFrame(frame.path, frame.line, root, exists);
         if (where && !current.frames.includes(where)) current.frames.push(where);
       }
       continue;
     }
-    close();
     const line = raw.replace(LEADING_STAMP, '');
     const tag = TAG.exec(line);
+    // An error's header names its class before a colon. Only a known class
+    // is named; the rest of the line is never read.
+    const header = ERROR_HEADER.exec(line);
+    // A multi-line message: lines after a header and before its frames stay
+    // with it, unless one starts a new tagged line or a new error.
+    if (current && !current.framed && !tag && !header && current.between < CONTINUATION_LINES) {
+      current.between++;
+      continue;
+    }
+    close();
     if (tag) {
       const name = tag[1]!.toLowerCase();
       if (HOST_LOG_TAGS.has(name)) tags.set(name, (tags.get(name) ?? 0) + 1);
       else otherTags++;
     }
-    // An error's header names its class before a colon. Only a known class
-    // is named; the rest of the line is never read.
-    const header = /(?:^|[\s(\[])((?:[A-Z][A-Za-z0-9]*)?Error)(?::|\s*$)/.exec(line);
-    if (header) current = { className: ERROR_CLASSES.has(header[1]!) ? header[1]! : 'another error class', frames: [] };
+    if (header) current = { className: ERROR_CLASSES.has(header[1]!) ? header[1]! : 'another error class', frames: [], between: 0, framed: false };
   }
   close();
   const errors = [...shapes.values()].sort((a, b) => b.count - a.count);
@@ -541,17 +628,38 @@ export interface BugReport {
 }
 
 const LEFT_OUT = 'Left out: every log line and error message; llm-calls requests, responses and errors; '
-  + 'the system prompt and all other recipe text; server names, commands, args and URLs; env values; file paths. '
-  + 'We may ask whether you can share more.';
+  + 'the system prompt and all other recipe text; the names of the recipe, of servers, of custom modules and '
+  + 'custom models, and of packages other than our own MCP servers; commands, args, URLs and env values; '
+  + 'and file paths outside our own code. We may ask whether you can share more.';
+
+/** How much a report shows: everything, or lists collapsed to a bounded
+ *  size to fit the link (servers as counts by state, the top five tags and
+ *  three errors, no failure list or frames). */
+type Detail = 'full' | 'brief';
+
+/** Lists in the saved file stop here, saying how many more there were. */
+const FULL_LIST = 50;
 
 function onOff(value: boolean | null): string {
   return value === null ? 'unknown' : value ? 'on' : 'off';
 }
 
-export function formatBugReport(text: string, facts: BugReportFacts, opts: { brief?: boolean } = {}): BugReport {
-  const firstLine = text.split('\n').find((line) => line.trim() !== '')?.trim() ?? '';
-  const titleText = firstLine.length > TITLE_CHARS ? `${[...firstLine].slice(0, TITLE_CHARS - 1).join('')}…` : firstLine;
+function points(text: string): string[] {
+  return [...text];
+}
+
+/** Text without lone surrogates, which a URL can't carry. */
+export function wellFormed(text: string): string {
+  return text.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '\uFFFD');
+}
+
+export function formatBugReport(text: string, facts: BugReportFacts, detail: Detail = 'full'): BugReport {
+  const what = wellFormed(text);
+  const firstLine = what.split('\n').find((line) => line.trim() !== '')?.trim() ?? '';
+  const titlePoints = points(firstLine);
+  const titleText = titlePoints.length > TITLE_CHARS ? `${titlePoints.slice(0, TITLE_CHARS - 1).join('')}…` : firstLine;
   const lines: string[] = [];
+  const more = (n: number, what: string): void => { if (n > 0) lines.push(`  (${n} more ${what} not listed)`); };
   lines.push(`${BUG_REPORT_MARKER} · ${facts.now.toISOString().replace(/\.\d+Z$/, 'Z')}`);
   lines.push('This part was assembled by /bug. "What happened" is the reporter\'s own words.');
   lines.push('');
@@ -570,47 +678,67 @@ export function formatBugReport(text: string, facts: BugReportFacts, opts: { bri
   lines.push(`  maxTokens: ${s.maxTokens ?? 'default'} · contextBudgetTokens: ${s.contextBudgetTokens ?? 'default'} · cacheTtl: ${s.cacheTtl ?? 'default'} · proseRouting: ${s.proseRouting ?? 'default'} · thinking: ${s.thinking === null ? 'default' : onOff(s.thinking)}`);
   lines.push(`  modules: ${s.modules.length > 0 ? s.modules.join(', ') : 'none'}${s.customModules > 0 ? ` · custom: ${s.customModules}` : ''}`);
   lines.push('');
-  lines.push(`MCP servers${facts.servers.length === 0 ? ': none' : ''}`);
-  facts.servers.forEach((row, index) => {
-    const state = row.refused ? 'refused' : row.connected ? 'connected' : row.retrying ? 'retrying' : 'not connected';
-    lines.push(`  server ${index + 1}: ${row.kind} · ${row.transport} · ${row.family} · ${state} · ${row.toolCount} tools`);
-  });
+  const state = (row: ServerRow): string => (row.refused ? 'refused' : row.connected ? 'connected' : row.retrying ? 'retrying' : 'not connected');
+  if (detail === 'full') {
+    lines.push(`MCP servers${facts.servers.length === 0 ? ': none' : ''}`);
+    facts.servers.forEach((row, index) => {
+      lines.push(`  server ${index + 1}: ${row.kind} · ${row.transport} · ${row.family} · ${state(row)} · ${row.toolCount} tools`);
+    });
+  } else if (facts.servers.length === 0) {
+    lines.push('MCP servers: none');
+  } else {
+    const byState = new Map<string, number>();
+    for (const row of facts.servers) byState.set(state(row), (byState.get(state(row)) ?? 0) + 1);
+    lines.push(`MCP servers: ${facts.servers.length} (${[...byState].map(([name, n]) => `${name} ${n}`).join(', ')})`);
+  }
+  for (const note of facts.configNotes) lines.push(`  (${note})`);
   lines.push('');
-  if (facts.providerCalls) {
-    const pc = facts.providerCalls;
+  const pc = facts.providerCalls;
+  if (!pc) {
+    lines.push('Provider calls: no call log in this process');
+  } else if (!pc.readable) {
+    lines.push('Provider calls: this process\'s call log couldn\'t be read');
+  } else {
     lines.push(`Provider calls, last hour: ${pc.calls}, ${pc.failed} failed`);
-    if (opts.brief && pc.recent.length > 0) {
-      lines.push(`  (the ${pc.recent.length} newest failures are left out to fit the link)`);
-    } else {
-      for (const f of pc.recent) {
+    if (pc.truncated) lines.push('  (only the call log\'s last 4 MiB were read)');
+    if (pc.skipped > 0) lines.push(`  (${pc.skipped} records couldn't be read)`);
+    if (detail === 'full') {
+      const shown = pc.recent.slice(0, FULL_LIST);
+      for (const f of shown) {
         lines.push(`  ${f.at} ${f.kind ?? '?'} ${f.provider ?? '?'} ${f.status ?? '?'} ${f.type ?? '?'}${f.retryable === null ? '' : f.retryable ? ' retryable' : ' not retryable'}${f.code ? ` ${f.code}` : ''}`);
       }
+      more(pc.recent.length - shown.length + pc.omitted, 'failures');
+    } else if (pc.failed > 0) {
+      lines.push(`  (the failures are listed in the saved report, not in this link)`);
     }
     const newest = pc.recent[0];
     if (newest) lines.push(`  signature: ${newest.provider ?? '?'}/${newest.status ?? '?'}/${newest.type ?? '?'}/${newest.code ?? '-'}`);
-  } else {
-    lines.push('Provider calls: no call log in this process');
   }
   lines.push('');
-  if (facts.hostErrors) {
-    const he = facts.hostErrors;
-    lines.push(`Host errors this session (${he.log})`);
-    const tagText = he.tags.map(([name, n]) => `${name} ${n}`);
-    if (he.otherTags > 0) tagText.push(`other ${he.otherTags}`);
+  const he = facts.hostErrors;
+  if (!he) {
+    lines.push('Host errors: this mode keeps no error log (it prints to the terminal)');
+  } else if (!he.readable) {
+    lines.push(`Host errors: ${he.log} couldn't be read`);
+  } else {
+    lines.push(`Host errors this run (${he.log})`);
+    if (he.truncated) lines.push(`  (only ${he.log}'s last 4 MiB were read)`);
+    const tagList = detail === 'full' ? he.tags : he.tags.slice(0, 5);
+    const tagText = tagList.map(([name, n]) => `${name} ${n}`);
+    const otherTags = he.otherTags + he.tags.slice(tagList.length).reduce((sum, [, n]) => sum + n, 0);
+    if (otherTags > 0) tagText.push(`other ${otherTags}`);
     lines.push(`  tags: ${tagText.length > 0 ? tagText.join(', ') : 'none'}`);
     if (he.errors.length === 0) lines.push('  errors: none');
-    const shown = opts.brief ? he.errors.slice(0, 3) : he.errors.slice(0, 10);
+    const shown = he.errors.slice(0, detail === 'full' ? FULL_LIST : 3);
     for (const error of shown) {
       lines.push(`  ${error.className} ×${error.count} · sig ${error.signature}`);
-      if (!opts.brief) for (const frame of error.frames) lines.push(`    ${frame}`);
+      if (detail === 'full') for (const frame of error.frames) lines.push(`    ${frame}`);
     }
-    if (he.errors.length > shown.length) lines.push(`  (${he.errors.length - shown.length} more distinct errors left out to fit)`);
-  } else {
-    lines.push('Host errors: this mode keeps no error log (it prints to the terminal)');
+    more(he.errors.length - shown.length, 'distinct errors');
   }
   lines.push('');
   lines.push(LEFT_OUT);
-  return { title: `[/bug] ${titleText}`, what: text, report: lines.join('\n') };
+  return { title: `[/bug] ${titleText}`, what, report: lines.join('\n') };
 }
 
 /** The new-issue link, filled in by field id. Never `labels=`: GitHub
@@ -626,28 +754,36 @@ export function bugReportUrl(report: BugReport): string {
 }
 
 /**
- * The report and its link, within the link's cap. Past it, the lists
- * collapse first, then the user's own text is cut, each saying so; the
- * local file keeps the whole text for them to paste.
+ * The report and its link, within the link's cap as measured on the link
+ * itself. Past it, the lists collapse first, to a size that doesn't grow
+ * with the setup, then the user's own text is cut, each saying so; the
+ * saved file keeps the whole report.
  */
 export function buildBugReport(text: string, facts: BugReportFacts): { full: BugReport; linked: BugReport; url: string; cut: string[] } {
-  const full = formatBugReport(text, facts);
+  const full = formatBugReport(text, facts, 'full');
+  const fits = (report: BugReport): boolean => bugReportUrl(report).length <= BUG_REPORT_URL_CAP;
   let linked = full;
   const cut: string[] = [];
-  if (bugReportUrl(linked).length > BUG_REPORT_URL_CAP) {
-    linked = formatBugReport(text, facts, { brief: true });
-    cut.push('the failure list and error frames');
+  if (!fits(linked)) {
+    const brief = formatBugReport(text, facts, 'brief');
+    if (brief.report !== linked.report) {
+      linked = brief;
+      cut.push('the server rows, the failure list and the error frames');
+    }
   }
-  if (bugReportUrl(linked).length > BUG_REPORT_URL_CAP) {
-    const fixed = bugReportUrl({ ...linked, what: '' }).length;
-    const room = Math.max(0, BUG_REPORT_URL_CAP - fixed - 200);
-    let points = [...text];
-    // Shorten until the encoded text fits the room left.
-    let keep = points.length;
-    while (keep > 0 && encodeURIComponent(points.slice(0, keep).join('')).length > room) keep = Math.floor(keep * 0.8);
-    const omitted = points.length - keep;
-    points = points.slice(0, keep);
-    linked = { ...linked, what: `${points.join('')}\n\n[${omitted} characters cut to fit the link; the whole text is in the report file]` };
+  if (!fits(linked)) {
+    // Keep as much of the reporter's text as the link has room for,
+    // measured on the link: the longest prefix, by code points, that fits.
+    const all = points(linked.what);
+    const note = (omitted: number): string => `\n\n[${omitted} characters cut to fit the link; the whole text is in the report file]`;
+    let lo = 0;
+    let hi = all.length;
+    while (lo < hi) {
+      const mid = Math.ceil((lo + hi) / 2);
+      if (fits({ ...linked, what: `${all.slice(0, mid).join('')}${note(all.length - mid)}` })) lo = mid;
+      else hi = mid - 1;
+    }
+    linked = { ...linked, what: `${all.slice(0, lo).join('')}${note(all.length - lo)}` };
     cut.push('part of "What happened"');
   }
   return { full, linked, url: bugReportUrl(linked), cut };
@@ -665,6 +801,14 @@ export function runtimeMode(argv: readonly string[] = process.argv, stdinIsTTY =
   if (!stdinIsTTY) return 'batch';
   if (argv.includes('--no-tui')) return 'readline';
   return 'tui';
+}
+
+/** This process's llm-calls file, as index.ts names it when it creates it. */
+let callLogPath: string | null = null;
+
+/** Named by index.ts: the llm-calls file this process writes. */
+export function setCallLogPath(path: string): void {
+  callLogPath = path;
 }
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -687,18 +831,23 @@ function dependencyVersion(name: string, from: string): string | null {
   }
 }
 
-/** The commit this checkout is at, and whether tracked files are modified. */
+/** The commit this checkout is at, and whether tracked files are modified.
+ *  Each git call runs synchronously on the command's thread, bounded at a
+ *  second. */
 function hostCommit(root: string): BugReportFacts['host']['commit'] {
   if (!existsSync(join(root, '.git'))) return null;
-  const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 3000 });
+  const head = spawnSync('git', ['-C', root, 'rev-parse', 'HEAD'], { encoding: 'utf8', timeout: 1000 });
   const sha = head.status === 0 ? head.stdout.trim() : '';
   if (!SHA.test(sha)) return null;
-  const status = spawnSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', timeout: 3000 });
+  const status = spawnSync('git', ['-C', root, 'status', '--porcelain', '--untracked-files=no'], { encoding: 'utf8', timeout: 1000 });
   return { sha, modified: status.status === 0 ? status.stdout.trim() !== '' : null };
 }
 
-/** The last `bytes` of a file as lines, the first (likely partial) dropped. */
-export function tailLines(path: string, bytes: number): string[] {
+/** What a log read gave: its last `bytes` as lines (the first, likely
+ *  partial, dropped when it was cut), whether it was cut, and whether it
+ *  could be read. Null when the file doesn't exist. */
+export function tailLines(path: string, bytes: number): { lines: string[]; truncated: boolean; readable: boolean } | null {
+  if (!existsSync(path)) return null;
   let fd: number | undefined;
   try {
     const size = statSync(path).size;
@@ -707,23 +856,15 @@ export function tailLines(path: string, bytes: number): string[] {
     fd = openSync(path, 'r');
     readSync(fd, buffer, 0, buffer.length, start);
     const lines = buffer.toString('utf8').split('\n');
-    return start > 0 ? lines.slice(1) : lines;
+    return { lines: start > 0 ? lines.slice(1) : lines, truncated: start > 0, readable: true };
   } catch {
-    return [];
+    return { lines: [], truncated: false, readable: false };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
 }
 
-/** This process's llm-calls file: the newest one in the data directory. */
-function newestCallLog(dataDir: string): string | null {
-  try {
-    const names = readdirSync(dataDir).filter((name) => /^llm-calls\..*\.jsonl$/.test(name)).sort();
-    return names.length > 0 ? join(dataDir, names[names.length - 1]!) : null;
-  } catch {
-    return null;
-  }
-}
+const LOG_WINDOW = 4 * 1024 * 1024;
 
 export interface GatherOptions {
   now?: Date;
@@ -731,8 +872,12 @@ export interface GatherOptions {
   dataDir: string;
   recipe: RecipeLike;
   liveServers: readonly LiveServerLike[];
-  /** Server configurations by id: the recipe's, then the servers file's. */
+  /** Server configurations by id, as the host composed them. */
   serverConfig: (id: string) => ServerConfigLike | undefined;
+  /** Why some configurations are missing (a file that couldn't be read), without paths. */
+  configNotes?: string[];
+  /** This process's llm-calls file; by default the one index.ts named. */
+  callLog?: string | null;
   /** The checkout or install to report on; this one by default. */
   root?: string;
 }
@@ -743,20 +888,32 @@ export function gatherBugReportFacts(opts: GatherOptions): BugReportFacts {
   const pkg = readJson(join(root, 'package.json'));
   const packages = ['@animalabs/agent-framework', '@animalabs/membrane', '@animalabs/context-manager', '@animalabs/chronicle']
     .map((name) => ({ name, version: dependencyVersion(name, root) }));
-  const callLog = newestCallLog(opts.dataDir);
+  const setup = setupFacts(opts.recipe);
+  const callLog = opts.callLog === undefined ? callLogPath : opts.callLog;
+  let providerCalls: ProviderCallSummary | null = null;
+  if (callLog) {
+    const read = tailLines(callLog, LOG_WINDOW);
+    if (read) {
+      const summary = summarizeProviderCalls(read.lines, now, {
+        fallbackProvider: setup.provider === 'anthropic' || setup.provider === 'bedrock' ? setup.provider : null,
+      });
+      providerCalls = { ...summary, truncated: read.truncated, readable: read.readable };
+    }
+  }
   const errorLogName = opts.mode === 'tui' ? 'tui-error.log' : opts.mode === 'headless' ? 'headless.log' : null;
   let hostErrors: HostErrorSummary | null = null;
   if (errorLogName) {
-    const session = currentSession(tailLines(join(opts.dataDir, errorLogName), 4 * 1024 * 1024).join('\n'));
-    const parsed = parseErrorLog(session, root, (file) => existsSync(file));
+    const read = tailLines(join(opts.dataDir, errorLogName), LOG_WINDOW);
+    const parsed = parseErrorLog(currentSession((read?.lines ?? []).join('\n')), root, (file) => existsSync(file));
     hostErrors = {
       log: errorLogName,
+      readable: read ? read.readable : true,
+      truncated: read ? read.truncated : false,
       tags: [...parsed.tags.entries()].sort((a, b) => b[1] - a[1]),
       otherTags: parsed.otherTags,
       errors: parsed.errors,
     };
   }
-  const releaseText = release();
   return {
     now,
     mode: opts.mode,
@@ -764,14 +921,15 @@ export function gatherBugReportFacts(opts: GatherOptions): BugReportFacts {
     packages,
     runtime: {
       os: platform(),
-      release: version(releaseText),
+      release: version(release()),
       arch: arch(),
       bun: version(process.versions.bun),
       node: version(process.versions.node),
     },
-    setup: setupFacts(opts.recipe),
+    setup,
     servers: serverRows(opts.liveServers, opts.serverConfig),
-    providerCalls: callLog ? summarizeProviderCalls(tailLines(callLog, 4 * 1024 * 1024), now) : null,
+    configNotes: opts.configNotes ?? [],
+    providerCalls,
     hostErrors,
   };
 }

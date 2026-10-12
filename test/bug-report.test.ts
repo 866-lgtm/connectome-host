@@ -19,20 +19,29 @@ import {
   buildBugReport,
   bugReportUrl,
   currentSession,
+  formatBugReport,
+  frameLocation,
   gatherBugReportFacts,
   parseErrorLog,
   publicModelId,
   runtimeMode,
   serverRows,
+  composeServerConfig,
+  sessionMarker,
+  setCallLogPath,
   summarizeProviderCalls,
+  tailLines,
   type BugReportFacts,
 } from '../src/bug-report.js';
+import { FleetModule } from '../src/modules/fleet-module.js';
 import { createBranchState, handleCommand } from '../src/commands.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const NOW = new Date('2026-10-11T23:50:00.000Z');
 /** Spelled so no casing of the report's own words can contain it. */
 const CANARY = 'zqxcanaryzqx';
+/** This process's call log, by name, in the canary data directory. */
+const CALL_LOG = 'llm-calls.2026-10-11T23-00-00-000Z.jsonl';
 /** A data directory under the checkout, as DATA_DIR's default puts it. */
 const SESSION_FILE_DIR = join(ROOT, `data-bug-probe-${process.pid}`, 'workspace');
 
@@ -51,10 +60,13 @@ function canaryDataDir(): string {
     response: { content: [{ type: 'text', text: `reply ${CANARY}` }] },
     ...fields,
   });
-  writeFileSync(join(dir, 'llm-calls.2026-10-11T23-00-00-000Z.jsonl'), [
+  // An older process's call log, newer by name than this one's: never read.
+  writeFileSync(join(dir, 'llm-calls.2026-10-12T00-00-00-000Z.jsonl'), call({ type: 'error', httpStatus: 500 }) + '\n');
+  writeFileSync(join(dir, CALL_LOG), [
     call({ type: 'call' }),
+    // The Anthropic and Bedrock writers put no provider key on a record.
     call({
-      type: 'error', provider: 'anthropic', httpStatus: 529, errorType: 'server', retryable: true,
+      type: 'error', httpStatus: 529, errorType: 'server', retryable: true,
       providerErrorCode: 'overloaded_error', error: `Overloaded while answering "${CANARY}"`,
     }),
     call({
@@ -108,6 +120,8 @@ function canaryRecipe(model = `${CANARY}-finetune`) {
     extensions: { [`${CANARY}Ext`]: { path: `/home/${CANARY}/ext.js` } },
     mcpServers: {
       [`${CANARY}-server`]: { command: `/home/${CANARY}/bin/server`, args: [CANARY], env: { TOKEN: CANARY } },
+      // A name under our scope that isn't one of our servers is still a name someone chose.
+      scoped: { command: 'node', source: { npm: `@animalabs/${CANARY}@1.0.0` } },
       discord: { command: 'node', args: ['x'], source: { npm: '@animalabs/discord-mcpl@1.2.3' } },
       other: { command: 'npx', args: [`${CANARY}-mcp`], source: { npm: `${CANARY}-mcp@1.0.0` } },
       remote: { url: `wss://${CANARY}.example/mcpl?token=${CANARY}`, token: CANARY },
@@ -120,10 +134,10 @@ const LIVE = [
   { id: 'discord', connected: false, retrying: true, toolCount: 0 },
   { id: 'other', connected: true, toolCount: 2 },
   { id: 'remote', connected: false, refused: `MCP server "remote": url wss://${CANARY}.example/mcpl does not match transport "stdio"`, toolCount: 0 },
+  { id: 'scoped', connected: true, toolCount: 1 },
 ];
 
-function canaryFacts(dir: string, mode: 'tui' | 'headless' = 'tui'): BugReportFacts {
-  const recipe = canaryRecipe();
+function canaryFacts(dir: string, mode: 'tui' | 'headless' = 'tui', recipe: ReturnType<typeof canaryRecipe> = canaryRecipe()): BugReportFacts {
   return gatherBugReportFacts({
     now: NOW,
     mode,
@@ -131,6 +145,7 @@ function canaryFacts(dir: string, mode: 'tui' | 'headless' = 'tui'): BugReportFa
     recipe,
     liveServers: LIVE,
     serverConfig: (id) => (recipe.mcpServers as Record<string, never>)[id],
+    callLog: join(dir, CALL_LOG),
   });
 }
 
@@ -157,10 +172,12 @@ describe('the guarantee', () => {
       expect(full.report).toContain('modules: subagents, wake · custom: 2');
       expect(full.report).toContain('server 1: a local command · stdio · legacy · connected · 4 tools');
       expect(full.report).toContain('server 2: @animalabs/discord-mcpl@1.2.3 · stdio · legacy · retrying · 0 tools');
+      expect(full.report).toContain('server 5: a registry package · stdio · legacy · connected · 1 tools');
       expect(full.report).toContain('server 3: a registry package · stdio · legacy · connected · 2 tools');
       expect(full.report).toContain('server 4: a url server · websocket · legacy · refused · 0 tools');
       expect(full.report).toContain('Provider calls, last hour: 3, 2 failed');
-      expect(full.report).toContain('2026-10-11T23:40:00Z stream anthropic 529 server retryable overloaded_error');
+      // No provider key, and the setup's provider isn't one whose writer omits it.
+      expect(full.report).toContain('2026-10-11T23:40:00Z stream ? 529 server retryable overloaded_error');
       expect(full.report).toContain('2026-10-11T23:45:00Z stream ? 400 ? not retryable other');
       expect(full.report).toContain('tags: mcpl 2, routing 1, other 1');
       expect(full.report).toContain('TypeError ×1');
@@ -265,7 +282,7 @@ describe('the shapes', () => {
     expect(parsed.otherTags).toBe(0);
     expect(parsed.errors.map((e) => [e.className, e.count, e.frames])).toEqual([
       ['RangeError', 2, ['connectome-host/src/a.ts:1', 'connectome-host/src/b.ts:2', 'connectome-host/src/c.ts:3']],
-      ['Error', 1, ['connectome-host/src/e.ts:5', '@animalabs/agent-framework/dist/src/framework.js:9']],
+      ['an unnamed error', 1, ['connectome-host/src/e.ts:5', '@animalabs/agent-framework/dist/src/framework.js:9']],
     ]);
     expect(parsed.errors[0]!.signature).toMatch(/^[0-9a-f]{8}$/);
     // The same shape gives the same signature: a repeat is one search away.
@@ -313,9 +330,26 @@ describe('the shapes', () => {
     expect(rows).toEqual([
       { kind: 'a url server', transport: 'http', family: 'modern', connected: true, retrying: false, refused: false, toolCount: 1 },
       { kind: 'a local command', transport: 'stdio', family: 'legacy', connected: true, retrying: false, refused: false, toolCount: 2 },
-      { kind: 'unknown', transport: 'unknown', family: 'legacy', connected: false, retrying: false, refused: false, toolCount: 0 },
+      { kind: 'unknown', transport: 'unknown', family: 'unknown', connected: false, retrying: false, refused: false, toolCount: 0 },
     ]);
     expectNoCanary(JSON.stringify(rows), 'the rows');
+    // agent-framework #262 gives a refused server null family and transport:
+    // it has none it could use, whatever its configuration says.
+    const [refused] = serverRows(
+      [{ id: 'r', family: null, transport: null, refused: 'a sentence', url: 'x' }],
+      () => ({ url: 'wss://h/x' }),
+    );
+    expect(refused).toMatchObject({ kind: 'a url server', transport: 'unknown', family: 'unknown', refused: true });
+  });
+
+  test("an overlay entry that replaces a server is its whole configuration, as the host composes it", () => {
+    const file = { command: 'node', source: { npm: '@animalabs/discord-mcpl@1.2.3' } };
+    const replaced = composeServerConfig({ file, overlay: { command: '/usr/local/bin/my-own' } });
+    expect(serverRows([{ id: 's' }], () => replaced)[0]!.kind).toBe('a local command');
+    // A tombstone doesn't replace it, and neither does a malformed entry.
+    expect(composeServerConfig({ file, overlay: { disabled: true } })).toEqual(file);
+    expect(composeServerConfig({ recipe: { url: 'wss://a' }, file: { command: 'x' } })).toEqual({ url: 'wss://a', command: 'x' });
+    expect(composeServerConfig({})).toBe(undefined);
   });
 
   test('servers are rows by ordinal, and only our own packages are named', () => {
@@ -334,7 +368,7 @@ describe('the shapes', () => {
     ]);
   });
 
-  test("every tag connectome-host's own code begins a log line with is a named tag", () => {
+  test("every tag connectome-host's own strings begin with is a named tag", () => {
     const src = join(ROOT, 'src');
     const tags = new Set<string>();
     const walk = (dir: string): void => {
@@ -342,7 +376,9 @@ describe('the shapes', () => {
         const path = join(dir, entry.name);
         if (entry.isDirectory()) walk(path);
         else if (/\.tsx?$/.test(entry.name)) {
-          for (const match of readFileSync(path, 'utf8').matchAll(/console\.(?:error|warn|log)\(\s*[`'"]\[([a-z0-9:_-]{1,40})\]/gi)) {
+          // Any string our code begins with a bracketed tag: a log call's, a
+          // logger's, or a constant's.
+          for (const match of readFileSync(path, 'utf8').matchAll(/[`'"]\[([a-z0-9:_-]{1,40})\][ `'"]/gi)) {
             tags.add(match[1]!.toLowerCase());
           }
         }
@@ -365,9 +401,12 @@ describe('the link', () => {
       expect(params.get('title')).toBe('[/bug] It crashed.');
       expect(params.get('report')!.startsWith(BUG_REPORT_MARKER)).toBe(true);
       const form = readFileSync(join(ROOT, '.github/ISSUE_TEMPLATE/bug_report.yml'), 'utf8');
-      expect(form).toContain('id: what');
-      expect(form).toContain('id: report');
-      expect(form).toContain('labels: ["bug"]');
+      const blocks = form.split(/\n  - type: /).slice(1).map((block) => `type: ${block}`);
+      const field = (id: string) => blocks.find((block) => new RegExp(`\\n    id: ${id}\\n`).test(block));
+      expect(field('what')?.startsWith('type: textarea')).toBe(true);
+      expect(field('report')?.startsWith('type: textarea')).toBe(true);
+      expect(field('report')).toMatch(/\n      render: text\n/);
+      expect(form).toMatch(/^labels: \["bug"\]$/m);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -380,7 +419,7 @@ describe('the link', () => {
       const long = `${'A long account of what happened. '.repeat(400)}`;
       const { full, linked, url, cut } = buildBugReport(long, facts);
       expect(url.length).toBeLessThanOrEqual(BUG_REPORT_URL_CAP);
-      expect(cut).toEqual(['the failure list and error frames', 'part of "What happened"']);
+      expect(cut).toEqual(['the server rows, the failure list and the error frames', 'part of "What happened"']);
       expect(linked.what).toMatch(/\[\d+ characters cut to fit the link; the whole text is in the report file\]$/);
       expect(full.what).toBe(long);
       expect(bugReportUrl(full).length).toBeGreaterThan(BUG_REPORT_URL_CAP);
@@ -406,6 +445,7 @@ describe('the mode', () => {
     expect(runtimeMode(['bun', 'src/index.ts', '--headless'], false)).toBe('headless');
     expect(runtimeMode(['bun', 'src/index.ts'], false)).toBe('batch');
     expect(runtimeMode(['bun', 'src/index.ts', '--no-tui'], true)).toBe('readline');
+    expect(runtimeMode(['bun', 'src/index.ts', '--no-tui'], false)).toBe('batch');
     expect(runtimeMode(['bun', 'src/index.ts'], true)).toBe('tui');
   });
 
@@ -424,3 +464,199 @@ describe('the mode', () => {
     }
   });
 });
+
+describe('who runs it', () => {
+  test('the fleet tool refuses /bug, so a session never files one, in a child or here', async () => {
+    const fleet = new FleetModule();
+    for (const command of ['/bug it broke', '/bug', '  /bug\tx']) {
+      const result = await fleet.handleToolCall({ id: 't', name: 'command', input: { name: 'any', command } } as never);
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toContain('/bug is for a person to run');
+    }
+    // Other commands still reach the child check.
+    const other = await fleet.handleToolCall({ id: 't', name: 'command', input: { name: 'missing', command: '/status' } } as never);
+    expect(String(other.error)).not.toContain('/bug');
+  });
+});
+
+describe('what the report says about itself', () => {
+  test("only this process's call log is read, and a process with none says so", () => {
+    const dir = canaryDataDir();
+    try {
+      // canaryFacts names this process's file; the newer-named one holds a failure it must not count.
+      expect(buildBugReport('x', canaryFacts(dir)).full.report).toContain('Provider calls, last hour: 3, 2 failed');
+      // By default, the file index.ts named when it created it.
+      setCallLogPath(join(dir, CALL_LOG));
+      const named = gatherBugReportFacts({ now: NOW, mode: 'tui', dataDir: dir, recipe: {}, liveServers: [], serverConfig: () => undefined });
+      expect(named.providerCalls).toMatchObject({ calls: 3, failed: 2 });
+      const none = gatherBugReportFacts({ now: NOW, mode: 'tui', dataDir: dir, recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null });
+      expect(buildBugReport('x', none).full.report).toContain('Provider calls: no call log in this process');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a log that can't be read says so, and one read only in part says how much", () => {
+    const dir = scratch();
+    try {
+      // A directory where the log should be: it exists and can't be read as a file.
+      mkdirSync(join(dir, 'tui-error.log'));
+      const unreadable = gatherBugReportFacts({ now: NOW, mode: 'tui', dataDir: dir, recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null });
+      expect(buildBugReport('x', unreadable).full.report).toContain("Host errors: tui-error.log couldn't be read");
+      rmSync(join(dir, 'tui-error.log'), { recursive: true });
+      writeFileSync(join(dir, 'tui-error.log'), `${'x'.repeat(4 * 1024 * 1024 + 10)}\n[mcpl] after\n`);
+      const big = gatherBugReportFacts({ now: NOW, mode: 'tui', dataDir: dir, recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null });
+      expect(buildBugReport('x', big).full.report).toContain("(only tui-error.log's last 4 MiB were read)");
+      expect(tailLines(join(dir, 'missing.log'), 10)).toBe(null);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a servers file or overlay that couldn't be read is named, without its path", () => {
+    const facts = { ...canaryFactsless(), configNotes: ["the servers file couldn't be read"] };
+    expect(formatBugReport('x', facts).report).toContain("(the servers file couldn't be read)");
+  });
+
+  test('a record with no provider takes the setup\'s, only for the writers that omit it', () => {
+    const line = JSON.stringify({ type: 'error', timestamp: '2026-10-11T23:40:00.000Z', httpStatus: 529 });
+    expect(summarizeProviderCalls([line], NOW, { fallbackProvider: 'anthropic' }).recent[0]!.provider).toBe('anthropic');
+    expect(summarizeProviderCalls([line], NOW).recent[0]!.provider).toBe(null);
+    const facts = gatherBugReportFacts({
+      now: NOW, mode: 'batch', dataDir: scratch(), recipe: { agent: { provider: 'anthropic' } }, liveServers: [],
+      serverConfig: () => undefined, callLog: null,
+    });
+    expect(facts.setup.provider).toBe('anthropic');
+  });
+
+  test('records with no time, a time ahead of now, or no JSON are counted as unreadable; the list keeps its newest', () => {
+    const at = (minute: number) => `2026-10-11T23:${String(minute).padStart(2, '0')}:00.000Z`;
+    const lines = [
+      ...Array.from({ length: 12 }, (_, i) => JSON.stringify({ type: 'error', timestamp: at(i + 1), httpStatus: 500 })),
+      JSON.stringify({ type: 'error', timestamp: '2026-10-12T05:00:00.000Z' }),
+      'not json',
+      JSON.stringify({ type: 'error' }),
+    ];
+    const summary = summarizeProviderCalls(lines, NOW, { recentMax: 10 });
+    expect(summary).toMatchObject({ calls: 12, failed: 12, skipped: 3, omitted: 2 });
+    expect(summary.recent[0]!.at).toBe('2026-10-11T23:12:00Z');
+    expect(summary.recent).toHaveLength(10);
+  });
+});
+
+describe('the shapes, at their edges', () => {
+  test('a frame path with spaces or parentheses still resolves, read from the end', () => {
+    expect(frameLocation('    at fn (/home/A B/x (1)/src/a.ts:12:3)')).toEqual({ path: '/home/A B/x (1)/src/a.ts', line: '12' });
+    expect(frameLocation('    at /opt/app/src/b.ts:4:1')).toEqual({ path: '/opt/app/src/b.ts', line: '4' });
+    expect(frameLocation('    at fn (node:internal/x:1:1)')).toBe(null);
+    expect(frameLocation('not a frame')).toBe(null);
+  });
+
+  test("a multi-line message stays one error with its frames", () => {
+    const parsed = parseErrorLog([
+      'TypeError: first line of the message',
+      'second line of the message',
+      `    at a (${join(ROOT, 'src/commands.ts')}:3:1)`,
+    ].join('\n'), ROOT, () => true);
+    expect(parsed.errors.map((e) => [e.className, e.frames])).toEqual([['TypeError', ['connectome-host/src/commands.ts:3']]]);
+  });
+
+  test('the session marker the runtimes write is the one the reader finds', () => {
+    const marker = sessionMarker(NOW);
+    expect(currentSession(`old\n${marker}\nnew`)).toBe('new');
+    for (const file of ['src/tui.ts', 'src/headless.ts']) {
+      expect(readFileSync(join(ROOT, file), 'utf8')).toContain('sessionMarker(new Date())');
+    }
+  });
+
+  test('values outside the setup lists stay out', () => {
+    const recipe = canaryRecipe('claude-sonnet-4-5');
+    const agent = recipe.agent as Record<string, unknown>;
+    agent.provider = CANARY;
+    agent.formatter = CANARY;
+    agent.cacheTtl = CANARY;
+    agent.proseRouting = CANARY;
+    const dir = canaryDataDir();
+    try {
+      const { full } = buildBugReport('x', canaryFacts(dir, 'tui', recipe));
+      expectNoCanary(full.report, 'the report');
+      expect(full.report).toContain('provider: other · model: custom');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the environment: versions, commit and modified flag, from a real checkout', () => {
+    const root = scratch();
+    try {
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.3' }));
+      mkdirSync(join(root, 'node_modules/@animalabs/agent-framework'), { recursive: true });
+      writeFileSync(join(root, 'node_modules/@animalabs/agent-framework/package.json'), JSON.stringify({ version: '0.21.0' }));
+      const git = (...args: string[]) => Bun.spawnSync(['git', '-C', root, ...args], { env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+      git('init', '-q');
+      git('add', 'package.json');
+      git('commit', '-q', '-m', 'x');
+      const facts = () => gatherBugReportFacts({ now: NOW, mode: 'batch', dataDir: root, recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null, root });
+      const clean = facts();
+      expect(clean.host.version).toBe('1.2.3');
+      expect(clean.host.commit?.modified).toBe(false);
+      expect(clean.host.commit?.sha).toMatch(/^[0-9a-f]{40}$/);
+      expect(clean.packages.find((p) => p.name === '@animalabs/agent-framework')?.version).toBe('0.21.0');
+      writeFileSync(join(root, 'package.json'), JSON.stringify({ version: '1.2.4' }));
+      expect(facts().host.commit?.modified).toBe(true);
+      expect(formatBugReport('x', clean).report).toContain(`connectome-host 1.2.3 (commit ${clean.host.commit!.sha.slice(0, 12)}, modified: no) · mode: batch`);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the link, at its edges', () => {
+  test('punctuation-heavy text, many servers and a lone surrogate still fit the cap', () => {
+    const dir = canaryDataDir();
+    try {
+      const many = { ...canaryFacts(dir), servers: Array.from({ length: 300 }, () => ({ kind: 'a local command', transport: 'stdio' as const, family: 'legacy' as const, connected: true, retrying: false, refused: false, toolCount: 3 })) };
+      for (const text of ["(it's) !~".repeat(900), `bad \uD800 surrogate ${'x'.repeat(100)}`, 'short']) {
+        const { url, linked } = buildBugReport(text, many);
+        expect(url.length).toBeLessThanOrEqual(BUG_REPORT_URL_CAP);
+        expect(linked.report).toContain('MCP servers: 300 (connected 300)');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the brief form says what it leaves out, and is bounded', () => {
+    const dir = canaryDataDir();
+    try {
+      const facts = canaryFacts(dir);
+      const brief = formatBugReport('x', facts, 'brief').report;
+      expect(brief).toContain('(the failures are listed in the saved report, not in this link)');
+      expect(brief).not.toContain('connectome-host/src/commands.ts:12');
+      expect(brief).toContain('MCP servers: 5 (connected 3, retrying 1, refused 1)');
+      // Three errors at most, by class and signature, without frames.
+      expect(brief.match(/ sig [0-9a-f]{8}/g)?.length).toBe(3);
+      expect(brief).not.toMatch(/^    connectome-host\//m);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a cut is named only when it removed something', () => {
+    const bare = canaryFactsless();
+    const { cut } = buildBugReport('y'.repeat(8000), bare);
+    expect(cut).toEqual(['part of "What happened"']);
+  });
+
+  test('a title is cut at 80 code points, astral characters included', () => {
+    const { full } = buildBugReport('😀'.repeat(79), canaryFactsless());
+    expect(full.title).toBe(`[/bug] ${'😀'.repeat(79)}`);
+    const long = buildBugReport('😀'.repeat(81), canaryFactsless()).full.title;
+    expect([...long].length).toBe('[/bug] '.length + 80);
+  });
+});
+
+/** Facts with nothing in their lists. */
+function canaryFactsless(): BugReportFacts {
+  return gatherBugReportFacts({ now: NOW, mode: 'batch', dataDir: scratch(), recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null });
+}
