@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { KeepaliveCall, KeepaliveUsage, ProviderRequest } from '@animalabs/membrane';
@@ -401,6 +401,35 @@ describe('the keepalive refusal dragnet and request retention, poke by poke', ()
       rmSync(dir, { recursive: true, force: true });
     }
   }
+
+  test('after an append that may have left part of a row, the next row starts on a new line and keeps the request whole', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'logging-keepalive-torn-'));
+    const later = join(dir, 'later');
+    const path = join(later, 'llm-calls.unit.jsonl');
+    try {
+      const adapter = new LoggingAnthropicAdapter({ apiKey: 'fixture-key', cacheKeepalive: { enabled: false } }, path);
+      adapter.onRefusal = () => {};
+      const log = (call: KeepaliveCall) => (adapter as unknown as { logKeepaliveCall(call: KeepaliveCall): void }).logKeepaliveCall(call);
+      // The first append throws (no directory yet); what a write cut short
+      // would have left is put there by hand.
+      log(receipt('A', 1, 'refusal'));
+      mkdirSync(later);
+      const fragment = '{"type":"call","kind":"keepal';
+      writeFileSync(path, fragment);
+      log(receipt('A', 1, 'refusal'));
+      log(receipt('A', 1, 'refusal'));
+      // The fragment, then two whole rows, each on its own line and none blank.
+      const lines = readFileSync(path, 'utf8').split('\n');
+      expect(lines).toHaveLength(4);
+      expect(lines[0]).toBe(fragment);
+      expect(lines[3]).toBe('');
+      const rows = lines.slice(1, 3).map(line => JSON.parse(line));
+      expect(rows.map(r => r.rawRequest !== undefined)).toEqual([true, false]);
+      expect(rows[1].keepalive.request).toBe(rows[0].keepalive.request);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   test('each lineage is heard and kept on its own', () => {
     withAdapter(({ log, refusals, rows }) => {

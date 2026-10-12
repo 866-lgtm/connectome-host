@@ -335,13 +335,26 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   private readonly warnedEffort = new Set<string>();
   private readonly warnedThinking = new Set<string>();
 
-  /** Append one record; true when it was written. Never throws. */
+  /** True after an append threw, which may have left part of a row behind. */
+  private logTorn = false;
+
+  /** Append one record; true when it was written. Never throws. After an
+   *  append that threw, the next row starts on a new line, so a row cut
+   *  short can't take the next one with it. */
   private log(record: Record<string, unknown>): boolean {
+    let line: string;
     try {
-      appendFileSync(this.logPath, JSON.stringify(record) + '\n');
+      line = JSON.stringify(record) + '\n';
+    } catch {
+      return false;
+    }
+    try {
+      appendFileSync(this.logPath, this.logTorn ? '\n' + line : line);
+      this.logTorn = false;
       return true;
     } catch {
       // never throw from logging
+      this.logTorn = true;
       return false;
     }
   }
