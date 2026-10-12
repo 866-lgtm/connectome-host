@@ -37,6 +37,7 @@ import { join, resolve, isAbsolute } from 'node:path';
 import { type IncomingCommand, type WireEvent, type PanelResponseEvent, matchesSubscription } from './fleet-types.js';
 import { loadRecipe } from '../recipe.js';
 import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
+import { parseCommand } from '../command-name.js';
 
 /**
  * Cross-process telemetry the parent host needs from every child, on top of
@@ -1404,9 +1405,11 @@ export class FleetModule implements Module {
   }
 
   private handleCommand(input: { name: string; command: string }): ToolResult {
-    if (typeof input.command === 'string' && /^\/bug(?:\s|$)/.test(input.command.trim())) {
+    if (typeof input.command === 'string' && parseCommand(input.command).name === 'bug') {
       // A /bug report's only free text is the words of the person filing it
-      // (bug-report.ts), so a session never runs it, here or in a child.
+      // (bug-report.ts), so a session never runs it, here or in a child. The
+      // name is read as the child's handleCommand reads it, so whatever would
+      // run /bug there is refused here.
       return {
         success: false,
         isError: true,

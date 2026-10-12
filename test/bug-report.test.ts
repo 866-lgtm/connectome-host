@@ -34,6 +34,7 @@ import {
   type BugReportFacts,
 } from '../src/bug-report.js';
 import { FleetModule } from '../src/modules/fleet-module.js';
+import { parseCommand } from '../src/command-name.js';
 import { createBranchState, handleCommand } from '../src/commands.js';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -204,7 +205,8 @@ describe('the guarantee', () => {
         branchState: createBranchState(),
         switchSession: async () => {},
       };
-      const result = handleCommand('/bug  It froze when the Discord server reconnected.', app);
+      // Read as any command is: the first character dropped, then the name.
+      const result = handleCommand('/ bug  It froze when the Discord server reconnected.', app);
       const output = result.lines.map((line) => line.text).join('\n');
       expectNoCanary(output.replace(dir, '<dir>'), 'the command output');
       expect(output).toContain('nothing has been sent');
@@ -468,11 +470,21 @@ describe('the mode', () => {
 describe('who runs it', () => {
   test('the fleet tool refuses /bug, so a session never files one, in a child or here', async () => {
     const fleet = new FleetModule();
-    for (const command of ['/bug it broke', '/bug', '  /bug\tx']) {
+    // Whatever the child's handleCommand would run as /bug: it drops the
+    // first character, whatever it is, and trims after it.
+    for (const command of ['/bug it broke', '/bug', '/bug\tx', '/ bug the model wrote this', 'xbug words', '!bug words', '/\tbug x']) {
       const result = await fleet.handleToolCall({ id: 't', name: 'command', input: { name: 'any', command } } as never);
       expect(result.success).toBe(false);
       expect(String(result.error)).toContain('/bug is for a person to run');
     }
+    // The handler reads those names the same way: each would run /bug.
+    for (const command of ['/ bug words', 'xbug words', '/\tbug words']) {
+      expect(parseCommand(command)).toEqual({ name: 'bug', rest: 'words' });
+    }
+    expect(parseCommand('/bug   two  spaced\nlines  ')).toEqual({ name: 'bug', rest: 'two  spaced\nlines' });
+    expect(parseCommand('/')).toEqual({ name: '', rest: '' });
+    // A leading space makes the name "/bug", which no command is: it runs nothing.
+    expect(parseCommand('  /bug x').name).toBe('/bug');
     // Other commands still reach the child check.
     const other = await fleet.handleToolCall({ id: 't', name: 'command', input: { name: 'missing', command: '/status' } } as never);
     expect(String(other.error)).not.toContain('/bug');

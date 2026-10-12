@@ -37,6 +37,7 @@ import {
   DEFAULT_AGENT_OVERLAY_PATH, type AgentOverlayEntry, type ServerFileEntry,
 } from './mcpl-config.js';
 import { buildBugReport, composeServerConfig, gatherBugReportFacts, runtimeMode } from './bug-report.js';
+import { parseCommand } from './command-name.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
 import { type FleetModule, formatChildRow } from './modules/fleet-module.js';
@@ -168,7 +169,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
   // otherwise leave an empty last token, and name-taking commands that join
   // the rest of the line would look up "name " instead of "name".
   const parts = command.slice(1).trim().split(/\s+/);
-  const cmd = parts[0]!;
+  const cmd = parseCommand(command).name;
   const args = parts.slice(1);
   const framework = app.framework;
 
@@ -623,7 +624,7 @@ function handleRecipe(app: AppContext): CommandResult {
  * reporter reads it in the form and submits it themselves.
  */
 function handleBug(command: string, app: AppContext): CommandResult {
-  const text = command.trim().replace(/^\/bug\b/, '').trim();
+  const text = parseCommand(command).rest.trim();
   if (text === '') {
     return {
       lines: [
