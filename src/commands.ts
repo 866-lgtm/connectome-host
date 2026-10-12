@@ -32,11 +32,8 @@ import type { AgentFramework } from '@animalabs/agent-framework';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import type { CredentialActionId, CredentialState } from './credential-state.js';
-import {
-  readMcplServersFile, saveMcplServers, readAgentOverlay, DEFAULT_CONFIG_PATH,
-  DEFAULT_AGENT_OVERLAY_PATH, type AgentOverlayEntry, type ServerFileEntry,
-} from './mcpl-config.js';
-import { buildBugReport, composeServerConfig, gatherBugReportFacts, runtimeMode } from './bug-report.js';
+import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
+import { buildBugReport, composedServerConfigs, gatherBugReportFacts, runtimeMode, type LiveSetup } from './bug-report.js';
 import { parseCommand } from './command-name.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
@@ -636,43 +633,37 @@ function handleBug(command: string, app: AppContext): CommandResult {
     };
   }
   const dataDir = resolve(process.env.DATA_DIR || './data');
-  // Each server's configuration as the host composes it
-  // (composeServerConfig). A file that can't be read is named in the
-  // report, without its path.
-  const configNotes: string[] = [];
-  let fileServers: Record<string, ServerFileEntry> = {};
-  let overlay: Record<string, AgentOverlayEntry> = {};
-  try {
-    fileServers = readMcplServersFile(DEFAULT_CONFIG_PATH);
-  } catch {
-    configNotes.push("the servers file couldn't be read");
-  }
-  try {
-    overlay = readAgentOverlay(DEFAULT_AGENT_OVERLAY_PATH);
-  } catch {
-    configNotes.push("the agent overlay couldn't be read");
-  }
+  // Each server's configuration as startup composes it, by the same
+  // functions; a stage that fails is named in the report, without a path.
+  const servers = composedServerConfigs(app.recipe.mcpServers, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH);
+  // The running setup: the main agent's own fields (MODEL and defaults
+  // resolve the model, settings change live) and the modules registered.
+  const framework = app.framework;
+  const agent = (app.agentName ? framework.getAgent(app.agentName) : undefined) ?? framework.getAllAgents()[0];
   const facts = gatherBugReportFacts({
     mode: runtimeMode(),
     dataDir,
     recipe: app.recipe,
-    liveServers: app.framework.listMcplServers(),
-    serverConfig: (id) => composeServerConfig({
-      recipe: app.recipe.mcpServers?.[id],
-      file: Object.hasOwn(fileServers, id) ? fileServers[id] : undefined,
-      overlay: Object.hasOwn(overlay, id) ? overlay[id] : undefined,
-    }),
-    configNotes,
+    liveServers: framework.listMcplServers(),
+    serverConfig: servers.configFor,
+    configNotes: servers.notes,
+    live: {
+      agent: agent as unknown as NonNullable<LiveSetup['agent']> | undefined,
+      modules: framework.getAllModules().map((module) => module.name),
+      // The wake gate is a framework option, on unless a recipe turns it off (index.ts).
+      wake: (app.recipe.modules as { wake?: unknown } | undefined)?.wake !== false,
+    },
   });
   const { full, url, cut } = buildBugReport(text, facts);
   const path = join(dataDir, `bug-report-${facts.now.toISOString().replace(/[:.]/g, '-')}.txt`);
-  let saved: string;
+  let saved: string | null = null;
+  let saveError = '';
   try {
     mkdirSync(dataDir, { recursive: true });
     writeFileSync(path, `${full.title}\n\nWhat happened:\n${full.what}\n\nReport:\n${full.report}\n\nFile it here:\n${url}\n`);
-    saved = `Saved to ${path}`;
+    saved = path;
   } catch (err) {
-    saved = `Couldn't save it to a file (${err instanceof Error ? err.message : String(err)}); the link below still holds it.`;
+    saveError = err instanceof Error ? err.message : String(err);
   }
   const lines: Line[] = [
     { text: '--- Bug report: nothing has been sent ---', style: 'system' },
@@ -683,10 +674,20 @@ function handleBug(command: string, app: AppContext): CommandResult {
     ...full.report.split('\n').map((line) => ({ text: line, style: 'system' as const })),
     { text: '', style: 'system' },
   ];
+  // Say only what holds: whether the file was written, and whether the
+  // link carries the whole report.
   if (cut.length > 0) {
-    lines.push({ text: `To fit the link, it leaves out ${cut.join(' and ')}. The file holds the full report.`, style: 'system' });
+    lines.push({
+      text: saved
+        ? `To fit the link, it leaves out ${cut.join(' and ')}. The saved file holds the full report.`
+        : `To fit the link, it leaves out ${cut.join(' and ')}. The file couldn't be saved, so copy the full report above into the issue.`,
+      style: 'system',
+    });
   }
-  lines.push({ text: saved, style: 'system' });
+  lines.push({
+    text: saved ? `Saved to ${saved}` : `Couldn't save it to a file (${saveError}).${cut.length > 0 ? '' : ' The link below holds the whole report.'}`,
+    style: 'system',
+  });
   lines.push({ text: 'To file it, open this link, read the report there, and submit it on GitHub:', style: 'system' });
   lines.push({ text: url, style: 'system' });
   return { lines };

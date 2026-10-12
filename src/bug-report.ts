@@ -28,13 +28,13 @@
  * reads it there and submits it themselves, so no credentials are needed.
  */
 
-import { closeSync, existsSync, openSync, readFileSync, readSync, readdirSync, statSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, readSync, realpathSync, statSync } from 'node:fs';
 import { arch, platform, release } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
-import { overlayEntryReplaces } from './mcpl-config.js';
+import { applyAgentOverlay, loadMcplServers, mergeRecipeServers } from './mcpl-config.js';
 
 // ---------------------------------------------------------------------------
 // Where reports go, and what they're called
@@ -101,6 +101,14 @@ const BUILT_IN_MODULES = [
   'subagents', 'lessons', 'retrieval', 'wake', 'workspace', 'instructions', 'activity', 'notices',
   'mcplAdmin', 'history', 'identity', 'fleet', 'webui', 'ttsRelay', 'subscriptionGc', 'channelMode',
 ];
+/** The names our own modules register under (connectome-host's and
+ *  agent-framework's), as a running framework lists them. Any other is an
+ *  extension's, counted. */
+const LIVE_MODULE_NAMES = new Set([
+  'activity', 'api', 'channel-mode', 'discord', 'fleet', 'health', 'history', 'identity', 'instructions',
+  'lessons', 'mcpl-admin', 'notices', 'observers', 'openai-codex', 'retrieval', 'settings', 'subagent',
+  'subscription-gc', 'time', 'tts-relay', 'tui', 'webui', 'workspace',
+]);
 
 const FORMATTERS = new Set(['native', 'anthropic-xml']);
 const PROSE_ROUTING = new Set(['locus', 'explicit', 'hybrid', 'disabled']);
@@ -326,41 +334,100 @@ export interface LiveServerLike {
 const OUR_SERVER_PACKAGES = ['discord-mcpl', 'slack-mcpl', 'heartbeat-mcpl', 'portal-mcpl', 'mcpl-harness'];
 const OUR_PACKAGE_SPEC = new RegExp(`^@animalabs/(?:${OUR_SERVER_PACKAGES.join('|')})@\\d{1,6}(?:\\.\\d{1,6}){2}$`);
 
-export function setupFacts(recipe: RecipeLike): BugReportFacts['setup'] {
+/**
+ * What the running host uses, read from it rather than from the recipe,
+ * which the host resolves further: MODEL in the environment and a default
+ * pick the model, settings change live, and some modules are on unless a
+ * recipe turns them off. Each value still goes through its allowlist.
+ */
+export interface LiveSetup {
+  /** The main agent's own fields. */
+  agent?: { model?: unknown; maxTokens?: unknown; thinking?: unknown; proseRouting?: unknown; cacheTtl?: unknown; contextBudgetTokens?: unknown };
+  /** The names of the modules the framework has registered. */
+  modules?: readonly string[];
+  /** Whether the wake gate is on: it is a framework option, not a module. */
+  wake?: boolean;
+}
+
+export function setupFacts(recipe: RecipeLike, live: LiveSetup = {}): BugReportFacts['setup'] {
   const agent = recipe.agent ?? {};
+  const running = live.agent ?? {};
+  // A field the running agent gives wins over the recipe's.
+  const pick = <K extends keyof NonNullable<LiveSetup['agent']>>(key: K): unknown =>
+    running[key] !== undefined ? running[key] : (agent as Record<string, unknown>)[key];
   const provider = typeof agent.provider === 'string' && PROVIDERS.has(agent.provider)
     ? agent.provider
     : agent.provider === undefined ? 'anthropic' : 'other';
   const modules = (recipe.modules ?? {}) as Record<string, unknown>;
   const enabled = (value: unknown): boolean => value !== undefined && value !== false && value !== null;
-  const thinking = agent.thinking && typeof agent.thinking === 'object'
-    ? (agent.thinking as { enabled?: unknown }).enabled === true
+  const thinkingValue = pick('thinking');
+  const thinking = thinkingValue && typeof thinkingValue === 'object'
+    ? (thinkingValue as { enabled?: unknown }).enabled === true
     : null;
+  const cacheTtl = pick('cacheTtl');
+  const proseRouting = pick('proseRouting');
+  let named: string[];
+  let custom: number;
+  if (live.modules) {
+    named = [...new Set(live.modules.filter((name) => LIVE_MODULE_NAMES.has(name)))].sort();
+    if (live.wake) named = ['wake', ...named];
+    custom = live.modules.filter((name) => !LIVE_MODULE_NAMES.has(name)).length;
+  } else {
+    named = BUILT_IN_MODULES.filter((name) => Object.hasOwn(modules, name) && enabled(modules[name]));
+    custom = Object.keys(recipe.extensions ?? {}).length
+      + Object.keys(modules).filter((name) => !BUILT_IN_MODULES.includes(name) && enabled(modules[name])).length;
+  }
   return {
     provider,
-    model: publicModelId(provider, agent.model),
+    model: publicModelId(provider, pick('model')),
     formatter: typeof agent.formatter === 'string' && FORMATTERS.has(agent.formatter) ? agent.formatter : null,
-    maxTokens: count(agent.maxTokens),
-    contextBudgetTokens: count(agent.contextBudgetTokens),
-    cacheTtl: typeof agent.cacheTtl === 'string' && CACHE_TTLS.has(agent.cacheTtl) ? agent.cacheTtl : null,
-    proseRouting: typeof agent.proseRouting === 'string' && PROSE_ROUTING.has(agent.proseRouting) ? agent.proseRouting : null,
+    maxTokens: count(pick('maxTokens')),
+    contextBudgetTokens: count(pick('contextBudgetTokens')),
+    cacheTtl: typeof cacheTtl === 'string' && CACHE_TTLS.has(cacheTtl) ? cacheTtl : null,
+    proseRouting: typeof proseRouting === 'string' && PROSE_ROUTING.has(proseRouting) ? proseRouting : null,
     thinking,
-    modules: BUILT_IN_MODULES.filter((name) => Object.hasOwn(modules, name) && enabled(modules[name])),
-    customModules: Object.keys(recipe.extensions ?? {}).length
-      + Object.keys(modules).filter((name) => !BUILT_IN_MODULES.includes(name) && enabled(modules[name])).length,
+    modules: named,
+    customModules: custom,
   };
 }
 
 /**
- * A server's configuration as the host composes it (index.ts): the
- * recipe's, the servers file's over it, and an agent overlay entry in
- * place of both when it replaces the server (overlayEntryReplaces). An
- * agent-deployed server has only its overlay entry.
+ * Each server's configuration as startup composes it (index.ts), by the
+ * same functions: the servers file's entries, the recipe's servers merged
+ * with them (mergeRecipeServers: a recipe can adopt a file server and
+ * override its policy, url and transport), then the agent overlay
+ * (applyAgentOverlay: an agent-deployed server, or one replacing an
+ * operator's). A stage that fails is named in `notes`, without a path.
  */
-export function composeServerConfig(layers: { recipe?: object; file?: object; overlay?: unknown }): ServerConfigLike | undefined {
-  if (overlayEntryReplaces(layers.overlay)) return layers.overlay as ServerConfigLike;
-  const below = [layers.recipe, layers.file].filter((layer): layer is object => layer !== undefined);
-  return below.length > 0 ? Object.assign({}, ...below) as ServerConfigLike : undefined;
+export function composedServerConfigs(
+  recipeServers: Record<string, object> | undefined,
+  configPath: string,
+  overlayPath: string,
+): { configFor: (id: string) => ServerConfigLike | undefined; notes: string[] } {
+  const notes: string[] = [];
+  let fileServers: ReturnType<typeof loadMcplServers> = [];
+  try {
+    fileServers = loadMcplServers(configPath);
+  } catch {
+    notes.push("the servers file couldn't be read");
+  }
+  let merged: Array<{ id: string } & Record<string, unknown>> = [];
+  try {
+    merged = mergeRecipeServers(
+      (recipeServers ?? {}) as Record<string, Record<string, unknown>>,
+      fileServers as unknown as Array<{ id: string } & Record<string, unknown>>,
+    ) as unknown as Array<{ id: string } & Record<string, unknown>>;
+  } catch {
+    notes.push("the recipe's servers couldn't be composed with the servers file");
+  }
+  let final: Array<{ id: string } & Record<string, unknown>> = merged;
+  try {
+    final = applyAgentOverlay(merged, overlayPath);
+  } catch {
+    notes.push("the agent overlay couldn't be read");
+  }
+  const byId = new Map(final.map((server) => [server.id, server as ServerConfigLike]));
+  return { configFor: (id) => byId.get(id), notes };
 }
 
 /** Each live server by ordinal: no id, command, argument or url, since a
@@ -488,8 +555,6 @@ const LEADING_STAMP = /^\[\d{4}-\d{2}-\d{2}T[\d:.]+Z\]\s*/;
 const TAG = /^\[([A-Za-z0-9:_./-]{1,40})\]/;
 const FRAME_LINE = /^\s+at\s+/;
 const ERROR_HEADER = /(?:^|[\s(\[])((?:[A-Z][A-Za-z0-9]*)?Error)(?::|\s*$)/;
-/** Lines between an error's header and its frames (a multi-line message). */
-const CONTINUATION_LINES = 5;
 
 /** A frame line's file and line number, read from its end: the last
  *  parenthesised location, or what follows "at". A path may hold spaces
@@ -510,38 +575,80 @@ export function frameLocation(line: string): { path: string; line: string } | nu
   return { path, line: match[2]! };
 }
 
+/**
+ * Where our own code is, for naming frames: connectome-host's root, the
+ * files git tracks there when it runs from a checkout, and the roots our
+ * dependencies are installed at, each by its real path. `realpath` gives a
+ * file's real path, or null when it doesn't exist.
+ */
+export interface FrameScope {
+  hostRoot: string;
+  /** Root-relative paths git tracks, when the host runs from a checkout. */
+  tracked: ReadonlySet<string> | null;
+  /** Each of our dependencies by name, at the root it is installed at. */
+  packageRoots: ReadonlyMap<string, string>;
+  realpath: (file: string) => string | null;
+}
+
+function realpathOrNull(file: string): string | null {
+  try {
+    return realpathSync(file);
+  } catch {
+    return null;
+  }
+}
+
+/** The scope for the host installed at `root`. Git runs once, bounded at
+ *  a second, on the command's thread. */
+export function frameScope(root: string): FrameScope {
+  const hostRoot = realpathOrNull(root) ?? root;
+  let tracked: Set<string> | null = null;
+  if (existsSync(join(root, '.git'))) {
+    const listed = spawnSync('git', ['-C', root, 'ls-files', '-z', '--', ...CODE_DIRECTORIES], { encoding: 'utf8', timeout: 1000 });
+    tracked = new Set(listed.status === 0 ? listed.stdout.split('\0').filter((name) => name !== '') : []);
+  }
+  const packageRoots = new Map<string, string>();
+  for (const pkg of OUR_PACKAGES) {
+    const found = dependencyRoot(`@animalabs/${pkg}`, root);
+    const real = found ? realpathOrNull(found) : null;
+    if (real) packageRoots.set(pkg, real);
+  }
+  return { hostRoot, tracked, packageRoots, realpath: realpathOrNull };
+}
+
 /** A frame's location inside our own code, `package/path:line`, or null
- *  for any other frame: connectome-host's code directories under `root`
- *  (wherever it is installed), and our dependencies' under
- *  node_modules/@animalabs. `exists` confirms the file is real, so a line
- *  that only looks like a frame can't bring in a made-up path. */
-export function ourFrame(path: string, line: string, root: string, exists: (file: string) => boolean): string | null {
+ *  for any other frame. The file must exist, and by its real path lie in a
+ *  code directory (src/ or dist/) of connectome-host's root or of a root
+ *  one of our dependencies is installed at: a directory merely named
+ *  node_modules/@animalabs/… elsewhere is not one, and neither is a
+ *  checkout's data directory, where a session can write files under names
+ *  from the conversation. From a checkout, the file must also be one git
+ *  tracks. */
+export function ourFrame(path: string, line: string, scope: FrameScope): string | null {
+  if (!/^\d{1,7}$/.test(line)) return null;
   let file: string;
   try {
     file = path.startsWith('file://') ? fileURLToPath(path) : path;
   } catch {
     return null;
   }
-  // Only a package's code directories: a checkout's data and workspace
-  // directories sit under it too (DATA_DIR defaults to ./data), and a
-  // session can write a file there under a name from the conversation.
-  const codeDirectory = (rest: string[]): boolean => rest.length >= 2 && CODE_DIRECTORIES.includes(rest[0]!);
-  const located = ((): string | null => {
-    const parts = file.split(sep);
-    for (let i = parts.length - 2; i >= 2; i--) {
-      if (parts[i - 1] === '@animalabs' && parts[i - 2] === 'node_modules' && OUR_PACKAGES.includes(parts[i]!)) {
-        const rest = parts.slice(i + 1);
-        return codeDirectory(rest) ? `@animalabs/${parts[i]}/${rest.join('/')}` : null;
-      }
-    }
-    if (file.startsWith(root + sep)) {
-      const rest = relative(root, file).split(sep);
-      return codeDirectory(rest) && !rest.includes('node_modules') ? `connectome-host/${rest.join('/')}` : null;
-    }
-    return null;
-  })();
-  if (!located || !/^[@A-Za-z0-9_./-]{1,200}$/.test(located) || located.includes('..')) return null;
-  if (!/^\d{1,7}$/.test(line) || !exists(file)) return null;
+  const real = scope.realpath(file);
+  if (!real) return null;
+  const within = (root: string): string[] | null => {
+    if (!real.startsWith(root + sep)) return null;
+    const rest = relative(root, real).split(sep);
+    return rest.length >= 2 && CODE_DIRECTORIES.includes(rest[0]!) && !rest.includes('node_modules') && !rest.includes('..') ? rest : null;
+  };
+  let located: string | null = null;
+  for (const [pkg, root] of scope.packageRoots) {
+    const rest = within(root);
+    if (rest) { located = `@animalabs/${pkg}/${rest.join('/')}`; break; }
+  }
+  if (!located) {
+    const rest = within(scope.hostRoot);
+    if (rest && (!scope.tracked || scope.tracked.has(rest.join('/')))) located = `connectome-host/${rest.join('/')}`;
+  }
+  if (!located || !/^[@A-Za-z0-9_./-]{1,200}$/.test(located)) return null;
   return `${located}:${line}`;
 }
 
@@ -561,15 +668,14 @@ export function currentSession(text: string): string {
  */
 export function parseErrorLog(
   text: string,
-  root: string,
-  exists: (file: string) => boolean,
+  scope: FrameScope,
 ): { tags: Map<string, number>; otherTags: number; errors: HostErrorShape[] } {
   const tags = new Map<string, number>();
   let otherTags = 0;
   const shapes = new Map<string, HostErrorShape>();
   // The error being read: its class (empty when no header named one), its
-  // frames in our code, and how many non-frame lines followed its header.
-  let current: { className: string; frames: string[]; between: number; framed: boolean } | null = null;
+  // frames in our code, and whether its frames have begun.
+  let current: { className: string; frames: string[]; framed: boolean } | null = null;
   const close = (): void => {
     if (current && (current.className !== '' || current.frames.length > 0)) {
       const className = current.className || 'an unnamed error';
@@ -583,10 +689,10 @@ export function parseErrorLog(
   for (const raw of text.split('\n')) {
     const frame = frameLocation(raw);
     if (frame) {
-      if (!current) current = { className: '', frames: [], between: 0, framed: true };
+      if (!current) current = { className: '', frames: [], framed: true };
       current.framed = true;
       if (current.frames.length < 3) {
-        const where = ourFrame(frame.path, frame.line, root, exists);
+        const where = ourFrame(frame.path, frame.line, scope);
         if (where && !current.frames.includes(where)) current.frames.push(where);
       }
       continue;
@@ -596,19 +702,18 @@ export function parseErrorLog(
     // An error's header names its class before a colon. Only a known class
     // is named; the rest of the line is never read.
     const header = ERROR_HEADER.exec(line);
-    // A multi-line message: lines after a header and before its frames stay
-    // with it, unless one starts a new tagged line or a new error.
-    if (current && !current.framed && !tag && !header && current.between < CONTINUATION_LINES) {
-      current.between++;
-      continue;
-    }
+    // A multi-line message: every line after a header and before its
+    // frames stays with it, until a new record begins (a tagged or stamped
+    // line, a new error, or a new run).
+    const newRecord = tag !== null || header !== null || LEADING_STAMP.test(raw) || SESSION_MARKER.test(raw.trim());
+    if (current && !current.framed && !newRecord) continue;
     close();
     if (tag) {
       const name = tag[1]!.toLowerCase();
       if (HOST_LOG_TAGS.has(name)) tags.set(name, (tags.get(name) ?? 0) + 1);
       else otherTags++;
     }
-    if (header) current = { className: ERROR_CLASSES.has(header[1]!) ? header[1]! : 'another error class', frames: [], between: 0, framed: false };
+    if (header) current = { className: ERROR_CLASSES.has(header[1]!) ? header[1]! : 'another error class', frames: [], framed: false };
   }
   close();
   const errors = [...shapes.values()].sort((a, b) => b.count - a.count);
@@ -822,13 +927,20 @@ function readJson(path: string): Record<string, unknown> | null {
   }
 }
 
-/** A dependency's version, from the nearest node_modules that has it. */
-function dependencyVersion(name: string, from: string): string | null {
+/** Where a dependency is installed: the nearest node_modules that has it,
+ *  as Node resolves a package from `from`. */
+function dependencyRoot(name: string, from: string): string | null {
   for (let dir = from; ; dir = dirname(dir)) {
-    const pkg = readJson(join(dir, 'node_modules', name, 'package.json'));
-    if (pkg) return version(pkg.version);
+    const candidate = join(dir, 'node_modules', name);
+    if (existsSync(join(candidate, 'package.json'))) return candidate;
     if (dirname(dir) === dir) return null;
   }
+}
+
+/** A dependency's version, from where it is installed. */
+function dependencyVersion(name: string, from: string): string | null {
+  const root = dependencyRoot(name, from);
+  return root ? version(readJson(join(root, 'package.json'))?.version) : null;
 }
 
 /** The commit this checkout is at, and whether tracked files are modified.
@@ -878,6 +990,8 @@ export interface GatherOptions {
   configNotes?: string[];
   /** This process's llm-calls file; by default the one index.ts named. */
   callLog?: string | null;
+  /** What the running host uses, where it differs from the recipe. */
+  live?: LiveSetup;
   /** The checkout or install to report on; this one by default. */
   root?: string;
 }
@@ -888,7 +1002,7 @@ export function gatherBugReportFacts(opts: GatherOptions): BugReportFacts {
   const pkg = readJson(join(root, 'package.json'));
   const packages = ['@animalabs/agent-framework', '@animalabs/membrane', '@animalabs/context-manager', '@animalabs/chronicle']
     .map((name) => ({ name, version: dependencyVersion(name, root) }));
-  const setup = setupFacts(opts.recipe);
+  const setup = setupFacts(opts.recipe, opts.live);
   const callLog = opts.callLog === undefined ? callLogPath : opts.callLog;
   let providerCalls: ProviderCallSummary | null = null;
   if (callLog) {
@@ -904,7 +1018,7 @@ export function gatherBugReportFacts(opts: GatherOptions): BugReportFacts {
   let hostErrors: HostErrorSummary | null = null;
   if (errorLogName) {
     const read = tailLines(join(opts.dataDir, errorLogName), LOG_WINDOW);
-    const parsed = parseErrorLog(currentSession((read?.lines ?? []).join('\n')), root, (file) => existsSync(file));
+    const parsed = parseErrorLog(currentSession((read?.lines ?? []).join('\n')), frameScope(root));
     hostErrors = {
       log: errorLogName,
       readable: read ? read.readable : true,

@@ -6,7 +6,7 @@
  * file it saves.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -26,7 +26,10 @@ import {
   publicModelId,
   runtimeMode,
   serverRows,
-  composeServerConfig,
+  composedServerConfigs,
+  frameScope,
+  setupFacts,
+  type FrameScope,
   sessionMarker,
   setCallLogPath,
   summarizeProviderCalls,
@@ -43,6 +46,16 @@ const NOW = new Date('2026-10-11T23:50:00.000Z');
 const CANARY = 'zqxcanaryzqx';
 /** This process's call log, by name, in the canary data directory. */
 const CALL_LOG = 'llm-calls.2026-10-11T23-00-00-000Z.jsonl';
+/** A scope for made-up frames: the paths are taken as real, the checkout
+ *  tracks everything, and agent-framework is installed under ROOT. */
+function fakeScope(realpath: (file: string) => string | null = (file) => file): FrameScope {
+  return {
+    hostRoot: ROOT,
+    tracked: null,
+    packageRoots: new Map([['agent-framework', join(ROOT, 'node_modules/@animalabs/agent-framework')]]),
+    realpath,
+  };
+}
 /** A data directory under the checkout, as DATA_DIR's default puts it. */
 const SESSION_FILE_DIR = join(ROOT, `data-bug-probe-${process.pid}`, 'workspace');
 
@@ -199,7 +212,12 @@ describe('the guarantee', () => {
     try {
       const recipe = canaryRecipe();
       const app = {
-        framework: { listMcplServers: () => LIVE } as unknown as AgentFramework,
+        framework: {
+          listMcplServers: () => LIVE,
+          getAllModules: () => [{ name: 'webui' }, { name: 'subscription-gc' }, { name: `${CANARY}-extension` }],
+          getAgent: () => undefined,
+          getAllAgents: () => [{ model: `${CANARY}-model`, maxTokens: 4096, thinking: { enabled: false }, proseRouting: 'hybrid', cacheTtl: '5m' }],
+        } as unknown as AgentFramework,
         sessionManager: {} as never,
         recipe: recipe as never,
         branchState: createBranchState(),
@@ -210,6 +228,10 @@ describe('the guarantee', () => {
       const output = result.lines.map((line) => line.text).join('\n');
       expectNoCanary(output.replace(dir, '<dir>'), 'the command output');
       expect(output).toContain('nothing has been sent');
+      // The running setup: the live agent's fields and the registered modules.
+      expect(output).toContain('maxTokens: 4096');
+      expect(output).toContain('proseRouting: hybrid · thinking: off');
+      expect(output).toContain('modules: wake, subscription-gc, webui · custom: 1');
       expect(output).toContain('  It froze when the Discord server reconnected.');
       expect(output).toContain('https://github.com/anima-research/connectome-host/issues/new?template=bug_report.yml');
       const saved = readdirSync(dir).filter((name) => name.startsWith('bug-report-'));
@@ -279,7 +301,7 @@ describe('the shapes', () => {
       `    at f (${join(ROOT, 'node_modules/@animalabs/agent-framework/dist/src/framework.js')}:9:1)`,
     ].join('\n'));
     expect(session.includes('old')).toBe(false);
-    const parsed = parseErrorLog(session, ROOT, exists);
+    const parsed = parseErrorLog(session, fakeScope());
     expect([...parsed.tags.entries()]).toEqual([['shutdown', 1], ['mcpl', 1]]);
     expect(parsed.otherTags).toBe(0);
     expect(parsed.errors.map((e) => [e.className, e.count, e.frames])).toEqual([
@@ -288,18 +310,69 @@ describe('the shapes', () => {
     ]);
     expect(parsed.errors[0]!.signature).toMatch(/^[0-9a-f]{8}$/);
     // The same shape gives the same signature: a repeat is one search away.
-    expect(parseErrorLog(session, ROOT, exists).errors[0]!.signature).toBe(parsed.errors[0]!.signature);
+    expect(parseErrorLog(session, fakeScope()).errors[0]!.signature).toBe(parsed.errors[0]!.signature);
   });
 
-  test('a frame names our code only, and only a file that exists', () => {
+  test('a frame names our code only: a real file, in a code directory, at a root our code is installed at', () => {
+    const scope = frameScope(ROOT);
     const parsed = parseErrorLog([
       'TypeError: x',
       `    at a (${join(ROOT, 'src/commands.ts')}:3:1)`,
       `    at b (${join(ROOT, 'src/not-a-real-file.ts')}:3:1)`,
       `    at c (/elsewhere/project/src/commands.ts:3:1)`,
       `    at d (${join(ROOT, 'node_modules/left-pad/index.js')}:3:1)`,
-    ].join('\n'), ROOT, (file) => readdirSync(dirname(file)).includes(file.split('/').pop()!));
+    ].join('\n'), scope);
     expect(parsed.errors[0]!.frames).toEqual(['connectome-host/src/commands.ts:3']);
+    // A directory merely named node_modules/@animalabs/<package>/src, made
+    // by a session somewhere else, isn't where the package is installed.
+    const fake = join(SESSION_FILE_DIR, 'node_modules/@animalabs/agent-framework/src');
+    mkdirSync(fake, { recursive: true });
+    writeFileSync(join(fake, `${CANARY}-client.js`), '// a session wrote this\n');
+    const elsewhere = parseErrorLog(['TypeError: x', `    at a (${join(fake, `${CANARY}-client.js`)}:1:1)`].join('\n'), scope);
+    expect(elsewhere.errors[0]!.frames).toEqual([]);
+    expect(scope.packageRoots.get('agent-framework')).toBe(realpathSync(join(ROOT, 'node_modules/@animalabs/agent-framework')));
+  });
+
+  test('installed without git, a frame still names only a real file in a code directory', () => {
+    const root = scratch();
+    try {
+      mkdirSync(join(root, 'src'));
+      mkdirSync(join(root, 'data'));
+      writeFileSync(join(root, 'src/real.ts'), '// ours\n');
+      writeFileSync(join(root, `data/${CANARY}-scene.js`), '// a session wrote this\n');
+      const scope = frameScope(root);
+      expect(scope.tracked).toBe(null);
+      const parsed = parseErrorLog([
+        'TypeError: x',
+        `    at a (${join(root, 'src/real.ts')}:2:1)`,
+        `    at b (${join(root, `data/${CANARY}-scene.js`)}:1:1)`,
+        `    at c (${join(root, `src/${CANARY}-missing.ts`)}:1:1)`,
+      ].join('\n'), scope);
+      expect(parsed.errors[0]!.frames).toEqual(['connectome-host/src/real.ts:2']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test('from a checkout, a frame names only a file git tracks', () => {
+    const root = scratch();
+    try {
+      mkdirSync(join(root, 'src'));
+      writeFileSync(join(root, 'src/tracked.ts'), '// tracked\n');
+      const git = (...args: string[]) => Bun.spawnSync(['git', '-C', root, ...args], { env: { ...process.env, GIT_AUTHOR_NAME: 't', GIT_AUTHOR_EMAIL: 't@t', GIT_COMMITTER_NAME: 't', GIT_COMMITTER_EMAIL: 't@t' } });
+      git('init', '-q');
+      git('add', 'src/tracked.ts');
+      git('commit', '-q', '-m', 'x');
+      writeFileSync(join(root, `src/${CANARY}.ts`), '// a session wrote this\n');
+      const parsed = parseErrorLog([
+        'TypeError: x',
+        `    at a (${join(root, 'src/tracked.ts')}:2:1)`,
+        `    at b (${join(root, `src/${CANARY}.ts`)}:1:1)`,
+      ].join('\n'), frameScope(root));
+      expect(parsed.errors[0]!.frames).toEqual(['connectome-host/src/tracked.ts:2']);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   test('provider calls: the last hour, by classification only', () => {
@@ -344,14 +417,31 @@ describe('the shapes', () => {
     expect(refused).toMatchObject({ kind: 'a url server', transport: 'unknown', family: 'unknown', refused: true });
   });
 
-  test("an overlay entry that replaces a server is its whole configuration, as the host composes it", () => {
-    const file = { command: 'node', source: { npm: '@animalabs/discord-mcpl@1.2.3' } };
-    const replaced = composeServerConfig({ file, overlay: { command: '/usr/local/bin/my-own' } });
-    expect(serverRows([{ id: 's' }], () => replaced)[0]!.kind).toBe('a local command');
-    // A tombstone doesn't replace it, and neither does a malformed entry.
-    expect(composeServerConfig({ file, overlay: { disabled: true } })).toEqual(file);
-    expect(composeServerConfig({ recipe: { url: 'wss://a' }, file: { command: 'x' } })).toEqual({ url: 'wss://a', command: 'x' });
-    expect(composeServerConfig({})).toBe(undefined);
+  test("servers are configured as startup composes them: the file, the recipe's overrides, then the overlay", () => {
+    const dir = scratch();
+    try {
+      const file = join(dir, 'mcpl-servers.json');
+      const overlay = join(dir, 'mcpl-servers.agent.json');
+      writeFileSync(file, JSON.stringify({ mcplServers: { adopted: { command: 'node', transport: 'stdio' } } }));
+      // A recipe adopting a file server may move it to WebSocket; a server
+      // the recipe defines itself keeps its own fields, its source included.
+      const recipe = {
+        adopted: { url: 'wss://h/x', transport: 'websocket' },
+        ours: { command: 'node', source: { npm: '@animalabs/discord-mcpl@1.2.3' } },
+      };
+      const before = composedServerConfigs(recipe, file, overlay);
+      expect(before.notes).toEqual([]);
+      expect(serverRows([{ id: 'adopted' }], before.configFor)[0]).toMatchObject({ kind: 'a url server', transport: 'websocket' });
+      expect(serverRows([{ id: 'ours' }], before.configFor)[0]!.kind).toBe('@animalabs/discord-mcpl@1.2.3');
+      // An overlay entry that replaces a server is its whole configuration.
+      writeFileSync(overlay, JSON.stringify({ mcplServers: { ours: { command: '/usr/local/bin/my-own' } } }));
+      expect(serverRows([{ id: 'ours' }], composedServerConfigs(recipe, file, overlay).configFor)[0]!.kind).toBe('a local command');
+      // A file that can't be read is named, without its path.
+      writeFileSync(overlay, '{ not json');
+      expect(composedServerConfigs(recipe, file, overlay).notes).toEqual(["the agent overlay couldn't be read"]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test('servers are rows by ordinal, and only our own packages are named', () => {
@@ -564,13 +654,21 @@ describe('the shapes, at their edges', () => {
     expect(frameLocation('not a frame')).toBe(null);
   });
 
-  test("a multi-line message stays one error with its frames", () => {
+  test("a multi-line message stays one error with its frames, however long, until a new record begins", () => {
     const parsed = parseErrorLog([
       'TypeError: first line of the message',
-      'second line of the message',
+      ...Array.from({ length: 8 }, (_, i) => `line ${i + 2} of the message`),
+      '',
       `    at a (${join(ROOT, 'src/commands.ts')}:3:1)`,
-    ].join('\n'), ROOT, () => true);
-    expect(parsed.errors.map((e) => [e.className, e.frames])).toEqual([['TypeError', ['connectome-host/src/commands.ts:3']]]);
+    ].join('\n'), fakeScope());
+    expect(parsed.errors.map((e) => [e.className, e.count, e.frames])).toEqual([['TypeError', 1, ['connectome-host/src/commands.ts:3']]]);
+    // A tagged line is a new record: the frames after it aren't the TypeError's.
+    const split = parseErrorLog([
+      'TypeError: x',
+      '[mcpl] something else',
+      `    at a (${join(ROOT, 'src/commands.ts')}:3:1)`,
+    ].join('\n'), fakeScope());
+    expect(split.errors.map((e) => e.className).sort()).toEqual(['TypeError', 'an unnamed error']);
   });
 
   test('the session marker the runtimes write is the one the reader finds', () => {
@@ -672,3 +770,47 @@ describe('the link, at its edges', () => {
 function canaryFactsless(): BugReportFacts {
   return gatherBugReportFacts({ now: NOW, mode: 'batch', dataDir: scratch(), recipe: {}, liveServers: [], serverConfig: () => undefined, callLog: null });
 }
+
+describe('the running setup and the saved file', () => {
+  test("the running agent's fields and modules come before the recipe's", () => {
+    const recipe = { agent: { provider: 'anthropic', model: 'claude-opus-4-6', maxTokens: 1000, thinking: { enabled: true } }, modules: { lessons: true } };
+    const facts = setupFacts(recipe, {
+      agent: { model: 'claude-sonnet-4-5', maxTokens: 2000, thinking: { enabled: false } },
+      modules: ['subscription-gc', 'lessons', `${CANARY}-ext`, 'workspace'],
+      wake: true,
+    });
+    expect(facts).toMatchObject({ model: 'claude-sonnet-4-5', maxTokens: 2000, thinking: false, modules: ['wake', 'lessons', 'subscription-gc', 'workspace'], customModules: 1 });
+    expectNoCanary(JSON.stringify(facts), 'the setup');
+    // Without a running framework's word, the recipe's.
+    expect(setupFacts(recipe)).toMatchObject({ model: 'claude-opus-4-6', maxTokens: 1000, thinking: true, modules: ['lessons'] });
+  });
+
+  test("when the file can't be saved, the output says so and promises nothing of it", () => {
+    const dir = scratch();
+    const previous = process.env.DATA_DIR;
+    // A data directory under a file can't be made.
+    writeFileSync(join(dir, 'a-file'), '');
+    process.env.DATA_DIR = join(dir, 'a-file', 'data');
+    try {
+      const app = {
+        framework: { listMcplServers: () => [], getAllModules: () => [], getAgent: () => undefined, getAllAgents: () => [] } as unknown as AgentFramework,
+        sessionManager: {} as never,
+        recipe: {} as never,
+        branchState: createBranchState(),
+        switchSession: async () => {},
+      };
+      const short = handleCommand('/bug it broke', app).lines.map((line) => line.text).join('\n');
+      expect(short).toContain("Couldn't save it to a file");
+      expect(short).toContain('The link below holds the whole report.');
+      expect(short).not.toContain('Saved to');
+      const long = handleCommand(`/bug ${'y'.repeat(9000)}`, app).lines.map((line) => line.text).join('\n');
+      expect(long).toContain("The file couldn't be saved, so copy the full report above into the issue.");
+      expect(long).not.toContain('The link below holds the whole report.');
+      expect(long).not.toContain('saved file holds');
+    } finally {
+      if (previous === undefined) delete process.env.DATA_DIR;
+      else process.env.DATA_DIR = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
