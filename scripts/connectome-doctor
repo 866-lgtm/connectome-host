@@ -249,7 +249,8 @@ llm_ts = None
 llm_detail = ""
 turn_ts = None          # the agent's last turn (a stream call) in the window
 llm_window_from = None  # the oldest row's time, when the window holds no turn
-llm_unsure = False      # an unreadable or incomplete row may be a turn
+llm_written_at = None   # the newest file's last write
+llm_unsure = False      # an unreadable or incomplete row may be a turn after the ingest
 LLM_WINDOW = 30_000_000
 llm_files = sorted(
     (f for f in os.listdir(data_dir) if f.startswith("llm-calls.")),
@@ -258,12 +259,14 @@ llm_files = sorted(
 if llm_files:
     newest = os.path.join(data_dir, llm_files[-1])
     size = os.path.getsize(newest)
-    where = "the newest file's last 30 MB" if size > LLM_WINDOW else "the newest file"
+    llm_written_at = os.path.getmtime(newest)
+    where = "the newest file's last 30 MB" if size > LLM_WINDOW + 1 else "the newest file"
     # The file's tail, split at newlines only: splitlines() also splits at
     # U+2028, U+2029 and U+0085, which JSON.stringify leaves unescaped inside
     # a row. One byte more than the window is read, so where the window cuts
-    # a file, the first piece is the part of a row before it, or empty when
-    # the cut falls between rows, and is dropped either way.
+    # a file, the first piece holds the part of a row that began before the
+    # window (all of a row that began one byte before it), or nothing when
+    # the window begins at a row, and is dropped either way.
     raw = tail_bytes(newest, LLM_WINDOW + 1).decode("utf-8", "replace")
     lines = raw.split("\n")
     if size > LLM_WINDOW + 1:
@@ -284,6 +287,11 @@ if llm_files:
     answered = {}      # per lineage, its newest answered poke seen so far
     pokes = 0
     unreadable = 0     # rows since the last turn that couldn't be parsed
+    # Rows are written in time order, so an unreadable row newer than a row
+    # from before the ingest could be a turn after it; an older one couldn't.
+    # The last row, incomplete, was written at the file's last write.
+    before_ingest = False
+    llm_unsure = incomplete and (rec_ts is None or llm_written_at >= rec_ts - 120)
     for ln in reversed(lines):
         ln = ln.strip()
         if not ln.startswith("{"):
@@ -292,8 +300,12 @@ if llm_files:
             r = json.loads(ln)
         except Exception:
             unreadable += 1
+            llm_unsure = llm_unsure or not before_ingest
             continue
-        llm_window_from = parse_iso(str(r.get("timestamp", ""))) or llm_window_from
+        r_ts = parse_iso(str(r.get("timestamp", "")))
+        if rec_ts is not None and r_ts is not None and r_ts < rec_ts - 120:
+            before_ingest = True
+        llm_window_from = r_ts or llm_window_from
         # Cache keepalive pokes write rows here too, while the agent is idle,
         # so neither the file's mtime nor its last row says when it last
         # inferred: report the newest row that isn't a poke, at its own time.
@@ -337,17 +349,15 @@ if llm_files:
         llm_detail += f"  {C_YEL}{unreadable} row(s){' since the last turn' if turn_ts else ''} unreadable{C_OFF}"
     if incomplete:
         llm_detail += f"  {C_YEL}last row incomplete (being written, or cut off){C_OFF}"
-    llm_unsure = bool(unreadable or incomplete)
+    def when(row):
+        return hhmm(parse_iso(str(row.get("timestamp", ""))))
 
-    def poke_when(row, later):
-        when = hhmm(parse_iso(str(row.get("timestamp", ""))))
-        if later is not None:
-            when += f", answered again {hhmm(parse_iso(str(later.get('timestamp', ''))))}"
-        return when
+    def answered_again(later):
+        return f" (answered again {when(later)})" if later is not None else ""
 
     if refused is not None:
         r, later = refused
-        llm_detail += f"  {C_RED}keepalive poke {poke_when(r, later)} REFUSED{C_OFF}"
+        llm_detail += f"  {C_RED}keepalive poke {when(r)} REFUSED{answered_again(later)}{C_OFF}"
         warn("a cache keepalive poke since the agent's last turn was REFUSED"
              + (", though a later poke of its lineage was answered" if later is not None else "")
              + ": a turn sending the context it replays may be refused too (see "
@@ -356,7 +366,7 @@ if llm_files:
         r, later = failed
         f_text = err_text(r.get("error"))[:80] or (
             f"status {r.get('httpStatus')}" if r.get("httpStatus") else "(no text)")
-        llm_detail += f"  {C_RED}keepalive poke {poke_when(r, later)} failed: {f_text}{C_OFF}"
+        llm_detail += f"  {C_RED}keepalive poke {when(r)} failed: {f_text}{answered_again(later)}{C_OFF}"
 stages.append(("inference (llm call)", llm_ts, llm_detail))
 
 # 4d. delivery: last routeSpeech in agent log
@@ -394,12 +404,15 @@ for name, ts, detail in stages:
 # The turn is what follows an ingest; a compression call is not one. Logging
 # is best-effort, so this says what was recorded, not that the model never
 # ran. With no llm-calls file no turn was recorded. With one, an unreadable
-# or incomplete row might be the turn, and with no turn in the window, none
-# was recorded after the ingest only if the window reaches back past it.
+# or incomplete row that may be newer than the ingest might be the turn.
+# With no turn in the window, none was recorded after the ingest only if
+# the window reaches back past it; with no readable row at all, the file's
+# last write bounds it.
 NO_TURN = "NO turn was recorded after it"
 no_turn_after = turn_ts is None or (rec_ts is not None and turn_ts < rec_ts - 120)
+window_from = llm_window_from if llm_window_from is not None else llm_written_at
 turn_unknown = bool(llm_files) and (llm_unsure or (turn_ts is None and (
-    llm_window_from is None or (rec_ts is not None and rec_ts < llm_window_from))))
+    window_from is None or (rec_ts is not None and rec_ts < window_from))))
 if globals().get("_last_ingest_triggered") and rec_ts and no_turn_after and not turn_unknown:
     warn(f"a gate-TRIGGERED event was ingested but {NO_TURN} — events may be "
          "dying between the gate and the model (check inference policy drops / "
