@@ -330,7 +330,12 @@ describe('the shapes', () => {
     writeFileSync(join(fake, `${CANARY}-client.js`), '// a session wrote this\n');
     const elsewhere = parseErrorLog(['TypeError: x', `    at a (${join(fake, `${CANARY}-client.js`)}:1:1)`].join('\n'), scope);
     expect(elsewhere.errors[0]!.frames).toEqual([]);
-    expect(scope.packageRoots.get('agent-framework')).toBe(realpathSync(join(ROOT, 'node_modules/@animalabs/agent-framework')));
+    // The scope found where agent-framework is actually installed, wherever
+    // the install put it (a workspace may hoist it above the checkout).
+    const installed = scope.packageRoots.get('agent-framework');
+    expect(installed).toBeDefined();
+    expect(installed).toBe(realpathSync(installed!));
+    expect(JSON.parse(readFileSync(join(installed!, 'package.json'), 'utf8')).name).toBe('@animalabs/agent-framework');
   });
 
   test('installed without git, a frame still names only a real file in a code directory', () => {
