@@ -26,6 +26,7 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'positionedRecallPairs',
   'recallHeaderTemplate',
   'carrierPolicy',
+  'topologyPolicy',
   'targetChunkTokens',
   'mergeThreshold',
   'mergeMaxSourceSpanMessages',

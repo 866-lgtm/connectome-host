@@ -113,6 +113,19 @@ export interface RecipeStrategy {
    * inside the LIVE window as reasoning extraction.
    */
   carrierPolicy?: 'full' | 'live-strip';
+  /**
+   * Load-time store-topology policy (Context Manager `topologyPolicy`). Every
+   * open audits the summary archive for crossed ownership (a summary whose
+   * leaves are not contiguous among chunk-owned messages). `'reject'` (the
+   * library default) throws `StoreTopologyError`, so the agent refuses to
+   * start on such a store until it is repaired. `'report'` opens it anyway,
+   * logs the violations at error level and surfaces them through compression
+   * debt (state `critical`). Set `'report'` to run a resident whose archive is
+   * known to carry crossed summaries (e.g. older cross-era merges) while a
+   * repair is pending. Merges that would mint a new crossed node are refused
+   * either way.
+   */
+  topologyPolicy?: 'reject' | 'report';
   targetChunkTokens?: number;
   mergeThreshold?: number;
   mergeMaxSourceSpanMessages?: number;
@@ -2099,6 +2112,19 @@ export function validateRecipe(raw: unknown): Recipe {
       throw new Error(
         `Recipe agent.strategy.carrierPolicy is invalid: ${JSON.stringify(strategy.carrierPolicy)}. ` +
         `Must be "full" or "live-strip".`,
+      );
+    }
+    // Same reasoning: Context Manager throws only on the exact string
+    // 'reject' and opens the store under any other truthy value, so a typo
+    // ('rejct') would silently disable the load-time topology gate.
+    if (
+      strategy.topologyPolicy !== undefined &&
+      strategy.topologyPolicy !== 'reject' &&
+      strategy.topologyPolicy !== 'report'
+    ) {
+      throw new Error(
+        `Recipe agent.strategy.topologyPolicy is invalid: ${JSON.stringify(strategy.topologyPolicy)}. ` +
+        `Must be "reject" or "report".`,
       );
     }
     validateKvUnifiedConfig(strategy);

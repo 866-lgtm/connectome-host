@@ -192,3 +192,29 @@ describe('carrierPolicy passthrough', () => {
   });
 });
 
+
+describe('topologyPolicy passthrough', () => {
+  test("'report' and 'reject' reach the constructed strategy config; omission leaves the library default", () => {
+    for (const value of ['report', 'reject'] as const) {
+      for (const type of ['autobiographical', 'frontdesk'] as const) {
+        const strategy = buildFrameworkStrategy(
+          recipe({ name: 'Mira', strategy: { type, topologyPolicy: value } }),
+          'some-model',
+          'America/Los_Angeles',
+        );
+        expect(configView(strategy).topologyPolicy).toBe(value);
+      }
+    }
+    // Omitted: the host adds nothing, so Context Manager resolves its own
+    // default ('reject', or 'report' under gap-tolerant kv-unified).
+    const omitted = buildFrameworkStrategy(recipe({ name: 'Mira' }), 'some-model', 'America/Los_Angeles');
+    expect(configView(omitted).topologyPolicy).toBeUndefined();
+  });
+
+  test('malformed values fail at recipe load', () => {
+    for (const bad of ['Report', 'warn', '', 1, true, null, {}] as unknown[]) {
+      expect(() => recipe({ name: 'Mira', strategy: { type: 'autobiographical', topologyPolicy: bad } }))
+        .toThrow(/topologyPolicy/);
+    }
+  });
+});
