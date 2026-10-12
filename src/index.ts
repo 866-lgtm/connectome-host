@@ -1342,35 +1342,52 @@ async function main() {
 
   const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
 
-  // Optional: separate membrane for compression/summarization. Routes memory-
-  // formation LLM calls through a different openai-compatible endpoint while
-  // live conversation stays on the primary provider. Enabled by setting
-  // COMPRESSION_OPENAI_BASE_URL; falls back to OPENAI_API_KEY when
-  // COMPRESSION_OPENAI_API_KEY is unset.
-  if (process.env.COMPRESSION_OPENAI_BASE_URL) {
-    const compressionInner = new OpenAICompatibleAdapter({
-      baseURL: process.env.COMPRESSION_OPENAI_BASE_URL,
-      apiKey: process.env.COMPRESSION_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY,
-    });
-    const compressionLoggingAdapter = new LoggingProviderAdapter(
-      compressionInner,
-      llmLogPath,
-      () => settingsModule.getReasoning(),
-    );
-
-    const compressionMembrane = new Membrane(compressionLoggingAdapter, {
-      formatter: new NativeFormatter(),
-      assistantParticipant: agentName,
-    });
+  // (local patch) Optional: separate membrane for compression/summarization.
+  // Routes memory-formation LLM calls (L1 mints, merges, their refusal /
+  // carrier retries, transition summaries) through a different
+  // openai-compatible endpoint while live conversation stays on the primary
+  // provider. Enabled by setting COMPRESSION_OPENAI_BASE_URL; falls back to
+  // OPENAI_API_KEY when COMPRESSION_OPENAI_API_KEY is unset. The model is the
+  // recipe's compressionModel (the strategy puts it on every request). Calls
+  // land in the same llm-calls log as the primary's, tagged 'compression'.
+  //
+  // Bypasses the framework's auxiliary-admission gate (which wraps only the
+  // PRIMARY membrane): compression on another endpoint neither waits for nor
+  // holds up primary turns, and its failures never arm a provider hold on
+  // the primary — the right shape for a separate provider.
+  const compressionMembrane = process.env.COMPRESSION_OPENAI_BASE_URL
+    ? new Membrane(
+        new LoggingProviderAdapter(
+          new OpenAICompatibleAdapter({
+            baseURL: process.env.COMPRESSION_OPENAI_BASE_URL,
+            apiKey: process.env.COMPRESSION_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY,
+          }),
+          llmLogPath,
+          () => settingsModule.getReasoning(),
+          { tag: 'compression' },
+        ),
+        {
+          formatter: new NativeFormatter(),
+          assistantParticipant: agentName,
+        },
+      )
+    : null;
+  if (compressionMembrane) {
     console.log(`[compression] Using separate endpoint: ${process.env.COMPRESSION_OPENAI_BASE_URL}`);
-
-    // Patch the main agent's ContextManager post-hoc since the framework
-    // package hardcodes `membrane: this.membrane` in ContextManager.open().
-    const agent = framework.getAgent(agentName);
-    if (agent) {
-      (agent.getContextManager() as any).setCompressionMembrane?.(compressionMembrane); // TRIAL STUB: CM 0.13 dropped this
-    }
   }
+  // The framework opens each agent's ContextManager itself (membrane: its
+  // own), so the compression membrane is attached post-hoc — on every
+  // framework this process builds, session switches included, before start().
+  const attachCompressionMembrane = (fw: AgentFramework): void => {
+    if (!compressionMembrane) return;
+    const cm = fw.getAgent(agentName)?.getContextManager();
+    if (!cm) {
+      console.warn(`[compression] no agent '${agentName}' to attach the compression membrane to — compression stays on the primary`);
+      return;
+    }
+    cm.setCompressionMembrane(compressionMembrane);
+  };
+  attachCompressionMembrane(framework);
 
   // Build app context
   const app: AppContext = {
@@ -1397,6 +1414,7 @@ async function main() {
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
       this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
+      attachCompressionMembrane(this.framework);
       this.framework.start();
       this.userMessageCount = 0;
       resetBranchState(this.branchState);

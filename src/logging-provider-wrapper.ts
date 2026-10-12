@@ -24,7 +24,7 @@
 // own stream() (codex does) self-call the INNER method, not the wrapper —
 // each membrane-level call logs exactly once.
 //
-// Each line: { type: 'call'|'error', provider, kind: 'complete'|'stream',
+// Each line: { type: 'call'|'error', provider, tag?, kind: 'complete'|'stream',
 //   timestamp, durationMs, requestSummary?, response?, rawRequest?,
 //   rawResponse?, error?, errorType?, httpStatus?, providerErrorCode?,
 //   retryable?, errorChars?, truncated?, summaryUnavailable? }
@@ -123,6 +123,10 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     /** (local patch) Runtime reasoning kill switch: when the agent's
      *  reasoning setting is disabled, strip the recipe's `reasoning` param. */
     private readonly getReasoning?: ReasoningGetter,
+    /** (local patch) Purpose tag stamped on every record as `tag` (e.g.
+     *  'compression' for the dedicated summarizer endpoint), so calls that
+     *  share a provider name and log file stay tell-apart-able. */
+    private readonly options: { tag?: string } = {},
   ) {
     this.name = inner.name;
   }
@@ -181,7 +185,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
         } catch {
           // Even the summaries can't be serialized (a BigInt in usage, say):
           // keep the head and the error alone, so the call is never silent.
-          const keep = ['type', 'provider', 'kind', 'timestamp', 'durationMs', 'error', 'errorType',
+          const keep = ['type', 'provider', 'tag', 'kind', 'timestamp', 'durationMs', 'error', 'errorType',
             'httpStatus', 'providerErrorCode', 'retryable', 'errorChars'];
           line = JSON.stringify({
             ...Object.fromEntries(keep.filter((k) => k in record).map((k) => [k, record[k]])),
@@ -219,6 +223,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     const head = {
       type: failed ? 'error' : 'call',
       provider: this.name,
+      ...(this.options.tag ? { tag: this.options.tag } : {}),
       kind,
       timestamp: new Date(started).toISOString(),
       durationMs: Date.now() - started,
