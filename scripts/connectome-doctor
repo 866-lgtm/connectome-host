@@ -289,9 +289,11 @@ if llm_files:
     unreadable = 0     # rows since the last turn that couldn't be parsed
     # Rows are written in time order, so an unreadable row newer than a row
     # from before the ingest could be a turn after it; an older one couldn't.
-    # The last row, incomplete, was written at the file's last write.
-    before_ingest = False
-    llm_unsure = incomplete and (rec_ts is None or llm_written_at >= rec_ts - 120)
+    # No row is newer than the file's last write, so in a file last written
+    # before the ingest none could be; the last row, incomplete, was written
+    # at that last write.
+    before_ingest = rec_ts is not None and llm_written_at < rec_ts - 120
+    llm_unsure = incomplete and not before_ingest
     for ln in reversed(lines):
         ln = ln.strip()
         if not ln.startswith("{"):

@@ -414,15 +414,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       if (call.outcome === 'error') this.onProviderError?.(call.error, 'keepalive');
       else this.onProviderSuccess?.('keepalive');
     } catch { /* observers never affect provider traffic */ }
-    // A refused poke tells an idle resident's operator that the context its
-    // next turn would send is refused, before that turn. The dragnet hears a
-    // refused request unless it's the one last heard for that lineage.
-    // membrane keeps replaying the same request every refresh interval (a
-    // refusal is a success to its breaker), and another alert about the same
-    // bytes asks nothing new of the operator, even after a poke of them
-    // succeeded. A real call reseeds the lineage, usually with other bytes,
-    // whose refusal is heard afresh. An observer that throws hasn't heard it,
-    // so the next refused poke of that request tries again.
+    // A refused poke tells an idle resident's operator that the last real
+    // request of its lineage, a context a later turn builds on, is refused,
+    // before that turn. The dragnet hears a refused request unless it's the
+    // one last heard for that lineage. membrane keeps replaying the same
+    // request every refresh interval (a refusal is a success to its
+    // breaker), and another alert about the same bytes asks nothing new of
+    // the operator, even after a poke of them succeeded. A real call
+    // reseeds the lineage, usually with other bytes, whose refusal is heard
+    // afresh. An observer that throws hasn't heard it, so the next refused
+    // poke of that request tries again.
     if (refused && request !== undefined) {
       const heard = this.heardKeepaliveRefusals.has(call.key, request);
       const usage = response?.usage as KeepaliveUsage | undefined;
