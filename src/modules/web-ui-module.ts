@@ -244,6 +244,25 @@ function isChildScope(scope: string | undefined): scope is string {
   return scope !== undefined && scope !== '' && scope !== 'local';
 }
 
+/**
+ * JSON.stringify replacer behind `/debug/context?media=0`: collapses base64
+ * payloads (inlined Discord images) to size placeholders. With a few images
+ * in the window the full response runs to several MB, which stalls browser
+ * fetches over SSH tunnels. `data:` URLs keep their media-type prefix
+ * (`data:image/png;base64,[stripped 312kb]`); bare base64 becomes
+ * `[base64 stripped 312kb]`. Strings of 2 KiB or less, and long strings that
+ * are not base64 (prose, tool output), pass through untouched.
+ */
+export function stripBase64Media(_key: string, value: unknown): unknown {
+  if (typeof value === 'string' && value.length > 2048) {
+    const kb = Math.round(value.length / 1024);
+    const dataUrl = /^(data:[^;,]+);base64,/.exec(value);
+    if (dataUrl) return `${dataUrl[1]};base64,[stripped ${kb}kb]`;
+    if (/^[A-Za-z0-9+/=\r\n]+$/.test(value)) return `[base64 stripped ${kb}kb]`;
+  }
+  return value;
+}
+
 /** Map a panel-layer failure onto the HTTP response it deserves. */
 function panelErrorResponse(err: unknown): Response {
   const status = err instanceof PanelError ? err.status : 500;
@@ -1112,13 +1131,18 @@ export class WebUiModule implements Module {
     const scopeParam = url.searchParams.get('scope');
     if (scopeParam && scopeParam !== 'local') {
       const op = HTTP_PANEL_OPS[url.pathname];
-      if (op) return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url));
+      if (op) {
+        const replacer = op === 'debug-context' && url.searchParams.get('media') === '0'
+          ? stripBase64Media
+          : undefined;
+        return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url), replacer);
+      }
       // Fall through: non-panel routes (static, /files) ignore the param.
     }
 
     // Debug: the membrane-normalized request that WOULD be emitted if the
     // agent were activated right now — no inference, no state mutation.
-    //   GET /debug/context[?agent=<name>][&hooks=false][&pretty=1]
+    //   GET /debug/context[?agent=<name>][&hooks=false][&pretty=1][&media=0]
     if (url.pathname === '/debug/context/makeup') {
       return this.handleContextMakeup(url);
     }
@@ -1247,6 +1271,8 @@ export class WebUiModule implements Module {
     childName: string,
     op: string,
     params: Record<string, unknown>,
+    /** Serialize the child's payload through this (e.g. `media=0` stripping). */
+    replacer?: (key: string, value: unknown) => unknown,
   ): Promise<Response> {
     const fleet = this.fleetModule();
     if (!fleet) {
@@ -1258,6 +1284,9 @@ export class WebUiModule implements Module {
     const result = await fleet.requestPanel(childName, op, params);
     if (!result.ok) {
       return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
+    }
+    if (replacer) {
+      return new Response(JSON.stringify(result.data, replacer), { headers: { 'content-type': 'application/json' } });
     }
     return Response.json(result.data);
   }
@@ -1335,22 +1364,13 @@ export class WebUiModule implements Module {
     if (!app) return new Response('Not ready', { status: 503 });
     const params = panelParamsFromUrl(url);
     const pretty = url.searchParams.get('pretty') !== null && url.searchParams.get('pretty') !== '0';
-      // media=0: collapse base64 payloads (inlined Discord images) to size
-      // placeholders; the /prompt inspector and ContextDocument ask for it.
-      const stripMedia = url.searchParams.get('media') === '0';
-      const mediaReplacer = (_k: string, v: unknown): unknown => {
-        if (typeof v === 'string' && v.length > 2048) {
-          const kb = Math.round(v.length / 1024);
-          const dataUrl = /^(data:[^;,]+);base64,/.exec(v);
-          if (dataUrl) return `${dataUrl[1]};base64,[stripped ${kb}kb]`;
-          if (/^[A-Za-z0-9+/=\r\n]+$/.test(v)) return `[base64 stripped ${kb}kb]`;
-        }
-        return v;
-      };
+    // media=0: collapse base64 payloads (inlined Discord images) to size
+    // placeholders. The /prompt inspector and ContextDocument ask for it.
+    const stripMedia = url.searchParams.get('media') === '0';
     try {
       const payload = await buildDebugContext(app, resolveAgent(app, params.agent), params);
       return new Response(
-        JSON.stringify(payload, null, pretty ? 2 : undefined),
+        JSON.stringify(payload, stripMedia ? stripBase64Media : undefined, pretty ? 2 : undefined),
         { headers: { 'content-type': 'application/json' } },
       );
     } catch (err) {

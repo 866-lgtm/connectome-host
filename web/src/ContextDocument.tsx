@@ -63,18 +63,30 @@ function textOf(c: unknown): string {
   return String(c ?? '');
 }
 
+/** One inline image: either renderable (`dataUrl`) or collapsed server-side
+ *  by `/debug/context?media=0` (`stripped` = the size label, e.g. "312kb"). */
+type InlineImage = { mediaType: string; dataUrl?: string; stripped?: string };
+
+/** `?media=0` replaces payloads over 2 KiB with `[base64 stripped 312kb]`
+ *  (or `data:…;base64,[stripped 312kb]`). Small images arrive intact. */
+const STRIPPED_MEDIA = /\[(?:base64 )?stripped ([^\]]*)\]$/;
+
 /** Inline images in the compiled message (the request ships them as base64
  *  — exactly what the model sees), including ones nested in tool results. */
-function imagesOf(c: unknown): Array<{ mediaType: string; dataUrl: string }> {
+function imagesOf(c: unknown): InlineImage[] {
   if (!Array.isArray(c)) return [];
-  const out: Array<{ mediaType: string; dataUrl: string }> = [];
+  const out: InlineImage[] = [];
   const visit = (b: unknown): void => {
     if (!b || typeof b !== 'object') return;
     const blk = b as { type?: string; source?: { type?: string; data?: unknown; mediaType?: unknown; media_type?: unknown }; content?: unknown };
     if (blk.type === 'image' && blk.source?.type === 'base64' && typeof blk.source.data === 'string') {
       const mt = typeof blk.source.mediaType === 'string' ? blk.source.mediaType
         : typeof blk.source.media_type === 'string' ? blk.source.media_type : 'image/png';
-      if (mt.startsWith('image/')) out.push({ mediaType: mt, dataUrl: `data:${mt};base64,${blk.source.data}` });
+      if (!mt.startsWith('image/')) return;
+      const stripped = STRIPPED_MEDIA.exec(blk.source.data);
+      out.push(stripped
+        ? { mediaType: mt, stripped: stripped[1] }
+        : { mediaType: mt, dataUrl: `data:${mt};base64,${blk.source.data}` });
     } else if (blk.type === 'tool_result' && Array.isArray(blk.content)) {
       blk.content.forEach(visit);
     }
@@ -116,7 +128,8 @@ export function ContextDocument(props: {
     setLoading(true); setErr(null);
     try {
       // media=0: inlined base64 images can make the response several MB
-      // (stalls over tunnels); the document view renders text only.
+      // (stalls over tunnels). The server collapses each large payload to a
+      // size placeholder, rendered below as a chip instead of a thumbnail.
       const q = query().replace(/^\?/, '&');
       const [ctxRes, mkRes] = await Promise.all([
         fetch(`/debug/context?media=0${q}`, { credentials: 'same-origin' }),
@@ -244,7 +257,18 @@ export function ContextDocument(props: {
                   <div class="whitespace-pre-wrap text-[13px] leading-relaxed text-neutral-300">{t.slice(0, 4000)}{t.length > 4000 ? '…' : ''}</div>
                   <Show when={images.length > 0}>
                     <div class="mt-1 flex flex-wrap gap-1">
-                      <For each={images}>{(img) => <MediaView mediaType={img.mediaType} dataUrl={img.dataUrl} compact />}</For>
+                      <For each={images}>{(img) => (
+                        <Show when={img.dataUrl} fallback={
+                          <div
+                            class="my-1 mr-1 inline-block text-[11px] font-mono text-sky-400/80 bg-sky-950/20 border border-sky-900/40 rounded px-2 py-0.5"
+                            title="image payload stripped server-side (media=0) to keep this view light; the model sees the full image"
+                          >
+                            🖼 {img.mediaType} · {img.stripped}
+                          </div>
+                        }>
+                          <MediaView mediaType={img.mediaType} dataUrl={img.dataUrl} compact />
+                        </Show>
+                      )}</For>
                     </div>
                   </Show>
                 </div>
