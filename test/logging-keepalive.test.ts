@@ -27,6 +27,10 @@ async function exercise(options: {
   failStatus?: 400 | 401;
   /** A successful poke's stop_reason: max_tokens unless given. */
   pokeStopReason?: string;
+  /** Each successful poke's stop_reason in turn, in place of pokeStopReason. */
+  pokeStopReasons?: string[];
+  /** Run with LLM_CALLS_FULL_PAYLOADS set, which keeps every request. */
+  fullPayloads?: boolean;
   observer?: (call: KeepaliveCall) => void | Promise<void>;
   ledgerThrows?: boolean;
   credentialThrows?: boolean;
@@ -38,6 +42,11 @@ async function exercise(options: {
   const events: string[] = [];
   /** What the credential monitor's taps heard, in order. */
   const credential: Array<{ kind: string; error?: unknown }> = [];
+  /** What the off-path refusal dragnet heard, in order. */
+  const refusals: Array<{ kind: string; model: string; messages: number; inputTokens: number }> = [];
+  /** The `this` the caller's onCall ran with, per receipt. */
+  const callerThis: unknown[] = [];
+  let pokesAnswered = 0;
   const ledger = new CallLedger({ hydrate: false });
   let finished!: () => void;
   const done = new Promise<void>(resolve => { finished = resolve; });
@@ -59,10 +68,13 @@ async function exercise(options: {
           ? Response.json({ type: 'error', error: { type: 'authentication_error', message: 'fixture credential rejected' } }, { status: 401 })
           : Response.json({ type: 'error', error: { type: 'invalid_request_error', message: 'fixture rejection' } }, { status: 400 });
       }
+      const stopReason = poke
+        ? options.pokeStopReasons?.[pokesAnswered++] ?? options.pokeStopReason ?? 'max_tokens'
+        : 'end_turn';
       return Response.json({
         id: 'msg_fixture', type: 'message', role: 'assistant', model,
         content: poke ? [] : [{ type: 'text', text: 'ok' }],
-        stop_reason: poke ? (options.pokeStopReason ?? 'max_tokens') : 'end_turn', stop_sequence: null,
+        stop_reason: stopReason, stop_sequence: null,
         usage: poke ? (options.usage ?? readUsage) : {
           input_tokens: 5, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 100,
           cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 100 },
@@ -72,6 +84,9 @@ async function exercise(options: {
     },
   });
   let timeout: ReturnType<typeof setTimeout> | undefined;
+  // The adapter reads the full-payload flag when it is constructed.
+  const fullPayloadsBefore = process.env.LLM_CALLS_FULL_PAYLOADS;
+  if (options.fullPayloads) process.env.LLM_CALLS_FULL_PAYLOADS = '1';
   try {
     adapter = new LoggingAnthropicAdapter({
       apiKey: 'fixture-key', baseURL: server.url.toString(),
@@ -81,6 +96,7 @@ async function exercise(options: {
         maxIdleMs: 10000,
         onEvent(event) { events.push(event.type); },
         onCall(call) {
+          callerThis.push(this);
           receipts++;
           if (receipts >= (options.pokes ?? 1)) {
             adapter?.cacheKeepalive?.stop();
@@ -103,6 +119,8 @@ async function exercise(options: {
       credential.push({ kind });
       if (options.credentialThrows && kind === 'keepalive') throw new Error('fixture credential observer');
     };
+    // Wired as index.ts wires the off-path refusal dragnet.
+    adapter.onRefusal = (info) => { refusals.push(info); };
     await adapter.complete(request);
     seedFinished();
     await Promise.race([
@@ -114,8 +132,10 @@ async function exercise(options: {
     // Let isolated observer promises and onEvent finish before checking them.
     await Bun.sleep(0);
     const logs = readFileSync(path, 'utf8').trim().split('\n').map(line => JSON.parse(line));
-    return { wire, seen, events, credential, logs, receipts, live: ledger.snapshot(), reloaded: new CallLedger({ dataDir: dir }).snapshot() };
+    return { wire, seen, events, credential, refusals, callerThis, logs, receipts, live: ledger.snapshot(), reloaded: new CallLedger({ dataDir: dir }).snapshot() };
   } finally {
+    if (fullPayloadsBefore === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+    else process.env.LLM_CALLS_FULL_PAYLOADS = fullPayloadsBefore;
     seedFinished();
     if (timeout !== undefined) clearTimeout(timeout);
     adapter?.cacheKeepalive?.stop();
@@ -186,11 +206,29 @@ describe('keepalive calls reach the normal logs and spend ledger', () => {
   test('a refused poke logs its request, as a refused turn does', async () => {
     const result = await exercise({ pokeStopReason: 'refusal' });
     expect(result.logs[1]).toMatchObject({ kind: 'keepalive', type: 'call', rawRequest: { max_tokens: 0 } });
+    expect(result.reloaded).toEqual(result.live);
+  });
+
+  test("the refusal dragnet hears a lineage once when its pokes turn refused, and again only after one succeeds", async () => {
+    const result = await exercise({ pokes: 4, pokeStopReasons: ['refusal', 'refusal', 'max_tokens', 'refusal'] });
+    expect(result.logs.slice(1).map(r => r.rawResponse.stop_reason)).toEqual(['refusal', 'refusal', 'max_tokens', 'refusal']);
+    // The whole replayed prompt, most of it read from cache.
+    expect(result.refusals).toEqual([
+      { kind: 'keepalive', category: undefined, model, messages: 1, inputTokens: 6007 },
+      { kind: 'keepalive', category: undefined, model, messages: 1, inputTokens: 6007 },
+    ]);
+  });
+
+  test('with full payloads on, a successful poke keeps its request', async () => {
+    const result = await exercise({ fullPayloads: true });
+    expect(result.logs[1]).toMatchObject({ kind: 'keepalive', type: 'call' });
+    expect(JSON.stringify(result.logs[1].rawRequest)).toBe(result.wire[1]);
   });
 
   test("a poke whose credential is rejected reaches the credential monitor as an auth failure", async () => {
     const result = await exercise({ fail: true, failStatus: 401 });
     expect(result.logs[1]).toMatchObject({ kind: 'keepalive', type: 'error' });
+    expect(result.reloaded).toEqual(result.live);
     expect(result.credential.map(c => c.kind)).toEqual(['complete', 'keepalive']);
     expect(isAuthFailure(result.credential[1].error)).toBe(true);
   });
@@ -210,6 +248,12 @@ describe('keepalive calls reach the normal logs and spend ledger', () => {
     // And a throwing ledger observer doesn't keep the poke from the credential monitor.
     expect(result.credential.map(c => c.kind)).toEqual(['complete', 'keepalive', 'keepalive']);
     expect(result.events.filter(event => event === 'refreshed')).toHaveLength(2);
+  });
+
+  test("the caller's onCall runs as membrane's method, with its config as this", async () => {
+    const result = await exercise();
+    // membrane calls onCall on its own copy of the keepalive config.
+    expect((result.callerThis[0] as { refreshAfterMs?: number } | undefined)?.refreshAfterMs).toBe(40);
   });
 
   test('caller async rejection remains isolated from the keepalive loop', async () => {

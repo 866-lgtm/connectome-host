@@ -29,6 +29,7 @@ import type {
   ProviderRequestOptions,
   StreamCallbacks,
   KeepaliveCall,
+  KeepaliveUsage,
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
@@ -130,8 +131,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
           // Log before calling the caller's observer, which owns its copy and
           // may mutate it. Failure in either observer must not suppress the other.
           try { observeKeepalive?.(call); } catch { /* observability is isolated */ }
-          // Membrane isolates sync errors and returned promise rejections.
-          return callerOnCall?.(call);
+          // Membrane isolates sync errors and returned promise rejections. The
+          // caller's observer runs with the `this` membrane gives this one, as
+          // it did when membrane called it directly.
+          return callerOnCall?.call(this, call);
         },
       },
     });
@@ -237,6 +240,11 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     };
   }
 
+  /** Keepalive lineages whose latest pokes were refused: the refusal
+   *  dragnet has heard each once, and hears it again only after one of its
+   *  pokes succeeds. */
+  private readonly refusedKeepaliveLineages = new Set<string>();
+
   private readonly warnedEffort = new Set<string>();
   private readonly warnedThinking = new Set<string>();
 
@@ -282,12 +290,38 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     this.log(record);
     // A poke spends the same credential as a turn, so the credential monitor
     // hears it too: an idle resident's rejected credential shows at its next
-    // poke rather than at its next turn, and a poke that succeeds settles an
+    // poke rather than at its next turn (membrane pokes a lineage for up to a
+    // day after its last real request), and a poke that succeeds settles an
     // auth alert as a turn would.
     try {
       if (call.outcome === 'error') this.onProviderError?.(call.error, 'keepalive');
       else this.onProviderSuccess?.('keepalive');
     } catch { /* observers never affect provider traffic */ }
+    // A refused poke is the earliest sign that the context the resident's
+    // next turn would send is refused, and nothing on the turn path sees it,
+    // so the refusal dragnet hears it. Membrane keeps poking a refused lineage
+    // (a refusal is a success to its breaker) every refresh interval for up to
+    // a day, longer than the alert cooldown, so the dragnet hears a lineage
+    // once when its pokes turn refused, and again only after one succeeds.
+    if (response?.stop_reason === 'refusal') {
+      if (!this.refusedKeepaliveLineages.has(call.key)) {
+        this.refusedKeepaliveLineages.add(call.key);
+        const usage = response.usage as KeepaliveUsage | undefined;
+        try {
+          this.onRefusal?.({
+            kind: 'keepalive',
+            category: (response as { stop_details?: { category?: string } }).stop_details?.category,
+            model: typeof raw.model === 'string' ? raw.model : String(raw.model),
+            messages: Array.isArray(raw.messages) ? raw.messages.length : 0,
+            // The whole prompt the poke replayed: most of it is read from cache.
+            inputTokens: (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0)
+              + (usage?.cache_creation_input_tokens ?? 0),
+          });
+        } catch { /* observers never affect provider traffic */ }
+      }
+    } else if (call.outcome === 'success') {
+      this.refusedKeepaliveLineages.delete(call.key);
+    }
     // Share the log decoder so live and rehydrated spend use identical vendor
     // fields (including cache-write buckets, geography, and service tier).
     // The ledger comes last, so a throwing ledger observer skips nothing here,
@@ -316,11 +350,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * — compression/summarizer drains, maintenance — flows through this
    * adapter's complete() and previously refused in silence; the 2026-07-15
    * mythos cascade STARTED there and alerted nowhere. Fired for
-   * kind==='complete' only: agent turns stream, so this never double-reports
-   * a refusal the main driver already escalated.
+   * kind==='complete' (agent turns stream, so this never double-reports a
+   * refusal the main driver already escalated), and for kind==='keepalive'
+   * when a cache keepalive lineage's pokes turn refused.
    */
   onRefusal?: (info: {
-    kind: 'complete' | 'stream';
+    kind: 'complete' | 'stream' | 'keepalive';
     category?: string;
     model: string;
     messages: number;

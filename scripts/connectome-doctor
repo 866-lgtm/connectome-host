@@ -237,7 +237,7 @@ if records:
                 pass
 stages.append(("chronicle ingest (+gate)", rec_ts, rec_detail))
 
-# 4c. inference: newest llm-calls file, last record stop_reason
+# 4c. inference: newest llm-calls file, last model call's stop_reason
 llm_ts = None
 llm_detail = ""
 llm_files = sorted(
@@ -246,7 +246,6 @@ llm_files = sorted(
 )
 if llm_files:
     newest = os.path.join(data_dir, llm_files[-1])
-    llm_ts = os.path.getmtime(newest)
     # last complete JSON line from tail (lines can be multi-MB)
     raw = tail_bytes(newest, 30_000_000).decode("utf-8", "replace")
     for ln in reversed(raw.splitlines()):
@@ -257,6 +256,12 @@ if llm_files:
             r = json.loads(ln)
         except Exception:
             continue
+        # Cache keepalive pokes write rows here too, while the agent is idle,
+        # so neither the file's mtime nor its last row says when it last
+        # inferred: take the newest row that isn't a poke, and its own time.
+        if r.get("kind") == "keepalive":
+            continue
+        llm_ts = parse_iso(str(r.get("timestamp", "")))
         resp = r.get("rawResponse") or {}
         resp = resp.get("response") or resp
         sr = resp.get("stop_reason")

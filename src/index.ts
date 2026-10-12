@@ -1368,8 +1368,12 @@ async function main() {
       fw.notifyOpsAlert?.(
         'refusal-offpath',
         app.agentName,
-        `off-path refusal (category=${info.category ?? 'unknown'}) on a ${info.messages}-message ` +
-          `complete() call (~${Math.round(info.inputTokens / 1000)}k tok) — likely compression/summarizer`,
+        info.kind === 'keepalive'
+          ? `off-path refusal (category=${info.category ?? 'unknown'}) on a cache keepalive poke, which ` +
+            `replays a ${info.messages}-message request (~${Math.round(info.inputTokens / 1000)}k tok): ` +
+            `a turn sending that context would likely be refused too`
+          : `off-path refusal (category=${info.category ?? 'unknown'}) on a ${info.messages}-message ` +
+            `complete() call (~${Math.round(info.inputTokens / 1000)}k tok) — likely compression/summarizer`,
         { ...info },
       );
     };
