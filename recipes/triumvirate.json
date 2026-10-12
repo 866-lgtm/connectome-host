@@ -22,7 +22,12 @@
     "retrieval": false,
     "wake": true,
     "workspace": false,
-    "webui": true,
+    "webui": {
+      "basicAuth": {
+        "username": "${WEBUI_USERNAME:-admin}",
+        "password": "${WEBUI_PASSWORD:-admin}"
+      }
+    },
     "fleet": {
       "children": [
         {

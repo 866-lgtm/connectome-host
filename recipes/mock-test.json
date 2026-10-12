@@ -1,0 +1,19 @@
+{
+  "name": "Mock Test",
+  "description": "Zero-cost offline smoke recipe: membrane's mock adapter, no API key, no provider spend. Echoes your messages back through the full host loop.",
+  "agent": {
+    "name": "agent",
+    "provider": "mock",
+    "systemPrompt": "You are a mock agent for offline host testing."
+  },
+  "modules": {
+    "subagents": false,
+    "lessons": false,
+    "retrieval": false,
+    "wake": false,
+    "workspace": false,
+    "webui": {
+      "host": "127.0.0.1"
+    }
+  }
+}

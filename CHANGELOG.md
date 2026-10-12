@@ -1,6 +1,961 @@
 # Changelog
 
+Entries land with the change that causes them, as fragment files in
+[`changelog.d/`](changelog.d/) that are folded into a version section at
+release time — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
+
 ## Unreleased
+
+### Fixed
+
+- Fleet state snapshots no longer persist resolved child environment overrides. Adopted children recover restart overrides from the current matching recipe configuration, including `autoStart: false` entries; legacy persisted env is ignored. A child with no matching configured name, recipe, and data directory gets no overrides. A same-name recipe or data-directory mismatch logs the mismatched fields and withheld restart overrides without logging their values. Existing Chronicle history and backups may still contain previously saved secrets; operators should rotate affected credentials and handle historical copies according to their retention policy. Running child processes keep their existing environment until restarted.
+- Evacuator-generated recipes pin the imported participant before host construction, keeping the live framework and Membrane role anchor aligned through `/session switch`. Name resolution uses `--agent`, then the chosen warmup session's sidecar, then `Claude`; the same name is passed explicitly to warmup. For custom imports without a selected warmup session or sidecar, supply `--agent`. Existing generated recipes need their hardcoded `agent` name corrected. Warmup selection rejects duplicate titles and ambiguous ID prefixes with candidate IDs; the guide and CLI explicitly require selecting the intended imported store before chatting under the revival identity. Replacing an output recipe with a different participant emits a warning, including when a resumed run falls back from a custom name to `Claude`.
+- Headless command replies bypass event subscriptions like other protocol responses. Fleet commands and direct socket clients receive `command-output` even with narrow or empty subscriptions; unrelated telemetry remains filtered. Protocol replies stay with the requesting connection and are discarded if that connection closes or is replaced while work is pending. The headless log reports the dropped response type and reason, without its payload.
+- The WebUI and fleet WebUI smoke-test recipes bind to `127.0.0.1`, so their unauthenticated local servers pass the existing bind-safety check. The fleet parent uses port 8788 and its child uses 8787 to avoid competing for one listener.
+- The clerk recipe's channel-management procedures use `wake_add_rule` and `wake_remove_rule` for live, persisted gate changes, while retaining Zulip subscriptions and protected default policies. They no longer direct the clerk to edit a Chronicle workspace copy or promise a timed reload. The prompt distinguishes recipe-shipped rules restored at startup from runtime-only rules whose removal survives restart.
+- The generic provider logging wrapper forwards an adapter's optional `toolResultImageMediaTypes` capability, preserving its native tool-image policy. Older adapters keep their existing behavior; Gemini HEIC/HEIF history preservation requires a membrane version containing antra-tess/membrane#92.
+### Added
+
+- Recipes can tune `agent.strategy.maxLiveImages`, `imageStripDepthTokens`, and `maxLiveImageBytes` for autobiographical and frontdesk strategies. Values must be non-negative safe integers; zero disables the corresponding limit. Omitted values keep context-manager's defaults.
+### Fixed
+
+- **Recipe authors using `kv-unified`:** `agent.strategy.kvUnified.preserveGapBearingSummaries` must now be an explicit boolean, and cannot be `true` together with `treeifyNonContiguousSummaries`. Add the flag to older recipes. Both requirements already apply in context-manager; invalid configurations now fail at recipe load instead of the first solve. Valid explicit policies and other folding strategies are unchanged.
+- MCPL server definitions in `mcpl-servers.json` now preserve `inheritEnv`, and recipes can override it (including explicit `false`) for file-defined servers. Recipes and server files reject non-boolean values. Agent-owned overlays strip `inheritEnv` entirely, including when replacing an operator-defined server; full host-environment access is an operator grant. Full environment inheritance requires an agent-framework version containing its PR #175; the host's locked 0.19.0 predates that control and remains unchanged.
+
+## 0.9.0 — 2026-09-21
+
+### Added
+
+- Recipes can set **`modules.history: true`** to attach agent-framework's
+  `HistoryModule` (agent-framework 0.16.0): `history--stats` / `history--extract`
+  / `history--search` / `history--overview` tools for querying an agent's own
+  uncompressed chronicle via native secondary indexes, and for browsing
+  already-compressed spans via existing compression summaries (no new LLM
+  calls). `bind()` is wired post-creation with the agent's live
+  `ContextManager` and the framework's `ChannelRegistry` (when MCPL is
+  configured), so channel-filter arguments on all four tools accept a live or
+  historical channel label/address, not just the raw internal channel id.
+  Bumps `@animalabs/agent-framework` to `^0.16.0` and
+  `@animalabs/context-manager` to `^0.10.0` (both required for `HistoryModule`
+  and its summary-overview support) and `@animalabs/chronicle` to `^0.4.0`
+  (native secondary-index support the history tools depend on).
+
+- Recipes can set **`agent.retry`** (Membrane's retry policy, passed through
+  verbatim) and **`mcpServers.<id>.requestTimeoutMs`** (the framework's
+  per-server JSON-RPC timeout). Both knobs existed underneath — Membrane's
+  `MembraneConfig.retry` and `McplServerConfig.requestTimeoutMs` — but the host
+  never surfaced them, so a gateway 502 killed a turn on first failure
+  (Membrane retries generic retryable errors zero times by default; only
+  `529`/`overloaded_error` has a dedicated schedule) and a tool slower than the
+  60s default (image generation) could only ever time out. Both validate at
+  recipe-load time.
+
+- Subscription hosts (Claude OAuth token via `ANTHROPIC_AUTH_TOKEN`, Codex
+  login via `openai-codex`) show quota windows instead of a dollar estimate:
+  the TUI status line and the WebUI header read `10% weekly | 99% 5h`, one
+  entry per window the provider reports (5-hour, weekly, per-model weekly),
+  and the WebUI usage panel lists each window with its reset time.
+  List-price dollars were fiction on a subscription. Pay-per-token hosts are
+  unchanged.
+  - The windows are polled out-of-band (no inference spend) by a new
+    `QuotaMeter`: the TUI polls while it runs, the WebUI only while its tab
+    is visible and focused (`GET /quota`, panel op `quota`, observer scope
+    `health`), floored at one provider read per 30s however many viewers.
+  - A 429 while a window is spent is now recognised as a quota, not a
+    throttle: the agent parks until the window resets instead of retrying
+    into it and recording a failed turn per attempt. Needs an
+    agent-framework with `providerHold`; on older frameworks the option is
+    inert and behaviour is as before.
+  - Both provider surfaces are private to the vendors' own CLIs and may
+    change; an unreadable answer shows no readout rather than a guess.
+
+- WebUI live surgery, quiesce toggle, inline images, operator log
+  (requires agent-framework with `rollbackToMessage`/`suppressMessages`;
+  quiesce needs agent-framework #122 — every affordance is feature-detected
+  from `welcome.features`, so the bundle is safe against older hosts):
+  - **Roll back to a message** (hover ⏪ in Chat, "roll back to here" on raw
+    boxes in the Context document): forks at that message and makes the fork
+    the live branch; confirm dialog names what leaves the context.
+  - **Suppress messages** (hover ⊘ enters multi-select, floating bar to
+    confirm): fork at head, redact on the fork, switch. Parent keeps them.
+  - **Quiesce/resume** header switch showing the host's serving state; a
+    busy-agent refusal offers "quiesce, then retry".
+  - **Images render** in Chat and Context views with a lightbox. Chat frames
+    carry a `ref` and the browser fetches bytes lazily from
+    `GET /media/<messageId>/<blockPath>` (observer scope `messages`,
+    `?scope=` proxies to fleet children) — base64 never rides the WebSocket.
+    Tool-result images (read_image, cameras) render too.
+  - **Operator log** in the branch panel: the host's durable
+    `operator-actions.jsonl`, live-refreshed on `operator:action` traces.
+  - New WS frames: `rollback`, `suppress`, `host-quiesce`, `host-resume`,
+    `request-host-mode`, `request-operator-log` → `surgery-result`,
+    `host-mode`, `operator-log`; `welcome.features` + `welcome.hostMode`.
+    Panel op `media`.
+
+### Changed
+
+- Depends on `@animalabs/agent-framework` ^0.17.0, `@animalabs/context-manager`
+  ^0.10.1 and `@animalabs/membrane` ^0.5.86. With AF 0.17 the quota meter's
+  `providerHold` is live: a subscription 429 on a spent quota window parks the
+  agent until the window resets instead of retrying into it (older AF ignored
+  the option). CM 0.10.1 carries the kv-unified stale-receipt fix (CM #97);
+  membrane 0.5.86 makes the ChatGPT-subscription prompt cache hit (stable
+  `session_id` header). `package-lock.json` had drifted to AF 0.13 / CM 0.8 /
+  chronicle 0.3 and is regenerated alongside `bun.lock`.
+
+- The `frontdesk` strategy no longer adds its provenance header to a message
+  whose server already rendered who, where, when and the id into the body
+  (metadata `attributed: true`, as zulip-mcp now stamps); its question and
+  mention salience scans the body with the server's `attributionHeader`
+  prefix removed. Unstamped MCPL messages keep the header. Without this, a
+  frontdesk agent on a current zulip-mcp reads two headers per message.
+
+- Route ChatGPT subscription inference through Membrane's shared Responses adapter, preserving Codex app-server login, token refresh, endpoint configuration, and Fast mode controls in the host. Provider usage now declares the cache-inclusive convention and is normalized by Membrane.
+- Preserve cache-usage and formatter capabilities through the logging decorator, fixing duplicate cached-input accounting for both subscription and API-key Responses calls. Keep participant names in auxiliary calls and mark logged usage with its convention while retaining the `openai-codex` provider label.
+- Serialize a forced Codex token refresh behind any in-flight non-refresh acquisition, coalescing concurrent refresh callers without reusing a stale token.
+
+- README documents `agent.proseRouting` (`locus` / `hybrid` / `explicit` /
+  `disabled`) and `agent.sameRoundThinkTextPolicy`, and recommends
+  `proseRouting: "disabled"` for tool-heavy agents woken from shared channels,
+  where stray same-round narration otherwise auto-publishes to the sticky
+  channel (#128).
+
+### Fixed
+
+- Subscription quota meter, review follow-up:
+  - the meter no longer stops polling after consecutive failed reads (a
+    timer tick suppressed by the error backoff left no timer armed — two
+    failures froze the TUI readout for the life of the process);
+  - the WebUI keeps asking after a transient `/quota` failure (401 before
+    the observer session exists, 503 while the host binds, 5xx); only a
+    definite answer ends the polling;
+  - "inference parked" is shown only when the framework reports a host
+    hold; a spent window otherwise reads "quota window spent — resets …";
+  - the usage panel of a fleet child reads that child's own quota
+    (`/quota?scope=`), so a pay-per-token child keeps its dollars;
+  - the hold uses the failing agent's own model when the framework supplies
+    it; a spent window with no reset time holds one slice on a fresh
+    reading; numeric `resets_at` and Codex `rateLimitsByLimitId.codex` are
+    parsed; per-agent dollars are hidden and call-ledger dollars labelled
+    as list-price equivalents on a subscription; a TUI session switch no
+    longer brings the dollar readout back.
+
+## 0.8.1 — 2026-09-10
+
+### Added
+
+- Recipe `subconscious` block (tune-out, agent-framework#77): `enabled`,
+  `systemPrompt` (required — the subconscious's mode block), optional `name`,
+  `model`, `allowChannelSpeech`, `reAnchorFraction`. Validated at recipe load
+  (unknown fields refused by name) and passed through verbatim to
+  `FrameworkConfig.subconscious`; the framework owns the defaults. Requires
+  agent-framework with tune-out (#115).
+
+- Add validated recipe plumbing for Agent Framework's default-off `agent.toolWrapperProseGuard` containment boundary.
+
+### Changed
+
+- Gate telemetry reads `x-gate-channel` from the turn's routing locus or,
+  for gate-batched wakes that set none, from the framework's telemetry-only
+  `wakeChannelId` (agent-framework ≥0.14). On residents with a subconscious
+  the stamp now follows the primary (the exactly-one-agent guard had
+  silenced it), and — because one provider adapter serves every agent — the
+  origin trio is stamped only while the primary is the only agent with a
+  turn in flight; overlap withholds rather than misattributes. Compression
+  debt is read from the primary as well.
+
+### Fixed
+
+- Recipes' `agent.strategy.mergeMaxSourceSpanMessages` now reaches the Context
+  Manager (it was accepted but never passed through, so the CM default applied
+  regardless of the recipe). Also plumbs and validates the Context Manager's
+  `compressionSplitFallback`, `compressionSplitPlaceholder`,
+  `compressionSplitMaxCallsPerChunk` and `compressionSplitMaxCallsPer10Min`
+  keys (all default off / CM defaults).
+
+- Gate telemetry classifies EventGate-batched wakes (`gate:debounce`, source
+  `gate`) as origin `event` instead of passing the raw reason through.
+
+- Name-taking commands (`/checkpoint`, `/restore`, `/checkout`,
+  `/session switch`, `/session delete`) parse the rest of the line instead of
+  only the first token, so multi-word names round-trip with
+  `/session rename` instead of silently truncating (`/checkpoint my test
+  point` used to save a checkpoint named `my`).
+- `/session delete` requires `--confirm`: the bare command echoes exactly
+  which session matched (name, id, message count) before anything
+  irreversible happens. `/help` documents that switch/delete accept ids.
+- Head-moving commands (`/undo`, `/redo`, `/checkout`, `/restore`,
+  `/branchto`, `/newtopic`) are refused while a turn is in flight — moving
+  the head mid-stream committed the streaming reply onto the wrong branch,
+  detached from its request (orphaned Chronicle nodes), including when the
+  move came from a second client on the same session.
+- `/mcp add` on an existing server preserves its env vars and `toolPrefix`
+  (and reports the kept env keys); previously a command update silently
+  wiped the server's env, which only surfaced when the server next started
+  without its tokens.
+- Checkpoints are visible: `/branches` lists them alongside branches, and
+  bare `/checkpoint` lists existing checkpoints (matching bare `/restore`).
+- `/budget` displays small values exactly instead of flooring to `0k`
+  (`/budget 50` used to report "set to 0k" while rejecting `/budget 0`).
+- `/clear` clears the WebUI transcript view (client-side, like the TUI's
+  scrollback wipe) instead of appending a "(cleared)" line while clearing
+  nothing; `/help` and the headless reply now say what `/clear` actually
+  does — display only, history and context kept.
+
+- The WebUI HTTP surface answers honestly: unknown `/debug/*` paths (typos,
+  casing, trailing slashes) return a JSON 404 instead of the SPA shell with
+  a 200; missing `/assets/*` files return 404 instead of HTML (which
+  produced a blank page with a MIME error on stale bundle hashes); non-GET
+  methods get 405 with an `Allow` header. SPA client-side routes still fall
+  back to the shell.
+- The context-makeup panel's exact token count calls `count_tokens` with the
+  model the agent actually runs (provider/Bedrock prefixes normalized away)
+  instead of a hardcoded id that 404'd on every install and silently nulled
+  `exactTotalTokens`. `COUNT_TOKENS_MODEL` remains as an explicit override;
+  non-Anthropic models report `count_tokens_unsupported_model` instead of
+  counting against the wrong tokenizer.
+
+## 0.8.0 — 2026-09-05
+
+### Added
+
+- Recipes accept `agent.proseRouting: "disabled"` for tool-only external publication when paired with a supporting Agent Framework release.
+- **`modules.instructions`** — a shared living-instructions file (a CLAUDE.md
+  analogue kept in a workspace mount) injected into every agent's context on
+  every turn, ephemeral subagents included. `true` for defaults
+  (`instructions/AGENTS.md`, 32 KB cap, `system` position) or
+  `{ path, header, maxBytes, position }`. Reads resolve through the workspace
+  mount (scoping + traversal guard apply), are bounded to `maxBytes`, reject
+  symlinks leading outside the mount (realpath containment), are cached by
+  `(realpath, mtime, size)`, and fail open — a missing file never blocks
+  inference. Recipe validation cross-checks the path's mount prefix against
+  the effective workspace mounts (explicit and implicit alike) at load time,
+  requires `autoMaterialize: true` on a read-write instructions mount so
+  agent curation edits actually reach the disk-side injection, and rejects
+  the host-managed `_config` mount (it materializes only on branch-changing
+  commands). Validation and the runtime share one mount builder
+  (`src/workspace-mounts.ts`), so the two cannot drift.
+
+- Recipes accept the default-off `agent.strategy.compressionSourceOnly` flag and pass it through to Context Manager's residence-scoped L1 compression request builder (#103).
+
+- Gate telemetry stamps why the turn fired: `x-gate-origin` (heartbeat |
+  event | mail | operator | raw reason), `x-gate-channel` and
+  `x-gate-counterparty` (adapter-namespaced ids, never content or display
+  names) ride the stream lane under the same `GATE_TELEMETRY=1` + base-URL
+  gate as the debt stamp; background calls on the complete lane carry debt
+  only (#113).
+
+- Gate-bound Anthropic calls carry an `x-gate-debt-chunks` header with the
+  live compression-debt pending-chunk count (membrane `dynamicHeaders`,
+  antra-tess/membrane#65) — the gateway records it per ledger row and strips
+  it before the vendor. Double-gated on `GATE_TELEMETRY=1` AND a configured
+  `ANTHROPIC_BASE_URL`, so the stamp can never reach a vendor endpoint;
+  unreadable state sends no header rather than a guess (#109).
+
+- Health tab renders the per-agent compression-debt reduction (state, pending
+  chunks, oldest age, merge queue) and says "not reported by this stack" when
+  absent — the queue is now distinct from context composition, and the top
+  line reads "inference queued" (#110).
+
+- Add complete fail-closed recipe validation and strategy passthrough for `foldingStrategy: "kv-unified"`; partial policies, invalid occupancy bands, unsafe approximation grids, and implicit treeification are rejected at load time.
+
+- **`agent.provider: 'openai-compatible'`** — run an agent against any
+  OpenAI chat-completions endpoint (Ollama, vLLM, Together, Groq, NanoGPT,
+  ...) via membrane's existing `OpenAICompatibleAdapter`, which no host ever
+  wired. The recipe names the endpoint (`agent.baseUrl`, validated as an
+  absolute http(s) URL at load) and the model (required — no default for an
+  arbitrary endpoint); the key comes from `OPENAI_COMPATIBLE_API_KEY`
+  only (no `OPENAI_API_KEY` fallback — `baseUrl` is recipe-controlled, so a
+  fallback would silently send a real OpenAI credential to an arbitrary
+  endpoint) and may be absent for local servers.
+  `agent.baseUrl` with any other provider is rejected at load time.
+
+- Recipes can pass the Context Manager source-only compression controls through Host/FKM, including the new default-off L1 and merge final-fallback modes, with boolean validation and cross-agent isolation.
+
+### Added
+
+- **`agent.cacheKeepalive` — hold an idle agent's 1h prompt cache warm.** With
+  `cacheTtl: "1h"`, an idle agent's cached prefix expires after an hour and its
+  next wake pays a **2x cache write** over the entire context. Reading an entry
+  restarts its clock, so membrane now replays the last request with
+  `max_tokens: 0` (prefill only) to refresh it at cache-**read** price (0.1x).
+  On by default for the anthropic provider; `{ "enabled": false }` opts out.
+  - **Cost is proportional to actual idleness, not to `maxIdleHours`.** A poke
+    fires only when the entry is genuinely near expiry, so a busy agent never
+    fires one — its own traffic already refreshed the TTL. Measured on mythos
+    llm-calls over 36h: 563 of 637 gaps were under 5 minutes, only 5 exceeded
+    1h.
+  - Knobs: `maxIdleHours` (default 24, measured from the last **real** request
+    so pokes cannot extend their own mandate) and `refreshAfterMinutes`
+    (default 45). Recipe validation **rejects `refreshAfterMinutes >= the cache
+    TTL`** — such a keepalive always fires after the entry has already expired,
+    paying a full cache write on every poke while still looking like a healthy
+    successful call.
+  - Events land in `service-stderr.log`, warn-level for `ineffective` and
+    `disabled`, so a background spender is legible without opening a billing
+    dashboard.
+  - Sizing, from fable-cm's 11-day log (~500k-token prefix): 49.7M tokens of
+    `cache_creation` landed on turns following a >1h idle gap — ~$944 of write
+    premium at fable-5 rates that this converts to ~$308 of reads.
+
+- **`provider: "mock"` — run the whole host with zero provider spend and no
+  credentials.** Wires membrane's existing `MockAdapter` (previously
+  unreachable from any recipe) as a first-class provider: echoes the last
+  user message by default, or returns `agent.mock.defaultResponse` with
+  `agent.mock.echoMode: false` for deterministic scripted output. No API
+  key is required or read. Mock calls still ride the generic logging
+  decorator, so `llm-calls.*.jsonl` receipts work exactly as they do for
+  real providers. `recipes/mock-test.json` is a ready-made offline smoke
+  recipe (loopback webui, everything else off).
+
+### Added
+
+- **Hybrid prose routing.** Recipes may set `agent.proseRouting: "hybrid"`: unprefixed text keeps ordinary frozen-locus delivery, while a leading `>>>destination` publication envelope routes through Agent Framework’s existing authorized cross-surface resolver. Source text retains the envelope; recipients see only the body; success/failure returns to resident context.
+
+- **`conversations` recipe block — per-channel conversation forks.** Maps to
+  agent-framework's `ConversationRouter`: the recipe's agent becomes a dormant
+  trunk template, and qualifying incoming channel messages spawn per-channel
+  fork agents seeded from the trunk's current context. Recipe surface: `bind` /
+  `trigger` rules per channel kind (`dm`/`groupDm`/`channel`), `idleTtlMs`
+  (default 12h), `closurePrompt`, and `agentPrefix`. The host fills
+  `templateAgent` from the recipe and creates a fresh stateful strategy instance
+  for each fork. Absent block means no routing and no behavior change.
+
+- **Protective reaction-suppression baseline for Discord adapters.** Stdio
+  MCPL children now receive `DISCORD_SUPPRESSED_REACTIONS_BASELINE` — the
+  agent-framework's exported refusal-annotation set (`REFUSAL_REACTION_BASELINE`,
+  comma-joined) — so a never-configured Discord adapter defaults to
+  suppressing exactly the markers this host's framework stamps, instead of
+  defaulting to nothing. An operator-set value on the server entry
+  supersedes the house baseline, and the adapter's own precedence (filters-file
+  key including explicit `[]` → legacy operator env → baseline) governs
+  enforcement; lost configuration stays stale rather than re-defaulting.
+  Requires an agent-framework release carrying the `REFUSAL_REACTION_BASELINE`
+  export.
+
+- **Standing autobiographical production target.** Recipes may set `agent.strategy.productionBudgetTokens` to keep the summary forest deep enough for a later live context-budget descent without a fold storm. This is a context-token target passed through to Context Manager, not a provider-spend ceiling; omission preserves Context Manager defaults.
+
+- **`mcpl_list` reports manifest freshness.** Each loaded server now shows the
+  last validated manifest revision plus fetch and grant-negotiation timestamps.
+  Older Agent Framework versions remain legible as `manifest=unknown`, and the
+  server-authored revision is quoted and bounded before reaching model-facing
+  text.
+
+- **`BEDROCK_BASE_URL` env hook** for the bedrock provider — mirrors
+  `ANTHROPIC_BASE_URL`, routing bedrock-runtime calls through an inference
+  gateway (gate.animalabs.ai/bedrock/<credSet>). The gate reads the agent
+  token from the SigV4 Credential (`AWS_ACCESS_KEY_ID` slot), discards the
+  client signature, and re-signs with real AWS creds. First user: Princess,
+  moved off the first-party Anthropic API (classifier "bio" false-positive
+  streak) onto Bedrock Sonnet 4.5 via gate apse1 — needs membrane ≥1dcd4e3
+  for `global.` inference-profile id pass-through.
+
+### Changed
+
+- **Dependency floor: agent-framework `^0.10.0`, chronicle `^0.3.0`,
+  membrane `^0.5.78`.** af 0.10.0 brings `ConversationRouter` (the
+  per-channel conversation-fork machinery this release’s `conversations`
+  recipe surface targets, and includes the current `hybrid` prose router) and exports `nudgeAgent`, which `/nudge` has
+  called since it landed — on every published af before 0.9.0 that call
+  was a guaranteed `TypeError`, so the floor also makes `/nudge` actually
+  work. Chronicle `^0.3.0` aligns the whole tree on one chronicle copy
+  (previously context-manager `0.6.3` nested its own `0.3.0` next to the
+  host's `0.2.x`). Operators: run a clean `npm ci` — a stale
+  `node_modules` predating the lock is the known failure mode here.
+
+- **The public triumvirate recipes boot from a fresh clone.**
+  `knowledge-miner.json` no longer ships a `syncntn` (Notion) block pointing at
+  an org-internal adapter that isn't publicly available — with `NOTION_*` env
+  vars unset the block failed recipe load, and with them set it died at spawn
+  on the dangling `../syncntn` path. The `scribe` block is dropped for the
+  same reason: it hard-required `GEMINI_API_KEY` and a `../scribe-mcp`
+  sibling checkout, neither mentioned anywhere in the setup guides — a
+  guide-following fresh install always got a crashed miner. Notion and
+  Scribe are now add-a-block opt-ins, documented in SETUP.md and
+  TRIUMVIRATE-SETUP.md (the miner prompt's tool-name contracts are
+  unchanged). `triumvirate.json` declares
+  webui Basic-Auth defaulting to `admin`/`admin` (override via
+  `WEBUI_USERNAME` / `WEBUI_PASSWORD` in `.env`) instead of bare
+  `"webui": true`, which the non-loopback bind guard refuses to start.
+
+- **agent-framework `^0.11.0`** (was `^0.10.0`). Activates `proseRouting:
+  "disabled"` for recipes that set it (#100 accepted the key; the runtime now
+  implements it — generated prose is never published externally, only explicit
+  tools speak), plus AF 0.11's Windows workspace-mount fix and the
+  org-acceleration 429 cooldown. Clears the last two standing cross-package
+  `tsc` errors — the typecheck is fully clean at this lock.
+
+- Changelog entries now land as per-change fragment files in `changelog.d/`
+  (`<slug>.<breaking|added|changed|fixed>.md`), folded into the version
+  section at release time — concurrent PRs no longer conflict in
+  `CHANGELOG.md`. Editing `## Unreleased` directly still works and is merged
+  at the same point.
+
+- **membrane `^0.5.80`** (was `^0.5.78`, lockfile-resolved 0.5.79). Two
+  latent cache behaviors the host already configures become ACTIVE with this
+  relock: the prompt-cache keepalive (`agent.cacheKeepalive`, on by default —
+  previously passed to an adapter version with no such field and silently
+  ignored, so idle gaps over the 1h TTL repaid a full cache write on wake)
+  and the floating cache marker (incremental prompt caching inside the native
+  tool loop, membrane's default-on). Both reduce cost; neither changes
+  visible agent behavior. Also clears two of the four standing cross-package
+  `tsc` errors (the membrane-typing pair).
+
+- Depend on `@animalabs/agent-framework` ^0.12.0 and `@animalabs/membrane` ^0.5.82 —
+  the published versions that implement the active-turn trigger and the
+  lane-aware `dynamicHeaders` the wake-cause stamp (#113) relies on; the
+  compatibility cast and optional lookup are gone, and an adapter-level test
+  proves a stream call carries the origin trio while a complete call carries
+  debt only.
+
+### Fixed
+
+- **Prompt-cache keepalive events all go to stderr**, so every one of them lands
+  in `service-stderr.log` beside `[inference-refusal]` instead of being split by
+  severity across two sinks. Routine `refreshed` events previously went to
+  stdout — which the host unit leaves on the journal — so the log an operator
+  actually greps showed nothing. Observed on fable-cm 2026-08-23: the keepalive
+  refreshed a 523,102-token prefix three times, correctly and with zero cache
+  writes, while a monitor tailing `service-stderr.log` reported no activity for
+  three hours. A background spender that can't be found in the operator's log is
+  indistinguishable from one that never ran.
+
+- Plumb `agent.strategy.compressionRecallBudgetTokens` through recipe validation and Framework strategy construction, with positive-integer validation instead of silently accepting an inert key.
+
+- **Saved recipe snapshots no longer contain resolved secrets.** `loadRecipe`
+  substitutes every `${VAR}` — API tokens included — and the host then wrote
+  that fully resolved recipe to `$DATA_DIR/.recipe.json` at default file mode:
+  plaintext credentials in the exact directory deployments bind-mount and back
+  up (found by an external recipe review that verified live tokens in a backed
+  up `data/` directory on a production VM). The snapshot now keeps the
+  pre-substitution form — `${VAR}` references literal, a URL `systemPrompt`
+  kept as the URL — and a resumed session re-runs substitution, validation,
+  and the prompt fetch against the *current* environment, so secret rotation
+  and remote prompt updates take effect on restart without re-cooking. The
+  file is written 0600 and re-chmod'd 0600 on every save. Legacy resolved
+  snapshots (no `$unresolved` marker) still load verbatim, with no
+  substitution, so a literal `${...}` surviving in prose cannot fail them;
+  resuming an unresolved snapshot whose required env var has since disappeared
+  fails loudly naming the variable instead of silently starting the default
+  recipe.
+
+- **Ephemeral subagents inherit the caller's `proseRouting` mode.** They
+  previously always ran AF's `'locus'` default regardless of the recipe, so a
+  resident running `proseRouting: "disabled"` still spawned subagents whose
+  between-tool-calls prose published live into its open channel as parent
+  speech (field-confirmed on a deployed resident, 2026-08-26 — including
+  after the recipe adopted `"disabled"`, which reached only the resident).
+
+### Fixed
+
+- **`mcpServers.<id>.source` accepts cook's npm registry form.**
+  `validateRecipe` demanded `source.url`, but connectome-cook's source grammar
+  also has `{ "npm": "pkg@version" }` — which the shipped knowledge-miner
+  recipe uses for its gitlab server, so that recipe failed to load
+  (`mcpServers.gitlab.source.url must be a non-empty string`). Exactly one of
+  `url` / `npm` is now required; the field remains build-tooling metadata,
+  ignored at runtime.
+
+## 0.7.4 — 2026-08-03
+
+### Changed
+
+- **Frontdesk agents ride the adaptive path.** `frontdesk` strategies now
+  default to adaptive resolution + kv-stable folding, same as
+  `autobiographical` (a recipe can pin `adaptiveResolution: false` to keep the
+  old hierarchical renderer). The hierarchical renderer reserves nothing for
+  the raw tail and cannot shed summary mass, so a long-lived frontdesk agent
+  eventually saturates its fixed context budget into a terminal
+  `UncoveredDropError` refusal loop — the 2026-08-03 boter clerk outage.
+  Details and deltas:
+  - Topic-aware chunking now rides context-manager's `chunkBoundaryHint` seam
+    (requires CM ≥0.6.3) instead of a fork of `rebuildChunks` that silently
+    bypassed chunk-record persistence and the fail-closed orphan guard.
+  - Existing frontdesk stores carry no chunk records (the fork never wrote
+    them); context-manager's `migrateChunkRecords` backfills them from L1
+    `sourceIds` on first load, so upgraded stores do not re-compress lived
+    history. First boot re-plans folds (one-time KV churn, possibly a burst of
+    L1 production for the un-summarized frontier).
+  - The salience-biased L1 emission order is retired (it was a hierarchical-
+    renderer concept); unanswered questions/@mentions are still preserved
+    verbatim through the compression prompt.
+  - Witnessed chunks now get the base witnessed compression prompt; the fork
+    predated witnessed prompts and overrode them.
+
+### Added
+
+- **Every WebUI inspection panel now works per fleet child.** One persistent
+  scope dropdown in the sidebar header ("inspecting: …") replaces the
+  per-tab pill rows Lessons/Files carried — MCPL, Context, Settings, Pins,
+  Health, and the main-pane Context document all follow it, instead of the
+  previous split where only Lessons/Files could switch (statefully, via
+  duplicated pickers), Context 404'd by mis-sending the child name as an
+  `?agent=` param, and MCPL/Settings/Pins/Health were silently locked to the
+  fleetmaster. Backed by one generic fleet IPC verb pair
+  (`panel-request`/`panel-response`) dispatching into a shared panel layer
+  (`src/web/panel-data.ts`) that both the WebUI host and headless children
+  run — a new panel op needs no protocol change to work fleet-wide.
+  Details:
+  - `/debug/context/{,makeup,coverage,curve,preview,maintenance}` and
+    `/healthz` accept `?scope=<child>` — the host proxies to the child over
+    the fleet IPC and answers with its JSON verbatim (still curl-able;
+    connectome-doctor / fleet hub can now watch children through the host).
+    `/curve?scope=<child>` passes through to the scoped JSON.
+  - The MCPL tab shows the scoped process's **live** loaded servers
+    (connection status, tool counts — the long-missing fleet mcpl snapshot)
+    above the shared registry file; registry edits stay host-scope (the
+    file is one cwd-shared registry, so a "child-local edit" would be a
+    lie) and the panel says so instead of hiding the fact.
+  - Settings mutations, dry-run previews (single-flight guard now lives in
+    the target process), and pin add/remove run inside the scoped child;
+    child pins snapshots ship picker candidates (real store ids) since the
+    SPA has no window into a child's message store.
+  - Scoped WS responses (`lessons-list`, `workspace-*`, `mcpl-list`,
+    `settings-state`, `pins-list`) now echo their `scope`, and the SPA
+    drops replies that arrive after the operator switched — fixing a
+    pre-existing race where a slow child's lessons/files could render under
+    another child's header.
+  - Child health snapshots include the child's recent provider-call ledger.
+- **TUI: context budget gauge.** The status bar's `ctx:` readout and the fleet
+  tree's per-agent readouts show `142k/180k` against the *live* runtime budget
+  (runtime overrides win over the recipe), and the status segment goes yellow at
+  75% / red at 90% — "how close to compression/trouble" at a glance instead of a
+  bare number.
+- **TUI: fleet view viewport.** The tree now scrolls with the cursor
+  (`┈ N lines above/below ┈` markers) instead of clipping past the bottom of the
+  terminal — previously a large fleet let the cursor walk below the fold and
+  Del:stop targeted rows the operator couldn't see.
+- **TUI: fleet view opens with a summary header** — agent counts
+  (running/done/failed/cancelled across local subagents *and* fleet children),
+  children up/crashed, session cost — plus the active ops alerts in full (the
+  status bar only has room for a count).
+- **TUI: event timestamps.** Alerts, tool batches, subagent results, wake
+  triggers, branch switches, errors and user messages get an `HH:MM` prefix, so
+  scrollback read an hour later still answers "when".
+- **TUI: root-agent tool completions are visible.** Verbose shows every
+  `✓ tool (1.2s)`; terse shows the slow ones (≥2s). Slow *running* tools show a
+  live elapsed in the status bar after 5s — "still executing" and "stuck" no
+  longer look identical.
+- **TUI: the status bar names the worst active alert** (`⚠ 2 ·
+  compression-quarantine`), with quarantine and inference-exhausted outranking
+  the merely-recent.
+
+### Changed
+
+- **TUI: thinking honors the Ctrl+V verbose toggle.** Terse mode collapses live
+  thinking to a counting one-liner (`💭 thinking… ~1.2k tok`) and replayed
+  history thinking to one truncated line per block — the toggle's label always
+  claimed this.
+- **TUI: session-history replay caps at the last 50 messages** (marker points at
+  the web UI for the rest) instead of flooding scrollback with the whole session.
+- **TUI: elapsed times are humane everywhere** — `5m48s`, not `348s`; the fleet
+  tree and both peek views now agree.
+- **TUI: peek-proc renders child `ops:alert` events properly** (red `⚠ kind:
+  message`, cyan for `-clear`) instead of a dim `· ops:alert` dot line, and no
+  longer prints dot lines for per-block/per-round bookkeeping events.
+- **TUI: the status-left segment truncates to fit** the terminal width instead of
+  shoving the tokens/mem segment off the row.
+
+### Fixed
+
+- `cancel-subagent-result` was missing from the headless runtime's
+  subscription-filter exemptions: a parent that narrowed the event stream
+  could never see its own cancel confirmations.
+- The Vite dev server proxies `/debug`, `/healthz`, `/curve`, and `/files`
+  to the running host — previously every HTTP panel fetch 404'd under
+  `bun run dev`.
+- **TUI: "Branch switched" announcements survive.** The line was printed *before*
+  `refreshFromStore()` cleared the scrollbox, so it was destroyed unread.
+
+### Upgrade notes
+
+- **subagents/lessons/retrieval are now opt-in** (they were opt-out, and
+  DEFAULT_RECIPE enabled all three). A recipe that omits them ran them under
+  v0.7.2 and stops running them on this upgrade — that is the fix for
+  "lessons injected despite following the onboarding guide" (Discord issue
+  #32) working as intended. A recipe that *explicitly* enables them keeps
+  them, deliberately: a defaults change cannot tell old boilerplate from a
+  real choice. Before upgrading an existing deployment, run
+
+      bun scripts/audit-module-optins.ts <recipes-and-data-dirs...>
+
+  It reports every explicit enable, every omission that changes behavior,
+  and every retrieval-without-lessons combination that would go silently
+  inert — and modifies nothing; the decisions stay with the operator.
+  Persisted `data/.recipe.json` files are launch-time snapshots, not
+  authoritative sources — the audit lists them separately as pointers back
+  to the source recipe. Retrieved-lesson injection also moved from the
+  system prompt to after the last user message, which keeps the stable
+  prefix KV-cacheable.
+
+### Added
+
+- **Operator retrieval traces.** The Web UI now exposes operator-only,
+  process-memory retrieval traces at `/debug/retrieval` and a readable
+  lesson-selection viewer at `/debug/retrieval/view`, including invoking-agent
+  attribution, mechanical candidates, relevance decisions, cache provenance,
+  and the exact injected lesson block. Exact conversation/model inputs remain
+  opt-in via literal `includeInputs=1`.
+
+### Fixed
+
+- **OpenAI retrieval reasoning effort.** Recipes using `openai-responses` or
+  `openai-codex` can set `modules.retrieval.reasoningEffort` independently of
+  the primary agent. Unsupported providers fail recipe validation instead of
+  receiving an invalid OpenAI-shaped request, and reasoning-enabled retrieval
+  requires an explicit model instead of falling through to the Claude default.
+  
+- **`mcpl_list` reports the live MCPL policy boundary.** Each server now shows
+  connected/retrying state, whether its initial policy was established, its
+  effective grant, host-masked and deny-by-default capability paths, and the
+  separate host-owned `host/command` authority. During a rolling upgrade,
+  fields unavailable from an older agent-framework render as `unknown` rather
+  than as a misleading empty grant.
+
+## 0.7.3 — 2026-08-01
+
+### Changed
+
+- **Prompt caching enabled on Bedrock for models that support it**
+  (Discord issue #35). The previous transport-wide `promptCaching: false`
+  was a workaround for "your request did not allow prompt caching" —
+  which turned out to be the account-level denial for 3.5 Sonnet v2
+  (caching there was preview-only and dropped at Bedrock's GA), not a
+  transport property. Caching is now gated per model
+  (`bedrockModelSupportsPromptCaching`): on for the Bedrock caching-GA
+  lineup (3.5 Haiku, 3.7 Sonnet, Claude 4+), off for the pre-GA families
+  (Claude v2/instant, Claude 3, 3.5 Sonnet — matched at the family
+  boundary, so bare aliases and `-latest` forms gate the same as dated
+  ids; non-Claude Bedrock ids are conservatively off). New recipe field
+  `agent.promptCaching: boolean` overrides the gate in either direction
+  on any provider, and lands at both layers — per-agent config and
+  Membrane's default for internal callers (compression/merge) — for
+  accounts/regions whose entitlements differ from the GA table.
+  `cacheTtl` is withheld at the host layer on bedrock (Agent Framework
+  still supplies its own default downstream; membrane ≥ 0.5.77 strips
+  the ttl field at the provider boundary, so the wire request never
+  carries it either way). Verified live 2026-07-31: every currently
+  invokable Claude on Bedrock (all 4-era; 3.5-era and opus-4-0514 are
+  EOL there) writes and reads the cache cleanly. Requires
+  `@animalabs/membrane` ≥ 0.5.77 (cache_control ttl strip, stream cache
+  usage capture, 4-era inference-profile model mapping); the dependency
+  and lockfile are bumped accordingly in this change.
+
+- **Subscription-GC closes carry honest provenance and respect explicit
+  opens** (Discord issue #5, the Mythos "channel settings keep resetting"
+  mechanism). GC closes are now recorded as `subscription-gc`, never
+  `agent-tool`; a channel the resident/operator explicitly opened is no
+  longer auto-closed under the *default* budget — a configured per-channel
+  numeric budget in `agent_settings.channel_idle_limits` counts as an
+  explicit idle lease and still closes at that budget. (The override state
+  records no actor — agent, operator, or imported are all possible — so
+  receipts say `configured-budget`, claiming no more than the state
+  proves.) Pins and policy-opened channels behave as before. Requires
+  agent-framework with machine-close provenance; against an older
+  framework GC behaves as it did.
+- **GC closes emit an operator-side ops receipt** (`subscription-gc-close`
+  via the framework ops channel: failures.log + `ops:alert` trace +
+  webhook) naming channel, threshold, decision source, and the restore
+  action — ids and thresholds only, no content. A durable listening-state
+  change no longer looks spontaneous from outside the transcript.
+
+## 0.7.2 — 2026-07-27
+
+### Added
+
+- **`LLM_CALLS_FULL_PAYLOADS` env flag** — retain the raw request on every
+  llm-call log entry, not only on refusal/error. Debugging aid; off by
+  default (the logs grow gigabytes fast with it on).
+
+## 0.7.1 — 2026-07-26
+
+### Changed
+
+- **Health call stats are now per-call, not cumulative.** The previous version
+  rolled everything into two totals (main / compression), which hid exactly what
+  you want to see — how an individual turn behaved. Now one row per call, newest
+  first: time, origin, messages, fresh input, cached tokens, cached share, cache
+  write, output, breakpoints, duration and verdict, with refusals and errors
+  highlighted. Cumulative totals for the session remain in the Usage panel.
+
+## 0.7.0 — 2026-07-26
+
+### Added
+
+- **Health panel: recent LLM call stats, split main vs compression.** Aggregates
+  the call ledger the client already receives — fresh input, cache read/write,
+  **cached share** (cacheRead ÷ input+cacheRead: what fraction of the prompt was
+  reused rather than re-read), prefix-reuse rate, output, average cache
+  breakpoints, cost, and errors/refusals — separately for `turn~` (main) and
+  `aux~` (compression/summarizer). Includes the last 8 fresh-input values per
+  group, so a budget descent can be seen trending down.
+  - The `~` is honest: origin is inferred from stream-vs-complete (turns stream,
+    compression uses `complete()`), not a definitive tag. Stated in the panel.
+- **Health panel: context composition of the last compile** — head / raw middle /
+  summaries by level / tail, with shares and bars. Sourced from `/healthz`, which
+  now carries the strategy's in-process render stats: unlike
+  `/debug/context/makeup` this costs nothing and makes no `count_tokens` network
+  call, so it is safe on the 15s health poll.
+
+## 0.6.1 — 2026-07-26
+
+### Fixed
+
+- **Pin id picker sourced the wrong ids.** It read `/debug/context/curve`, which
+  looked right but isn't: on a live store 0 of 208 raw entries carried a
+  `sourceMessageId`, and the 26 entries that *did* have an `id` were summaries,
+  whose ids (`L3-544`) are not message ids. Pinning with one would have created a
+  pin matching no message and silently done nothing. The picker now uses the
+  client's own message list, where `WelcomeMessageEntry.id` is the store id and
+  server-sourced rows are exactly those carrying a store `index`; it also gains a
+  text/id filter. Caught by checking the endpoint against a real store before
+  anyone used the panel.
+
+## 0.6.0 — 2026-07-26
+
+### Added
+
+- **Pins panel** — operator control over protected ranges, using the pin surface
+  that already existed in context-manager (`pinRange` / `markDocument` / `unpin`
+  / `listPins`). No cm or af change was needed.
+  - Three semantics kept visibly distinct rather than collapsed into one "pin",
+    because they do different things to the fold plan: **raw** (never folded),
+    **max L<sub>k</sub>** (fold no deeper than k; k=0 ≡ raw), and **at
+    L<sub>k</sub>** (pinned at exactly k — the frontier cut passes through that
+    node).
+  - `at L_k` is honored **only** by `foldingStrategy: 'kv-stable'`; elsewhere it
+    degrades to raw. The panel detects this and warns, rather than letting a
+    request silently mean something else.
+  - Ids are pickable from `/debug/context/curve` (~14ms, the cheapest debug
+    endpoint and the only one exposing per-entry store ids with a text preview),
+    so ranges are selected from the live context instead of pasted by hand.
+    Entries without a store id — merged summaries — are omitted, since a pin
+    needs a message id.
+  - New `request-pins` / `pin-add` / `pin-remove`, server frame `pins-list`,
+    broadcast on change like `settings-state`: pins alter what the next compile
+    folds, so operators must not hold divergent views. Full-auth only via
+    `observerMaySend`'s default-deny. `level` and `maxLevel` together is rejected
+    at the wire as ambiguous.
+  - Pins take effect on the next compile — no restart — and pair with dry run,
+    which is now ~1.6s rather than minutes.
+
+### Fixed
+
+- Dry-run cost text said "~8s"; measured ~1.6s after the context-manager solver
+  fixes. Corrected rather than left pessimistic.
+
+## 0.5.4 — 2026-07-26
+
+### Corrected after release
+
+- The `0.5.4` note below claimed the entry projection fixed the 110s stall. **It
+  did not.** Re-measuring after the change showed 121,855ms — unchanged. The
+  projection cut payload (megabytes → 265KB) and removed the blob-inlining heap
+  exposure, both worth keeping, but the time was never serialization. The actual
+  cause was an O(members × groupSize) cliff in three kv-control solver loops,
+  triggered whenever a head/tail boundary falls inside a deep summary group —
+  fixed in context-manager (`1c4c436`, `7f2d5e1`; see
+  `docs/incremental-compile-problem.md` §9.3). Measured after that fix: dry run
+  **1.56s**, dry run + render **1.69s**, live compile 22.5s → 2.4s.
+
+### Fixed
+
+- **`dry run + show context` was a 110-second agent stall.** Measured 110,348ms
+  against ~8s for the numbers-only dry run. `select()` builds the rendered
+  entries either way, so the extra ~102s was pure serialization of 353 full
+  entries — content the pane never showed, since it truncated every body past
+  600 chars. The server now projects to `{i, who, chars, media, truncated,
+  text}` with text capped at 1,200 chars; content blocks never leave the
+  process and media is counted rather than inlined, which also removes the
+  blob-resolution heap exposure `/curve` warns about.
+- The cost disclosure was understated by ~20× and in the dangerous direction
+  ("seconds… briefly pauses the agent"). It now states that the compile runs on
+  the agent's thread and the agent does nothing else meanwhile, quotes the
+  measured cost, and notes runs are serialized so a second click is refused
+  rather than queueing another pause.
+
+## 0.5.3 — 2026-07-26
+
+### Added
+
+- **Dry-run buttons, and the resulting context in the main pane.** Settings now
+  has explicit `dry run` and `dry run + show context` buttons; the latter
+  renders the context those settings WOULD produce in a new main-pane view,
+  behind an unmissable "dry run — not applied" banner. Entries come from
+  context-manager's dry-run select, so it is the actual layout, not an estimate.
+- Dry runs report how long they took, and the panel states the cost up front: a
+  full compile, seconds on a large store, briefly pausing the agent.
+
+### Fixed
+
+- **Preview no longer fires on every keystroke.** It was debounced-on-input, but
+  a dry run is a real compile and `select()` is synchronous — so each one blocks
+  the agent's event loop (no heartbeat, no Discord, no MCPL). Typing a budget
+  stacked those stalls and made the UI look hung. It is now operator-initiated
+  only, with server-side single-flight and a 3s cooldown that returns 429 rather
+  than queueing more agent pauses.
+- `middleChunkCount` was labelled "middle chunks" but the adaptive picker's unit
+  is the MESSAGE (14,057 for a store with 800 chunks). Relabelled "middle
+  messages (picker units)".
+- The sidebar was `w-72` (288px) and clipped the dense numeric tables; now
+  `w-96`, wider still on xl displays.
+
+## 0.5.2 — 2026-07-26
+
+### Fixed
+
+- **Settings preview reported unreachable budgets as fitting.** context-manager's
+  `PreviewResult.budgetTokens` is the *rejection* budget —
+  `(requested - reserve) * (1 + overBudgetGraceRatio)` — and its `fits` means
+  "would not throw `OverBudgetError`", not "fits the budget you asked for". On
+  Mythos (`overBudgetGraceRatio: 0.35`) those differ by a third: previewing
+  250k reported `fits: true` at 273,828 tokens, a budget the picker had in fact
+  exhausted trying to reach. The endpoint now returns an `accounting` block
+  separating `fitsRequested` / `withinGrace` / `unreachable`, and the panel
+  renders three distinct verdicts (fits / over-requested-but-graced /
+  would-hard-fail) plus the full budget derivation.
+
+## 0.5.1
+
+### Added
+
+- **llm-calls logging for every provider**: `LoggingProviderAdapter`, a
+  provider-agnostic decorator over any `ProviderAdapter`, wraps the
+  openai-codex, openrouter, and openai-responses transports — which
+  previously had NO wire visibility (found post-deploy on Mica: zero
+  llm-calls files, requests undiagnosable). Full raw request + response
+  summary + usage + timing + error per call, size-guarded against
+  pathological payloads. Anthropic/Bedrock keep their purpose-built
+  logging classes.
+
+## 0.5.0 — 2026-07-26
+
+### Added
+
+- **Context settings panel** (webui `Settings` tab) — live control of the
+  agent's compile window, replacing the stop → edit the `framework/state`
+  Chronicle slot → start dance. Edits `contextBudgetTokens`, `tailTokens` and
+  `transitionPaceTokens`; Apply / reset-to-recipe / revert-edits, plus cancel
+  for an in-flight descent.
+  - New client messages `request-settings`, `settings-update`,
+    `settings-reset`, `settings-cancel-transition`; new server frame
+    `settings-state`. No protocol version bump (additive).
+  - `settings-state` is **broadcast** to every welcomed client, unlike
+    `mcpl-list` — these are live process values, so two operators must not see
+    divergent budgets.
+  - Mutations are full-auth only for free: `observerMaySend` denies by default,
+    so new message types are never reachable by scoped observers.
+  - `persist: false` applies ephemerally (live now, reverts on restart) for
+    operator experiments. `notify: true` optionally pushes a notice to the
+    agent; **off by default**, because the notice is new text in the very
+    context being tuned — it invalidates the KV prefix and is itself
+    classifier-visible. The agent can always pull current settings via its own
+    `agent_settings` tool instead.
+  - The panel is explicit about three things that would otherwise mislead:
+    raising the budget applies at once but **lowering starts a paced
+    convergence** (shown as `converging` / `blocked`, with the blocked reason
+    spelled out); only a few keys are hot, so `targetChunkTokens`,
+    `headWindowTokens`, `mergeThreshold`, `foldingStrategy` and friends are
+    listed under "restart only" rather than offered as controls; and preview
+    requires a context-manager with dry-run support, so an older build reports
+    "preview unavailable" instead of rendering an empty result.
+- **`GET /debug/context/preview?budget=&tail=[&agent=]`** — non-committing
+  preview of the fold plan at a hypothetical window. Persists no fold
+  resolutions, enqueues no compression, advances no transition bookkeeping
+  (the guarantee lives in context-manager's dry-run select). An infeasible
+  budget is reported as `fits: false` with per-component diagnostics rather
+  than an error — learning a budget cannot work is the reason to preview
+  instead of applying and taking the outage. Returns 501 when the resolved
+  context-manager predates dry-run support. Requires the `debug` scope.
+
+### Fixed
+
+- `/debug/context/curve` compiled against `app.recipe.agent.contextBudgetTokens`
+  — the **stale recipe** value. Runtime overrides live in the `framework/state`
+  Chronicle slot and win over the recipe, so the curve was plotted at the wrong
+  budget for any agent whose budget had ever been changed at runtime. Now reads
+  the live `getAgentRuntimeSettings`, falling back to the recipe.
+
+## 0.4.0
+
+### Changed
+
+- **context-manager ^0.6.0** — the fatal coverage invariant: a compile
+  refuses (`OverBudgetError` / `UncoveredDropError`) rather than shipping a
+  context with silently-dropped messages, and recall-pair pricing includes
+  reasoning carriers (fixes the permanent compile wedge / silent middle loss
+  on carrier-bearing stores). Default `overBudgetGraceRatio` is now 0.02.
+- **agent-framework ^0.7.0** — host-side recovery for context refusals: the
+  OverBudget drain breaker also kicks for `UncoveredDropError`, and a
+  `context-refusal` ops alert fires immediately (fleet-watch) with the
+  recovery knobs named. Plus the context-settings preview surface and the
+  workspace read cap.
+
+### Added
+
+- `compressionMaxTokens` recipe passthrough — cap compression output for
+  models with low output ceilings (2c78936).
+
+### Fixed
+
+- **TUI bug sweep** (#64): operator-safety and observability fixes.
+  - `/quit` confirm no longer treats arbitrary input as consent — only an
+    explicit `y`/`yes` (or re-typed `/quit`) kills fleet children, `d`
+    detaches, anything else cancels; a typed-through message is restored to
+    the input (paste referents intact) instead of discarded. Ctrl+C now goes
+    through the same confirmation; a second Ctrl+C force-quits.
+  - `/checkpoint` records the message position and `/restore` branches back
+    to it (previously restored to the branch head — rolling back nothing);
+    repeat restores at the same position are a no-op, and an unreachable
+    position degrades to the branch head with an explicit note.
+  - Session switch fully resets TUI observability state (tree aggregator,
+    stream subscriptions, per-agent caches) — fleet subtrees no longer
+    freeze after `/session switch`.
+  - Memory: peek logs / transcripts / scrollback capped, and detached
+    renderables are `destroy()`ed so their native text buffers are actually
+    freed (the fleet view leaked one buffer per line per 500ms repaint).
+  - Agent-name resolution is exact (`shortAgentName`, fork `-d{depth}`
+    scheme included) instead of substring matching that cross-wired agents
+    with prefix-overlapping names; peek tails no longer clip the newest
+    lines; fleet-view kill/restart failures are surfaced; per-round context
+    size (`ctx:`) and session totals (`Σ`) are separate status segments;
+    synesthete summaries moved off the render path and back off 30s after
+    a failed call instead of retrying at 2 Hz.
+  - Smaller UX: peek works on finished subagents (final runtime shown),
+    fork `done` summaries always print a chat line, Esc/Ctrl+B work from
+    the fleet view, paste placeholders survive `]` in the pasted text,
+    `/help` documents `/find` and `/branchto`, `/clear` with arguments
+    clears.
+
+### Docs
+
+- Synced stale documentation with the current build: repos marked public
+  (AGENT-ONBOARDING), `forking-knowledge-miner` → `connectome-host`
+  naming, webui default port corrected to 7340, DEV-ENVIRONMENT
+  branch/version table refreshed (all feature branches merged),
+  LOCUS-ROUTING and both root plan docs marked implemented.
+
+### Changed
+
+- **Tool-bloat reduction**: subscription-gc's `set_channel_idle_limit` /
+  `list_channel_idle_limits` tools folded into `agent_settings` as the
+  `channel_idle_limits` field (per-entry merge; number / `"off"` /
+  `"default"`-or-null to clear), following the reasoning-controls
+  precedent. The old tool names remain routable (undeclared), so agent
+  muscle memory keeps working; agents just no longer carry the two extra
+  tool schemas. `get` also reports read-only `channel_idle_default`,
+  `channel_idle_counters`, and `channel_idle_pinned`, preserving what
+  `list_channel_idle_limits` exposed. Updates are all-or-nothing: a patch
+  with any invalid entry applies none of its entries.
+- **GC pins split from agent overrides**: ChannelModeModule now holds
+  debounced channels open via an internal `pin_channel_idle_limit` verb
+  and a separate pins layer, instead of writing an `"off"` override.
+  Consequences: a blanket `agent_settings reset` clears only agent-set
+  limits — it can no longer silently re-enable auto-close on a channel in
+  debounced mode — and a pre-existing agent override now survives a
+  debounced→mentions round-trip rather than being reset to default.
+  (Pins persisted by earlier builds as `"off"` overrides stay agent-level
+  until the next mode change re-asserts them as pins.)
 
 ## 0.3.10 — 2026-07-21
 

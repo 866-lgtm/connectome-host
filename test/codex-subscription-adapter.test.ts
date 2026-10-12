@@ -1,226 +1,169 @@
 import { afterEach, describe, expect, test } from 'bun:test';
-import type { ProviderRequest } from '@animalabs/membrane';
-import {
-  CodexSubscriptionAdapter,
-  type CodexAuthProvider,
-} from '../src/codex-subscription-adapter.js';
+import { OpenAIResponsesAPIAdapter, type ProviderRequest } from '@animalabs/membrane';
+import { CodexSubscriptionAdapter, codexGateAuth } from '../src/codex-subscription-adapter.js';
 
 const originalFetch = globalThis.fetch;
-
+const originalBaseURL = process.env.CODEX_BASE_URL;
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  if (originalBaseURL === undefined) delete process.env.CODEX_BASE_URL;
+  else process.env.CODEX_BASE_URL = originalBaseURL;
+});
+const request: ProviderRequest = { model: 'gpt-5.4', messages: [], maxTokens: 100 };
+const completed = () => new Response('data: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n');
+
+describe('Codex host integration', () => {
+  test('bridges token refresh and the refreshed account ID to Membrane', async () => {
+    const flags: boolean[] = [];
+    const headers: Headers[] = [];
+    let account = 'old-account';
+    globalThis.fetch = async (_url, init) => {
+      headers.push(new Headers(init?.headers));
+      return headers.length === 1 ? new Response('expired', { status: 401 }) : completed();
+    };
+    const adapter = new CodexSubscriptionAdapter({ authProvider: {
+      getAccessToken: async (forceRefresh = false) => {
+        flags.push(forceRefresh);
+        if (forceRefresh) account = 'new-account';
+        return forceRefresh ? 'fresh' : 'expired';
+      },
+      getAccountId: () => account,
+    } });
+    expect(adapter).toBeInstanceOf(OpenAIResponsesAPIAdapter);
+    expect(adapter.usageCacheConvention).toBe('cache-inclusive');
+    await adapter.complete(request);
+    expect(flags).toEqual([false, true]);
+    expect(headers[1]?.get('authorization')).toBe('Bearer fresh');
+    expect(headers[1]?.get('chatgpt-account-id')).toBe('new-account');
+  });
+
+  test('preserves CODEX_BASE_URL, Fast controls and auth disposal', async () => {
+    process.env.CODEX_BASE_URL = 'https://example.test/codex/';
+    const calls: Array<{ url: string; body: any }> = [];
+    let disposed = false;
+    globalThis.fetch = async (url, init) => {
+      calls.push({ url: String(url), body: JSON.parse(String(init?.body)) });
+      return completed();
+    };
+    const adapter = new CodexSubscriptionAdapter({ fastMode: true, authProvider: {
+      getAccessToken: async () => 'token', dispose: () => { disposed = true; },
+    } });
+    expect(adapter.isFastMode()).toBe(true);
+    await adapter.complete(request);
+    adapter.setFastMode(false);
+    await adapter.complete(request);
+    expect(calls[0]?.url).toBe('https://example.test/codex/responses');
+    expect(calls[0]?.body.service_tier).toBe('priority');
+    expect(calls[1]?.body.service_tier).toBeUndefined();
+    adapter.dispose();
+    expect(disposed).toBe(true);
+  });
+
+  test('a gate token authenticates to the gate, with no login and no account id', async () => {
+    expect(codexGateAuth({})).toBeUndefined();
+    expect(codexGateAuth({ CODEX_GATE_TOKEN: '  ' })).toBeUndefined();
+    expect(() => codexGateAuth({ CODEX_GATE_TOKEN: 'gt_x' })).toThrow(/CODEX_BASE_URL/);
+    process.env.CODEX_BASE_URL = 'https://gate.test/codex';
+    const auth = codexGateAuth({ CODEX_GATE_TOKEN: 'gt_devops', CODEX_BASE_URL: process.env.CODEX_BASE_URL })!;
+    const seen: Array<{ url: string; headers: Headers }> = [];
+    globalThis.fetch = async (url, init) => {
+      seen.push({ url: String(url), headers: new Headers(init?.headers) });
+      // the gate refreshed the login behind a 401; the single retry meets it
+      return seen.length === 1 ? new Response('expired', { status: 401 }) : completed();
+    };
+    const adapter = new CodexSubscriptionAdapter({ codexBinary: '/nonexistent/codex', authProvider: auth });
+    await adapter.complete(request);
+    expect(seen.map((c) => c.url)).toEqual(['https://gate.test/codex/responses', 'https://gate.test/codex/responses']);
+    expect(seen.every((c) => c.headers.get('authorization') === 'Bearer gt_devops')).toBe(true);
+    expect(seen[0]!.headers.get('chatgpt-account-id')).toBeNull();
+    expect(await adapter.readRateLimits()).toBeNull();
+    // Observe-only credential source: the gate holds the login, so no
+    // host-side refresh/login/paste is offered — a 401 is reported, not "fixed".
+    const source = adapter.credentialSource();
+    expect(source.provider).toBe('openai-codex via https://gate.test/codex');
+    expect(source.canRefresh()).toBe(false);
+    expect(source.refresh).toBeUndefined();
+    expect(source.login).toBeUndefined();
+    expect(source.setToken).toBeUndefined();
+    expect(source.probe).toBeUndefined();
+    adapter.dispose();
+  });
+
+  test('passes explicit endpoint configuration through the host wrapper', async () => {
+    process.env.CODEX_BASE_URL = 'https://unused.test';
+    let endpoint: string | undefined;
+    globalThis.fetch = async url => { endpoint = String(url); return completed(); };
+    await new CodexSubscriptionAdapter({ baseURL: 'https://explicit.test', authProvider: { getAccessToken: async () => 'token' } }).complete(request);
+    expect(endpoint).toBe('https://explicit.test/responses');
+  });
 });
 
-function request(extra: Record<string, unknown> = {}): ProviderRequest {
-  return {
-    model: 'gpt-5.4',
-    messages: [{ type: 'message', role: 'user', content: 'Hello' }],
-    maxTokens: 8192,
-    temperature: 0.2,
-    topP: 0.9,
-    topK: 20,
-    extra,
-  };
+for (const mode of ['subscription', 'api'] as const) {
+  for (const lane of ['complete', 'stream'] as const) {
+    test(`logging wrapper preserves disjoint Membrane usage (${mode}/${lane})`, async () => {
+      const { Membrane, OpenAIResponsesFormatter } = await import('@animalabs/membrane');
+      const { LoggingProviderAdapter } = await import('../src/logging-provider-wrapper.js');
+      const { mkdtempSync, readFileSync, rmSync } = await import('node:fs');
+      const { tmpdir } = await import('node:os');
+      const dir = mkdtempSync(`${tmpdir()}/codex-usage-`);
+      try {
+        const data = { status: 'completed', model: 'gpt-5.4', output: [
+          { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'hello' }] },
+        ], usage: { input_tokens: 100, output_tokens: 2, input_tokens_details: { cached_tokens: 80 } } };
+        globalThis.fetch = async (_url, init) => JSON.parse(String(init?.body)).stream
+          ? new Response(`data: ${JSON.stringify({ type: 'response.completed', response: data })}\n\n`)
+          : new Response(JSON.stringify(data));
+        const adapter = mode === 'subscription'
+          ? new CodexSubscriptionAdapter({ authProvider: { getAccessToken: async () => 'token' } })
+          : new OpenAIResponsesAPIAdapter({ apiKey: 'sk-fixture' });
+        const wrapped = new LoggingProviderAdapter(adapter, `${dir}/calls.jsonl`);
+        const membrane = new Membrane(wrapped, { formatter: new OpenAIResponsesFormatter() });
+        const normalized = { messages: [{ participant: 'user', content: [{ type: 'text' as const, text: 'hello' }] }], config: { model: 'gpt-5.4', maxTokens: 100 } };
+        const response = lane === 'complete' ? await membrane.complete(normalized) : await membrane.stream(normalized, { onChunk: () => {} });
+        // 2026-07-31 incident: adding cached tokens twice ratcheted calibration until the agent wedged.
+        expect(response.usage.inputTokens).toBe(20);
+        expect(response.usage.cacheReadTokens).toBe(80);
+        const log = JSON.parse(readFileSync(`${dir}/calls.jsonl`, 'utf8').trim());
+        expect(log.response.usage.inputTokens).toBe(100);
+        expect(log.response.usage.cacheConvention).toBe('cache-inclusive');
+        expect(log.provider).toBe(mode === 'subscription' ? 'openai-codex' : 'openai-responses-api');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
 }
 
-function completedResponse(): Response {
-  const item = {
-      type: 'message',
-      id: 'msg_test',
-      role: 'assistant',
-      content: [{ type: 'output_text', text: 'Hello back' }],
+test('wrapped subscription maintenance calls keep participant attribution', async () => {
+  const { Membrane, OpenAIResponsesFormatter, NativeFormatter } = await import('@animalabs/membrane');
+  const { LoggingProviderAdapter } = await import('../src/logging-provider-wrapper.js');
+  let input: unknown;
+  globalThis.fetch = async (_url, init) => { input = JSON.parse(String(init?.body)).input; return completed(); };
+  const adapter = new LoggingProviderAdapter(new CodexSubscriptionAdapter({ authProvider: { getAccessToken: async () => 't' } }), '/dev/null');
+  const membrane = new Membrane(adapter, { formatter: new OpenAIResponsesFormatter() });
+  await membrane.complete({ messages: [
+    { participant: 'Alice', content: [{ type: 'text', text: 'first' }] },
+    { participant: 'Bob', content: [{ type: 'text', text: 'second' }] },
+  ], config: { model: 'gpt-5.4', maxTokens: 100 } }, { formatter: new NativeFormatter({ participantMode: 'multiuser' }) });
+  expect(JSON.stringify(input)).toContain('Alice: first');
+  expect(JSON.stringify(input)).toContain('Bob: second');
+  expect(adapter.requiresNativeResponsesInput).toBe(false);
+});
+
+test('a forced refresh waits behind an ordinary acquisition rather than joining it', async () => {
+  const { CodexAppServerAuth } = await import('../src/codex-subscription-adapter.js');
+  const auth = new CodexAppServerAuth();
+  const flags: boolean[] = [];
+  let release!: (token: string) => void;
+  // Only the app-server exchange is stubbed; exercise real acquisition coordination.
+  (auth as any).authenticate = (refresh: boolean) => {
+    flags.push(refresh);
+    return refresh ? Promise.resolve('fresh') : new Promise<string>(resolve => { release = resolve; });
   };
-  const events = [
-    { type: 'response.output_item.done', output_index: 0, item },
-    {
-      type: 'response.completed',
-      response: {
-        id: 'resp_test',
-        model: 'gpt-5.4',
-        status: 'completed',
-        output: [],
-        usage: { input_tokens: 1, output_tokens: 2, total_tokens: 3 },
-      },
-    },
-  ];
-  return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''), {
-    headers: { 'Content-Type': 'text/event-stream' },
-  });
-}
-
-describe('CodexSubscriptionAdapter', () => {
-  test('uses the subscription endpoint and enables Fast mode per request', async () => {
-    const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
-    globalThis.fetch = async (input, init) => {
-      requests.push({
-        url: String(input),
-        headers: new Headers(init?.headers),
-        body: JSON.parse(String(init?.body)),
-      });
-      return completedResponse();
-    };
-    const auth: CodexAuthProvider = {
-      getAccessToken: async () => 'subscription-token',
-      getAccountId: () => 'account-test',
-    };
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: auth,
-      baseURL: 'https://example.test/backend-api/codex/',
-      fastMode: true,
-    });
-
-    const response = await adapter.complete(request({ max_output_tokens: 999 }));
-
-    expect(response.stopReason).toBe('end_turn');
-    expect((response.content as Array<{ text?: string }>)[0]?.text).toBe('Hello back');
-    expect(requests).toHaveLength(1);
-    expect(requests[0]?.url).toBe('https://example.test/backend-api/codex/responses');
-    expect(requests[0]?.headers.get('authorization')).toBe('Bearer subscription-token');
-    expect(requests[0]?.headers.get('chatgpt-account-id')).toBe('account-test');
-    expect(requests[0]?.body.service_tier).toBe('priority');
-    expect(requests[0]?.body.max_output_tokens).toBeUndefined();
-    expect(requests[0]?.body.temperature).toBeUndefined();
-    expect(requests[0]?.body.top_p).toBeUndefined();
-    expect(requests[0]?.body.input).toEqual([{
-      type: 'message',
-      role: 'user',
-      content: [{ type: 'input_text', text: 'Hello' }],
-    }]);
-  });
-
-  test('normalizes maintenance text, images, and tool blocks at the transport boundary', async () => {
-    let body: Record<string, any> = {};
-    globalThis.fetch = async (_input, init) => {
-      body = JSON.parse(String(init?.body));
-      return completedResponse();
-    };
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: { getAccessToken: async () => 'subscription-token' },
-      baseURL: 'https://example.test/codex',
-    });
-
-    await adapter.complete({
-      model: 'gpt-5.4',
-      messages: [
-        {
-          type: 'message', role: 'user', content: [
-            { type: 'text', text: 'inspect' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGVsbG8=' } },
-          ],
-        },
-        {
-          type: 'message', role: 'assistant', content: [
-            { type: 'tool_use', id: 'call_1', name: 'lookup', input: { q: 'x' } },
-          ],
-        },
-        {
-          type: 'message', role: 'user', content: [
-            { type: 'tool_result', tool_use_id: 'call_1', content: 'found' },
-          ],
-        },
-      ] as any,
-      maxTokens: 1024,
-    });
-
-    expect(body.input).toEqual([
-      {
-        type: 'message', role: 'user', content: [
-          { type: 'input_text', text: 'inspect' },
-          { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
-        ],
-      },
-      { type: 'function_call', call_id: 'call_1', name: 'lookup', arguments: '{"q":"x"}' },
-      { type: 'function_call_output', call_id: 'call_1', output: 'found' },
-    ]);
-  });
-
-  test('turns Fast mode off without reconstructing the adapter', async () => {
-    const bodies: Record<string, unknown>[] = [];
-    globalThis.fetch = async (_input, init) => {
-      bodies.push(JSON.parse(String(init?.body)));
-      return completedResponse();
-    };
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: { getAccessToken: async () => 'subscription-token' },
-      baseURL: 'https://example.test/codex',
-      fastMode: true,
-    });
-
-    await adapter.complete(request());
-    adapter.setFastMode(false);
-    await adapter.complete(request({ service_tier: 'priority' }));
-
-    expect(bodies[0]?.service_tier).toBe('priority');
-    expect(bodies[1]?.service_tier).toBeUndefined();
-  });
-
-  test('refreshes the ChatGPT token once after a 401', async () => {
-    const refreshFlags: boolean[] = [];
-    let calls = 0;
-    globalThis.fetch = async () => {
-      calls += 1;
-      if (calls === 1) return new Response('expired', { status: 401 });
-      return completedResponse();
-    };
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: {
-        getAccessToken: async (forceRefresh = false) => {
-          refreshFlags.push(forceRefresh);
-          return forceRefresh ? 'fresh-token' : 'expired-token';
-        },
-      },
-      baseURL: 'https://example.test/codex',
-    });
-
-    await adapter.complete(request());
-
-    expect(calls).toBe(2);
-    expect(refreshFlags).toEqual([false, true]);
-  });
-
-  test('reconstructs tool calls when the terminal event has an empty output', async () => {
-    const item = {
-      type: 'function_call',
-      id: 'fc_test',
-      call_id: 'call_test',
-      name: 'lookup',
-      arguments: '{"query":"connectome"}',
-    };
-    globalThis.fetch = async () => new Response([
-      `data: ${JSON.stringify({ type: 'response.output_item.done', output_index: 0, item })}\n\n`,
-      `data: ${JSON.stringify({
-        type: 'response.completed',
-        response: {
-          model: 'gpt-5.4', status: 'completed', output: [],
-          usage: { input_tokens: 2, output_tokens: 3 },
-        },
-      })}\n\n`,
-    ].join(''), { headers: { 'Content-Type': 'text/event-stream' } });
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: { getAccessToken: async () => 'subscription-token' },
-      baseURL: 'https://example.test/codex',
-    });
-
-    const response = await adapter.complete(request());
-
-    expect(response.stopReason).toBe('tool_use');
-    expect(response.content).toEqual([expect.objectContaining({
-      type: 'tool_use', id: 'call_test', name: 'lookup', input: { query: 'connectome' },
-    })]);
-  });
-
-  test('surfaces nested SSE error details', async () => {
-    globalThis.fetch = async () => new Response(
-      'data: {"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"input is too large"}}\n\n',
-      { headers: { 'Content-Type': 'text/event-stream' } },
-    );
-    const adapter = new CodexSubscriptionAdapter({
-      authProvider: { getAccessToken: async () => 'subscription-token' },
-      baseURL: 'https://example.test/codex',
-    });
-
-    await expect(adapter.complete(request())).rejects.toThrow(
-      /context_length_exceeded.*input is too large/,
-    );
-  });
+  const ordinary = auth.getAccessToken(false);
+  const forced = auth.getAccessToken(true);
+  const secondForced = auth.getAccessToken(true);
+  release('stale');
+  expect(await ordinary).toBe('stale');
+  expect(await forced).toBe('fresh');
+  expect(await secondForced).toBe('fresh');
+  expect(flags).toEqual([false, true]);
 });

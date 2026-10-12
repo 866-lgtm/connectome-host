@@ -9,8 +9,12 @@
  * audited path. Read-only for key-authenticated observers.
  */
 
-import { createMemo, For, Show } from 'solid-js';
-import type { BranchRow } from '@conhost/web/protocol';
+import { createMemo, createSignal, For, Show } from 'solid-js';
+import type { BranchRow, OperatorLogEntryWire } from '@conhost/web/protocol';
+import { OperatorLogList } from './Surgery';
+import { BranchGraph } from './BranchGraph';
+import { BranchTimeline } from './BranchTimeline';
+import { ConversationGraphPanel, type ConversationGraphNode } from './ConversationGraph';
 
 interface TreeRow {
   branch: BranchRow;
@@ -64,17 +68,72 @@ export function BranchPanel(props: {
   /** True for key-authenticated observers — checkout affordances hidden. */
   readOnly: boolean;
   onCheckout(name: string): void;
+  /** Checkout a branch and navigate to its branch-point message. */
+  onNavigateToBranch?(branchId: string, branchName: string): void;
   onRefresh(): void;
+  conversationNodes: ConversationGraphNode[];
+  onRefreshConversation(): void;
   onClose(): void;
+  /** Durable operator-actions record; null when the host does not keep one. */
+  operatorLog?: OperatorLogEntryWire[] | null;
+  operatorLogPath?: string;
+  operatorLogLoading?: boolean;
+  onRefreshLog?(): void;
 }) {
   const rows = createMemo(() => toTreeRows(props.branches));
+  const [view, setView] = createSignal<'graph' | 'timeline' | 'list' | 'conversation'>('graph');
+  /** Branch names created by live surgery / undo carry their purpose as a prefix. */
+  const kindOf = (name: string): string | null => {
+    const prefix = name.split('/')[0];
+    return prefix === 'rollback' || prefix === 'suppress' || prefix === 'undo' || prefix === 'undo-msgs'
+      || prefix === 'recovery' || prefix === 'surgery' || prefix === 'treatment' ? prefix : null;
+  };
 
-  return (
+  return view() === 'conversation' ? (
+    <ConversationGraphPanel nodes={props.conversationNodes} currentId={props.currentId} onClose={props.onClose} />
+  ) : view() === 'graph' ? (
+    <BranchGraph
+      branches={props.branches}
+      currentId={props.currentId}
+      readOnly={props.readOnly}
+      onCheckout={props.onCheckout}
+      onNavigateToBranch={props.onNavigateToBranch}
+      onShowList={() => setView('list')}
+      onShowTimeline={() => setView('timeline')}
+      onShowConversation={() => { setView('conversation'); props.onRefreshConversation(); }}
+      onClose={props.onClose}
+    />
+  ) : view() === 'timeline' ? (
+    <BranchTimeline
+      branches={props.branches}
+      currentId={props.currentId}
+      readOnly={props.readOnly}
+      onCheckout={props.onCheckout}
+      onShowList={() => setView('list')}
+      onShowGraph={() => setView('graph')}
+      onShowConversation={() => { setView('conversation'); props.onRefreshConversation(); }}
+      onClose={props.onClose}
+    />
+  ) : (
     <div class="border-l border-neutral-800 w-96 shrink-0 bg-neutral-950 flex flex-col h-full">
       <div class="border-b border-neutral-800 px-3 py-2 flex items-center gap-2">
         <span class="text-[10px] uppercase tracking-wider text-neutral-500 font-semibold">branches</span>
         <span class="text-neutral-500 text-xs">{props.branches.length || ''}</span>
         <div class="ml-auto flex gap-1">
+          <button
+            type="button"
+            class="px-2 py-0.5 bg-cyan-950/50 hover:bg-cyan-900/50 text-cyan-300 rounded text-xs"
+            onClick={() => setView('graph')}
+          >
+            graph
+          </button>
+          <button
+            type="button"
+            class="px-2 py-0.5 bg-fuchsia-950/50 hover:bg-fuchsia-900/50 text-fuchsia-300 rounded text-xs"
+            onClick={() => { setView('conversation'); props.onRefreshConversation(); }}
+          >
+            conversation
+          </button>
           {/* Not disabled while loading: a server-side listing error leaves
               `loading` latched, and re-clicking is the recovery path. */}
           <button
@@ -122,6 +181,9 @@ export function BranchPanel(props: {
                 <Show when={b.branchPoint !== undefined}>
                   <span class="text-neutral-600 shrink-0">@{b.branchPoint}</span>
                 </Show>
+                <Show when={kindOf(b.name)}>
+                  <span class={`shrink-0 text-[9px] uppercase tracking-wider ${kindOf(b.name) === 'suppress' ? 'text-rose-400/80' : 'text-amber-400/80'}`}>{kindOf(b.name)}</span>
+                </Show>
                 <span class="ml-auto shrink-0 text-neutral-600">{fmtDate(b.created)}</span>
                 <Show when={current()}>
                   <span class="shrink-0 text-[10px] uppercase tracking-wider text-cyan-400">current</span>
@@ -142,8 +204,17 @@ export function BranchPanel(props: {
         </Show>
         <div class="mt-3 px-1 text-neutral-600 leading-relaxed">
           Branches fork from <span class="text-neutral-500">@sequence</span> in their parent.
-          /undo, /checkpoint and /branchto create them; checkout switches the live context.
+          /undo, /checkpoint, /branchto and live rollback/suppress create them; checkout switches the live context.
+          To undo a rollback or suppression, checkout its parent.
         </div>
+        <Show when={props.operatorLog}>
+          <OperatorLogList
+            entries={props.operatorLog!}
+            path={props.operatorLogPath}
+            loading={props.operatorLogLoading ?? false}
+            onRefresh={() => props.onRefreshLog?.()}
+          />
+        </Show>
       </div>
     </div>
   );

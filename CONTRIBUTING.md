@@ -43,7 +43,7 @@ plus, when applicable, **Not verified**, **Out of scope**, and
 - **Tests accompany behavior changes.** Review scrutinizes test substance,
   not mere presence — a test that can't fail on the unfixed code will be
   called out.
-- **Changelog entry** under `## Unreleased` for anything behavior-affecting
+- **Changelog fragment** in `changelog.d/` for anything behavior-affecting
   (see below).
 
 Conventional-commit-style titles (`feat(recipe): …`, `fix(subagent): …`) are
@@ -80,33 +80,61 @@ that don't fail on unfixed code, or with claims the branch itself disproves.
 
 ## Changelog
 
-`CHANGELOG.md` keeps a standing `## Unreleased` section with
-`### Breaking` / `### Added` / `### Changed` / `### Fixed` subsections
-(loosely [Keep a Changelog](https://keepachangelog.com/)).
+Changelog entries land as **fragment files** in
+[`changelog.d/`](changelog.d/) — one file per change — and are folded into
+`CHANGELOG.md` (loosely [Keep a Changelog](https://keepachangelog.com/)) at
+release time. One file per change is what keeps concurrent work from
+conflicting: when every PR edited the same `## Unreleased` section, any PR
+that outlived another merge hit a conflict in `CHANGELOG.md`; distinct files
+never do.
 
-- **The entry lands with the change** — same commit, or at least the same
+- **Format:** `changelog.d/<slug>.<breaking|added|changed|fixed>.md`, a flat
+  file directly in `changelog.d/`, containing one or more markdown bullets
+  (`- …`) written exactly as they should appear in `CHANGELOG.md`:
+  continuation lines indent two spaces, nested bullets are fine, headings
+  and horizontal rules are refused (even indented — a heading inside a
+  fragment would corrupt the section structure). The slug just has to be
+  unique among pending fragments and filesystem-safe — the PR number works,
+  and so does the branch name with `/` replaced by `-`
+  (`100-prose-routing.added.md`, `fix-retry-backoff.fixed.md`). The release
+  script scans the directory fail-closed: a subdirectory, an unrecognized
+  category suffix, or any other stray file aborts the release rather than
+  silently stranding an entry.
+
+- **The fragment lands with the change** — same commit, or at least the same
   PR. This binds direct pushes to `main` just as much as PRs. On PRs, CI
-  enforces it softly: touching `src/` without touching `CHANGELOG.md` fails
-  the `changelog` check unless the `no-changelog` label is applied.
+  enforces it softly: touching `src/` without adding a fragment (or editing
+  `CHANGELOG.md`) fails the `changelog` check unless the `no-changelog`
+  label is applied.
 - **What needs an entry:** anything an operator, recipe author, or module
   developer would notice — behavior, config/recipe schema, CLI, tool
   surfaces, defaults. Internal refactors, test-only, and docs-only changes
   don't.
-- **Breaking entries are audience-scoped.** Name the audience in the heading
-  (`### Breaking (recipe authors only)`) and cover: **who needs to act**,
+- **Breaking entries are audience-scoped.** Open the bullet by naming who
+  needs to act (`- **Recipe authors:** …`) and cover: **who needs to act**,
   **migration**, and **unchanged** (what readers might fear broke but
   didn't). The fleet recipe-path entry in `CHANGELOG.md` is the canonical
   example of the format.
+- **Editing `## Unreleased` in `CHANGELOG.md` directly still works** and is
+  merged with the fragments at release time — it remains the right place to
+  restructure pending entries, and the escape hatch for anything the
+  fragment format can't express (e.g. an audience-qualified
+  `### Breaking (recipe authors only)` heading, which `breaking` fragments
+  will then join). Keep one `## Unreleased` heading — the release script
+  refuses more than one, since only the first is ever cut.
 - **Releases** (maintainers): `npm version <patch|minor|major>` does the
-  whole cut — the `version` hook retitles `Unreleased` to
-  `## X.Y.Z — YYYY-MM-DD` (keeping a fresh `Unreleased` above it, and
-  refusing to release when there are no entries), then npm commits and tags.
-  `git push --follow-tags` triggers CI, which refuses a tag with no matching
-  changelog section, publishes `@animalabs/connectome-host` to npm, and
-  creates the GitHub release with that section as its notes. The two release
-  jobs are independent: some consumers run github-clone checkouts, so
-  release notes must exist even when npm publish fails. Version bumps are a
-  maintainer release-time action, not part of feature PRs.
+  whole cut — the `version` hook folds the pending fragments plus any
+  entries filed directly under `Unreleased` into `## X.Y.Z — YYYY-MM-DD`
+  (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
+  `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
+  `Unreleased` above, and refuses to release when there is nothing to
+  release; npm then commits and tags. `git push --follow-tags` triggers CI,
+  which refuses a tag with no matching changelog section, publishes
+  `@animalabs/connectome-host` to npm, and creates the GitHub release with
+  that section as its notes. The two release jobs are independent: some
+  consumers run github-clone checkouts, so release notes must exist even
+  when npm publish fails. Version bumps are a maintainer release-time
+  action, not part of feature PRs.
 
 ## Building and testing
 
@@ -117,10 +145,15 @@ bunx tsc --noEmit   # typecheck
 bun src/index.ts    # run (generic assistant)
 ```
 
-Push-time CI (`ci.yml`) builds and tests every push and PR on ubuntu and
-macos, installing the web app with a strict lockfile (`npm ci`) — if you
-touched `web/` dependencies, regenerate the lock with `npm run relock:web`
-so it carries both platforms' native binaries.
+CI (`ci.yml`) runs on every pull request and every push to `main`, on ubuntu
+and macOS. Both install the web app with a strict lockfile (`npm ci`) and
+build it; the test suite runs on ubuntu only. If you touched `web/`
+dependencies, regenerate the npm lock with `npm run relock:web`, so it
+carries both platforms' native binaries. It resolves every web dependency
+afresh, so review the lock's diff. Then regenerate `web/bun.lock` from it:
+delete `web/bun.lock` and run `bun install --lockfile-only` in `web/`, which
+builds Bun's lock from the npm lock, so both pin the same versions.
 
-See `docs/DEV-ENVIRONMENT.md` for the full dev setup and `docs/` generally
-for architecture and operations guides.
+See `docs/DEV-ENVIRONMENT.md` for the full dev setup, `ARCHITECTURE.md` for
+how the host is built, and `docs/README.md` for the index of operations and
+workflow guides.

@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, onCleanup, onMount, Show } from 'solid-js';
+import { createMemo, createSignal, For, onCleanup, onMount, Show, type JSX } from 'solid-js';
 import { createStore, produce } from 'solid-js/store';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
@@ -9,13 +9,21 @@ import { TreeSidebar } from './TreeSidebar';
 import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
 import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
-import { McplPanel, type McplServerRow } from './Mcpl';
+import { McplPanel, type McplServerRow, type McplLiveRow, type ToolClassRow } from './Mcpl';
+import { SettingsPanel, type SettingsState } from './Settings';
+import { DryContext, type DryContextData } from './DryContext';
+import { PinsPanel, type PinsState, type PinCandidate } from './Pins';
 import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewer } from './Files';
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
 import { ObserverGateScreen } from './ObserverGate';
-import { OpsAlertStrip, HealthPanel, type OpsAlert, type HealthSnapshot } from './Health';
+import {
+  OpsAlertStrip, HealthPanel, CREDENTIAL_ALERT_KINDS,
+  type OpsAlert, type HealthSnapshot, type CredentialInfo, type CredentialAction,
+} from './Health';
 import { BranchPanel } from './Branches';
+import { ConversationGraphPanel } from './ConversationGraph';
+import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
 import {
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
@@ -24,10 +32,22 @@ import {
   type HistoryPageMessage,
   type MessageBlock,
   type TokenUsage,
+  type QuotaSnapshotData,
   type PerAgentCost,
   type CallLedgerSnapshot,
   type BranchRow,
+  type HostModeSnapshot,
+  type SurgeryResultMessage,
+  type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
+import {
+  Lightbox,
+  MediaView,
+  HostModeToggle,
+  SurgeryDialog,
+  SelectionBar,
+  type SurgeryRequest,
+} from './Surgery';
 
 /** Client-side block: the wire MessageBlock plus live-stream bookkeeping. */
 type UiBlock =
@@ -41,7 +61,7 @@ type UiBlock =
       durationMs?: number;
     }
   | { kind: 'tool_result'; toolUseId: string; text: string; isError?: boolean; truncated?: boolean }
-  | { kind: 'media'; mediaType: string }
+  | { kind: 'media'; mediaType: string; ref?: string }
   /** Client-only: a tool call being written live (raw partial JSON from
    *  blockType 'tool_call' token deltas). Replaced by the parsed tool_use
    *  blocks when inference:tool_calls_yielded lands. */
@@ -49,6 +69,9 @@ type UiBlock =
 
 interface Message {
   id: string;
+  /** Chronicle store id — present only for canonical (server-sourced)
+   *  messages; the target of rollback / suppress. */
+  storeId?: string;
   participant: 'user' | 'assistant' | 'system' | 'tool' | 'command' | 'trigger';
   text: string;
   /** Ordered content blocks — present on server-sourced and streamed
@@ -56,6 +79,9 @@ interface Message {
   blocks?: UiBlock[];
   /** Store slot index (paging cursor); absent on synthetic messages. */
   index?: number;
+  /** Sequence number within the branch — used as scroll anchor for
+   *  branch-point navigation from the graph/timeline views. */
+  seq?: number;
   /** Epoch millis. Server value for canonical entries; client clock for
    *  optimistic/streamed rows until the canonical entry replaces them. */
   timestamp?: number;
@@ -81,11 +107,13 @@ const streamLineId = (): number => ++streamIdSeq;
 function entryToMessage(e: WelcomeMessageEntry): Message {
   return {
     id: e.id ?? nextMessageId(),
+    ...(e.id ? { storeId: e.id } : {}),
     participant: e.participant,
     text: e.text,
     blocks: (e.blocks ?? []) as UiBlock[],
     index: e.index,
     timestamp: e.timestamp,
+    seq: e.seq,
   };
 }
 
@@ -113,6 +141,9 @@ export function App() {
   /** session.id + '/' + branch.id of the last welcome; same key → soft
    *  merge (keep paged-in scrollback), changed key → hard reset. */
   let welcomeKey: string | null = null;
+  /** session.id of the last welcome, to tell a session switch apart from a
+   *  first connect or a reconnect. */
+  let welcomeSessionId: string | null = null;
   /** Whether the operator is pinned to the bottom of the scroll pane.
    *  Autoscroll only fires when true, so reading history isn't yanked. */
   let atBottom = true;
@@ -120,6 +151,7 @@ export function App() {
   let pendingHistoryCorr: string | null = null;
   let pendingHistoryTimer: number | undefined;
   const [usage, setUsage] = createSignal<TokenUsage>({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
+  const quota = createQuotaPoll();
   const [perAgentCost, setPerAgentCost] = createSignal<PerAgentCost[]>([]);
   const [callLedger, setCallLedger] = createSignal<CallLedgerSnapshot | null>(null);
   const [draft, setDraft] = createSignal('');
@@ -130,6 +162,14 @@ export function App() {
   type PanelMode = 'stream' | 'usage' | 'branches';
   const [focusedId, setFocusedId] = createSignal<string | null>(null);
   const [focusedNode, setFocusedNode] = createSignal<UiNode | null>(null);
+  /** The usage panel follows the focused node, and a fleet child answers for
+   *  its own credential: a pay-per-token child under a subscription parent
+   *  keeps its dollars. (The header stays the parent's readout.) */
+  const usageQuotaScope = (): string | null => {
+    const src = focusedNode()?.streamSource;
+    return src && (src.kind === 'child-event-all' || src.kind === 'child-event-agent') ? src.childName : null;
+  };
+  const focusedQuota = createQuotaPoll(usageQuotaScope);
   const [panelMode, setPanelMode] = createSignal<PanelMode | null>(null);
   const [streamLines, setStreamLines] = createSignal<StreamLine[]>([]);
   /** Default-collapsed; the parent root and freshly-spawned fleet children
@@ -152,7 +192,7 @@ export function App() {
   const alertList = createMemo(() =>
     [...opsAlerts().values()].sort((a, b) => b.at - a.at));
 
-  const upsertOpsAlert = (kind: string, agent: string, message: string, bump = true): void => {
+  const upsertOpsAlert = (kind: string, agent: string, message: string, bump = true, actions?: CredentialAction[]): void => {
     const key = `${agent}:${kind}`;
     setOpsAlerts((prev) => {
       const next = new Map(prev);
@@ -164,6 +204,10 @@ export function App() {
         message,
         at: Date.now(),
         count: existing ? existing.count + (bump ? 1 : 0) : 1,
+        // The strip is a host-level (local) surface: its actions always
+        // target the local process, whatever the sidebar is inspecting.
+        scope: 'local',
+        ...(actions ? { actions } : existing?.actions ? { actions: existing.actions } : {}),
       });
       return next;
     });
@@ -188,7 +232,75 @@ export function App() {
       removeOpsAlert(`${agent}:${kind.slice(0, -'-clear'.length)}`);
       return;
     }
-    upsertOpsAlert(kind, agent, message);
+    upsertOpsAlert(kind, agent, message, true, readActions((e.data as { actions?: unknown } | undefined)?.actions));
+  };
+
+  /** `data.actions` on a credential alert, defensively typed. */
+  const readActions = (raw: unknown): CredentialAction[] | undefined => {
+    if (!Array.isArray(raw)) return undefined;
+    const out: CredentialAction[] = [];
+    for (const a of raw) {
+      const id = (a as { id?: unknown })?.id;
+      const label = (a as { label?: unknown })?.label;
+      if (typeof id !== 'string' || typeof label !== 'string') continue;
+      const hint = (a as { hint?: unknown })?.hint;
+      out.push({ id, label, ...(typeof hint === 'string' ? { hint } : {}) });
+    }
+    return out.length > 0 ? out : undefined;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Credential state — the host's one named verdict on its provider
+  // credential (spent quota, expired token, pending login) and the actions
+  // it can run. Arrives as `credential-state` frames (after an action) and
+  // inside /healthz; both reconcile the alert strip so a page opened
+  // mid-incident alarms with its buttons.
+  // ---------------------------------------------------------------------------
+  /** Last credential-state frame, tagged with the process it describes; the
+   *  Health tab uses it only while inspecting that same scope. */
+  const [credentialState, setCredentialState] = createSignal<{ scope: string; info: CredentialInfo } | null>(null);
+  const credentialForScope = (): CredentialInfo | null => {
+    const c = credentialState();
+    return c && c.scope === panelScope() ? c.info : null;
+  };
+
+  /** Bumped by every credential-state FRAME (an action's answer); a health
+   *  read that started before the latest frame must not replace it. */
+  let credentialFrameSeq = 0;
+  const applyCredentialState = (c: CredentialInfo | undefined, scope: string, from: 'frame' | 'health' = 'frame'): void => {
+    if (!c || c.subscription === false) return;
+    if (from === 'frame') credentialFrameSeq++;
+    setCredentialState({ scope, info: c });
+    // The alert strip is local-only; a child's state must not key into it.
+    if (scope !== 'local') return;
+    const agent = c.agent ?? '?';
+    const kind = c.kind ?? 'ok';
+    for (const k of CREDENTIAL_ALERT_KINDS) {
+      const key = `${agent}:${k}`;
+      if (k === kind) {
+        if (opsAlerts().get(key)?.message !== c.message) {
+          upsertOpsAlert(kind, agent, c.message ?? kind, false, c.actions);
+        }
+      } else {
+        removeOpsAlert(key);
+      }
+    }
+  };
+
+  /** A button on an alert row / the Health tab. `scope` is the process the
+   *  button belongs to (the alert's, or the Health tab's), never inferred.
+   *  `set-token` asks for the paste here; the token goes to the host once
+   *  and is never echoed. */
+  const runCredentialAction = (actionId: string, scope: string): void => {
+    if (actionId === 'set-token') {
+      const who = scope === 'local' ? 'this host' : `fleet child "${scope}"`;
+      const token = window.prompt(`Paste the replacement token for ${who} (kept in memory; written to the credentials file only when that process loaded one):`);
+      if (!token || !token.trim()) return;
+      wire.send({ type: 'credential-action', scope, action: 'set-token', token: token.trim() });
+      return;
+    }
+    if (actionId !== 'refresh' && actionId !== 'login' && actionId !== 'recheck') return;
+    wire.send({ type: 'credential-action', scope, action: actionId });
   };
 
   /** /healthz snapshot — feeds the Health tab and reconciles durable-state
@@ -199,6 +311,7 @@ export function App() {
   let healthDenied = false;
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
+    applyCredentialState(h.credential, 'local');
     const quarantine = h.compressionQuarantine ?? {};
     for (const [agent, q] of Object.entries(quarantine)) {
       const key = `${agent}:compression-quarantine`;
@@ -231,27 +344,54 @@ export function App() {
   };
 
   /** `force` retries past a remembered 401/403 — the operator's grant may
-   *  have gained the 'health' scope since the poll gave up. */
+   *  have gained the 'health' scope since the poll gave up. Follows the
+   *  inspection scope: a fleet child's /healthz is proxied over the panel
+   *  IPC by the host. Alert reconciliation stays LOCAL-only — the strip is
+   *  a host-level surface, and child agent names could collide with the
+   *  parent's alert keys. */
   const loadHealth = async (force = false): Promise<void> => {
     if (healthDenied && !force) return;
     if (force) healthDenied = false;
+    const scope = panelScope();
+    const frameSeqAtStart = credentialFrameSeq;
     try {
-      const res = await fetch('/healthz', { credentials: 'same-origin' });
+      const res = await fetch(`/healthz${scopeQuery()}`, { credentials: 'same-origin' });
       if (!res.ok) {
         if (res.status === 403 || res.status === 401) {
           healthDenied = true;
           setHealthErr('403');
           return;
         }
-        throw new Error(`HTTP ${res.status}`);
+        const body = (await res.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `HTTP ${res.status}`);
       }
       const h = (await res.json()) as HealthSnapshot;
+      if (scope !== panelScope()) return; // scope switched mid-flight — stale
       setHealth(h);
       setHealthErr(null);
-      reconcileHealthAlerts(h);
+      if (scope === 'local') reconcileHealthAlerts(h);
+      // A child's health read is the freshest word on its credential: it
+      // must replace the frame saved from an earlier child action, or the
+      // Health tab keeps the old state and buttons (an API-key parent's own
+      // polls carry no credential block to displace it) — unless a newer
+      // frame arrived while this read was in flight.
+      else if (h.credential && credentialFrameSeq === frameSeqAtStart) applyCredentialState(h.credential, scope, 'health');
     } catch (e) {
+      if (scope !== panelScope()) return;
       setHealthErr(e instanceof Error ? e.message : String(e));
     }
+  };
+
+  /** Local-alert reconciliation when the panel scope is parked on a child:
+   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  and must keep reconciling regardless of what the Health tab inspects. */
+  const reconcileLocalAlerts = async (): Promise<void> => {
+    if (healthDenied) return;
+    try {
+      const res = await fetch('/healthz', { credentials: 'same-origin' });
+      if (!res.ok) return; // auth handling lives on the loadHealth path
+      reconcileHealthAlerts((await res.json()) as HealthSnapshot);
+    } catch { /* transient — next tick retries */ }
   };
 
   // ---------------------------------------------------------------------------
@@ -261,27 +401,174 @@ export function App() {
   const [branches, setBranches] = createSignal<BranchRow[]>([]);
   const [branchesCurrentId, setBranchesCurrentId] = createSignal<string | null>(null);
   const [branchesLoading, setBranchesLoading] = createSignal(false);
+  const [conversationGraph, setConversationGraph] = createSignal<import('./ConversationGraph').ConversationGraphNode[]>([]);
 
   const refreshBranches = (): void => {
     setBranchesLoading(true);
     wire.send({ type: 'request-branches' });
   };
 
+  const refreshConversationGraph = (): void => {
+    wire.send({ type: 'request-conversation-graph' });
+  };
+
   const checkoutBranch = (name: string): void => {
     wire.send({ type: 'command', command: `/checkout ${name}` });
   };
 
+  // ---------------------------------------------------------------------------
+  // Live surgery (rollback / suppress), host quiesce, operator log. Every
+  // affordance is gated on `welcome.features` so an older host shows nothing.
+  // ---------------------------------------------------------------------------
+
+  const features = (): Set<string> => new Set(welcome()?.features ?? []);
+  const isObserver = (): boolean => wire.observerState() === 'observer';
+  const canRollback = (): boolean => features().has('rollback') && !isObserver();
+  const canSuppress = (): boolean => features().has('suppress') && !isObserver();
+  const canQuiesce = (): boolean => features().has('quiesce') && !isObserver();
+
+  const [hostMode, setHostMode] = createSignal<HostModeSnapshot | null>(null);
+  const [hostModeBusy, setHostModeBusy] = createSignal(false);
+  const [surgery, setSurgery] = createSignal<SurgeryRequest | null>(null);
+  const [surgeryPending, setSurgeryPending] = createSignal(false);
+  const [surgeryResult, setSurgeryResult] = createSignal<SurgeryResultMessage | null>(null);
+  /** Set when the operator chose "quiesce, then retry": the pending surgery
+   *  is resent as soon as the host reports `quiesced`. */
+  let retryAfterQuiesce: { note: string } | null = null;
+  const [selecting, setSelecting] = createSignal(false);
+  const [selected, setSelected] = createSignal<Set<string>>(new Set());
+  const [opLog, setOpLog] = createSignal<OperatorLogEntryWire[]>([]);
+  const [opLogPath, setOpLogPath] = createSignal<string | undefined>(undefined);
+  const [opLogLoading, setOpLogLoading] = createSignal(false);
+
+  const previewOf = (m: Message): string => {
+    const who = m.participant === 'assistant' ? (welcome()?.agents[0]?.name ?? 'assistant') : m.participant;
+    const body = (m.text || (m.blocks ?? []).map((b) => b.kind === 'tool_use' ? `⚙ ${b.name}` : b.kind === 'media' ? `📎 ${b.mediaType}` : '').filter(Boolean).join(' ')).replace(/\s+/g, ' ').trim();
+    return `${who}: ${body.slice(0, 90)}${body.length > 90 ? '…' : ''}`;
+  };
+
+  /** Rollback so `storeId` becomes the tail. `preview` is used when the
+   *  message is not in the loaded chat window (context-document boxes). */
+  const beginRollback = (storeId: string, preview?: string): void => {
+    if (!canRollback()) return;
+    const idx = messages.findIndex((m) => m.storeId === storeId);
+    const after = idx >= 0 ? messages.slice(idx + 1).filter((m) => m.storeId) : [];
+    setSurgeryResult(null);
+    setSurgery({
+      op: 'rollback',
+      messageIds: [storeId],
+      previews: [
+        `new tail → ${idx >= 0 ? previewOf(messages[idx]) : (preview ?? storeId)}`,
+        ...after.slice(0, 12).map((m) => `leaves: ${previewOf(m)}`),
+        ...(after.length > 12 ? [`… and ${after.length - 12} more`] : []),
+      ],
+      ...(idx >= 0 ? { affected: after.length } : {}),
+    });
+  };
+
+  const toggleSelected = (storeId: string): void => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(storeId)) next.delete(storeId); else next.add(storeId);
+      return next;
+    });
+  };
+  const clearSelection = (): void => { setSelected(new Set<string>()); setSelecting(false); };
+  const startSelecting = (storeId?: string): void => {
+    if (!canSuppress()) return;
+    setSelecting(true);
+    if (storeId) setSelected((prev) => new Set(prev).add(storeId));
+  };
+  const beginSuppressSelected = (): void => {
+    const ids = [...selected()];
+    if (ids.length === 0) return;
+    const byId = new Map(messages.filter((m) => m.storeId).map((m) => [m.storeId!, m]));
+    setSurgeryResult(null);
+    setSurgery({
+      op: 'suppress',
+      messageIds: ids,
+      previews: ids.map((id) => { const m = byId.get(id); return m ? previewOf(m) : id; }),
+    });
+  };
+
+  const sendSurgery = (req: SurgeryRequest, note: string): void => {
+    setSurgeryPending(true);
+    const corrId = `srg-${Date.now()}`;
+    if (req.op === 'rollback') {
+      wire.send({ type: 'rollback', messageId: req.messageIds[0], ...(note ? { note } : {}), corrId });
+    } else {
+      wire.send({ type: 'suppress', messageIds: req.messageIds, ...(note ? { note } : {}), corrId });
+    }
+  };
+  const confirmSurgery = (note: string): void => {
+    const req = surgery();
+    if (req) sendSurgery(req, note);
+  };
+  const quiesceHost = (reason: string): void => {
+    if (!canQuiesce()) return;
+    setHostModeBusy(true);
+    wire.send({ type: 'host-quiesce', ...(reason.trim() ? { reason: reason.trim() } : {}) });
+  };
+  const resumeHost = (): void => {
+    if (!canQuiesce()) return;
+    setHostModeBusy(true);
+    wire.send({ type: 'host-resume' });
+  };
+  const quiesceAndRetry = (note: string): void => {
+    retryAfterQuiesce = { note };
+    setSurgeryResult(null);
+    setSurgeryPending(true);
+    quiesceHost(note || `${surgery()?.op ?? 'surgery'} via webui`);
+  };
+  const onHostMode = (hm: HostModeSnapshot): void => {
+    setHostMode(hm);
+    setHostModeBusy(false);
+    if (retryAfterQuiesce && hm.mode === 'quiesced') {
+      const req = surgery();
+      const { note } = retryAfterQuiesce;
+      retryAfterQuiesce = null;
+      if (req) sendSurgery(req, note); else setSurgeryPending(false);
+    } else if (retryAfterQuiesce && hm.mode !== 'quiescing') {
+      // Quiesce did not land (error frame arrives separately) — stop waiting.
+      retryAfterQuiesce = null;
+      setSurgeryPending(false);
+    }
+  };
+  const onSurgeryResult = (r: SurgeryResultMessage): void => {
+    setSurgeryPending(false);
+    setSurgeryResult(r);
+    if (r.ok) clearSelection();
+    if (panelMode() === 'branches') { refreshBranches(); refreshOpLog(); }
+  };
+  const closeSurgery = (): void => {
+    if (surgeryPending()) return;
+    retryAfterQuiesce = null;
+    setSurgery(null);
+    setSurgeryResult(null);
+  };
+  const refreshOpLog = (): void => {
+    if (!features().has('operator-log')) return;
+    setOpLogLoading(true);
+    wire.send({ type: 'request-operator-log', limit: 200 });
+  };
+
   /** Right-sidebar tab selection. The Tree is the most-used surface so it's
    *  the default; lessons / mcp / files are operator-driven panels. */
-  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'health';
+  type SidebarTab = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'pins' | 'health';
   const [sidebarTab, setSidebarTab] = createSignal<SidebarTab>('tree');
-  const [mainView, setMainView] = createSignal<'chat' | 'context'>('chat');
+  const [mainView, setMainView] = createSignal<'chat' | 'context' | 'dry'>('chat');
+  /** Rendered dry-run context awaiting display. Never applied — see DryContext. */
+  const [dryContext, setDryContext] = createSignal<DryContextData | null>(null);
 
-  /** Scope shared by Lessons / Files / Recipe panels. 'local' means the
-   *  parent process; otherwise the fleet child's name. The scope is shared
-   *  so an operator can pin a child of interest and see all three views
-   *  without re-selecting per panel. */
+  /** THE inspection scope — one selector for every operator panel (lessons,
+   *  files, MCPL, context, settings, pins, health, recipe). 'local' means
+   *  the parent process; otherwise the fleet child's name. Deliberately
+   *  shared and sticky: an operator pins a child of interest once (the
+   *  dropdown in the sidebar header) and every panel follows. */
   const [panelScope, setPanelScope] = createSignal<string>('local');
+  /** Query-string suffix routing scoped HTTP debug fetches to a child. */
+  const scopeQuery = (): string =>
+    panelScope() !== 'local' ? `?scope=${encodeURIComponent(panelScope())}` : '';
   const availableScopes = (): Array<{ id: string; label: string }> => {
     const w = welcome();
     const local = { id: 'local', label: w?.recipe.name ?? 'parent' };
@@ -303,13 +590,47 @@ export function App() {
   };
 
   /** MCPL panel state — populated by 'mcpl-list' responses, which the server
-   *  also re-sends after every mutation so the panel auto-refreshes. */
+   *  also re-sends after every mutation so the panel auto-refreshes. The
+   *  `live` list is the scoped process's actually-loaded servers (recipe
+   *  opt-in + overlay) with connection status — per-scope truth the shared
+   *  registry file can't express. */
   const [mcplServers, setMcplServers] = createSignal<McplServerRow[]>([]);
+  const [mcplLive, setMcplLive] = createSignal<McplLiveRow[]>([]);
+  /** Every tool's effective MCPL class (RFC-008); undefined = older host. */
+  const [mcplToolClasses, setMcplToolClasses] = createSignal<ToolClassRow[] | undefined>(undefined);
   const [mcplLoaded, setMcplLoaded] = createSignal(false);
   const [mcplConfigPath, setMcplConfigPath] = createSignal('');
   const refreshMcpl = (): void => {
     setMcplLoaded(false);
-    wire.send({ type: 'request-mcpl' });
+    wire.send({ type: 'request-mcpl', scope: panelScope() });
+  };
+  const clearMcpl = (): void => {
+    setMcplLoaded(false);
+    setMcplServers([]);
+    setMcplLive([]);
+    setMcplToolClasses(undefined);
+  };
+
+  /** Context-settings panel state. The server BROADCASTS `settings-state` after
+   *  every mutation (unlike mcpl-list, which is requester-only), because these
+   *  are live process values — two operators must not see divergent budgets. */
+  const [settingsState, setSettingsState] = createSignal<SettingsState | null>(null);
+  const [settingsLoaded, setSettingsLoaded] = createSignal(false);
+  const refreshSettings = (): void => {
+    setSettingsLoaded(false);
+    wire.send({ type: 'request-settings', scope: panelScope() });
+  };
+
+  /** Pins panel state — broadcast on change, like settings: pins alter the next
+   *  compile's fold plan, so operators must not hold divergent views. For
+   *  fleet-child scopes the snapshot also carries picker `candidates` (real
+   *  store ids from the child) — the local candidate list below only knows
+   *  the parent's conversation. */
+  const [pinsState, setPinsState] = createSignal<PinsState | null>(null);
+  const [pinsLoaded, setPinsLoaded] = createSignal(false);
+  const refreshPins = (): void => {
+    setPinsLoaded(false);
+    wire.send({ type: 'request-pins', scope: panelScope() });
   };
 
   /** Workspace files panel state — mounts list + per-mount tree cache. */
@@ -345,9 +666,11 @@ export function App() {
     wire.send({ type: 'request-workspace-file', path, scope: panelScope() });
   };
 
-  /** Switch the shared panel scope. Invalidates cached lessons/files so the
-   *  new scope's data is re-fetched on next access. MCPL config is global,
-   *  so it doesn't follow scope. */
+  /** Switch the inspection scope. Every per-scope cache is invalidated; the
+   *  currently-visible tab re-fetches immediately and the rest lazy-load on
+   *  next open. Context / ContextDocument re-fetch reactively off their
+   *  `scope` prop, and the health poll picks the new scope up on its next
+   *  tick (forced immediately when the Health tab is open). */
   const changePanelScope = (scope: string): void => {
     if (scope === panelScope()) return;
     setPanelScope(scope);
@@ -357,10 +680,22 @@ export function App() {
     setMounts([]);
     setTreesByMount(new Map<string, FlatEntry[]>());
     setExpandedMounts(new Set<string>());
-    // Re-request whichever tab the operator is currently looking at; the
-    // others will lazy-load when they're opened.
-    if (sidebarTab() === 'lessons') refreshLessons();
-    if (sidebarTab() === 'files') refreshMounts();
+    setOpenFile(null);
+    setFileLoading(false);
+    clearMcpl();
+    setSettingsLoaded(false);
+    setSettingsState(null);
+    setPinsLoaded(false);
+    setPinsState(null);
+    setHealth(null);
+    setHealthErr(null);
+    const tab = sidebarTab();
+    if (tab === 'lessons') refreshLessons();
+    if (tab === 'files') refreshMounts();
+    if (tab === 'mcp') refreshMcpl();
+    if (tab === 'settings') refreshSettings();
+    if (tab === 'pins') refreshPins();
+    if (tab === 'health') void loadHealth(true);
   };
   /** Pending-token buffer for the active stream; flushes on newline or non-token event. */
   let streamTokenBuffer = '';
@@ -521,6 +856,19 @@ export function App() {
     }
     setProtoMismatch(null);
     setWelcome(msg);
+    // A scope pinned to a child that no longer exists (stopped, crashed,
+    // session switch) would leave every panel dead-ended on a name the
+    // fleet no longer knows. Fall back to the host.
+    if (panelScope() !== 'local' && !msg.childTrees.some((c) => c.name === panelScope())) {
+      changePanelScope('local');
+    }
+    // A session switch recreates the framework: MCPL servers reconnect and
+    // may offer other tools or classes, so the MCP tab's snapshot is stale.
+    if (welcomeSessionId !== null && msg.session.id !== welcomeSessionId) {
+      clearMcpl();
+      if (sidebarTab() === 'mcp') refreshMcpl();
+    }
+    welcomeSessionId = msg.session.id;
     const key = `${msg.session.id}/${msg.branch.id}`;
     const entries = msg.messages.map(entryToMessage);
 
@@ -597,21 +945,41 @@ export function App() {
     queueScroll();
   };
 
-  const requestOlder = (): void => {
+  /** Server page cap (web-ui-module HISTORY_PAGE_MAX); bulk loads chain pages. */
+  const HISTORY_PAGE_CAP = 500;
+  /** Messages still owed by an in-flight bulk load (0 = none). Bulk loads
+   *  chain one page per reply so a stop is honoured at a page boundary. */
+  const [bulkRemaining, setBulkRemaining] = createSignal(0);
+  const [bulkLoaded, setBulkLoaded] = createSignal(0);
+
+  const requestOlder = (limit = 200): void => {
     const info = historyInfo();
     if (!info || info.startIndex <= 0 || historyLoading() || protoMismatch() !== null) return;
     const corrId = `h${++historyCorrSeq}`;
     pendingHistoryCorr = corrId;
     setHistoryLoading(true);
-    wire.send({ type: 'request-history', corrId, beforeIndex: info.startIndex, limit: 200 });
+    wire.send({ type: 'request-history', corrId, beforeIndex: info.startIndex, limit: Math.min(limit, HISTORY_PAGE_CAP) });
     window.clearTimeout(pendingHistoryTimer);
     pendingHistoryTimer = window.setTimeout(() => {
       if (pendingHistoryCorr === corrId) {
         pendingHistoryCorr = null;
         setHistoryLoading(false);
+        setBulkRemaining(0);
       }
     }, 10_000);
   };
+
+  /** Load up to `n` older messages in server-sized pages; progress shows in
+   *  the header row and a stop lands at the next page boundary. */
+  const loadOlder = (n: number): void => {
+    const info = historyInfo();
+    if (!info || info.startIndex <= 0) return;
+    const want = Math.min(n, info.startIndex);
+    setBulkLoaded(0);
+    setBulkRemaining(want);
+    requestOlder(Math.min(want, HISTORY_PAGE_CAP));
+  };
+  const stopLoadOlder = (): void => setBulkRemaining(0);
 
   const applyHistoryPage = (msg: HistoryPageMessage): void => {
     if (msg.corrId !== pendingHistoryCorr) return;
@@ -632,6 +1000,16 @@ export function App() {
     requestAnimationFrame(() => {
       if (scrollPane) scrollPane.scrollTop = scrollPane.scrollHeight - prevScrollHeight + prevScrollTop;
     });
+    // Bulk load: chain the next page until the quota is met, history is
+    // exhausted, the operator stopped it, or a page came back empty.
+    const remaining = Math.max(0, bulkRemaining() - msg.entries.length);
+    setBulkLoaded((v) => v + msg.entries.length);
+    setBulkRemaining(remaining);
+    if (remaining > 0 && msg.startIndex > 0 && msg.entries.length > 0) {
+      requestOlder(Math.min(remaining, HISTORY_PAGE_CAP));
+    } else if (remaining > 0) {
+      setBulkRemaining(0);
+    }
   };
 
   const onScrollPane = (): void => {
@@ -773,6 +1151,7 @@ export function App() {
     setStreamLines([]);
     streamTokenBuffer = '';
     refreshBranches();
+    refreshConversationGraph();
   };
 
   const toggleExpand = (id: string): void => {
@@ -867,15 +1246,26 @@ export function App() {
         finishStream,
         queueScroll,
         openQuitConfirm: (children) => setQuitConfirm(children),
+        currentScope: panelScope,
         setLessons: (loaded, moduleLoaded, list) => {
           setLessonsLoaded(loaded);
           setLessonsModuleLoaded(moduleLoaded);
           setLessons(list);
         },
-        setMcpl: (configPath, servers) => {
+        setMcpl: (configPath, servers, live, toolClasses) => {
           setMcplLoaded(true);
           setMcplConfigPath(configPath);
           setMcplServers(servers);
+          setMcplLive(live);
+          setMcplToolClasses(toolClasses);
+        },
+        setSettings: (state) => {
+          setSettingsLoaded(true);
+          setSettingsState(state);
+        },
+        setPins: (state) => {
+          setPinsLoaded(true);
+          setPinsState(state);
         },
         setMounts: (loaded, moduleLoaded, list) => {
           setMountsLoaded(loaded);
@@ -894,11 +1284,13 @@ export function App() {
           setFileLoading(false);
         },
         onOpsAlert: applyOpsAlertTrace,
+        onCredentialState: (state, scope) => applyCredentialState(state, scope),
         setBranchesList: (list, currentId) => {
           setBranches(list);
           setBranchesCurrentId(currentId);
           setBranchesLoading(false);
         },
+        setConversationGraph: (nodes) => setConversationGraph(nodes),
         onBranchChanged: (branch) => {
           // Update the header chip immediately; the server's re-welcome
           // follows with the new branch's messages. Refresh the lineage
@@ -906,6 +1298,14 @@ export function App() {
           setWelcome((w) => (w ? { ...w, branch } : w));
           if (panelMode() === 'branches') refreshBranches();
         },
+        setHostMode: (hm) => { if (hm) onHostMode(hm); else setHostMode(null); },
+        requestHostMode: () => { if (features().has('quiesce')) wire.send({ type: 'request-host-mode' }); },
+        onTurnSettled: () => {
+          if (features().has('quiesce') && hostMode()?.mode === 'quiescing') wire.send({ type: 'request-host-mode' });
+        },
+        onSurgeryResult,
+        setOperatorLog: (entries, path) => { setOpLog(entries); setOpLogPath(path); setOpLogLoading(false); },
+        onOperatorAction: () => { if (panelMode() === 'branches') refreshOpLog(); },
       });
     });
     onCleanup(() => {
@@ -915,9 +1315,14 @@ export function App() {
 
     // Health poll: durable-state alerts (quarantine, hard-down) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
-    // honest without meaningful load (counts-only JSON).
+    // honest without meaningful load (counts-only JSON). With the scope on a
+    // fleet child, loadHealth feeds the Health tab from that child and a
+    // second local fetch keeps the alert strip reconciled.
     void loadHealth();
-    const healthTimer = window.setInterval(() => void loadHealth(), 15_000);
+    const healthTimer = window.setInterval(() => {
+      void loadHealth();
+      if (panelScope() !== 'local') void reconcileLocalAlerts();
+    }, 15_000);
     onCleanup(() => window.clearInterval(healthTimer));
   });
 
@@ -967,6 +1372,15 @@ export function App() {
     if (!text) return;
     setDraft('');
     if (text.startsWith('/')) {
+      // /clear is display-local (the TUI clears its scrollback the same
+      // way): wipe this client's transcript view without touching the
+      // Chronicle or other clients. Sending it to the host was a no-op
+      // that APPENDED a "(cleared)" line — the opposite of clearing.
+      if (text === '/clear' || text.startsWith('/clear ')) {
+        setMessages(produce((arr) => { arr.length = 0; }));
+        setStreamLines([]);
+        return;
+      }
       wire.send({ type: 'command', command: text });
       return;
     }
@@ -1013,12 +1427,37 @@ export function App() {
       <Header
         welcome={welcome()}
         usage={usage()}
+        quota={quota()}
         status={wire.status()}
         branchPanelOpen={panelMode() === 'branches'}
         onBranchClick={openBranches}
+        hostMode={features().has('quiesce') ? hostMode() : null}
+        hostModeBusy={hostModeBusy()}
+        hostModeReadOnly={!canQuiesce()}
+        onQuiesce={quiesceHost}
+        onResume={resumeHost}
       />
+      <Lightbox />
+      <Show when={surgery()}>
+        {(req) => (
+          <SurgeryDialog
+            request={req()}
+            pending={surgeryPending()}
+            result={surgeryResult()}
+            canQuiesce={canQuiesce()}
+            hostMode={hostMode()}
+            onConfirm={confirmSurgery}
+            onQuiesceAndRetry={quiesceAndRetry}
+            onClose={closeSurgery}
+          />
+        )}
+      </Show>
       <ReconnectBanner status={wire.status()} />
-      <OpsAlertStrip alerts={alertList()} onDismiss={removeOpsAlert} />
+      <OpsAlertStrip
+        alerts={alertList()}
+        onDismiss={removeOpsAlert}
+        onAction={(alert, id) => runCredentialAction(id, alert.scope ?? 'local')}
+      />
       <Show when={wire.observerState() === 'observer' && wire.observer()}>
         {(info) => (
           <div class="bg-violet-950/60 border-b border-violet-900 px-4 py-1.5 text-xs text-violet-200 flex items-center gap-2">
@@ -1061,24 +1500,63 @@ export function App() {
           <div class="flex border-b border-neutral-800 bg-neutral-900/40 text-[11px] font-mono">
             <button type="button" class={`px-3 py-1.5 ${mainView() === 'chat' ? 'text-neutral-100 bg-neutral-900 border-b border-cyan-700' : 'text-neutral-500 hover:text-neutral-300'}`} onClick={() => setMainView('chat')}>Chat</button>
             <button type="button" class={`px-3 py-1.5 ${mainView() === 'context' ? 'text-neutral-100 bg-neutral-900 border-b border-cyan-700' : 'text-neutral-500 hover:text-neutral-300'}`} onClick={() => setMainView('context')}>Context</button>
+            <Show when={dryContext()}>
+              <button type="button" class={`px-3 py-1.5 ${mainView() === 'dry' ? 'text-amber-200 bg-neutral-900 border-b border-amber-600' : 'text-amber-500/70 hover:text-amber-300'}`} onClick={() => setMainView('dry')}>Dry run</button>
+            </Show>
           </div>
           <div
             ref={scrollPane}
             class="flex-1 overflow-y-auto px-4 py-3 space-y-3"
             onScroll={onScrollPane}
           >
-            <Show when={mainView() === 'context'} fallback={<>
+            <Show when={mainView() === 'dry'}>
+              <DryContext data={dryContext()} onClose={() => { setDryContext(null); setMainView('chat'); }} />
+            </Show>
+            <Show when={mainView() === 'context'} fallback={<Show when={mainView() === 'chat'}>
             <Show when={(historyInfo()?.startIndex ?? 0) > 0}>
-              <button
-                type="button"
-                class="w-full text-center text-xs font-mono text-neutral-500 hover:text-neutral-300 py-1.5 border border-dashed border-neutral-800 rounded"
-                onClick={requestOlder}
-                disabled={historyLoading()}
-              >
-                {historyLoading()
-                  ? 'loading…'
-                  : `▲ ${historyInfo()!.startIndex} older message${historyInfo()!.startIndex === 1 ? '' : 's'} — scroll or click to load`}
-              </button>
+              <div class="flex items-center gap-1 text-xs font-mono text-neutral-500 py-1 px-2 border border-dashed border-neutral-800 rounded">
+                <button
+                  type="button"
+                  class="flex-1 text-left hover:text-neutral-300 disabled:text-neutral-600"
+                  onClick={() => requestOlder(200)}
+                  disabled={historyLoading()}
+                  title="scroll to the top or click to load 200 older messages"
+                >
+                  {bulkRemaining() > 0
+                    ? `loading older… ${bulkLoaded().toLocaleString()} / ${(bulkLoaded() + bulkRemaining()).toLocaleString()}`
+                    : historyLoading()
+                      ? 'loading…'
+                      : `▲ ${historyInfo()!.startIndex.toLocaleString()} older message${historyInfo()!.startIndex === 1 ? '' : 's'} — scroll or click to load`}
+                </button>
+                <Show when={bulkRemaining() > 0} fallback={
+                  <>
+                    <span class="text-neutral-700">load</span>
+                    <For each={[200, 1000, 5000].filter((n) => n <= (historyInfo()?.startIndex ?? 0) || n === 200)}>{(n) => (
+                      <button
+                        type="button"
+                        class="px-1.5 py-0.5 rounded border border-neutral-800 hover:border-neutral-600 hover:text-neutral-200 disabled:text-neutral-700"
+                        disabled={historyLoading()}
+                        title={`load the ${Math.min(n, historyInfo()?.startIndex ?? 0).toLocaleString()} older messages just above (500 per request)`}
+                        onClick={() => loadOlder(n)}
+                      >{n >= 1000 ? `${n / 1000}k` : n}</button>
+                    )}</For>
+                    <button
+                      type="button"
+                      class="px-1.5 py-0.5 rounded border border-neutral-800 hover:border-amber-800 hover:text-amber-200 disabled:text-neutral-700"
+                      disabled={historyLoading()}
+                      title={`load ALL ${historyInfo()!.startIndex.toLocaleString()} older messages — heavy for large stores`}
+                      onClick={() => loadOlder(historyInfo()!.startIndex)}
+                    >all</button>
+                  </>
+                }>
+                  <button
+                    type="button"
+                    class="px-1.5 py-0.5 rounded border border-rose-900/60 text-rose-300 hover:bg-rose-950/40"
+                    onClick={stopLoadOlder}
+                    title="stop after the current page"
+                  >stop</button>
+                </Show>
+              </div>
             </Show>
             <Show when={messages.length === 0}>
               <div class="text-neutral-500 text-sm italic">
@@ -1086,10 +1564,29 @@ export function App() {
               </div>
             </Show>
             <For each={messages}>{(m) => (
-              <MessageView msg={m} results={toolResults()} toolUseIds={toolUseIds()} />
+              <div data-seq={m.seq}>
+              <MessageRow
+                storeId={m.storeId}
+                canRollback={canRollback() && !!m.storeId}
+                canSuppress={canSuppress() && !!m.storeId}
+                selecting={selecting()}
+                selected={!!m.storeId && selected().has(m.storeId)}
+                onRollback={() => m.storeId && beginRollback(m.storeId)}
+                onSelect={() => m.storeId && (selecting() ? toggleSelected(m.storeId) : startSelecting(m.storeId))}
+              >
+                <MessageView msg={m} results={toolResults()} toolUseIds={toolUseIds()} />
+              </MessageRow>
+              </div>
             )}</For>
-            </>}>
-              <ContextDocument agent={panelScope() === 'local' ? undefined : panelScope()} />
+            <Show when={selecting()}>
+              <SelectionBar count={selected().size} onSuppress={beginSuppressSelected} onClear={clearSelection} />
+            </Show>
+            </Show>}>
+              <ContextDocument
+                scope={panelScope()}
+                canRollback={canRollback() && panelScope() === 'local'}
+                onRollback={(id, preview) => beginRollback(id, preview)}
+              />
             </Show>
           </div>
 
@@ -1150,6 +1647,7 @@ export function App() {
               sessionUsage={usage()}
               perAgentCost={perAgentCost()}
               callLedger={callLedger()}
+              quota={usageQuotaScope() === null ? quota() : focusedQuota()}
               onClose={closePanel}
             />
           )}
@@ -1161,11 +1659,40 @@ export function App() {
             loading={branchesLoading()}
             readOnly={wire.observerState() === 'observer'}
             onCheckout={checkoutBranch}
-            onRefresh={refreshBranches}
+            onNavigateToBranch={(branchId, branchName) => {
+              // Checkout the target branch; the server will broadcast a
+              // branch-switch event that updates branchesCurrentId() and
+              // triggers a conversation refresh with the new context.
+              checkoutBranch(branchName);
+              refreshConversationGraph();
+              // After checkout, scroll to the branch-point message so the
+              // user lands at the fork origin rather than the branch head.
+              const target = branches().find((b) => b.id === branchId);
+              if (target?.branchPoint !== undefined && scrollPane) {
+                requestAnimationFrame(() => {
+                  const el = scrollPane!.querySelector(`[data-seq="${target.branchPoint}"]`) as HTMLElement | null;
+                  if (el) {
+                    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    // Brief highlight so the fork point is visually obvious
+                    el.classList.add('ring-1', 'ring-cyan-500/60', 'rounded');
+                    setTimeout(() => el.classList.remove('ring-1', 'ring-cyan-500/60', 'rounded'), 2000);
+                  }
+                });
+              }
+            }}
+            conversationNodes={conversationGraph()}
+            onRefreshConversation={refreshConversationGraph}
+            onRefresh={() => { refreshBranches(); refreshOpLog(); }}
             onClose={closePanel}
+            operatorLog={features().has('operator-log') ? opLog() : null}
+            operatorLogPath={opLogPath()}
+            operatorLogLoading={opLogLoading()}
+            onRefreshLog={refreshOpLog}
           />
         </Show>
-        <aside class="w-72 border-l border-neutral-800 bg-neutral-950 shrink-0 flex flex-col">
+        {/* Was w-72 (288px): the context/settings panels have dense numeric
+            tables that did not fit. Widen, and give large displays more. */}
+        <aside class="w-96 xl:w-[30rem] border-l border-neutral-800 bg-neutral-950 shrink-0 flex flex-col">
           <SidebarTabs
             current={sidebarTab()}
             onSelect={(tab) => {
@@ -1175,7 +1702,14 @@ export function App() {
               if (tab === 'lessons' && !lessonsLoaded()) refreshLessons();
               if (tab === 'mcp' && !mcplLoaded()) refreshMcpl();
               if (tab === 'files' && !mountsLoaded()) refreshMounts();
+              if (tab === 'settings' && !settingsLoaded()) refreshSettings();
+              if (tab === 'pins' && !pinsLoaded()) refreshPins();
             }}
+          />
+          <ScopeBar
+            scopes={availableScopes()}
+            scope={panelScope()}
+            onChange={changePanelScope}
           />
           <div class="flex-1 min-h-0">
             <Show when={sidebarTab() === 'tree'}>
@@ -1196,9 +1730,6 @@ export function App() {
                 loaded={lessonsLoaded()}
                 moduleLoaded={lessonsModuleLoaded()}
                 lessons={lessons()}
-                scope={panelScope()}
-                scopes={availableScopes()}
-                onScopeChange={changePanelScope}
                 onRefresh={refreshLessons}
               />
             </Show>
@@ -1207,10 +1738,43 @@ export function App() {
                 loaded={mcplLoaded()}
                 configPath={mcplConfigPath()}
                 servers={mcplServers()}
+                live={mcplLive()}
+                toolClasses={mcplToolClasses()}
+                readOnly={panelScope() !== 'local'}
                 onRefresh={refreshMcpl}
                 onAdd={(input) => wire.send({ type: 'mcpl-add', ...input })}
                 onRemove={(id) => wire.send({ type: 'mcpl-remove', id })}
                 onSetEnv={(id, env) => wire.send({ type: 'mcpl-set-env', id, env })}
+              />
+            </Show>
+            <Show when={sidebarTab() === 'settings'}>
+              <SettingsPanel
+                loaded={settingsLoaded()}
+                state={settingsState()}
+                scope={panelScope()}
+                onRefresh={refreshSettings}
+                onApply={(patch) => wire.send({ type: 'settings-update', scope: panelScope(), ...patch })}
+                onReset={(keys, persist) =>
+                  wire.send({ type: 'settings-reset', scope: panelScope(), ...(keys ? { keys } : {}), persist })}
+                onCancelTransition={() => wire.send({ type: 'settings-cancel-transition', scope: panelScope() })}
+                onDryContext={(ctx) => { setDryContext(ctx as DryContextData); setMainView('dry'); }}
+              />
+            </Show>
+            <Show when={sidebarTab() === 'pins'}>
+              <PinsPanel
+                loaded={pinsLoaded()}
+                state={pinsState()}
+                agent={pinsState()?.agent}
+                candidates={panelScope() === 'local'
+                  ? messages
+                      .filter((m) => m.index !== undefined && m.id)
+                      .map<PinCandidate>((m) => ({
+                        id: m.id, index: m.index!, participant: m.participant, text: m.text ?? '',
+                      }))
+                  : pinsState()?.candidates ?? []}
+                onRefresh={refreshPins}
+                onAdd={(input) => wire.send({ type: 'pin-add', scope: panelScope(), ...input })}
+                onRemove={(pinId) => wire.send({ type: 'pin-remove', scope: panelScope(), pinId })}
               />
             </Show>
             <Show when={sidebarTab() === 'files'}>
@@ -1220,9 +1784,6 @@ export function App() {
                 mounts={mounts()}
                 treesByMount={treesByMount()}
                 expandedMounts={expandedMounts()}
-                scope={panelScope()}
-                scopes={availableScopes()}
-                onScopeChange={changePanelScope}
                 onRefreshMounts={refreshMounts}
                 onExpandMount={expandMount}
                 onCollapseMount={collapseMount}
@@ -1230,13 +1791,16 @@ export function App() {
               />
             </Show>
             <Show when={sidebarTab() === 'context'}>
-              <ContextPanel agent={panelScope() === 'local' ? undefined : panelScope()} />
+              <ContextPanel scope={panelScope()} />
             </Show>
             <Show when={sidebarTab() === 'health'}>
               <HealthPanel
                 health={health()}
                 error={healthErr()}
+                ledger={callLedger()?.rows}
                 onRefresh={() => void loadHealth(true)}
+                credential={credentialForScope()}
+                onCredentialAction={(id) => runCredentialAction(id, panelScope())}
               />
             </Show>
           </div>
@@ -1279,10 +1843,20 @@ interface HandlerHooks {
   queueScroll: () => void;
   /** Show the quit-confirm modal with the given list of running children. */
   openQuitConfirm: (children: string[]) => void;
+  /** The live inspection scope — scoped responses that don't match it are
+   *  dropped as stale (a slow child reply must not render under another
+   *  scope's header). Responses without a scope stamp (older host) pass. */
+  currentScope: () => string;
   /** Apply a lessons-list response from the server. */
   setLessons: (loaded: boolean, moduleLoaded: boolean, lessons: LessonRow[]) => void;
   /** Apply an mcpl-list response from the server. */
-  setMcpl: (configPath: string, servers: McplServerRow[]) => void;
+  setMcpl: (configPath: string, servers: McplServerRow[], live: McplLiveRow[], toolClasses?: ToolClassRow[]) => void;
+  /** Apply a settings-state broadcast. */
+  setSettings: (state: SettingsState) => void;
+  /** Apply a credential-state frame (answer to request-credential / an action). */
+  onCredentialState: (state: CredentialInfo, scope: string) => void;
+  /** Apply a pins-list broadcast. */
+  setPins: (state: PinsState) => void;
   /** Apply a workspace-mounts response. */
   setMounts: (loaded: boolean, moduleLoaded: boolean, mounts: Mount[]) => void;
   /** Apply a workspace-tree response for one mount. */
@@ -1293,8 +1867,26 @@ interface HandlerHooks {
   onOpsAlert: (event: { [k: string]: unknown }) => void;
   /** Apply a branches-list response. */
   setBranchesList: (branches: BranchRow[], currentId: string) => void;
+  /** Apply a conversation graph response. */
+  setConversationGraph: (nodes: import('./ConversationGraph').ConversationGraphNode[]) => void;
   /** React to a server-side branch switch (undo/redo/checkout). */
   onBranchChanged: (branch: { id: string; name: string }) => void;
+  /** Host serving state (welcome, host-mode frames). */
+  setHostMode: (hostMode: HostModeSnapshot | null) => void;
+  /** Ask the server for a fresh host-mode snapshot (after host:* traces). */
+  requestHostMode: () => void;
+  /** A turn ended — refresh host mode if a quiesce was still draining. */
+  onTurnSettled: () => void;
+  onSurgeryResult: (result: SurgeryResultMessage) => void;
+  setOperatorLog: (entries: OperatorLogEntryWire[], path?: string) => void;
+  /** An operator:action trace landed — refresh the log if it is on screen. */
+  onOperatorAction: () => void;
+}
+
+/** True when a scope-stamped response belongs to a scope the operator has
+ *  already navigated away from. Unstamped responses (older host) pass. */
+function staleScope(msgScope: string | undefined, current: string): boolean {
+  return msgScope !== undefined && msgScope !== current;
 }
 
 function handleServerMessage(
@@ -1308,8 +1900,18 @@ function handleServerMessage(
       hooks.setUsage(msg.usage);
       hooks.setPerAgentCost(msg.perAgentCost ?? []);
       hooks.setCallLedger(msg.callLedger ?? null);
+      hooks.setHostMode(msg.hostMode ?? null);
       return;
     }
+    case 'host-mode':
+      hooks.setHostMode(msg.hostMode);
+      return;
+    case 'surgery-result':
+      hooks.onSurgeryResult(msg);
+      return;
+    case 'operator-log':
+      hooks.setOperatorLog(msg.entries, msg.path);
+      return;
     case 'message-appended':
       hooks.applyAppended(msg.entry);
       return;
@@ -1340,6 +1942,9 @@ function handleServerMessage(
         case 'inference:completed':
         case 'inference:failed':
           hooks.finishStream();
+          // A quiesce that was still draining may have just settled; the
+          // framework emits no trace for "drained", so re-pull the snapshot.
+          hooks.onTurnSettled();
           return;
         case 'inference:tool_calls_yielded': {
           const calls = (e.calls as Array<{ id: string; name: string; input?: unknown }> | undefined) ?? [];
@@ -1364,7 +1969,14 @@ function handleServerMessage(
         case 'ops:alert':
           hooks.onOpsAlert(e);
           return;
+        case 'operator:action':
+          hooks.onOperatorAction();
+          return;
         default:
+          // Host serving-state transitions (host:quiesce / host:resume /
+          // host:quiesced_boot) may originate elsewhere (Discord host
+          // command, API) — pull a fresh snapshot rather than parsing them.
+          if (typeof e.type === 'string' && e.type.startsWith('host:')) hooks.requestHostMode();
           return;
       }
     }
@@ -1386,6 +1998,9 @@ function handleServerMessage(
       return;
     // The server follows a session switch with a full re-welcome (setApp
     // re-flushes every client), which resets all session-scoped state.
+    case 'conversation-graph':
+      hooks.setConversationGraph(msg.nodes);
+      return;
     case 'session-changed':
       return;
     case 'inbound-trigger': {
@@ -1408,18 +2023,37 @@ function handleServerMessage(
       hooks.openQuitConfirm(msg.children);
       return;
     case 'lessons-list':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setLessons(true, msg.loaded, msg.lessons);
       return;
     case 'mcpl-list':
-      hooks.setMcpl(msg.configPath, msg.servers);
+      if (staleScope(msg.scope, hooks.currentScope())) return;
+      hooks.setMcpl(msg.configPath, msg.servers, msg.live ?? [], msg.toolClasses);
+      return;
+    case 'settings-state':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
+      hooks.setSettings(msg as unknown as SettingsState);
+      return;
+    case 'credential-state':
+      // Not scope-filtered here: a local frame must reconcile the (local)
+      // alert strip even while the sidebar inspects a child. The hook keys
+      // the Health tab's copy by scope itself.
+      hooks.onCredentialState(msg as unknown as CredentialInfo, msg.scope ?? 'local');
+      return;
+    case 'pins-list':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
+      hooks.setPins(msg as unknown as PinsState);
       return;
     case 'workspace-mounts':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setMounts(true, msg.loaded, msg.mounts);
       return;
     case 'workspace-tree':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setMountTree(msg.mount, msg.entries);
       return;
     case 'workspace-file':
+      if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setOpenFile(msg);
       return;
     case 'error':
@@ -1439,9 +2073,17 @@ function handleServerMessage(
 function Header(props: {
   welcome: WelcomeMessage | null;
   usage: TokenUsage;
+  /** Subscription quota windows; replaces the dollar figure when present. */
+  quota: QuotaSnapshotData | null;
   status: string;
   branchPanelOpen: boolean;
   onBranchClick(): void;
+  /** null hides the toggle (host without quiesce support). */
+  hostMode: HostModeSnapshot | null;
+  hostModeBusy: boolean;
+  hostModeReadOnly: boolean;
+  onQuiesce(reason: string): void;
+  onResume(): void;
 }) {
   const fmt = (n: number): string => {
     if (n < 1000) return String(n);
@@ -1483,13 +2125,34 @@ function Header(props: {
           ⑂ {props.welcome!.branch.name}
         </button>
       </Show>
+      <Show when={props.hostMode}>
+        <HostModeToggle
+          hostMode={props.hostMode}
+          busy={props.hostModeBusy}
+          readOnly={props.hostModeReadOnly}
+          onQuiesce={props.onQuiesce}
+          onResume={props.onResume}
+        />
+      </Show>
       <div class="ml-auto text-xs font-mono text-neutral-500">
         {fmt(props.usage.input)} in
         <span class="ml-2">{fmt(props.usage.output)} out</span>
         <Show when={props.usage.cacheRead > 0}>
           <span class="ml-2">{fmt(props.usage.cacheRead)} cache</span>
         </Show>
-        <Show when={props.usage.cost && props.usage.cost.total > 0}>
+        <Show when={props.quota?.subscription && props.quota.windows.length > 0}>
+          <span class={`ml-3 ${quotaTone(props.quota!)}`} title={quotaTitle(props.quota!)}>
+            {quotaReadout(props.quota!)}
+          </span>
+        </Show>
+        {/* A subscription meter that has never read (inference-only token,
+            gateway without the usage path) must say so, not render nothing. */}
+        <Show when={props.quota?.subscription && props.quota.windows.length === 0 && props.quota.error}>
+          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable: ${props.quota!.error}`}>
+            quota: unreadable
+          </span>
+        </Show>
+        <Show when={!props.quota?.subscription && props.usage.cost && props.usage.cost.total > 0}>
           <span
             class="ml-3 text-emerald-300"
             title={`Estimated cost (${props.usage.cost!.currency})`}
@@ -1503,6 +2166,52 @@ function Header(props: {
 }
 
 type ToolResultInfo = { text: string; isError?: boolean; truncated?: boolean };
+
+/**
+ * Hover toolbar around a canonical chat row: "roll back to here" and
+ * "suppress" (which enters multi-select). Rows without a store id (synthetic
+ * command/trigger/streaming rows) render bare.
+ */
+function MessageRow(props: {
+  storeId?: string;
+  canRollback: boolean;
+  canSuppress: boolean;
+  selecting: boolean;
+  selected: boolean;
+  onRollback(): void;
+  onSelect(): void;
+  children: JSX.Element;
+}) {
+  const actionable = (): boolean => !!props.storeId && (props.canRollback || props.canSuppress);
+  // The toolbar lives INSIDE the row (top-right). An earlier version hung it
+  // off the row's left edge, where the scroll pane's overflow clipping made
+  // it all but invisible — hover affordances must be inside the clip box.
+  return (
+    <div class={`group relative ${actionable() ? 'pr-2' : ''} ${props.selected ? 'ring-1 ring-rose-800/70 rounded bg-rose-950/10' : ''}`}>
+      <Show when={actionable()}>
+        <div class={`absolute right-0 top-0 z-10 flex gap-1 ${props.selecting ? '' : 'opacity-0 group-hover:opacity-100 focus-within:opacity-100'} transition-opacity`}>
+          <Show when={props.canRollback && !props.selecting}>
+            <button
+              type="button"
+              class="px-1.5 py-0.5 rounded border bg-neutral-900/95 border-neutral-700 text-neutral-400 hover:border-amber-700 hover:text-amber-200 text-[10px] font-mono leading-tight shadow"
+              title="roll back: fork the chronicle here and make this message the tail of the live branch (the current branch keeps everything after it)"
+              onClick={props.onRollback}
+            >⏪ roll back</button>
+          </Show>
+          <Show when={props.canSuppress}>
+            <button
+              type="button"
+              class={`px-1.5 py-0.5 rounded border text-[10px] font-mono leading-tight shadow ${props.selected ? 'bg-rose-900/70 border-rose-700 text-rose-100' : 'bg-neutral-900/95 border-neutral-700 text-neutral-400 hover:border-rose-700 hover:text-rose-200'}`}
+              title={props.selecting ? (props.selected ? 'deselect' : 'select for suppression') : 'suppress: select this message (and more), then confirm in the bar below'}
+              onClick={props.onSelect}
+            >{props.selected ? '✓ selected' : props.selecting ? '⊘ select' : '⊘ suppress'}</button>
+          </Show>
+        </div>
+      </Show>
+      {props.children}
+    </div>
+  );
+}
 
 function MessageView(props: {
   msg: Message;
@@ -1711,13 +2420,41 @@ function ToolPayload(props: { raw: string; isError?: boolean }) {
  *  Module-scope signal: one timeline per page, and survival across <For>
  *  row recycling is exactly what we want. */
 const [expandedBlocks, setExpandedBlocks] = createSignal<Set<string>>(new Set());
-const toggleBlock = (key: string): void => {
-  setExpandedBlocks((prev) => {
-    const next = new Set(prev);
-    if (next.has(key)) next.delete(key);
-    else next.add(key);
-    return next;
-  });
+/**
+ * Second layer: whole KINDS expanded at once — `tool:<name>` ("expand all
+ * similar") or `thinking`. A block is open when it is pinned individually,
+ * or its kind is expanded and it was not individually collapsed afterwards.
+ * `blockKinds` remembers each toggled key's kind so collapsing a kind can
+ * also drop that kind's individual pins.
+ */
+const [expandedKinds, setExpandedKinds] = createSignal<Set<string>>(new Set());
+const [collapsedOverrides, setCollapsedOverrides] = createSignal<Set<string>>(new Set());
+const blockKinds = new Map<string, string>();
+const isBlockOpen = (key: string, kind: string): boolean =>
+  expandedBlocks().has(key) || (expandedKinds().has(kind) && !collapsedOverrides().has(key));
+const toggleBlock = (key: string, kind = ''): void => {
+  blockKinds.set(key, kind);
+  if (isBlockOpen(key, kind)) {
+    if (expandedBlocks().has(key)) {
+      setExpandedBlocks((prev) => { const next = new Set(prev); next.delete(key); return next; });
+    }
+    if (kind && expandedKinds().has(kind)) {
+      setCollapsedOverrides((prev) => new Set(prev).add(key));
+    }
+  } else {
+    setCollapsedOverrides((prev) => { if (!prev.has(key)) return prev; const next = new Set(prev); next.delete(key); return next; });
+    setExpandedBlocks((prev) => new Set(prev).add(key));
+  }
+};
+/** Expand or collapse every block of a kind across the loaded history. */
+const toggleKind = (kind: string): void => {
+  const opening = !expandedKinds().has(kind);
+  setExpandedKinds((prev) => { const next = new Set(prev); if (opening) next.add(kind); else next.delete(kind); return next; });
+  // Either way, per-block state for this kind resets to "follow the kind".
+  setCollapsedOverrides((prev) => { const next = new Set(prev); for (const [k, kd] of blockKinds) if (kd === kind) next.delete(k); return next; });
+  if (!opening) {
+    setExpandedBlocks((prev) => { const next = new Set(prev); for (const [k, kd] of blockKinds) if (kd === kind) next.delete(k); return next; });
+  }
 };
 
 function BlockView(props: {
@@ -1767,12 +2504,8 @@ function BlockView(props: {
       </div>
     );
   }
-  // media
-  return (
-    <div class="my-1 inline-block text-[11px] font-mono text-sky-400/80 bg-sky-950/20 border border-sky-900/40 rounded px-2 py-0.5">
-      📎 {b.mediaType}
-    </div>
-  );
+  // media — inline image when the host gave us a locator, else the type chip
+  return <MediaView mediaType={b.mediaType} mediaRef={b.ref} />;
 }
 
 function TextBlockView(props: { block: Extract<UiBlock, { kind: 'text' }> }) {
@@ -1800,23 +2533,33 @@ function ThinkingBlockView(props: {
 }) {
   // Expanded while streaming (watch the mind move), collapsed once done —
   // unless the operator pinned it open.
-  const open = (): boolean => props.block.streaming === true || expandedBlocks().has(props.blockKey);
+  const KIND = 'thinking';
+  const open = (): boolean => props.block.streaming === true || isBlockOpen(props.blockKey, KIND);
+  const allOpen = (): boolean => expandedKinds().has(KIND);
   return (
     <div class="my-1.5 border-l-2 border-violet-800/60 pl-2">
-      <button
-        type="button"
-        class="text-[11px] font-mono text-violet-400/80 hover:text-violet-300 flex items-center gap-1.5"
-        onClick={() => toggleBlock(props.blockKey)}
-      >
-        <span>{open() ? '▾' : '▸'}</span>
-        <span>💭 thinking · {props.block.text.length.toLocaleString()} chars</span>
-        <Show when={props.block.streaming}>
-          <span class="animate-pulse text-violet-300">▍</span>
-        </Show>
-        <Show when={props.block.truncated}>
-          <span class="text-neutral-600 italic">truncated</span>
-        </Show>
-      </button>
+      <div class="group/hdr flex items-center gap-2">
+        <button
+          type="button"
+          class="text-[11px] font-mono text-violet-400/80 hover:text-violet-300 flex items-center gap-1.5"
+          onClick={() => toggleBlock(props.blockKey, KIND)}
+        >
+          <span>{open() ? '▾' : '▸'}</span>
+          <span>💭 thinking · {props.block.text.length.toLocaleString()} chars</span>
+          <Show when={props.block.streaming}>
+            <span class="animate-pulse text-violet-300">▍</span>
+          </Show>
+          <Show when={props.block.truncated}>
+            <span class="text-neutral-600 italic">truncated</span>
+          </Show>
+        </button>
+        <button
+          type="button"
+          class={`text-[10px] font-mono px-1 rounded border transition-opacity ${allOpen() ? 'border-violet-800 text-violet-300 opacity-100' : 'border-neutral-800 text-neutral-500 opacity-0 group-hover/hdr:opacity-100 hover:text-violet-300'}`}
+          title={allOpen() ? 'collapse every thinking block in the loaded history' : 'expand every thinking block in the loaded history'}
+          onClick={() => toggleKind(KIND)}
+        >{allOpen() ? '⤡ all thinking' : '⤢ all thinking'}</button>
+      </div>
       <Show when={open()}>
         <div class="mt-1 text-[13px] leading-relaxed text-violet-200/60 italic whitespace-pre-wrap">
           {props.block.text}
@@ -1831,7 +2574,9 @@ function ToolBlockView(props: {
   blockKey: string;
   result?: ToolResultInfo;
 }) {
-  const open = (): boolean => expandedBlocks().has(props.blockKey);
+  const kind = (): string => `tool:${props.block.name}`;
+  const open = (): boolean => isBlockOpen(props.blockKey, kind());
+  const allOpen = (): boolean => expandedKinds().has(kind());
   const dot = (): string => {
     if (props.block.status === 'running') return 'bg-amber-400 animate-pulse';
     if (props.block.status === 'failed' || props.result?.isError) return 'bg-rose-500';
@@ -1845,17 +2590,25 @@ function ToolBlockView(props: {
   };
   return (
     <div class="my-1">
-      <button
-        type="button"
-        class="font-mono text-xs text-amber-400 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-900/30 px-2 py-1 rounded flex items-center gap-2"
-        onClick={() => toggleBlock(props.blockKey)}
-      >
-        <span class={`w-1.5 h-1.5 rounded-full ${dot()}`} />
-        <span>{open() ? '▾' : '▸'} {props.block.name}{duration()}</span>
-        <Show when={props.result?.isError}>
-          <span class="text-rose-400">error</span>
-        </Show>
-      </button>
+      <div class="group/hdr flex items-center gap-2">
+        <button
+          type="button"
+          class="font-mono text-xs text-amber-400 bg-amber-950/20 hover:bg-amber-950/40 border border-amber-900/30 px-2 py-1 rounded flex items-center gap-2"
+          onClick={() => toggleBlock(props.blockKey, kind())}
+        >
+          <span class={`w-1.5 h-1.5 rounded-full ${dot()}`} />
+          <span>{open() ? '▾' : '▸'} {props.block.name}{duration()}</span>
+          <Show when={props.result?.isError}>
+            <span class="text-rose-400">error</span>
+          </Show>
+        </button>
+        <button
+          type="button"
+          class={`text-[10px] font-mono px-1.5 py-0.5 rounded border transition-opacity ${allOpen() ? 'border-amber-800 text-amber-300 opacity-100' : 'border-neutral-800 text-neutral-500 opacity-0 group-hover/hdr:opacity-100 hover:text-amber-300'}`}
+          title={allOpen() ? `collapse every ${props.block.name} call in the loaded history` : `expand every ${props.block.name} call in the loaded history (input + result)`}
+          onClick={() => toggleKind(kind())}
+        >{allOpen() ? `⤡ all ${props.block.name}` : `⤢ all ${props.block.name}`}</button>
+      </div>
       <Show when={open()}>
         <div class="mt-1 ml-3 space-y-1">
           <div class="text-[10px] uppercase tracking-wider text-neutral-600">
@@ -1880,10 +2633,8 @@ function ToolBlockView(props: {
 
 function MediaChips(props: { blocks?: UiBlock[] }) {
   return (
-    <For each={(props.blocks ?? []).filter((b) => b.kind === 'media')}>{(b) => (
-      <div class="mt-1 inline-block mr-1 text-[11px] font-mono text-sky-400/80 bg-sky-950/20 border border-sky-900/40 rounded px-2 py-0.5">
-        📎 {(b as Extract<UiBlock, { kind: 'media' }>).mediaType}
-      </div>
+    <For each={(props.blocks ?? []).filter((b): b is Extract<UiBlock, { kind: 'media' }> => b.kind === 'media')}>{(b) => (
+      <MediaView mediaType={b.mediaType} mediaRef={b.ref} />
     )}</For>
   );
 }
@@ -1905,12 +2656,14 @@ const COMMANDS: CommandHint[] = [
   { name: '/restore', blurb: 'switch to checkpoint' },
   { name: '/undo', blurb: 'revert before last agent turn' },
   { name: '/redo', blurb: 're-apply last undone action' },
+  { name: '/nudge', blurb: 'run inference on current context, no new events' },
   { name: '/history', blurb: 'recent messages' },
   { name: '/lessons', blurb: 'list active lessons' },
   { name: '/export', blurb: 'export lessons to ./output/' },
   { name: '/session', blurb: 'list/new/switch/rename/delete sessions' },
   { name: '/newtopic', blurb: 'reset head window with summary' },
   { name: '/mcp', blurb: 'list/add/remove/env MCPL servers' },
+  { name: '/tools', blurb: 'each tool\'s effective class and its source' },
   { name: '/fleet', blurb: 'list/peek/stop/restart fleet children' },
   { name: '/clear', blurb: 'clear conversation display' },
   { name: '/quit', blurb: 'export lessons + exit' },
@@ -1943,7 +2696,7 @@ function CommandSuggestions(props: { draft: string; onPick: (cmd: string) => voi
   );
 }
 
-type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'health';
+type SidebarTabId = 'tree' | 'lessons' | 'mcp' | 'files' | 'context' | 'settings' | 'pins' | 'health';
 
 function SidebarTabs(props: {
   current: SidebarTabId;
@@ -1955,6 +2708,8 @@ function SidebarTabs(props: {
     { id: 'mcp', label: 'MCP', title: 'MCPL servers' },
     { id: 'files', label: 'Files', title: 'Workspace mounts + files' },
     { id: 'context', label: 'Context', title: 'Compiled context makeup' },
+    { id: 'settings', label: 'Settings', title: 'Live context budget / tail, with preview' },
+    { id: 'pins', label: 'Pins', title: 'Protected ranges — constrain what the fold plan may fold' },
     { id: 'health', label: 'Health', title: 'Runtime settings, failures, quarantine' },
   ];
   return (
@@ -1974,6 +2729,40 @@ function SidebarTabs(props: {
         </button>
       )}</For>
     </div>
+  );
+}
+
+/**
+ * The one fleet-scope selector — a persistent dropdown under the sidebar
+ * tabs that every inspection panel (lessons, files, MCPL, context, settings,
+ * pins, health, recipe) follows. A dropdown rather than pill rows so the
+ * control's footprint is independent of fleet size, and it stays visible on
+ * every tab instead of being re-invented per panel. Hidden entirely when no
+ * fleet children exist — single-process mode has nothing to select.
+ */
+function ScopeBar(props: {
+  scopes: Array<{ id: string; label: string }>;
+  scope: string;
+  onChange: (scope: string) => void;
+}) {
+  return (
+    <Show when={props.scopes.length > 1}>
+      <div class="flex items-center gap-2 px-3 py-1.5 border-b border-neutral-800 bg-neutral-900/20 font-mono">
+        <span class="text-neutral-600 uppercase tracking-wider text-[10px] shrink-0" title="Which process the panels below inspect — the host or a fleet child">
+          inspecting
+        </span>
+        <select
+          class="flex-1 min-w-0 bg-neutral-900 border border-neutral-700 rounded px-1.5 py-0.5
+                 text-[11px] text-neutral-100 focus:outline-none focus:ring-1 focus:ring-cyan-700"
+          value={props.scope}
+          onChange={(e) => props.onChange(e.currentTarget.value)}
+        >
+          <For each={props.scopes}>{(s) => (
+            <option value={s.id} selected={s.id === props.scope}>{s.label}</option>
+          )}</For>
+        </select>
+      </div>
+    </Show>
   );
 }
 

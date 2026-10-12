@@ -53,6 +53,74 @@ describe('LoggingAnthropicAdapter.withReasoning', () => {
       .withReasoning(baseRequest);
     expect(out).toBe(baseRequest);
   });
+
+  // Reasoning is host-wide, but every call through the shared membrane passes
+  // here — including RetrievalModule's Haiku calls. Models without adaptive
+  // thinking 400 on it, so they must go out untouched.
+  test.each([
+    'claude-haiku-4-5-20251001', 'claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-5',
+    'claude-opus-4-1', 'anthropic.claude-haiku-4-5', 'claude-opus-4-5@20251101',
+  ])('no thinking for %s (rejects adaptive)', (model) => {
+    const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null', enabled);
+    const req = { ...baseRequest, model };
+    const out = (adapter as unknown as { withReasoning(r: ProviderRequest): ProviderRequest })
+      .withReasoning(req);
+    expect(out).toBe(req);
+  });
+
+  test.each([
+    'claude-opus-4-6', 'claude-sonnet-4-6', 'claude-opus-4-7', 'claude-opus-4-8', 'claude-opus-5',
+    'claude-opus-5-5', 'claude-sonnet-5', 'claude-sonnet-5-5', 'claude-fable-5', 'claude-fable-5-1',
+    'claude-mythos-5-1', 'anthropic.claude-opus-5-5',
+  ])('adaptive thinking for %s', (model) => {
+    const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null', enabled);
+    const out = (adapter as unknown as { withReasoning(r: ProviderRequest): ProviderRequest })
+      .withReasoning({ ...baseRequest, model });
+    expect((out.extra as Record<string, { type?: string }> | undefined)?.thinking?.type).toBe('adaptive');
+  });
+});
+
+describe('LoggingAnthropicAdapter.withEffort', () => {
+  type WithEffort = { withEffort(r: ProviderRequest): ProviderRequest };
+  const fable: ProviderRequest = { ...baseRequest, model: 'claude-fable-5-1' };
+  const withEffort = (effort: string | undefined, req: ProviderRequest = fable) => {
+    const getter = () => ({ enabled: false, budgetTokens: 0, effort }) as ReturnType<
+      NonNullable<ConstructorParameters<typeof LoggingAnthropicAdapter>[2]>
+    >;
+    const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null', getter);
+    return (adapter as unknown as WithEffort).withEffort(req);
+  };
+
+  test('sends output_config.effort even with reasoning_enabled false', () => {
+    const out = withEffort('low');
+    expect((out.extra as { output_config?: unknown }).output_config).toEqual({ effort: 'low' });
+    expect((fable as { extra?: unknown }).extra).toBeUndefined();
+  });
+
+  test("no-op (same reference) for 'default' and for unset", () => {
+    expect(withEffort('default')).toBe(fable);
+    expect(withEffort(undefined)).toBe(fable);
+  });
+
+  test('merges into an existing output_config instead of replacing it', () => {
+    const req = { ...fable, extra: { output_config: { format: { type: 'json_schema' } }, keep: 1 } } as ProviderRequest;
+    const extra = withEffort('max', req).extra as Record<string, unknown>;
+    expect(extra.output_config).toEqual({ format: { type: 'json_schema' }, effort: 'max' });
+    expect(extra.keep).toBe(1);
+  });
+
+  test('drops levels the model rejects rather than bricking its turns', () => {
+    expect(withEffort('high', { ...baseRequest, model: 'claude-haiku-4-5' }).extra).toBeUndefined();
+    expect(withEffort('xhigh', { ...baseRequest, model: 'claude-opus-4-6' }).extra).toBeUndefined();
+    expect(withEffort('max', { ...baseRequest, model: 'claude-opus-4-5' }).extra).toBeUndefined();
+    expect(withEffort('max', { ...baseRequest, model: 'claude-opus-4-6' }).extra).toBeDefined();
+    expect(withEffort('xhigh', { ...baseRequest, model: 'claude-opus-5-5' }).extra).toBeDefined();
+  });
+
+  test('never sends a level outside the known set, whatever the model', () => {
+    expect(withEffort('minimal')).toBe(fable);
+    expect(withEffort('minimal', { ...baseRequest, model: 'claude-opus-4-6' }).extra).toBeUndefined();
+  });
 });
 
 describe('LoggingAnthropicAdapter request logging', () => {
@@ -100,6 +168,39 @@ describe('LoggingAnthropicAdapter request logging', () => {
     expect(internals.refusalRawRequest(refusal, rawRequest)).toBe(rawRequest);
   });
 
+  test('LLM_CALLS_FULL_PAYLOADS=1 retains the raw request on every call', () => {
+    const prev = process.env.LLM_CALLS_FULL_PAYLOADS;
+    process.env.LLM_CALLS_FULL_PAYLOADS = '1';
+    try {
+      const full = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null');
+      const fi = full as unknown as typeof internals;
+      const rawRequest = { messages: ['forensic context'] };
+      const success = { raw: { stop_reason: 'end_turn' } } as unknown as ProviderResponse;
+      const refusal = { raw: { stop_reason: 'refusal' } } as unknown as ProviderResponse;
+      expect(fi.refusalRawRequest(success, rawRequest)).toBe(rawRequest);
+      expect(fi.refusalRawRequest(refusal, rawRequest)).toBe(rawRequest);
+    } finally {
+      if (prev === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+      else process.env.LLM_CALLS_FULL_PAYLOADS = prev;
+    }
+  });
+
+  test('LLM_CALLS_FULL_PAYLOADS off-values keep refusal-only behavior', () => {
+    const prev = process.env.LLM_CALLS_FULL_PAYLOADS;
+    try {
+      for (const off of ['', '0', 'false', 'FALSE']) {
+        process.env.LLM_CALLS_FULL_PAYLOADS = off;
+        const a = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null');
+        const ai = a as unknown as typeof internals;
+        const success = { raw: { stop_reason: 'end_turn' } } as unknown as ProviderResponse;
+        expect(ai.refusalRawRequest(success, { m: 1 })).toBeUndefined();
+      }
+    } finally {
+      if (prev === undefined) delete process.env.LLM_CALLS_FULL_PAYLOADS;
+      else process.env.LLM_CALLS_FULL_PAYLOADS = prev;
+    }
+  });
+
   test('forwards authoritative billing buckets from the provider response', () => {
     const calls: ProviderCallRecord[] = [];
     const observed = new LoggingAnthropicAdapter(
@@ -114,7 +215,8 @@ describe('LoggingAnthropicAdapter request logging', () => {
         durationMs: number,
         request: ProviderRequest,
         rawRequest: unknown,
-        response: ProviderResponse,
+        outcome: { response: ProviderResponse },
+        errorText: undefined,
       ): void;
     };
     const response = {
@@ -131,7 +233,7 @@ describe('LoggingAnthropicAdapter request logging', () => {
       },
     } as unknown as ProviderResponse;
 
-    observed.observeCall('stream', '2026-07-13T00:00:00Z', 10, baseRequest, {}, response);
+    observed.observeCall('stream', '2026-07-13T00:00:00Z', 10, baseRequest, {}, { response }, undefined);
     expect(calls[0]).toMatchObject({
       cacheWriteTokens: 100,
       cacheWrite5mTokens: 25,

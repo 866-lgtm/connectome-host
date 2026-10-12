@@ -22,6 +22,8 @@
 
 import { CURVE_PAGE_HTML } from './web-ui-curve-page.js';
 import { PROMPT_PAGE_HTML } from './web-ui-prompt-page.js';
+import { RETRIEVAL_TRACE_PAGE_HTML } from './retrieval-trace-page.js';
+import type { RetrievalTraceSource } from './retrieval-trace.js';
 import type {
   AgentFramework,
   Module,
@@ -36,6 +38,7 @@ import type {
   SessionUsageSnapshot,
 } from '@animalabs/agent-framework';
 import type { ServerWebSocket } from 'bun';
+import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
 import { join, resolve, normalize, dirname, sep as pathSep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -44,6 +47,8 @@ import type { Recipe } from '../recipe.js';
 import type { SessionManager } from '../session-manager.js';
 import type { BranchState } from '../commands.js';
 import type { CallLedger } from '../call-ledger.js';
+import type { QuotaMeter } from '../quota-meter.js';
+import type { CredentialMonitor } from '../credential-state.js';
 import { handleCommand } from '../commands.js';
 import { AgentTreeReducer, type AgentTreeSnapshot } from '../state/agent-tree-reducer.js';
 import { FleetTreeAggregator } from '../state/fleet-tree-aggregator.js';
@@ -59,14 +64,51 @@ import {
   type TokenUsage,
   type CallLedgerSnapshot,
   type McplListMessage,
+  type SettingsStateMessage,
+  type PinsListMessage,
   type BranchesListMessage,
+  type ConversationGraphMessage,
   type LessonsListMessage,
+  type HostModeSnapshot,
+  type RollbackMessage,
+  type SuppressMessage,
+  type HostQuiesceMessage,
+  type HostResumeMessage,
+  type RequestOperatorLogMessage,
+  type OperatorLogEntryWire,
 } from '../web/protocol.js';
 import {
   readMcplServersFile,
   saveMcplServers,
   DEFAULT_CONFIG_PATH,
 } from '../mcpl-config.js';
+import {
+  resolveAgent,
+  buildMediaBlock,
+  buildMcplSnapshot,
+  buildToolClassesSnapshot,
+  buildSettingsState,
+  buildPinsSnapshot,
+  buildHealthSnapshot,
+  buildQuotaSnapshot,
+  buildCredentialSnapshot,
+  applyCredentialAction,
+  buildContextCoverage,
+  buildContextMakeup,
+  buildContextCurve,
+  buildContextMaintenance,
+  runContextPreview,
+  buildDebugContext,
+  notifyAgentOfSettingsChange,
+  applySettingsUpdate,
+  applySettingsReset,
+  applySettingsCancelTransition,
+  applyPinAdd,
+  applyPinRemove,
+  PanelError,
+  type PanelAppRef,
+  type McplLiveServer,
+} from '../web/panel-data.js';
 import { loadRecipe } from '../recipe.js';
 import {
   ObserverRegistry,
@@ -135,6 +177,12 @@ export interface WebUiModuleConfig {
   observersPath?: string;
   /** Content-free recent provider-call ledger for spend/cache diagnostics. */
   callLedger?: CallLedger;
+  /** Subscription quota windows (hosts on a subscription credential only). */
+  quotaMeter?: QuotaMeter;
+  /** Credential state + operator actions (subscription hosts only). */
+  credentials?: CredentialMonitor;
+  /** A subscription credential with no local quota meter (see PanelAppRef). */
+  subscriptionUnmetered?: boolean;
 }
 
 /** Data stashed on the Bun WS upgrade. */
@@ -161,6 +209,9 @@ interface ClientState {
    */
   auth: 'full' | 'pending' | 'observer';
   scopes: Set<ObserverScope> | null;
+  /** Observer grant label (key-authenticated clients) — the requester name
+   *  recorded in the operator log for any action this client takes. */
+  label?: string;
   /** Kills pending connections that never complete the hello. */
   authTimer?: ReturnType<typeof setTimeout>;
   /** Open peek subscriptions for this client, keyed by scope. Each entry
@@ -172,166 +223,62 @@ interface ClientState {
 /** Default port — picked to be memorable and unlikely to collide. */
 const DEFAULT_PORT = 7340;
 
+/** HTTP route → panel op, for ?scope=<child> proxying. /curve (the HTML
+ *  page) is deliberately absent: it is served locally and its own fetch of
+ *  /debug/context/curve carries the scope param through. */
+const HTTP_PANEL_OPS: Record<string, string> = {
+  '/debug/context/makeup': 'context-makeup',
+  '/debug/context/coverage': 'context-coverage',
+  '/debug/context/curve': 'context-curve',
+  '/debug/context/preview': 'context-preview',
+  '/debug/context/maintenance': 'context-maintenance',
+  '/debug/context': 'debug-context',
+  '/debug/tool-classes': 'tool-classes',
+  '/healthz': 'health',
+  '/quota': 'quota',
+  '/credential': 'credential',
+};
+
+/** True when a wire `scope` field names a fleet child (vs the local process). */
+function isChildScope(scope: string | undefined): scope is string {
+  return scope !== undefined && scope !== '' && scope !== 'local';
+}
+
+/** Map a panel-layer failure onto the HTTP response it deserves. */
+function panelErrorResponse(err: unknown): Response {
+  const status = err instanceof PanelError ? err.status : 500;
+  return Response.json(
+    { error: err instanceof Error ? err.message : String(err) },
+    { status },
+  );
+}
+
+/** Project the debug-route query string into panel-op params. Number/boolean
+ *  coercion happens here so the child-side handlers see typed values. */
+function panelParamsFromUrl(url: URL): Record<string, unknown> {
+  const params: Record<string, unknown> = {};
+  const agent = url.searchParams.get('agent');
+  if (agent) params.agent = agent;
+  const budget = url.searchParams.get('budget');
+  if (budget !== null) params.budget = Number(budget);
+  const tail = url.searchParams.get('tail');
+  if (tail !== null) params.tail = Number(tail);
+  const render = url.searchParams.get('render');
+  if (render !== null && render !== '0' && render !== 'false') params.render = true;
+  const inj = url.searchParams.get('injections');
+  if (inj !== null && inj !== '0' && inj !== 'false') params.injections = true;
+  return params;
+}
+
 /** Messages shipped in the welcome frame (the tail window). */
 const WELCOME_HISTORY_LIMIT = 200;
 /** Default / max page size for request-history. */
 const HISTORY_PAGE_DEFAULT = 200;
 const HISTORY_PAGE_MAX = 500;
 
-interface CoverageSummary {
-  id: string;
-  level: number;
-  tokens?: number;
-  sourceIds?: string[];
-  mergedInto?: string;
-}
-
-interface CoverageChunk {
-  index: number;
-  tokens?: number;
-  compressed?: boolean;
-  summaryId?: string;
-  messages?: Array<{ id?: string }>;
-}
-
-interface CoverageStrategy {
-  summaries?: CoverageSummary[];
-  chunks?: CoverageChunk[];
-  compressionQueue?: number[];
-  mergeQueue?: Array<{ level: number; sourceIds: string[] }>;
-  resolutions?: Map<string, number>;
-  pendingCompression?: Promise<void> | null;
-}
-
-export interface ContextCoverageSnapshot {
-  agent: string;
-  branch: string;
-  generatedAt: string;
-  supported: boolean;
-  totals: {
-    chunks: number;
-    compressedChunks: number;
-    coveredMessages: number;
-    coveredTokens: number;
-    summaries: number;
-  };
-  levels: Array<{
-    level: number;
-    summaries: number;
-    frontier: number;
-    tokens: number;
-    coveredChunks: number;
-    coveredMessages: number;
-    coveredTokens: number;
-  }>;
-  chunks: Array<{
-    index: number;
-    messages: number;
-    tokens: number;
-    compressed: boolean;
-    summaryId: string | null;
-    maxLevel: number;
-    selectedMin: number;
-    selectedMax: number;
-    queued: boolean;
-  }>;
-  queue: {
-    inFlight: boolean;
-    pending: string | null;
-    l1: number[];
-    merges: Array<{ targetLevel: number; sourceCount: number; firstSource: string | null; lastSource: string | null }>;
-  };
-}
-
-/** Build a text-free projection of the autobiographical summary pyramid. */
-export function buildContextCoverageSnapshot(
-  agentName: string,
-  cm: {
-    currentBranch: () => { name: string };
-    getStrategy: () => unknown;
-    getPendingWork?: () => { description?: string } | null;
-  },
-): ContextCoverageSnapshot {
-  const strategy = cm.getStrategy() as CoverageStrategy;
-  const summaries = Array.isArray(strategy.summaries) ? strategy.summaries : [];
-  const chunks = Array.isArray(strategy.chunks) ? strategy.chunks : [];
-  const compressionQueue = Array.isArray(strategy.compressionQueue) ? strategy.compressionQueue : [];
-  const mergeQueue = Array.isArray(strategy.mergeQueue) ? strategy.mergeQueue : [];
-  const resolutions = strategy.resolutions instanceof Map ? strategy.resolutions : new Map<string, number>();
-  const summaryById = new Map(summaries.map(summary => [summary.id, summary]));
-  const queuedChunks = new Set(compressionQueue);
-
-  const projectedChunks = chunks.map((chunk) => {
-    let maxLevel = 0;
-    let current = chunk.summaryId ? summaryById.get(chunk.summaryId) : undefined;
-    const seen = new Set<string>();
-    while (current && !seen.has(current.id)) {
-      seen.add(current.id);
-      maxLevel = Math.max(maxLevel, current.level);
-      current = current.mergedInto ? summaryById.get(current.mergedInto) : undefined;
-    }
-
-    const selected = (chunk.messages ?? [])
-      .map(message => typeof message.id === 'string' ? (resolutions.get(message.id) ?? 0) : 0);
-    return {
-      index: chunk.index,
-      messages: chunk.messages?.length ?? 0,
-      tokens: Math.max(0, chunk.tokens ?? 0),
-      compressed: chunk.compressed === true,
-      summaryId: chunk.summaryId ?? null,
-      maxLevel,
-      selectedMin: selected.length > 0 ? Math.min(...selected) : 0,
-      selectedMax: selected.length > 0 ? Math.max(...selected) : 0,
-      queued: queuedChunks.has(chunk.index),
-    };
-  });
-
-  const levelNumbers = [...new Set(summaries.map(summary => summary.level))]
-    .filter(level => Number.isFinite(level) && level > 0)
-    .sort((a, b) => a - b);
-  const levels = levelNumbers.map((level) => {
-    const atLevel = summaries.filter(summary => summary.level === level);
-    const covered = projectedChunks.filter(chunk => chunk.maxLevel >= level);
-    return {
-      level,
-      summaries: atLevel.length,
-      frontier: atLevel.filter(summary => !summary.mergedInto).length,
-      tokens: atLevel.reduce((total, summary) => total + Math.max(0, summary.tokens ?? 0), 0),
-      coveredChunks: covered.length,
-      coveredMessages: covered.reduce((total, chunk) => total + chunk.messages, 0),
-      coveredTokens: covered.reduce((total, chunk) => total + chunk.tokens, 0),
-    };
-  });
-  const covered = projectedChunks.filter(chunk => chunk.maxLevel > 0);
-  const pending = cm.getPendingWork?.()?.description ?? null;
-
-  return {
-    agent: agentName,
-    branch: cm.currentBranch().name,
-    generatedAt: new Date().toISOString(),
-    supported: Array.isArray(strategy.summaries) && Array.isArray(strategy.chunks),
-    totals: {
-      chunks: projectedChunks.length,
-      compressedChunks: projectedChunks.filter(chunk => chunk.compressed).length,
-      coveredMessages: covered.reduce((total, chunk) => total + chunk.messages, 0),
-      coveredTokens: covered.reduce((total, chunk) => total + chunk.tokens, 0),
-      summaries: summaries.length,
-    },
-    levels,
-    chunks: projectedChunks,
-    queue: {
-      inFlight: strategy.pendingCompression != null,
-      pending,
-      l1: [...compressionQueue],
-      merges: mergeQueue.map(merge => ({
-        targetLevel: merge.level,
-        sourceCount: merge.sourceIds.length,
-        firstSource: merge.sourceIds[0] ?? null,
-        lastSource: merge.sourceIds[merge.sourceIds.length - 1] ?? null,
-      })),
-    },
-  };
-}
+/** Re-exported from the shared panel-data layer (moved there so headless
+ *  fleet children serve the same snapshot over the fleet IPC). */
+export { buildContextCoverageSnapshot, type ContextCoverageSnapshot } from '../web/panel-data.js';
 
 /**
  * Structural view of the windowed-read facade added to
@@ -339,6 +286,38 @@ export function buildContextCoverageSnapshot(
  * structurally (not imported) so the host keeps running against older
  * context-manager copies on boxes — call sites feature-detect.
  */
+/**
+ * Optional live-surgery / quiesce surface of @animalabs/agent-framework,
+ * duck-typed so this host runs unchanged against older framework builds
+ * (the SPA hides affordances the `features` list does not advertise).
+ */
+interface SurgeryCapableFramework {
+  rollbackToMessage?: (
+    agentName: string,
+    opts: { messageId: string; requester?: { via: string; name?: string }; note?: string },
+  ) => Promise<{
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  }>;
+  suppressMessages?: (
+    agentName: string,
+    opts: { messageIds: string[]; requester?: { via: string; name?: string }; note?: string },
+  ) => Promise<{
+    sourceBranch: string;
+    targetBranch: string;
+    messagesRemoved: number;
+    lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+  }>;
+  quiesce?: (opts?: Record<string, unknown>) => Promise<unknown>;
+  resume?: (opts?: Record<string, unknown>) => Promise<unknown>;
+  getHostModeStatus?: () => unknown;
+  recordOperatorAction?: (entry: Omit<OperatorLogEntryWire, 'at'>) => unknown;
+  getOperatorLog?: (opts?: { limit?: number }) => OperatorLogEntryWire[];
+  getOperatorLogPath?: () => string | undefined;
+}
+
 interface WindowCapableCm {
   getMessageCount(): number;
   getMessageWindow(
@@ -424,6 +403,13 @@ interface SharedServerState {
 
 let sharedServer: SharedServerState | null = null;
 
+/** An openable URL for a bind address: IPv6 literals (the `::1` loopback
+ *  bind, say) need brackets, or the port reads as part of the address. */
+export function webUiHttpUrl(host: string, port: number): string {
+  const literal = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
+  return `http://${literal}:${port}`;
+}
+
 export class WebUiModule implements Module {
   readonly name = 'webui';
 
@@ -506,6 +492,16 @@ export class WebUiModule implements Module {
       state.allowedOrigins = defaultAllowedOrigins(boundPort);
     }
     sharedServer = state;
+    // A missing bundle otherwise shows at run time only as a 503 to whoever
+    // opens the page. Say it once, where the operator starting the host
+    // looks. This also covers a skipped postinstall (e.g. `--ignore-scripts`),
+    // which can't report anything itself.
+    if (!existsSync(join(state.staticRoot, 'index.html'))) {
+      console.warn(
+        `[webui] bundle not found at ${state.staticRoot}: the Web UI will answer 503 until it is built. ` +
+        `Run \`npm run build:web\` (or postinstall) to produce it.`,
+      );
+    }
 
     // Provider calls include auxiliary compression requests that never emit a
     // framework usage trace, so subscribe at the adapter ledger itself. This
@@ -520,7 +516,7 @@ export class WebUiModule implements Module {
       }
     }) ?? null;
 
-    console.log(`[webui] listening on http://${host}:${boundPort}`);
+    console.log(`[webui] listening on ${webUiHttpUrl(host, boundPort)}`);
   }
 
   async stop(): Promise<void> {
@@ -536,6 +532,13 @@ export class WebUiModule implements Module {
     sharedServer.treeAggregator?.dispose();
     sharedServer.treeAggregator = null;
     sharedServer.app = null;
+  }
+
+  /** Where the process-level web server listens, or null if none is up.
+   *  It outlives stop(), so batch mode reports it after the agent stops. */
+  listeningUrl(): string | null {
+    if (!sharedServer) return null;
+    return webUiHttpUrl(sharedServer.host, sharedServer.port);
   }
 
   getTools(): ToolDefinition[] { return []; }
@@ -621,7 +624,7 @@ export class WebUiModule implements Module {
     // Fleet integration: if FleetModule is mounted, spin up a private
     // FleetTreeAggregator and start forwarding child events to clients. The
     // aggregator's per-child reducers are populated via the `describe`/snapshot
-    // protocol, exactly as the TUI uses them — see UNIFIED-TREE-PLAN.md §3.
+    // protocol, exactly as the TUI uses them — see docs/history/UNIFIED-TREE-PLAN.md §3.
     const fleetMod = app.framework
       .getAllModules()
       .find((m) => m.name === 'fleet') as FleetModule | undefined;
@@ -678,9 +681,14 @@ export class WebUiModule implements Module {
         || eType === 'workspace-file-snapshot'
         || eType === 'cancel-subagent-result')
     ) {
-      this.routeChildSnapshotResponse(eType, corrId, event as Record<string, unknown>);
+      this.routeChildSnapshotResponse(eType, corrId, childName, event as Record<string, unknown>);
       return; // don't fan out — these are private replies, not telemetry
     }
+
+    // Panel-op replies are consumed by FleetModule.requestPanel's own
+    // corrId listener; they carry operator-panel payloads (settings, pins,
+    // health) and must never fan out as child-event telemetry.
+    if (eType === 'panel-response') return;
 
     // Roll up fleet-child session usage so the header total reflects every
     // process the operator is paying for, not just the parent. Children emit
@@ -739,6 +747,7 @@ export class WebUiModule implements Module {
   private routeChildSnapshotResponse(
     eType: string,
     corrId: string,
+    childName: string,
     event: Record<string, unknown>,
   ): void {
     if (!sharedServer) return;
@@ -751,6 +760,7 @@ export class WebUiModule implements Module {
     if (eType === 'lessons-snapshot') {
       this.send(client, {
         type: 'lessons-list',
+        scope: childName,
         loaded: Boolean(event.loaded),
         lessons: (event.lessons as LessonsListMessage['lessons']) ?? [],
       });
@@ -759,6 +769,7 @@ export class WebUiModule implements Module {
     if (eType === 'workspace-mounts-snapshot') {
       this.send(client, {
         type: 'workspace-mounts',
+        scope: childName,
         loaded: Boolean(event.loaded),
         mounts: (event.mounts as Array<{ name: string; path: string; mode: string }>) ?? [],
       });
@@ -767,6 +778,7 @@ export class WebUiModule implements Module {
     if (eType === 'workspace-tree-snapshot') {
       this.send(client, {
         type: 'workspace-tree',
+        scope: childName,
         mount: String(event.mount ?? ''),
         entries: (event.entries as Array<{ path: string; size: number }>) ?? [],
       });
@@ -780,6 +792,7 @@ export class WebUiModule implements Module {
       }
       this.send(client, {
         type: 'workspace-file',
+        scope: childName,
         path: String(event.path ?? ''),
         totalLines: Number(event.totalLines ?? 0),
         fromLine: Number(event.fromLine ?? 1),
@@ -975,6 +988,17 @@ export class WebUiModule implements Module {
   private async handleHttp(req: Request, server: ReturnType<typeof Bun.serve>): Promise<Response> {
     const url = new URL(req.url);
 
+    // Every HTTP route here is read-only — mutation happens over the WS.
+    // Wrong methods used to fall through to the same handlers (a POST
+    // /debug/context behaved exactly like the GET), which lies to API
+    // consumers probing the surface.
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      return new Response('Method Not Allowed', { status: 405, headers: { allow: 'GET, HEAD' } });
+    }
+
+    const isRetrievalTraceRoute = url.pathname === '/debug/retrieval'
+      || url.pathname === '/debug/retrieval/view';
+
     // Observer feature gate: live only when grants exist. With no grants
     // every path below reduces to the historical basic-auth-only behavior.
     const observersActive = sharedServer!.observers?.active() ?? false;
@@ -1013,6 +1037,7 @@ export class WebUiModule implements Module {
     // authenticate at all.
     const session = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req));
     const basicOk = this.checkAuth(req) || (session?.full ?? false);
+    const operatorAuthenticated = this.config.basicAuth !== undefined && basicOk;
     const sessionScopes = basicOk ? null : session?.scopes ?? null;
     const httpAllowed = (scope: ObserverScope): boolean =>
       basicOk || (sessionScopes?.has(scope) ?? false);
@@ -1039,16 +1064,19 @@ export class WebUiModule implements Module {
     const isStatic = !url.pathname.startsWith('/debug/')
       && url.pathname !== '/curve'
       && url.pathname !== '/healthz'
-      && !url.pathname.startsWith('/files/');
+      && url.pathname !== '/quota'
+      && url.pathname !== '/credential'
+      && !url.pathname.startsWith('/files/')
+      && !url.pathname.startsWith('/media/');
     if (!basicOk && !(observersActive && isStatic) && !sessionScopes) {
-      return this.unauthorized();
+      return this.unauthorized(isRetrievalTraceRoute);
     }
 
     // Per-route scope gates for observer sessions (basic auth passes all).
     if ((url.pathname.startsWith('/debug/') || url.pathname === '/curve' || url.pathname === '/prompt') && !httpAllowed('debug')) {
-      return this.unauthorized();
+      return this.unauthorized(isRetrievalTraceRoute);
     }
-    if (url.pathname === '/healthz' && !httpAllowed('health')) {
+    if ((url.pathname === '/healthz' || url.pathname === '/quota' || url.pathname === '/credential') && !httpAllowed('health')) {
       return this.unauthorized();
     }
     if (url.pathname.startsWith('/files/') && !basicOk) {
@@ -1056,6 +1084,36 @@ export class WebUiModule implements Module {
       // observer scope model (they are the agent's working files, not wire
       // events). Revisit if a 'files' scope is ever warranted.
       return this.unauthorized();
+    }
+
+    // Retrieval traces can include lesson contents, raw selector output, and
+    // opt-in recent conversation. Keep them operator-only: a password-authenticated
+    // full session is equivalent to Basic Auth, but observer `debug` scope is not.
+    if (isRetrievalTraceRoute && !operatorAuthenticated) return this.unauthorized(true);
+
+    if (url.pathname === '/debug/retrieval/view') {
+      return new Response(RETRIEVAL_TRACE_PAGE_HTML, {
+        headers: {
+          'content-type': 'text/html; charset=utf-8',
+          'cache-control': 'no-store',
+        },
+      });
+    }
+    if (url.pathname === '/debug/retrieval') {
+      return this.handleRetrievalTraces(url);
+    }
+
+    // Fleet-scope proxying: every debug/health route accepts ?scope=<child>.
+    // The request is forwarded to that fleet child over the panel IPC verb
+    // and the child's JSON comes back verbatim — same URLs, same payloads,
+    // whether the process answering is this one or a child. Keeps these
+    // endpoints curl-able for operators / connectome-doctor / the fleet hub
+    // without teaching any of them a second transport.
+    const scopeParam = url.searchParams.get('scope');
+    if (scopeParam && scopeParam !== 'local') {
+      const op = HTTP_PANEL_OPS[url.pathname];
+      if (op) return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url));
+      // Fall through: non-panel routes (static, /files) ignore the param.
     }
 
     // Debug: the membrane-normalized request that WOULD be emitted if the
@@ -1077,6 +1135,9 @@ export class WebUiModule implements Module {
     if (url.pathname === '/debug/context/maintenance') {
       return this.handleContextMaintenance();
     }
+    if (url.pathname === '/debug/context/preview') {
+      return this.handleContextPreview(url);
+    }
     if (url.pathname === '/curve') {
       return new Response(CURVE_PAGE_HTML, {
         headers: { 'content-type': 'text/html; charset=utf-8' },
@@ -1094,53 +1155,45 @@ export class WebUiModule implements Module {
       return this.handleDebugContext(url);
     }
 
+    // Each tool's effective MCPL class (RFC-008) and the source that decided
+    // it. Every tool offered, or one agent's surface with ?agent=<name>.
+    if (url.pathname === '/debug/tool-classes') {
+      return this.handleToolClasses(url);
+    }
+
+    // Inline image bytes for transcript media refs (see serveMedia). Same
+    // sensitivity tier as the transcript itself.
+    if (url.pathname.startsWith('/media/')) {
+      if (!httpAllowed('messages')) return this.unauthorized();
+      return this.serveMedia(url);
+    }
+
     // Liveness/health JSON for connectome-doctor and the fleet hub. Behind
-    // the same basic auth as everything else (checked above).
+    // the same basic auth as everything else (checked above). Assembly lives
+    // in panel-data so fleet children serve the identical snapshot.
     if (url.pathname === '/healthz') {
-      const app = sharedServer?.app;
+      const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
-      if (typeof fw.healthSnapshot !== 'function') {
-        return Response.json({ error: 'framework lacks healthSnapshot()' }, { status: 501 });
-      }
-      const snapshot = fw.healthSnapshot();
-      // Compression quarantine is a guaranteed-eventual-outage state (raw
-      // spans accumulate until the picker cannot fit the window). Surface it
-      // here so the fleet hub and connectome-doctor can alarm on it — it
-      // must never be observable only in agent.log.
       try {
-        const quarantine: Record<string, unknown> = {};
-        for (const agent of app.framework.getAllAgents()) {
-          const strategy = (agent.getContextManager() as unknown as {
-            getStrategy?: () => { getCompressionQuarantineStatus?: () => unknown };
-          }).getStrategy?.();
-          const status = strategy?.getCompressionQuarantineStatus?.();
-          if (status) quarantine[(agent as unknown as { name: string }).name] = status;
-        }
-        (snapshot as Record<string, unknown>).compressionQuarantine = quarantine;
-      } catch {
-        // Health reads never throw.
+        return Response.json(buildHealthSnapshot(app));
+      } catch (err) {
+        const status = err instanceof PanelError ? err.status : 500;
+        return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status });
       }
-      // Per-agent runtime settings (context budget, tail, transition pace +
-      // convergence state) — the same numbers `agent_settings get` returns,
-      // exposed externally so the fleet hub / connectome-doctor can watch
-      // budget convergence without an agent turn.
-      try {
-        const fw2 = app.framework as unknown as {
-          getAgentRuntimeSettings?: (name: string) => unknown;
-        };
-        if (typeof fw2.getAgentRuntimeSettings === 'function') {
-          const settings: Record<string, unknown> = {};
-          for (const agent of app.framework.getAllAgents()) {
-            const name = (agent as unknown as { name: string }).name;
-            settings[name] = fw2.getAgentRuntimeSettings(name);
-          }
-          (snapshot as Record<string, unknown>).runtimeSettings = settings;
-        }
-      } catch {
-        // Health reads never throw.
-      }
-      return Response.json(snapshot);
+    }
+
+    // Subscription quota windows, polled by the SPA only while it is visible.
+    if (url.pathname === '/quota') {
+      const app = this.panelApp();
+      if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+      return Response.json(await buildQuotaSnapshot(app));
+    }
+
+    // Credential state (health-scoped, like /healthz); no token ever rides here.
+    if (url.pathname === '/credential') {
+      const app = this.panelApp();
+      if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+      return Response.json(buildCredentialSnapshot(app));
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
@@ -1151,9 +1204,62 @@ export class WebUiModule implements Module {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
 
-    // Static SPA
+    // API namespace exhausted: anything still unmatched under /debug/ is a
+    // typo, wrong casing, or trailing slash — an honest 404 beats the SPA
+    // shell with a 200, which API consumers can't tell from data. (This was
+    // also the mechanism that swallowed real failures like the tokenizer
+    // 404 — the client saw 200/HTML instead of the error.)
+    if (url.pathname.startsWith('/debug/')) {
+      return Response.json({ error: `Unknown debug route: ${url.pathname}` }, { status: 404 });
+    }
+
+    // Static SPA. Bundle assets get real 404s: falling back to index.html
+    // for a missing /assets/*.js serves HTML where the browser expects JS —
+    // a blank page with a MIME error instead of a diagnosable miss.
     const requested = url.pathname === '/' ? '/index.html' : url.pathname;
-    return this.serveStatic(requested);
+    return this.serveStatic(requested, { spaFallback: !url.pathname.startsWith('/assets/') });
+  }
+
+  /** The minimal app slice the shared panel-data layer needs, or null before
+   *  setApp. Includes the call ledger so health snapshots ship recent calls. */
+  private panelApp(): PanelAppRef | null {
+    const app = sharedServer?.app;
+    if (!app) return null;
+    return {
+      framework: app.framework,
+      recipe: app.recipe,
+      callLedger: this.config.callLedger ?? null,
+      quotaMeter: this.config.quotaMeter ?? null,
+      credentials: this.config.credentials ?? null,
+      subscriptionUnmetered: this.config.subscriptionUnmetered === true,
+    };
+  }
+
+  private fleetModule(): FleetModule | undefined {
+    return sharedServer?.app?.framework.getAllModules().find((m) => m.name === 'fleet') as
+      | FleetModule | undefined;
+  }
+
+  /** Forward one panel op to a fleet child and answer with its JSON. Status
+   *  mapping comes from the child (PanelError.status travels the wire), with
+   *  502/504 supplied by requestPanel for unreachable/unresponsive children. */
+  private async proxyPanelToChild(
+    childName: string,
+    op: string,
+    params: Record<string, unknown>,
+  ): Promise<Response> {
+    const fleet = this.fleetModule();
+    if (!fleet) {
+      return Response.json(
+        { error: `scope '${childName}' requested but the fleet module is not loaded` },
+        { status: 404 },
+      );
+    }
+    const result = await fleet.requestPanel(childName, op, params);
+    if (!result.ok) {
+      return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
+    }
+    return Response.json(result.data);
   }
 
   /**
@@ -1162,302 +1268,165 @@ export class WebUiModule implements Module {
    * The framework snapshot deliberately contains no message or summary text.
    */
   private handleContextMaintenance(): Response {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-    const framework = app.framework as unknown as {
-      getContextMaintenanceSnapshot?: () => Record<string, unknown>;
-    };
-    if (typeof framework.getContextMaintenanceSnapshot !== 'function') {
-      return Response.json(
-        { error: 'framework lacks context-maintenance diagnostics' },
-        { status: 501 },
-      );
+    try {
+      return Response.json(buildContextMaintenance(app));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
-    return Response.json(framework.getContextMaintenanceSnapshot());
+  }
+
+  /** Tool names, classes and class sources — no arguments or results. */
+  private handleToolClasses(url: URL): Response {
+    const app = this.panelApp();
+    if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+    try {
+      return Response.json(buildToolClassesSnapshot(app, url.searchParams.get('agent') || undefined));
+    } catch (err) {
+      return panelErrorResponse(err);
+    }
   }
 
   /** Summary-tree coverage and queued work, with no message or summary text. */
   private handleContextCoverage(url: URL): Response {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return Response.json({ error: `Agent not found: ${agentName}` }, { status: 404 });
+    try {
+      return Response.json(buildContextCoverage(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined)));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
-    const cm = agent.getContextManager();
-    return Response.json(buildContextCoverageSnapshot(agentName, cm));
+  }
+
+  /**
+   * Preview the fold plan at a HYPOTHETICAL budget / tail, without applying it.
+   *
+   *   GET /debug/context/preview?budget=<tokens>[&tail=<tokens>][&agent=<name>][&render=1]
+   *
+   * Delegates to panel-data's runContextPreview, which owns the honest budget
+   * accounting AND the process-wide single-flight + cooldown guard (a preview
+   * is a real compile that blocks the agent's event loop — see panel-data).
+   * 429 responses here are the guard, not failures.
+   */
+  private handleContextPreview(url: URL): Response {
+    const app = this.panelApp();
+    if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+    try {
+      const params = panelParamsFromUrl(url);
+      return Response.json(runContextPreview(app, resolveAgent(app, params.agent), params));
+    } catch (err) {
+      return panelErrorResponse(err);
+    }
   }
 
   /**
    * Debug endpoint: return the membrane-normalized request the framework would
-   * hand to the model if the agent were activated right now. Delegates to
-   * `framework.previewActivation`. Auth is already enforced by the caller
-   * (`handleHttp`).
+   * hand to the model if the agent were activated right now. Auth is already
+   * enforced by the caller (`handleHttp`).
    *
    * Transparent by default: no inference, no Chronicle writes, no external
-   * MCPL calls — the preview leaves the system state untouched. This omits the
-   * dynamically-gathered injections (lessons/retrieval/MCPL context). Pass
-   * `?injections=1` to gather them for full fidelity, which is NOT transparent:
-   * it can run inference (e.g. RetrievalModule's Haiku calls) and fire MCPL
-   * `beforeInference` hooks (whose paired `afterInference` is never sent).
+   * MCPL calls. Pass `?injections=1` to gather the dynamic injections
+   * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
+   * transparent: it can run inference and fire MCPL `beforeInference` hooks.
    */
   private async handleDebugContext(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    // Default OFF: keep the preview transparent to system state. Opt in to
-    // dynamic injection gathering (and its side effects) with ?injections=1.
-    const injParam = url.searchParams.get('injections');
-    const injections = injParam !== null && injParam !== 'false' && injParam !== '0';
+    const params = panelParamsFromUrl(url);
     const pretty = url.searchParams.get('pretty') !== null && url.searchParams.get('pretty') !== '0';
-
-    if (!app.framework.getAgent(agentName)) {
-      return new Response(
-        JSON.stringify({ error: `Agent not found: ${agentName}` }),
-        { status: 404, headers: { 'content-type': 'application/json' } },
-      );
-    }
-
-    // media=0: collapse base64 payloads (inlined Discord images) to size
-    // placeholders. The full response can run to several MB, which stalls
-    // browser fetches over tunnels; the /prompt inspector always asks for
-    // the stripped form. Default keeps full fidelity.
-    const stripMedia = url.searchParams.get('media') === '0';
-    const mediaReplacer = (_k: string, v: unknown): unknown => {
-      if (typeof v === 'string' && v.length > 2048) {
-        const kb = Math.round(v.length / 1024);
-        const dataUrl = /^(data:[^;,]+);base64,/.exec(v);
-        if (dataUrl) return `${dataUrl[1]};base64,[stripped ${kb}kb]`;
-        if (/^[A-Za-z0-9+/=\r\n]+$/.test(v)) return `[base64 stripped ${kb}kb]`;
-      }
-      return v;
-    };
+      // media=0: collapse base64 payloads (inlined Discord images) to size
+      // placeholders; the /prompt inspector and ContextDocument ask for it.
+      const stripMedia = url.searchParams.get('media') === '0';
+      const mediaReplacer = (_k: string, v: unknown): unknown => {
+        if (typeof v === 'string' && v.length > 2048) {
+          const kb = Math.round(v.length / 1024);
+          const dataUrl = /^(data:[^;,]+);base64,/.exec(v);
+          if (dataUrl) return `${dataUrl[1]};base64,[stripped ${kb}kb]`;
+          if (/^[A-Za-z0-9+/=\r\n]+$/.test(v)) return `[base64 stripped ${kb}kb]`;
+        }
+        return v;
+      };
     try {
-      const request = await app.framework.previewActivation(agentName, { injections });
-      // `transparent` reflects whether this call was side-effect-free.
-      const body = JSON.stringify(
-        { agent: agentName, injections, transparent: !injections, request },
-        stripMedia ? mediaReplacer : undefined,
-        pretty ? 2 : undefined,
-      );
-      return new Response(body, { headers: { 'content-type': 'application/json' } });
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const payload = await buildDebugContext(app, resolveAgent(app, params.agent), params);
       return new Response(
-        JSON.stringify({ error: message }),
-        { status: 500, headers: { 'content-type': 'application/json' } },
+        JSON.stringify(payload, null, pretty ? 2 : undefined),
+        { headers: { 'content-type': 'application/json' } },
       );
+    } catch (err) {
+      return panelErrorResponse(err);
     }
   }
 
   /**
-   * Context curve (GET /debug/context/curve[?agent=<name>]): compile the
-   * agent's window and return one record per compiled entry with its
-   * provenance — kind (raw / L1..Ln summary), rendered token estimate, the
-   * raw-history tokens it covers (leaf messages, recursively through the
-   * summary tree), date span, and full text. The /curve page plots the
-   * cumulative raw→rendered curve from this; slope = local compression rate.
-   *
-   * Same side-effect class as previewActivation / makeup: the compile may
-   * commit resolution updates, exactly as the agent's own next turn would.
-   * No inference, no message writes.
+   * Context curve (GET /debug/context/curve[?agent=<name>]): per-entry
+   * provenance of the live compiled window, with a feasibility verdict. The
+   * compile is a dry run, so it commits no fold resolutions; its remaining
+   * effects with context-manager 0.13 are listed on buildContextCurve. No
+   * inference, no message writes.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return new Response(JSON.stringify({ error: `Agent not found: ${agentName}` }), {
-        status: 404, headers: { 'content-type': 'application/json' },
-      });
-    }
     try {
-      const cm = (agent as unknown as { getContextManager: () => any }).getContextManager();
-      const maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
-      const reserveForResponse = app.recipe.agent.maxTokens ?? 16_384;
-      const compiled = await cm.compile({ maxTokens, reserveForResponse });
-
-      // Curve inspection only needs text and source metadata. Resolving every
-      // historical blob here re-inlines all base64 media and can expand a
-      // few-hundred-MB Chronicle into several GB of JS heap. Use the windowed
-      // reader with blob resolution disabled so production diagnostics stay
-      // bounded by text history rather than the media archive.
-      const messageCount = cm.getMessageCount();
-      const messages: Array<{ id: string; timestamp?: unknown; content?: unknown[] }> =
-        cm.getMessageWindow(0, messageCount, { resolveBlobs: false }).messages;
-      const msgById = new Map(messages.map((mm) => [mm.id, mm]));
-      const estimate = (mm: { content?: unknown[] }): number => {
-        let t = 0;
-        for (const b of (mm.content ?? []) as Array<Record<string, unknown>>) {
-          if (b?.type === 'text') t += Math.ceil(String(b.text ?? '').length / 4);
-          else if (b?.type === 'image') t += 1600;
-          else if (b?.type === 'tool_result') t += Math.ceil(JSON.stringify(b.content ?? '').length / 4);
-          else if (b?.type === 'tool_use') t += Math.ceil(JSON.stringify(b.input ?? {}).length / 4);
-          else if (b?.type === 'thinking') t += Math.ceil(String(b.thinking ?? '').length / 4);
-        }
-        return t;
-      };
-
-      type Summary = { id: string; level: number; content: string; sourceLevel: number; sourceIds: string[] };
-      const strategy = cm.getStrategy() as { summaries?: Summary[] };
-      const sums: Summary[] = strategy.summaries ?? [];
-      const sumById = new Map(sums.map((x) => [x.id, x]));
-      const headOf = (txt: string): string => txt.replace(/\s+/g, ' ').slice(0, 100);
-      const byHead = new Map(sums.map((x) => [headOf(x.content), x]));
-      const leaves = (x: Summary, seen = new Set<string>()): string[] => {
-        if (seen.has(x.id)) return [];
-        seen.add(x.id);
-        if (x.sourceLevel === 0) return x.sourceIds;
-        const out: string[] = [];
-        for (const cid of x.sourceIds) {
-          const c = sumById.get(cid);
-          if (c) out.push(...leaves(c, seen));
-        }
-        return out;
-      };
-
-      const entries = [];
-      let i = 0;
-      for (const e of compiled.messages as Array<{ participant: string; content?: unknown[]; sourceMessageId?: string }>) {
-        const blocks = (e.content ?? []) as Array<Record<string, unknown>>;
-        const text = blocks.filter((b) => b?.type === 'text').map((b) => String(b.text ?? '')).join('\n');
-        const nImages = blocks.filter((b) => b?.type === 'image').length;
-        const rendered = Math.ceil(text.length / 4) + nImages * 1600 +
-          blocks.filter((b) => b?.type === 'tool_result' || b?.type === 'tool_use')
-            .reduce((a, b) => a + Math.ceil(JSON.stringify(b.input ?? b.content ?? '').length / 4), 0);
-        const sum = byHead.get(headOf(text));
-        if (sum) {
-          const leafIds = leaves(sum).filter((id) => msgById.has(id));
-          const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
-          const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
-          entries.push({
-            i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
-            rendered, rawCovered, msgCount: leafIds.length, nImages,
-            dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
-          });
-        } else {
-          const src = e.sourceMessageId ? msgById.get(e.sourceMessageId) : null;
-          entries.push({
-            i: i++, kind: 'raw', id: e.sourceMessageId ?? null, participant: e.participant,
-            rendered, rawCovered: src ? estimate(src) : rendered, msgCount: 1, nImages,
-            dateFirst: src?.timestamp ?? null, dateLast: src?.timestamp ?? null, text,
-          });
-        }
-      }
-      return Response.json({
-        agent: agentName,
-        generatedAt: new Date().toISOString(),
-        branch: cm.currentBranch().name,
-        budget: { maxTokens, reserveForResponse },
-        totals: {
-          entries: entries.length,
-          rendered: entries.reduce((a, e) => a + e.rendered, 0),
-          rawCovered: entries.reduce((a, e) => a + e.rawCovered, 0),
-        },
-        entries,
-      });
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
-        status: 500, headers: { 'content-type': 'application/json' },
-      });
+      return Response.json(await buildContextCurve(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined)));
+    } catch (err) {
+      return panelErrorResponse(err);
     }
+  }
+
+  private handleRetrievalTraces(url: URL): Response {
+    try {
+      const app = sharedServer?.app;
+      if (!app) return this.retrievalJson({ error: 'app not bound yet' }, { status: 503 });
+
+      const module = app.framework.getAllModules().find(candidate => candidate.name === 'retrieval') as
+        | (RetrievalTraceSource & { name: string })
+        | undefined;
+      if (!module || typeof module.getRetrievalTraces !== 'function') {
+        return this.retrievalJson(
+          { schemaVersion: 1, enabled: false, includeInputs: false, traces: [] },
+        );
+      }
+
+      const requestedLimit = Number(url.searchParams.get('limit') ?? '20');
+      const limit = Number.isFinite(requestedLimit) ? Math.trunc(requestedLimit) : 20;
+      const includeInputs = url.searchParams.get('includeInputs') === '1';
+      const traces = module.getRetrievalTraces({ limit, includeInputs });
+      return this.retrievalJson({ schemaVersion: 1, enabled: true, includeInputs, traces });
+    } catch (error) {
+      let message = 'unavailable error';
+      try {
+        message = error instanceof Error ? error.message : String(error);
+      } catch { /* keep the safe fallback */ }
+      return this.retrievalJson({ error: message }, { status: 500 });
+    }
+  }
+
+  private retrievalJson(value: unknown, init: ResponseInit = {}): Response {
+    const headers = new Headers(init.headers);
+    headers.set('cache-control', 'no-store');
+    return Response.json(value, { ...init, headers });
   }
 
   /**
    * Context makeup: the segment breakdown of the agent's current compiled
-   * context — head window, raw middle, summaries by level (L1/L2/L3), and the
-   * recent verbatim tail — from the strategy's RenderStats, plus an exact
-   * total token count via the model's count_tokens endpoint. Transparent:
+   * context, plus an exact total via count_tokens. Transparent:
    * previewActivation + count_tokens only; no inference, no Chronicle writes.
    *
    *   GET /debug/context/makeup[?agent=<name>]
    */
   private async handleContextMakeup(url: URL): Promise<Response> {
-    const app = sharedServer?.app;
+    const app = this.panelApp();
     if (!app) return new Response('Not ready', { status: 503 });
-    const agentName = url.searchParams.get('agent') || app.recipe.agent.name || 'agent';
-    const agent = app.framework.getAgent(agentName);
-    if (!agent) {
-      return new Response(JSON.stringify({ error: `Agent not found: ${agentName}` }), {
-        status: 404, headers: { 'content-type': 'application/json' },
-      });
-    }
     try {
-      // Populates the strategy's render stats as a side-effect of compiling.
-      const request = await app.framework.previewActivation(agentName);
-      const cm = (agent as { getContextManager: () => { getRenderStats: () => unknown } }).getContextManager();
-      const stats = cm.getRenderStats();
-
-      // Build an Anthropic-faithful payload for an exact count_tokens: map
-      // participants to roles (the agent's own -> assistant, others -> user
-      // with a "Name:" prefix) and merge consecutive same-role runs, mirroring
-      // what the NativeFormatter sends.
-      const textOf = (c: unknown): string =>
-        Array.isArray(c)
-          ? c.map((b) => (b && typeof b === 'object' && (b as { type?: string }).type === 'text' ? (b as { text: string }).text : '')).join('')
-          : String(c ?? '');
-      const merged: Array<{ role: 'user' | 'assistant'; text: string }> = [];
-      for (const m of ((request as { messages?: Array<{ participant?: string; role?: string; content: unknown }> }).messages ?? [])) {
-        const who = m.participant ?? m.role ?? 'user';
-        const role: 'user' | 'assistant' = who === agentName ? 'assistant' : 'user';
-        let t = textOf(m.content);
-        if (role === 'user' && who && who !== 'user') t = `${who}: ${t}`;
-        const last = merged[merged.length - 1];
-        if (last && last.role === role) last.text += '\n' + t;
-        else merged.push({ role, text: t });
-      }
-      const anthMessages = merged.filter((m) => m.text.trim().length > 0).map((m) => ({ role: m.role, content: m.text }));
-      const sysRaw = (request as { system?: unknown }).system;
-      const systemStr = Array.isArray(sysRaw)
-        ? sysRaw.map((b) => (b && typeof b === 'object' ? (b as { text?: string }).text ?? '' : String(b))).join('\n')
-        : (typeof sysRaw === 'string' ? sysRaw : undefined);
-
-      let exactTotalTokens: number | null = null;
-      const provider = process.env.LLM_PROVIDER ?? 'anthropic';
-      const countModel = process.env.COUNT_TOKENS_MODEL || (process.env.MODEL ?? 'anthropic/claude-opus-4.5');
-      let countSource = provider === 'openai-compatible'
-        ? 'unavailable_openai_compatible'
-        : 'count_tokens';
-      if (provider !== 'openai-compatible') try {
-        const base = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
-        const res = await fetch(base + '/v1/messages/count_tokens', {
-          method: 'POST',
-          headers: {
-            // Mirror the main adapter's auth: OAuth Bearer (subscription) when
-            // ANTHROPIC_AUTH_TOKEN is set, x-api-key otherwise.
-            ...(process.env.ANTHROPIC_AUTH_TOKEN
-              ? {
-                  authorization: `Bearer ${process.env.ANTHROPIC_AUTH_TOKEN}`,
-                  'anthropic-beta': 'oauth-2025-04-20',
-                }
-              : { 'x-api-key': process.env.ANTHROPIC_API_KEY ?? '' }),
-            'anthropic-version': '2023-06-01',
-            'content-type': 'application/json',
-            'user-agent': 'conhost/1.0',
-          },
-          body: JSON.stringify({ model: countModel, ...(systemStr ? { system: systemStr } : {}), messages: anthMessages }),
-        });
-        if (res.ok) {
-          const j = (await res.json()) as { input_tokens?: number };
-          exactTotalTokens = j.input_tokens ?? null;
-        } else {
-          countSource = `count_tokens_failed_${res.status}`;
-        }
-      } catch {
-        countSource = 'count_tokens_error';
-      }
-
+      const payload = await buildContextMakeup(app, resolveAgent(app, url.searchParams.get('agent') ?? undefined));
       return new Response(
-        JSON.stringify({ agent: agentName, stats, exactTotalTokens, countModel, countSource }, null, 2),
+        JSON.stringify(payload, null, 2),
         { headers: { 'content-type': 'application/json' } },
       );
-    } catch (error) {
-      return new Response(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }), {
-        status: 500, headers: { 'content-type': 'application/json' },
-      });
+    } catch (err) {
+      return panelErrorResponse(err);
     }
   }
 
@@ -1485,7 +1454,11 @@ export class WebUiModule implements Module {
     }
   }
 
-  private async serveStatic(requestedPath: string): Promise<Response> {
+  private async serveStatic(
+    requestedPath: string,
+    opts: { spaFallback?: boolean } = {},
+  ): Promise<Response> {
+    const spaFallback = opts.spaFallback ?? true;
     // Path containment: resolve and verify the result is still under staticRoot.
     // Plain startsWith without a separator is unsafe — both `<root>` and
     // `<root>-evil/...` pass `startsWith('<root>')`. The current callers
@@ -1501,16 +1474,20 @@ export class WebUiModule implements Module {
     try {
       const s = await stat(safePath);
       if (s.isDirectory()) {
-        return this.serveStatic(join(requestedPath, 'index.html'));
+        return this.serveStatic(join(requestedPath, 'index.html'), opts);
       }
       const data = await readFile(safePath);
-      return new Response(data, { headers: { 'content-type': mimeFor(safePath) } });
+      return new Response(data, { headers: { 'content-type': mimeFor(safePath), 'cache-control': cacheControlFor(safePath) } });
     } catch {
+      // Missing bundle assets are honest misses, not SPA routes.
+      if (!spaFallback) {
+        return new Response('Not Found', { status: 404 });
+      }
       // Fall back to index.html so the SPA can handle client-side routing.
       try {
         const indexPath = join(sharedServer!.staticRoot, 'index.html');
         const data = await readFile(indexPath);
-        return new Response(data, { headers: { 'content-type': 'text/html' } });
+        return new Response(data, { headers: { 'content-type': 'text/html', 'cache-control': cacheControlFor(indexPath) } });
       } catch {
         return new Response(
           `WebUI bundle not found at ${sharedServer!.staticRoot}. Run \`npm run build:web\` (or postinstall) to produce it.`,
@@ -1559,6 +1536,7 @@ export class WebUiModule implements Module {
     if (client.authTimer) clearTimeout(client.authTimer);
     client.auth = 'observer';
     client.scopes = result.scopes;
+    client.label = result.grant.label;
     this.send(client, {
       type: 'observer-ack',
       scopes: [...result.scopes],
@@ -1577,7 +1555,266 @@ export class WebUiModule implements Module {
     // Branch listing is conversation-shape metadata (names, fork points) —
     // same sensitivity tier as the message window, so same scope.
     if (type === 'request-branches') return client.scopes?.has('messages') ?? false;
-    return false; // observers are read-only: no user-message/command/mcpl/fleet
+    // Host serving state is liveness telemetry; the operator log is ops.
+    if (type === 'request-host-mode') return client.scopes?.has('health') ?? false;
+    // Credential state is health-tier telemetry (it can carry a pending
+    // device-code login); the ACTIONS stay operator-only (fall through).
+    if (type === 'request-credential') return client.scopes?.has('health') ?? false;
+    if (type === 'request-operator-log') return client.scopes?.has('ops') ?? false;
+    return false; // observers are read-only: no user-message/command/mcpl/fleet/surgery
+  }
+
+  /** Requester identity recorded in the operator log for this client. */
+  private requesterFor(client: ClientState): { via: string; name?: string } {
+    if (client.auth === 'observer') {
+      return { via: 'webui-observer', ...(client.label ? { name: client.label } : {}) };
+    }
+    return { via: 'webui', name: this.config.basicAuth?.username ?? 'operator' };
+  }
+
+  /** Capabilities the SPA feature-detects. Duck-typed against the bound
+   *  framework so this host works unchanged against an older
+   *  @animalabs/agent-framework (affordances simply do not appear). */
+  private hostFeatures(): string[] {
+    const fw = sharedServer?.app?.framework as unknown as SurgeryCapableFramework | undefined;
+    const features = ['media'];
+    if (!fw) return features;
+    if (typeof fw.rollbackToMessage === 'function') features.push('rollback');
+    if (typeof fw.suppressMessages === 'function') features.push('suppress');
+    if (typeof fw.quiesce === 'function' && typeof fw.resume === 'function'
+      && typeof fw.getHostModeStatus === 'function') features.push('quiesce');
+    if (typeof fw.getOperatorLog === 'function') features.push('operator-log');
+    return features;
+  }
+
+  /** Host serving state, or null when the framework predates quiesce. */
+  private hostModeSnapshot(): HostModeSnapshot | null {
+    const fw = sharedServer?.app?.framework as unknown as SurgeryCapableFramework | undefined;
+    if (!fw || typeof fw.getHostModeStatus !== 'function') return null;
+    try {
+      // agent-framework HostModeStatus (#122): { quiesced, drained, reason?,
+      // since?, activeTurns, gatedRequests, backgroundScripts }. A quiesce
+      // that is still draining turns reads as 'quiescing'.
+      const s = (fw.getHostModeStatus() ?? {}) as Record<string, unknown>;
+      const mode = typeof s.mode === 'string' ? s.mode
+        : s.quiesced === true ? (s.drained === false ? 'quiescing' : 'quiesced')
+        : 'serving';
+      return {
+        mode,
+        ...(typeof s.since === 'number' ? { since: s.since } : {}),
+        ...(typeof s.reason === 'string' ? { reason: s.reason } : {}),
+        ...(typeof s.activeTurns === 'number' ? { activeTurns: s.activeTurns } : {}),
+        detail: s,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private broadcastHostMode(): void {
+    const hostMode = this.hostModeSnapshot();
+    if (!hostMode) return;
+    this.broadcastToWelcomed({ type: 'host-mode', hostMode });
+  }
+
+  /**
+   * Live surgery: rollback (fork at a message, switch) or suppress (fork at
+   * head, redact, switch). The framework refuses while the agent is busy —
+   * the SPA offers "quiesce, then retry" on `code: 'agent-busy'`. On success
+   * every client is re-welcomed with the new branch's tail, exactly as
+   * `/checkout` does.
+   */
+  private async handleSurgery(
+    client: ClientState,
+    op: 'rollback' | 'suppress',
+    req: RollbackMessage | SuppressMessage,
+  ): Promise<void> {
+    const app = sharedServer?.app;
+    const panel = this.panelApp();
+    if (!app || !panel) return;
+    const fw = app.framework as unknown as SurgeryCapableFramework;
+    const fn = op === 'rollback' ? fw.rollbackToMessage : fw.suppressMessages;
+    if (typeof fn !== 'function') {
+      this.send(client, {
+        type: 'surgery-result', corrId: req.corrId, op, ok: false,
+        error: `this host's agent-framework has no live ${op} — upgrade @animalabs/agent-framework`,
+      });
+      return;
+    }
+    let agentName: string;
+    try {
+      agentName = resolveAgent(panel, req.agent);
+    } catch (err) {
+      this.send(client, {
+        type: 'surgery-result', corrId: req.corrId, op, ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+      return;
+    }
+    const requester = this.requesterFor(client);
+    const note = req.note?.trim() || undefined;
+    try {
+      const r = op === 'rollback'
+        ? await fw.rollbackToMessage!(agentName, {
+            messageId: (req as RollbackMessage).messageId,
+            requester,
+            ...(note ? { note } : {}),
+          })
+        : await fw.suppressMessages!(agentName, {
+            messageIds: (req as SuppressMessage).messageIds,
+            requester,
+            ...(note ? { note } : {}),
+          });
+      this.send(client, {
+        type: 'surgery-result', corrId: req.corrId, op, ok: true, agent: agentName,
+        sourceBranch: r.sourceBranch, targetBranch: r.targetBranch,
+        messagesRemoved: r.messagesRemoved, lastVisible: r.lastVisible ?? null,
+      });
+      // Same follow-through as a /checkout: config mount, branch chip,
+      // fresh tail for every welcomed client.
+      await this.materializeConfigMount();
+      this.broadcastBranchChanged();
+      this.refreshAllWelcomes();
+    } catch (err) {
+      const code = (err as { code?: unknown } | null)?.code;
+      this.send(client, {
+        type: 'surgery-result', corrId: req.corrId, op, ok: false, agent: agentName,
+        error: err instanceof Error ? err.message : String(err),
+        ...(typeof code === 'string' ? { code } : {}),
+      });
+    }
+  }
+
+  /** Quiesce / resume the host (agent-framework #122) and record it. */
+  private async handleHostMode(
+    client: ClientState,
+    verb: 'quiesce' | 'resume',
+    req: HostQuiesceMessage | HostResumeMessage,
+  ): Promise<void> {
+    const app = sharedServer?.app;
+    if (!app) return;
+    const fw = app.framework as unknown as SurgeryCapableFramework;
+    const fn = verb === 'quiesce' ? fw.quiesce : fw.resume;
+    if (typeof fn !== 'function') {
+      this.send(client, {
+        type: 'error', corrId: req.corrId,
+        message: `this host's agent-framework has no ${verb} support — upgrade @animalabs/agent-framework`,
+      });
+      return;
+    }
+    const requester = this.requesterFor(client);
+    const reason = verb === 'quiesce' ? (req as HostQuiesceMessage).reason?.trim() || undefined : undefined;
+    try {
+      // quiesce({reason?, timeoutMs?, abandon?}) waits for in-flight turns to
+      // drain (up to its timeout); resume({force?}) re-runs the per-agent
+      // feasibility gate and throws ResumeBlockedError with verdicts.
+      if (verb === 'quiesce') await fw.quiesce!(reason ? { reason } : {});
+      else await fw.resume!({});
+      const hostMode = this.hostModeSnapshot();
+      fw.recordOperatorAction?.({
+        kind: verb,
+        requester,
+        ...(reason ? { note: reason } : {}),
+        ...(hostMode ? { result: { mode: hostMode.mode } } : {}),
+      });
+      if (hostMode) this.send(client, { type: 'host-mode', corrId: req.corrId, hostMode });
+      this.broadcastHostMode();
+    } catch (err) {
+      let message = err instanceof Error ? err.message : String(err);
+      // ResumeBlockedError: say which agent's context would not fit and why,
+      // not just "blocked".
+      const verdicts = (err as { verdicts?: unknown } | null)?.verdicts;
+      if (Array.isArray(verdicts) && verdicts.length > 0) {
+        const lines = verdicts.map((v) => {
+          const vv = v as { agentName?: string; preview?: { reason?: string; transitionReason?: string; transition?: string } };
+          const why = vv.preview?.reason ?? vv.preview?.transitionReason ?? vv.preview?.transition ?? 'not feasible';
+          return `${vv.agentName ?? '?'}: ${why}`;
+        });
+        message = `${message} — ${lines.join('; ')}`;
+      }
+      fw.recordOperatorAction?.({ kind: verb, requester, ...(reason ? { note: reason } : {}), error: message });
+      this.send(client, { type: 'error', corrId: req.corrId, message: `${verb} failed: ${message}` });
+      this.broadcastHostMode();
+    }
+  }
+
+  private sendOperatorLog(client: ClientState, req: RequestOperatorLogMessage): void {
+    const fw = sharedServer?.app?.framework as unknown as SurgeryCapableFramework | undefined;
+    if (!fw || typeof fw.getOperatorLog !== 'function') {
+      this.send(client, { type: 'operator-log', corrId: req.corrId, entries: [] });
+      return;
+    }
+    const limit = Math.max(1, Math.min(1000, Math.floor(req.limit ?? 100)));
+    try {
+      const path = typeof fw.getOperatorLogPath === 'function' ? fw.getOperatorLogPath() : undefined;
+      this.send(client, {
+        type: 'operator-log', corrId: req.corrId,
+        entries: fw.getOperatorLog({ limit }),
+        ...(path ? { path } : {}),
+      });
+    } catch (err) {
+      this.send(client, {
+        type: 'error', corrId: req.corrId,
+        message: `operator log unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  /**
+   * `/media/<messageId>/<blockPath>` — one inline image, streamed as bytes.
+   * Transcript frames carry only a `ref`; the browser fetches on render, so
+   * multi-MB base64 never rides the WebSocket and never inflates a welcome.
+   * Observer sessions need the `messages` scope (same tier as the transcript).
+   */
+  private async serveMedia(url: URL): Promise<Response> {
+    const rest = url.pathname.slice('/media/'.length);
+    const slash = rest.indexOf('/');
+    if (slash <= 0 || slash === rest.length - 1) {
+      return Response.json({ error: 'expected /media/<messageId>/<blockPath>' }, { status: 400 });
+    }
+    let messageId: string;
+    try {
+      messageId = decodeURIComponent(rest.slice(0, slash));
+    } catch {
+      return Response.json({ error: 'malformed message id' }, { status: 400 });
+    }
+    const path = rest.slice(slash + 1);
+    const scope = url.searchParams.get('scope') ?? undefined;
+    const agent = url.searchParams.get('agent') ?? undefined;
+    let data: { mediaType: string; base64: string };
+    try {
+      if (isChildScope(scope)) {
+        const fleet = this.fleetModule();
+        if (!fleet) {
+          return Response.json({ error: `scope '${scope}' requested but the fleet module is not loaded` }, { status: 404 });
+        }
+        const r = await fleet.requestPanel(scope, 'media', { messageId, path, ...(agent ? { agent } : {}) });
+        if (!r.ok) return Response.json({ error: r.error ?? 'media request failed' }, { status: r.status ?? 502 });
+        data = r.data as { mediaType: string; base64: string };
+      } else {
+        const app = this.panelApp();
+        if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
+        data = buildMediaBlock(app, resolveAgent(app, agent), { messageId, path });
+      }
+    } catch (err) {
+      return panelErrorResponse(err);
+    }
+    if (typeof data?.base64 !== 'string' || typeof data?.mediaType !== 'string' || !data.mediaType.startsWith('image/')) {
+      return Response.json({ error: 'media payload malformed' }, { status: 502 });
+    }
+    const bytes = Buffer.from(data.base64, 'base64');
+    return new Response(bytes, {
+      headers: {
+        'content-type': data.mediaType,
+        'content-length': String(bytes.length),
+        // Store ids are stable and message content is immutable in practice;
+        // a day's private cache keeps re-renders free.
+        'cache-control': 'private, max-age=86400',
+        'x-content-type-options': 'nosniff',
+        // Defence in depth for SVG: no scripts, no external loads, no frames.
+        'content-security-policy': "default-src 'none'; style-src 'unsafe-inline'; sandbox",
+      },
+    });
   }
 
   private onWsMessage(ws: ServerWebSocket<WsData>, raw: string | Buffer): void {
@@ -1667,6 +1904,35 @@ export class WebUiModule implements Module {
         return;
       }
 
+      case 'rollback':
+        void this.handleSurgery(client, 'rollback', parsed);
+        return;
+
+      case 'suppress':
+        void this.handleSurgery(client, 'suppress', parsed);
+        return;
+
+      case 'host-quiesce':
+        void this.handleHostMode(client, 'quiesce', parsed);
+        return;
+
+      case 'host-resume':
+        void this.handleHostMode(client, 'resume', parsed);
+        return;
+
+      case 'request-host-mode': {
+        const hostMode = this.hostModeSnapshot();
+        this.send(client, {
+          type: 'host-mode', corrId: parsed.corrId,
+          hostMode: hostMode ?? { mode: 'unsupported' },
+        });
+        return;
+      }
+
+      case 'request-operator-log':
+        this.sendOperatorLog(client, parsed);
+        return;
+
       case 'subscribe-peek':
         this.handleSubscribePeek(client, parsed.scope, parsed.active);
         return;
@@ -1724,7 +1990,11 @@ export class WebUiModule implements Module {
       }
 
       case 'request-mcpl': {
-        this.sendMcplList(client);
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedMcpl(client, parsed.scope!);
+        } else {
+          this.sendMcplList(client);
+        }
         return;
       }
 
@@ -1733,6 +2003,16 @@ export class WebUiModule implements Module {
         return;
       }
 
+      case 'request-conversation-graph': {
+        this.sendConversationGraph(client);
+        return;
+      }
+
+      // MCPL mutations stay host-side regardless of panel scope: the registry
+      // FILE is one cwd-shared mcpl-servers.json for the whole fleet, so
+      // "edit clerk's zulip env" and "edit the shared file" are the same
+      // write. Which entries a child actually loads is its recipe's opt-in —
+      // the scoped VIEW (request-mcpl + live) is what differs per child.
       case 'mcpl-add': {
         try {
           const servers = readMcplServersFile(DEFAULT_CONFIG_PATH);
@@ -1785,6 +2065,200 @@ export class WebUiModule implements Module {
           return;
         }
         this.sendMcplList(client);
+        return;
+      }
+
+      case 'request-pins': {
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedPins(client, parsed.scope!, parsed.agent);
+        } else {
+          this.sendPinsList(client, parsed.agent);
+        }
+        return;
+      }
+
+      // Pins change what the NEXT compile folds, so like settings these
+      // broadcast rather than replying to the requester only.
+      case 'pin-add': {
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedPinMutation(client, parsed.scope!, 'pin-add', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.kind ? { kind: parsed.kind } : {}),
+            firstMessageId: parsed.firstMessageId,
+            ...(parsed.lastMessageId ? { lastMessageId: parsed.lastMessageId } : {}),
+            ...(parsed.level !== undefined ? { level: parsed.level } : {}),
+            ...(parsed.maxLevel !== undefined ? { maxLevel: parsed.maxLevel } : {}),
+            ...(parsed.name ? { name: parsed.name } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
+        try {
+          applyPinAdd(app, agentName, parsed as unknown as Record<string, unknown>);
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `pin-add failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastPinsList(agentName);
+        return;
+      }
+
+      case 'pin-remove': {
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedPinMutation(client, parsed.scope!, 'pin-remove', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            pinId: parsed.pinId,
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
+        try {
+          const ok = applyPinRemove(app, agentName, parsed.pinId);
+          if (!ok) {
+            // Not an exception: a stale panel can ask twice. Say so plainly and
+            // still re-broadcast, so the client converges on reality.
+            this.send(client, { type: 'error', message: `no such pin: ${parsed.pinId}` });
+          }
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `pin-remove failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastPinsList(agentName);
+        return;
+      }
+
+      case 'request-settings': {
+        if (isChildScope(parsed.scope)) {
+          void this.sendScopedSettings(client, parsed.scope!, parsed.agent);
+        } else {
+          this.sendSettingsState(client, parsed.agent);
+        }
+        return;
+      }
+
+      // Settings mutations are live process state, so every case BROADCASTS
+      // rather than replying to the requester only (contrast sendMcplList,
+      // which is file-only). Two operators must not see divergent budgets.
+      case 'settings-update': {
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-update', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.contextBudgetTokens !== undefined ? { contextBudgetTokens: parsed.contextBudgetTokens } : {}),
+            ...(parsed.tailTokens !== undefined ? { tailTokens: parsed.tailTokens } : {}),
+            ...(parsed.transitionPaceTokens !== undefined ? { transitionPaceTokens: parsed.transitionPaceTokens } : {}),
+            ...(parsed.immediate !== undefined ? { immediate: parsed.immediate } : {}),
+            ...(parsed.persist !== undefined ? { persist: parsed.persist } : {}),
+            ...(parsed.notify !== undefined ? { notify: parsed.notify } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
+        try {
+          applySettingsUpdate(app, agentName, parsed as unknown as Record<string, unknown>);
+        } catch (err) {
+          // Expected failures land here and must reach the operator verbatim:
+          // budget ≤ max response tokens, or a strategy that cannot prepare a
+          // smaller window live. Silently swallowing them would look like the
+          // apply worked.
+          this.send(client, {
+            type: 'error',
+            message: `settings-update failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        if (parsed.notify === true) notifyAgentOfSettingsChange(app, agentName, 'update');
+        this.broadcastSettingsState(agentName);
+        return;
+      }
+
+      case 'request-credential': {
+        if (isChildScope(parsed.scope)) {
+          void this.requestChildPanel(client, parsed.scope!, 'credential', {}).then((data) => {
+            if (data !== null) this.send(client, { type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+          });
+          return;
+        }
+        const app = this.panelApp();
+        if (!app) return;
+        this.send(client, { type: 'credential-state', scope: 'local', ...buildCredentialSnapshot(app) } as WebUiServerMessage);
+        return;
+      }
+
+      // Credential actions change process state (a rotated token serves every
+      // agent), so the outcome BROADCASTS like settings mutations do.
+      case 'credential-action': {
+        const params = { action: parsed.action, ...(parsed.token !== undefined ? { token: parsed.token } : {}) };
+        if (isChildScope(parsed.scope)) {
+          void this.requestChildPanel(client, parsed.scope!, 'credential-action', params).then((data) => {
+            if (data !== null) this.broadcastCredentialState({ type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+          });
+          return;
+        }
+        const app = this.panelApp();
+        if (!app) return;
+        void applyCredentialAction(app, params)
+          .then((data) => this.broadcastCredentialState({ type: 'credential-state', scope: 'local', ...data } as WebUiServerMessage))
+          .catch((err) => this.send(client, {
+            type: 'error',
+            message: `credential-action failed: ${err instanceof Error ? err.message : String(err)}`,
+          }));
+        return;
+      }
+
+      case 'settings-reset': {
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-reset', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+            ...(parsed.keys ? { keys: parsed.keys } : {}),
+            ...(parsed.persist !== undefined ? { persist: parsed.persist } : {}),
+            ...(parsed.notify !== undefined ? { notify: parsed.notify } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
+        try {
+          applySettingsReset(app, agentName, parsed as unknown as Record<string, unknown>);
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `settings-reset failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        if (parsed.notify === true) notifyAgentOfSettingsChange(app, agentName, 'reset');
+        this.broadcastSettingsState(agentName);
+        return;
+      }
+
+      case 'settings-cancel-transition': {
+        if (isChildScope(parsed.scope)) {
+          void this.applyScopedSettingsMutation(client, parsed.scope!, 'settings-cancel-transition', {
+            ...(parsed.agent ? { agent: parsed.agent } : {}),
+          });
+          return;
+        }
+        const app = this.panelApp()!;
+        const agentName = resolveAgent(app, parsed.agent);
+        try {
+          applySettingsCancelTransition(app, agentName);
+        } catch (err) {
+          this.send(client, {
+            type: 'error',
+            message: `settings-cancel-transition failed: ${err instanceof Error ? err.message : String(err)}`,
+          });
+          return;
+        }
+        this.broadcastSettingsState(agentName);
         return;
       }
 
@@ -1891,7 +2365,7 @@ export class WebUiModule implements Module {
   private async sendWorkspaceMounts(client: ClientState): Promise<void> {
     const mod = await this.workspaceMod();
     if (!mod) {
-      this.send(client, { type: 'workspace-mounts', loaded: false, mounts: [] });
+      this.send(client, { type: 'workspace-mounts', scope: 'local', loaded: false, mounts: [] });
       return;
     }
     try {
@@ -1899,6 +2373,7 @@ export class WebUiModule implements Module {
       const data = (result.data ?? {}) as { mounts?: Array<{ name: string; path: string; mode: string }> };
       this.send(client, {
         type: 'workspace-mounts',
+        scope: 'local',
         loaded: true,
         mounts: data.mounts ?? [],
       });
@@ -1926,6 +2401,7 @@ export class WebUiModule implements Module {
       const data = (result.data ?? {}) as { entries?: Array<{ path: string; size: number }> };
       this.send(client, {
         type: 'workspace-tree',
+        scope: 'local',
         mount,
         entries: data.entries ?? [],
       });
@@ -1982,6 +2458,7 @@ export class WebUiModule implements Module {
       }
       this.send(client, {
         type: 'workspace-file',
+        scope: 'local',
         path: data.path ?? path,
         totalLines,
         fromLine: data.fromLine ?? 1,
@@ -1998,24 +2475,24 @@ export class WebUiModule implements Module {
    *  config path is whatever the host's mcpl-config module resolves at
    *  module-load time — usually `<cwd>/mcpl-servers.json`. */
   private sendMcplList(client: ClientState): void {
-    let servers: ReturnType<typeof readMcplServersFile> = {};
-    try { servers = readMcplServersFile(DEFAULT_CONFIG_PATH); }
-    catch { /* missing or malformed file → empty list */ }
-    const out: McplListMessage = {
-      type: 'mcpl-list',
-      configPath: DEFAULT_CONFIG_PATH,
-      servers: Object.entries(servers).map(([id, entry]) => ({
-        id,
-        command: entry.command,
-        ...(entry.args ? { args: entry.args } : {}),
-        ...(entry.env ? { env: entry.env } : {}),
-        ...(entry.toolPrefix ? { toolPrefix: entry.toolPrefix } : {}),
-        ...(entry.reconnect !== undefined ? { reconnect: entry.reconnect } : {}),
-        ...(entry.enabledFeatureSets ? { enabledFeatureSets: entry.enabledFeatureSets } : {}),
-        ...(entry.disabledFeatureSets ? { disabledFeatureSets: entry.disabledFeatureSets } : {}),
-      })),
+    const app = this.panelApp();
+    if (!app) return;
+    const snap = buildMcplSnapshot(app) as {
+      configPath: string;
+      servers: McplListMessage['servers'];
+      live: McplLiveServer[];
+      toolClasses?: McplListMessage['toolClasses'];
     };
+    const out: McplListMessage = { type: 'mcpl-list', scope: 'local', ...snap };
     this.send(client, out);
+  }
+
+  /** Scoped MCPL view: the child's own runPanelOp('mcpl') — same shared
+   *  registry file, but the LIVE list is the child's actual loaded servers. */
+  private async sendScopedMcpl(client: ClientState, scope: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'mcpl', {});
+    if (data === null) return;
+    this.send(client, { type: 'mcpl-list', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   /** Build a BranchesListMessage from the agent's context manager. Lineage
@@ -2052,6 +2529,68 @@ export class WebUiModule implements Module {
     }
   }
 
+  /** Build a user/model-only projection for locating exact fork anchors. */
+  private sendConversationGraph(client: ClientState): void {
+    if (!sharedServer?.app) return;
+    const cm = sharedServer.app.framework.getAllAgents()[0]?.getContextManager();
+    if (!cm) {
+      this.send(client, { type: 'error', message: 'no agent context manager' });
+      return;
+    }
+    try {
+      const branches = cm.listBranches();
+      const current = cm.currentBranch();
+      const messages = cm.getAllMessages();
+      const visible = messages.filter((message) => {
+        const participant = message.participant.toLowerCase();
+        return participant === 'user' || participant === 'assistant' || participant === 'model';
+      });
+      const rows = branches.map((b) => ({
+        id: b.id,
+        name: b.name,
+        head: b.head,
+        ...(b.parentId !== undefined ? { parentId: b.parentId } : {}),
+        ...(b.branchPoint !== undefined ? { branchPoint: b.branchPoint } : {}),
+        created: b.created instanceof Date ? b.created.getTime() : Number(b.created),
+      }));
+      const bySequence = new Map(visible.map((message) => [message.sequence, message]));
+      const nodes = visible.map((message) => {
+        const branch = branches.find((candidate) =>
+          message.sequence <= candidate.head &&
+          (candidate.parentId === undefined || candidate.branchPoint === undefined || message.sequence > candidate.branchPoint),
+        ) ?? current;
+        const anchor = branch.branchPoint === undefined ? undefined : bySequence.get(branch.branchPoint);
+        const text = message.content
+          .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
+          .map((block) => block.text)
+          .join('\\n')
+          .trim();
+        return {
+          id: message.id,
+          sequence: message.sequence,
+          participant: message.participant.toLowerCase() === 'user' ? 'user' as const : 'assistant' as const,
+          text: text.length > 240 ? `${text.slice(0, 237)}...` : text,
+          timestamp: message.timestamp instanceof Date ? message.timestamp.getTime() : Number(message.timestamp),
+          branchId: branch.id,
+          ...(branch.branchPoint !== undefined ? { forkPoint: branch.branchPoint } : {}),
+          ...(anchor ? { forkAnchorId: anchor.id } : {}),
+        };
+      });
+      const out: ConversationGraphMessage = {
+        type: 'conversation-graph',
+        branches: rows,
+        currentId: current.id,
+        nodes,
+      };
+      this.send(client, out);
+    } catch (err) {
+      this.send(client, {
+        type: 'error',
+        message: `conversation graph failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
   /** Build a LessonsListMessage from the bound LessonsModule, if present. */
   private sendLessonsList(client: ClientState): void {
     if (!sharedServer?.app) return;
@@ -2059,7 +2598,7 @@ export class WebUiModule implements Module {
       | { getLessons(): Array<{ id: string; content: string; confidence: number; tags: string[]; deprecated: boolean; deprecationReason?: string; created?: number; updated?: number }> }
       | undefined;
     if (!lessonsMod) {
-      this.send(client, { type: 'lessons-list', loaded: false, lessons: [] });
+      this.send(client, { type: 'lessons-list', scope: 'local', loaded: false, lessons: [] });
       return;
     }
     const lessons = lessonsMod.getLessons().map(l => ({
@@ -2072,7 +2611,7 @@ export class WebUiModule implements Module {
       ...(typeof l.created === 'number' ? { created: l.created } : {}),
       ...(typeof l.updated === 'number' ? { updated: l.updated } : {}),
     }));
-    this.send(client, { type: 'lessons-list', loaded: true, lessons });
+    this.send(client, { type: 'lessons-list', scope: 'local', loaded: true, lessons });
   }
 
   /** Names of fleet children currently running. Empty when no fleet module
@@ -2451,6 +2990,151 @@ export class WebUiModule implements Module {
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Pins + settings senders — all snapshot/mutation logic lives in the shared
+  // panel-data layer; these wrappers only add wire envelopes, scope stamps,
+  // and requester-vs-broadcast routing.
+  // -------------------------------------------------------------------------
+
+  private sendPinsList(client: ClientState, agentName?: string): void {
+    const app = this.panelApp();
+    if (!app) return;
+    try {
+      const snap = buildPinsSnapshot(app, resolveAgent(app, agentName));
+      this.send(client, { type: 'pins-list', scope: 'local', ...snap });
+    } catch (err) {
+      this.send(client, {
+        type: 'error',
+        message: `pins unavailable: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  }
+
+  /** Scoped pins view. Asks the child for picker candidates too — the SPA
+   *  has no window into a child's message store to build its own list. */
+  private async sendScopedPins(client: ClientState, scope: string, agentName?: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'pins', {
+      ...(agentName ? { agent: agentName } : {}),
+      withCandidates: true,
+    });
+    if (data === null) return;
+    this.send(client, { type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  /** Run pin-add / pin-remove in a fleet child; the op returns the fresh
+   *  pins snapshot, which BROADCASTS (pins alter the next compile's fold
+   *  plan — two operators must not hold divergent views, same rule as the
+   *  local path). A `warning` in the data (stale pin-remove) goes back to
+   *  the requester only. */
+  private async applyScopedPinMutation(
+    client: ClientState,
+    scope: string,
+    op: 'pin-add' | 'pin-remove',
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, op, { ...params, withCandidates: true });
+    if (data === null) return;
+    const warning = (data as { warning?: unknown }).warning;
+    if (typeof warning === 'string') {
+      this.send(client, { type: 'error', message: warning });
+    }
+    this.broadcastToWelcomed({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  private broadcastPinsList(agentName: string): void {
+    const app = this.panelApp();
+    if (!app) return;
+    try {
+      const snap = buildPinsSnapshot(app, agentName);
+      this.broadcastToWelcomed({ type: 'pins-list', scope: 'local', ...snap });
+    } catch { /* pins unsupported — nothing to broadcast */ }
+  }
+
+  private sendSettingsState(client: ClientState, agentName?: string): void {
+    const app = this.panelApp();
+    if (!app) return;
+    const msg = buildSettingsState(app, resolveAgent(app, agentName));
+    if (!msg) {
+      this.send(client, { type: 'error', message: 'runtime settings unavailable on this build' });
+      return;
+    }
+    this.send(client, { type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
+  }
+
+  private async sendScopedSettings(client: ClientState, scope: string, agentName?: string): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, 'settings',
+      agentName ? { agent: agentName } : {});
+    if (data === null) return;
+    this.send(client, { type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  /** Run a settings mutation in a fleet child. The op applies the change AND
+   *  returns the fresh state in one round trip; like the local path, the
+   *  result broadcasts to every welcomed client. */
+  private async applyScopedSettingsMutation(
+    client: ClientState,
+    scope: string,
+    op: 'settings-update' | 'settings-reset' | 'settings-cancel-transition',
+    params: Record<string, unknown>,
+  ): Promise<void> {
+    const data = await this.requestChildPanel(client, scope, op, params);
+    if (data === null) return;
+    this.broadcastToWelcomed({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
+  }
+
+  /** Fan out to every welcomed client — settings are live process state. */
+  private broadcastSettingsState(agentName: string): void {
+    const app = this.panelApp();
+    if (!app) return;
+    const msg = buildSettingsState(app, agentName);
+    if (!msg) return;
+    this.broadcastToWelcomed({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
+  }
+
+  /** Credential state goes to operators and to observers holding the
+   *  'health' scope — the same gate as /healthz and the usage frame. */
+  private broadcastCredentialState(msg: WebUiServerMessage): void {
+    if (!sharedServer) return;
+    for (const c of sharedServer.clients.values()) {
+      if (c.welcomed && (c.scopes === null || c.scopes.has('health'))) this.send(c, msg);
+    }
+  }
+
+  private broadcastToWelcomed(msg: WebUiServerMessage): void {
+    if (!sharedServer) return;
+    for (const c of sharedServer.clients.values()) {
+      if (c.welcomed) this.send(c, msg);
+    }
+  }
+
+  /**
+   * Run one panel op in a fleet child and hand back its data, or send the
+   * error to the requesting client and return null. The WS twin of
+   * proxyPanelToChild — corrId bookkeeping lives inside requestPanel, so
+   * unlike routeFleetRequest there is no pendingFleetRequests entry.
+   */
+  private async requestChildPanel(
+    client: ClientState,
+    childName: string,
+    op: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown | null> {
+    const fleet = this.fleetModule();
+    if (!fleet) {
+      this.send(client, { type: 'error', message: 'fleet module not loaded' });
+      return null;
+    }
+    const result = await fleet.requestPanel(childName, op, params);
+    if (!result.ok) {
+      this.send(client, {
+        type: 'error',
+        message: `${op} on '${childName}' failed: ${result.error ?? 'unknown error'}`,
+      });
+      return null;
+    }
+    return result.data ?? {};
+  }
+
   private broadcastBranchChanged(): void {
     if (!sharedServer?.app) return;
     const cm = sharedServer?.app.framework.getAllAgents()[0]?.getContextManager();
@@ -2482,7 +3166,17 @@ export class WebUiModule implements Module {
     // pending connections get their welcome from handleObserverHello.
     if (client.auth === 'pending') return;
 
-    const welcome = await this.buildWelcome();
+    // The one await comes first. From building the welcome to marking the
+    // client welcomed nothing yields, so no event falls between what the
+    // welcome copies and the client's stream (a client skips live events
+    // until it's welcomed). That covers the fleet children's trees, which the
+    // welcome copies. It names the parent's agents without their trace state
+    // (see buildWelcome), so the client's parent nodes start from the live
+    // stream, and a parent trace before the welcome, during this await
+    // included, reaches the client in neither.
+    const childRecipes = await this.loadWelcomeRecipes();
+    if (!sharedServer?.app) return;
+    const welcome = this.buildWelcome(childRecipes);
     this.send(client, client.scopes === null ? welcome : scopeWelcome(welcome, client.scopes));
     client.welcomed = true;
     // Live trace forwarding is driven by the single fan-out listener
@@ -2530,7 +3224,29 @@ export class WebUiModule implements Module {
     });
   }
 
-  private async buildWelcome(): Promise<WelcomeMessage> {
+  /** Each fleet child's recipe, for its tree in the welcome. sendWelcome
+   *  loads them before the welcome reads anything: state copied before an
+   *  await would miss whatever landed during it, such as a child's usage
+   *  sample, which the client's next sample would then count as part of its
+   *  own call. */
+  private async loadWelcomeRecipes(): Promise<Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>> {
+    const recipes = new Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>();
+    const aggregator = sharedServer?.treeAggregator;
+    const fleetMod = aggregator
+      ? sharedServer?.app?.framework.getAllModules().find((m) => m.name === 'fleet') as FleetModule | undefined
+      : undefined;
+    if (aggregator && fleetMod) {
+      for (const name of aggregator.getAllChildNames()) {
+        recipes.set(name, await this.loadChildRecipeInfo(fleetMod, name));
+      }
+    }
+    return recipes;
+  }
+
+  /** The welcome, read synchronously (see sendWelcome). */
+  private buildWelcome(
+    childRecipes: Map<string, Awaited<ReturnType<WebUiModule['loadChildRecipeInfo']>>>,
+  ): WelcomeMessage {
     const app = sharedServer?.app!;
     const fw = app.framework;
     const agents = fw.getAllAgents();
@@ -2568,11 +3284,11 @@ export class WebUiModule implements Module {
       }
     }
 
-    // Parent-local snapshot via a transient reducer fed by the framework's
-    // current trace history. We have no replayable past traces, so the
-    // initial snapshot just registers the agents — the live trace stream
-    // takes over from there. Future: persist a parent-local reducer if
-    // cold-attach state recovery becomes important.
+    // Parent-local snapshot via a transient reducer that only registers the
+    // agents: there's no replayable trace history, so the live trace stream
+    // takes over from there, and no parent trace before the welcome is in
+    // it. Future: persist a parent-local reducer if cold-attach state
+    // recovery becomes important.
     const localReducer = new AgentTreeReducer();
     localReducer.seedFrameworkAgents(agents.map(a => a.name));
     const localSnap: AgentTreeSnapshot = localReducer.getSnapshot();
@@ -2583,11 +3299,12 @@ export class WebUiModule implements Module {
     // either way the live event stream keeps it current.
     const childTrees: WelcomeMessage['childTrees'] = [];
     if (sharedServer?.treeAggregator) {
-      const fleetMod = sharedServer.app?.framework.getAllModules().find((m) => m.name === 'fleet') as
-        | FleetModule | undefined;
-      for (const name of sharedServer?.treeAggregator.getAllChildNames()) {
-        const nodes = sharedServer?.treeAggregator.getChildNodes(name);
-        const recipeInfo = fleetMod ? await this.loadChildRecipeInfo(fleetMod, name) : undefined;
+      for (const name of sharedServer.treeAggregator.getAllChildNames()) {
+        const nodes = sharedServer.treeAggregator.getChildNodes(name);
+        // A child that registered while the recipes loaded is sent without
+        // its recipe, like one that registers after the welcome: a client
+        // learns recipes only from a welcome.
+        const recipeInfo = childRecipes.get(name);
         childTrees.push({
           name,
           asOfTs: Date.now(),
@@ -2599,6 +3316,7 @@ export class WebUiModule implements Module {
     }
 
     const branch = cm?.currentBranch();
+    const hostMode = this.hostModeSnapshot();
 
     return {
       type: 'welcome',
@@ -2626,6 +3344,8 @@ export class WebUiModule implements Module {
         callIdIndex: localSnap.callIdIndex,
       },
       childTrees,
+      features: this.hostFeatures(),
+      ...(hostMode ? { hostMode } : {}),
       usage: sharedServer!.latestUsage,
       ...(sharedServer!.latestPerAgentCost.length > 0
         ? { perAgentCost: sharedServer!.latestPerAgentCost }
@@ -2719,10 +3439,12 @@ export class WebUiModule implements Module {
     return userOk && passOk;
   }
 
-  private unauthorized(): Response {
+  private unauthorized(noStore = false): Response {
+    const headers = new Headers({ 'www-authenticate': 'Basic realm="connectome-host"' });
+    if (noStore) headers.set('cache-control', 'no-store');
     return new Response('Unauthorized', {
       status: 401,
-      headers: { 'www-authenticate': 'Basic realm="connectome-host"' },
+      headers,
     });
   }
 }
@@ -2781,6 +3503,9 @@ interface MessageLike {
   timestamp?: number | Date;
   bodyGroupId?: string;
   shardIndex?: number;
+  /** Sequence number within the branch — threaded to the client as a
+   *  scroll anchor for branch-point navigation from graph/timeline views. */
+  sequence?: number;
 }
 
 // Per-block size caps for wire frames. A single pathological tool result or
@@ -2803,13 +3528,24 @@ function capText(s: string, cap: number): { text: string; truncated?: boolean } 
  *
  * `index` is the message's store slot index — the client's paging cursor.
  */
-function toWireEntry(msg: MessageLike, index: number): WelcomeMessageEntry {
+function toWireEntry(
+  msg: MessageLike,
+  index: number,
+  opts: { mediaRefs?: boolean } = {},
+): WelcomeMessageEntry {
   const blocks: import('../web/protocol.js').MessageBlock[] = [];
   const textParts: string[] = [];
   let toolResults = 0;
   let conversational = 0; // text/thinking blocks — used for participant fixup
+  // Lazy image locator: `<messageId>/<blockIndex>[.<inner>]`, served by
+  // /media/. Only when the entry maps 1:1 onto one stored message (coalesced
+  // shard runs do not — their block indices are synthetic).
+  const mediaRef = (blockPath: string, mediaType: string): string | undefined =>
+    opts.mediaRefs !== false && typeof msg.id === 'string' && msg.id.length > 0 && mediaType.startsWith('image/')
+      ? `${encodeURIComponent(msg.id)}/${blockPath}`
+      : undefined;
 
-  for (const block of msg.content) {
+  for (const [bi, block] of msg.content.entries()) {
     const b = block as {
       type?: string; text?: unknown; thinking?: unknown; data?: unknown;
       id?: unknown; name?: unknown; input?: unknown;
@@ -2864,28 +3600,42 @@ function toWireEntry(msg: MessageLike, index: number): WelcomeMessageEntry {
             ...(b.isError === true ? { isError: true } : {}),
           });
           toolResults++;
+          // Images a tool returned (read_image, cameras, screenshots) ride as
+          // sibling media blocks with a nested locator so they render inline.
+          if (Array.isArray(b.content)) {
+            for (const [ii, inner] of b.content.entries()) {
+              const ib = inner as { type?: string; source?: { mediaType?: unknown }; ref?: { mediaType?: unknown } } | null;
+              const mt = ib?.type === 'image' && typeof ib.source?.mediaType === 'string' ? ib.source.mediaType
+                : ib?.type === 'blob_ref' && typeof ib.ref?.mediaType === 'string' ? ib.ref.mediaType
+                : null;
+              if (!mt || !mt.startsWith('image/')) continue;
+              const ref = mediaRef(`${bi}.${ii}`, mt);
+              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}) });
+            }
+          }
         }
         break;
       case 'image':
       case 'document':
       case 'audio':
-      case 'video':
-        blocks.push({
-          kind: 'media',
-          mediaType:
-            typeof b.source?.mediaType === 'string' ? b.source.mediaType
-            : typeof b.mediaType === 'string' ? b.mediaType
-            : b.type,
-        });
+      case 'video': {
+        const mediaType =
+          typeof b.source?.mediaType === 'string' ? b.source.mediaType
+          : typeof b.mediaType === 'string' ? b.mediaType
+          : b.type;
+        const ref = b.type === 'image' ? mediaRef(String(bi), mediaType) : undefined;
+        blocks.push({ kind: 'media', mediaType, ...(ref ? { ref } : {}) });
         break;
-      case 'blob_ref':
+      }
+      case 'blob_ref': {
         // Un-inflated media placeholder (welcome/history are read with
-        // resolveBlobs: false so multi-MB base64 never hits the wire).
-        blocks.push({
-          kind: 'media',
-          mediaType: typeof b.ref?.mediaType === 'string' ? b.ref.mediaType : 'blob',
-        });
+        // resolveBlobs: false so multi-MB base64 never hits the wire). The
+        // ref lets the browser fetch the bytes on render instead.
+        const mediaType = typeof b.ref?.mediaType === 'string' ? b.ref.mediaType : 'blob';
+        const ref = mediaRef(String(bi), mediaType);
+        blocks.push({ kind: 'media', mediaType, ...(ref ? { ref } : {}) });
         break;
+      }
       default:
         break; // unknown block types are skipped, not errored
     }
@@ -2906,6 +3656,7 @@ function toWireEntry(msg: MessageLike, index: number): WelcomeMessageEntry {
   if (msg.id) entry.id = msg.id;
   const ts = msg.timestamp instanceof Date ? msg.timestamp.getTime() : msg.timestamp;
   if (ts) entry.timestamp = ts;
+  if (msg.sequence !== undefined) entry.seq = msg.sequence;
   return entry;
 }
 
@@ -2961,7 +3712,7 @@ function coalesceAndFlatten(messages: readonly MessageLike[], startIndex: number
       }
     }
     const merged: MessageLike = { ...shards[0]!, content: mergedContent };
-    out.push(toWireEntry(merged, startIndex + runStart));
+    out.push(toWireEntry(merged, startIndex + runStart, { mediaRefs: false }));
   }
   return out;
 }
@@ -3073,6 +3824,20 @@ function aggregateFleetUsage(ss: SharedServerState): TokenUsage {
     out.cost = { total: costTotal, currency: costCurrency };
   }
   return out;
+}
+
+/**
+ * Cache policy for the SPA. Vite emits content-hashed files under
+ * `assets/`, so those are safe to cache forever; `index.html` is the one
+ * mutable entry point and must always be revalidated — with no header at
+ * all, browsers applied heuristic caching and a tab could keep pairing a
+ * stale index with a stale bundle across bundle swaps (2026-09-21, Fable).
+ */
+function cacheControlFor(path: string): string {
+  if (/[\\/]assets[\\/][^\\/]+-[A-Za-z0-9_-]{6,}\.[a-z0-9]+$/.test(path)) {
+    return 'public, max-age=31536000, immutable';
+  }
+  return 'no-cache';
 }
 
 function mimeFor(path: string): string {

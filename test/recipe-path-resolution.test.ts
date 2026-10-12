@@ -8,7 +8,7 @@
 import { describe, test, expect, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadRecipe, resolveRecipeRelative, type Recipe } from '../src/recipe.js';
 
@@ -48,15 +48,26 @@ describe('resolveRecipeRelative', () => {
   });
 
   test('bare filename resolves against parent dir', () => {
-    expect(resolveRecipeRelative('child.json', { kind: 'file', dir: '/opt/recipes' }))
-      .toBe('/opt/recipes/child.json');
+    const dir = resolve('/opt/recipes');
+    const out = resolveRecipeRelative('child.json', { kind: 'file', dir });
+
+    expect(isAbsolute(out)).toBe(true);
+    expect(dirname(out)).toBe(dir);
+    expect(basename(out)).toBe('child.json');
   });
 
   test('dotted prefix resolves against parent dir', () => {
-    expect(resolveRecipeRelative('./child.json', { kind: 'file', dir: '/opt/recipes' }))
-      .toBe('/opt/recipes/child.json');
-    expect(resolveRecipeRelative('../other/child.json', { kind: 'file', dir: '/opt/recipes' }))
-      .toBe('/opt/other/child.json');
+    const dir = resolve('/opt/recipes');
+
+    const here = resolveRecipeRelative('./child.json', { kind: 'file', dir });
+    expect(dirname(here)).toBe(dir);
+    expect(basename(here)).toBe('child.json');
+
+    // `..` must climb out of `dir` and land in a sibling directory.
+    const up = resolveRecipeRelative('../other/child.json', { kind: 'file', dir });
+    expect(basename(up)).toBe('child.json');
+    expect(basename(dirname(up))).toBe('other');
+    expect(dirname(dirname(up))).toBe(dirname(dir));
   });
 
   test('URL base resolves relative child to sibling URL', () => {
@@ -97,7 +108,7 @@ describe('loadRecipe — children[].recipe resolution', () => {
 
     const originalCwd = process.cwd();
     try {
-      process.chdir('/tmp');
+      process.chdir(tmpdir());
       const a = await loadRecipe(parentPath);
       process.chdir(tmpDir);
       const b = await loadRecipe(parentPath);

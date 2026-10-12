@@ -11,10 +11,13 @@
  * the middle are styled distinctly.
  */
 
-import { createSignal, onMount, For, Show } from 'solid-js';
+import { createEffect, createSignal, on, For, Show } from 'solid-js';
+import { MediaView } from './Surgery';
 import { displayName } from './display';
 
-interface Msg { participant?: string; role?: string; content: unknown }
+/** One compiled message. `sourceMessageId` is the chronicle id when the
+ *  entry is a raw message (strategies stamp it); summaries have none. */
+interface Msg { participant?: string; role?: string; content: unknown; sourceMessageId?: string }
 interface Seg { messages: number; tokens: number }
 interface Stats {
   head: Seg; tail: Seg; middleRaw: Seg;
@@ -26,39 +29,117 @@ const fmt = (n: number) => n.toLocaleString();
 const estTokens = (s: string) => Math.round(s.length / 3.6);
 const SUMMARY_LABELS = ['What do you remember', 'Context Manager'];
 
+type Block = { type?: string; text?: string; name?: string; input?: unknown; content?: unknown; is_error?: boolean; thinking?: string };
+
+const TOOL_INPUT_PREVIEW = 600;
+
+/** Render one content block as text. Every block type the API can put in a
+ *  message gets a visible form — a box whose blocks all map to '' is what an
+ *  operator reads as "empty context", which is never true. */
+function blockText(b: unknown): string {
+  if (!b || typeof b !== 'object') return String(b ?? '');
+  const blk = b as Block;
+  switch (blk.type) {
+    case 'text': return blk.text ?? '';
+    case 'image': return '[image]';
+    case 'thinking': return `[thinking · ${fmt((blk.thinking ?? '').length)} chars]`;
+    case 'redacted_thinking': return '[redacted thinking]';
+    case 'tool_use': {
+      let args = '';
+      try { args = JSON.stringify(blk.input ?? {}); } catch { args = String(blk.input); }
+      if (args.length > TOOL_INPUT_PREVIEW) args = `${args.slice(0, TOOL_INPUT_PREVIEW)}…`;
+      return `⚙ ${blk.name ?? 'tool'}(${args})`;
+    }
+    case 'tool_result': {
+      const inner = Array.isArray(blk.content) ? blk.content.map(blockText).join('') : String(blk.content ?? '');
+      return `${blk.is_error ? '✗ tool error' : '↳ tool result'}${inner ? `\n${inner}` : ' (empty)'}`;
+    }
+    default: return `[${blk.type ?? 'block'}]`;
+  }
+}
+
 function textOf(c: unknown): string {
-  if (Array.isArray(c)) return c.map((b) => (b && typeof b === 'object' && (b as { type?: string }).type === 'text' ? (b as { text: string }).text : (b && (b as { type?: string }).type === 'image' ? '[image]' : ''))).join('');
+  if (Array.isArray(c)) return c.map(blockText).join('\n');
   return String(c ?? '');
 }
 
-export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTMLElement | undefined }) {
+/** Inline images in the compiled message (the request ships them as base64
+ *  — exactly what the model sees), including ones nested in tool results. */
+function imagesOf(c: unknown): Array<{ mediaType: string; dataUrl: string }> {
+  if (!Array.isArray(c)) return [];
+  const out: Array<{ mediaType: string; dataUrl: string }> = [];
+  const visit = (b: unknown): void => {
+    if (!b || typeof b !== 'object') return;
+    const blk = b as { type?: string; source?: { type?: string; data?: unknown; mediaType?: unknown; media_type?: unknown }; content?: unknown };
+    if (blk.type === 'image' && blk.source?.type === 'base64' && typeof blk.source.data === 'string') {
+      const mt = typeof blk.source.mediaType === 'string' ? blk.source.mediaType
+        : typeof blk.source.media_type === 'string' ? blk.source.media_type : 'image/png';
+      if (mt.startsWith('image/')) out.push({ mediaType: mt, dataUrl: `data:${mt};base64,${blk.source.data}` });
+    } else if (blk.type === 'tool_result' && Array.isArray(blk.content)) {
+      blk.content.forEach(visit);
+    }
+  };
+  c.forEach(visit);
+  return out;
+}
+
+/** Coarse message kind for the box header: tool traffic gets labelled so a
+ *  tool-heavy stretch of context reads as what it is. */
+function kindOf(c: unknown): 'tool_use' | 'tool_result' | null {
+  if (!Array.isArray(c)) return null;
+  const types = new Set(c.map((b) => (b && typeof b === 'object' ? (b as Block).type : undefined)));
+  if (types.has('tool_result')) return 'tool_result';
+  if (types.has('tool_use')) return 'tool_use';
+  return null;
+}
+
+export function ContextDocument(props: {
+  scope?: string;
+  scrollRoot?: () => HTMLElement | undefined;
+  /** Show "roll back to here" on raw-message boxes (host supports it, local scope, operator). */
+  canRollback?: boolean;
+  onRollback?: (messageId: string, preview: string) => void;
+}) {
   const [msgs, setMsgs] = createSignal<Msg[]>([]);
   const [stats, setStats] = createSignal<Stats | null>(null);
   const [exact, setExact] = createSignal<number | null>(null);
   const [err, setErr] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
 
+  /** Fleet-child scopes route through the host's ?scope= proxy. */
+  const query = () => props.scope && props.scope !== 'local'
+    ? `?scope=${encodeURIComponent(props.scope)}`
+    : '';
+
   const load = async () => {
+    const scopeAtStart = props.scope;
     setLoading(true); setErr(null);
     try {
-      const q = props.agent ? `&agent=${encodeURIComponent(props.agent)}` : '';
-      // media=0: inlined base64 images can push the full response to several
-      // MB, which stalls and kills the fetch over proxied tunnels. The
-      // document view renders text only, so the stripped body is lossless
-      // for display purposes.
+      // media=0: inlined base64 images can make the response several MB
+      // (stalls over tunnels); the document view renders text only.
+      const q = query().replace(/^\?/, '&');
       const [ctxRes, mkRes] = await Promise.all([
         fetch(`/debug/context?media=0${q}`, { credentials: 'same-origin' }),
         fetch(`/debug/context/makeup?pretty=0${q}`, { credentials: 'same-origin' }),
       ]);
-      if (!ctxRes.ok) throw new Error(`context HTTP ${ctxRes.status}`);
+      if (!ctxRes.ok) {
+        const body = (await ctxRes.json().catch(() => null)) as { error?: string } | null;
+        throw new Error(body?.error ?? `context HTTP ${ctxRes.status}`);
+      }
       const ctx = await ctxRes.json();
+      if (props.scope !== scopeAtStart) return; // scope switched mid-flight
       setMsgs((ctx?.request?.messages ?? []) as Msg[]);
       if (mkRes.ok) { const mk = await mkRes.json(); setStats(mk.stats); setExact(mk.exactTotalTokens); }
     } catch (e) {
+      if (props.scope !== scopeAtStart) return;
       setErr(e instanceof Error ? e.message : String(e));
     } finally { setLoading(false); }
   };
-  onMount(load);
+  // Initial load AND scope-switch refetch, clearing the stale document first.
+  createEffect(on(() => props.scope, () => {
+    setMsgs([]); setStats(null); setExact(null); setErr(null);
+    void load();
+  }));
 
   // Zone boundaries from the makeup counts (render order: head | middle | tail).
   const headN = () => stats()?.head.messages ?? 0;
@@ -131,6 +212,9 @@ export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTML
             const summary = isSummary(m);
             const who = displayName(m.participant ?? m.role ?? '?');
             const t = textOf(m.content);
+            const kind = kindOf(m.content);
+            const images = imagesOf(m.content);
+            const rollbackable = !summary && !!props.canRollback && typeof m.sourceMessageId === 'string' && i() < msgs().length - 1;
             return (
               <>
                 <Show when={firstOfZone}>
@@ -138,12 +222,31 @@ export function ContextDocument(props: { agent?: string; scrollRoot?: () => HTML
                     {zone === 'head' ? 'Head — oldest, verbatim' : zone === 'tail' ? 'Recent — verbatim tail' : 'Middle — summaries + raw'}
                   </div>
                 </Show>
-                <div class={`rounded border px-3 py-2 ${summary ? 'border-cyan-900/60 bg-cyan-950/20' : 'border-neutral-800 bg-neutral-900/30'}`}>
+                <div class={`group rounded border px-3 py-2 ${summary ? 'border-cyan-900/60 bg-cyan-950/20' : 'border-neutral-800 bg-neutral-900/30'}`}>
                   <div class="flex items-center justify-between text-[10px] font-mono mb-1">
-                    <span class={summary ? 'text-cyan-400' : 'text-neutral-400'}>{summary ? '◆ summary' : who}</span>
-                    <span class="text-neutral-600">~{fmt(estTokens(t))} tok</span>
+                    <span class={summary ? 'text-cyan-400' : 'text-neutral-400'}>
+                      {summary ? '◆ summary' : who}
+                      <Show when={!summary && kind}><span class="ml-2 text-neutral-600">{kind === 'tool_use' ? '⚙ tool call' : '↳ tool result'}</span></Show>
+                      <Show when={images.length > 0}><span class="ml-2 text-sky-500/80">🖼 {images.length}</span></Show>
+                    </span>
+                    <span class="flex items-center gap-2">
+                      <Show when={rollbackable}>
+                        <button
+                          type="button"
+                          class="opacity-40 group-hover:opacity-100 focus:opacity-100 px-1.5 py-0.5 rounded border border-neutral-700 text-neutral-400 hover:border-amber-700 hover:text-amber-200 transition-opacity"
+                          title="roll back: make this message the tail of the live branch"
+                          onClick={() => props.onRollback?.(m.sourceMessageId!, `${who}: ${t.replace(/\s+/g, ' ').slice(0, 90)}`)}
+                        >⏪ roll back to here</button>
+                      </Show>
+                      <span class="text-neutral-600">~{fmt(estTokens(t) + images.length * 1600)} tok</span>
+                    </span>
                   </div>
                   <div class="whitespace-pre-wrap text-[13px] leading-relaxed text-neutral-300">{t.slice(0, 4000)}{t.length > 4000 ? '…' : ''}</div>
+                  <Show when={images.length > 0}>
+                    <div class="mt-1 flex flex-wrap gap-1">
+                      <For each={images}>{(img) => <MediaView mediaType={img.mediaType} dataUrl={img.dataUrl} compact />}</For>
+                    </div>
+                  </Show>
                 </div>
               </>
             );

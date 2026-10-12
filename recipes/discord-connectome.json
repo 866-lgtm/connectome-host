@@ -41,7 +41,7 @@
     },
     "playwright": {
       "command": "npx",
-      "args": ["@playwright/mcp@latest", "--headless", "--browser", "chromium"],
+      "args": ["@playwright/mcp@0.0.81", "--headless", "--browser", "chromium"],
       "toolPrefix": "web"
     }
   },

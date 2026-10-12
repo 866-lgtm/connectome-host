@@ -18,6 +18,7 @@
 
 import { For, Show } from 'solid-js';
 import { displayName } from './display';
+import type { CallLedgerRow } from '@conhost/web/protocol';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -29,13 +30,64 @@ export interface OpsAlert {
   /** Epoch millis of the latest firing. */
   at: number;
   count: number;
+  /** Operator actions the host offers for this alert (credential alerts
+   *  carry them in the trace's `data.actions`). Rendered as buttons. */
+  actions?: CredentialAction[];
+  /** Process the alert (and its actions) belong to. The strip is a
+   *  host-level surface, so this is 'local' for everything it shows. */
+  scope?: string;
 }
+
+export interface CredentialAction {
+  id: string;
+  label: string;
+  hint?: string;
+}
+
+/** The host's credential state (health `credential` block / credential-state
+ *  frame). Absent on API-key hosts. Never carries a token. */
+export interface CredentialInfo {
+  subscription?: boolean;
+  agent?: string;
+  kind?: string;
+  provider?: string;
+  message?: string;
+  since?: number;
+  until?: number;
+  windows?: string[];
+  rotatable?: boolean;
+  expiresAt?: number;
+  actions?: CredentialAction[];
+  login?: { verificationUrl: string; userCode: string };
+  lastAction?: { id: string; at: number; ok: boolean; message: string };
+}
+
+/** Credential alert kinds — the ones whose row gets action buttons and the
+ *  ones a fresh credential-state frame must reconcile away. */
+export const CREDENTIAL_ALERT_KINDS = [
+  'quota-spent', 'quota-unreadable', 'auth-expiring', 'auth-expired', 'auth-rejected', 'auth-login-required',
+] as const;
 
 /** Shape of GET /healthz — framework healthSnapshot() plus the host's
  *  compressionQuarantine / runtimeSettings extensions. All fields optional
  *  and defensively read: health rendering must survive version skew. */
+/** Rendered composition of the last compile — what was actually SENT. */
+export interface ContextComposition {
+  head?: { messages: number; tokens: number };
+  tail?: { messages: number; tokens: number };
+  middleRaw?: { messages: number; tokens: number };
+  summaries?: Record<string, { count: number; tokens: number }>;
+  total?: { messages: number; tokens: number };
+}
+
+/** One provider call. Aliased to the wire type so the two cannot drift; only
+ *  the fields this panel aggregates are read. */
+export type LedgerRow = CallLedgerRow;
+
 export interface HealthSnapshot {
   at?: string;
+  credential?: CredentialInfo;
+  contextComposition?: Record<string, ContextComposition>;
   uptimeSec?: number;
   gate?: Record<string, unknown> | null;
   pendingRequests?: number;
@@ -58,6 +110,36 @@ export interface HealthSnapshot {
     } | null;
   }>;
   compressionQuarantine?: Record<string, { count?: number; keys?: string[] }>;
+
+  /** cm's single-authority debt reduction (getCompressionDebt) — the QUEUE
+
+   * of closed-but-uncompressed chunks. Distinct from contextComposition:
+
+   * composition says what the last compile RENDERED (summaries L1 = 0 there
+
+   * means "no L1 tokens in the window", often healthy consolidation);
+
+   * this block says what the memory organ still OWES. Absent per-agent
+
+   * entry = the stack predates the reduction — render that as
+
+   * "not reported", never as zero (misread twice on 2026-08-29). */
+
+  compressionDebt?: Record<string, {
+
+    state?: 'healthy' | 'degraded' | 'critical';
+
+    pendingChunks?: number;
+
+    oldestPendingAgeMs?: number | null;
+
+    mergeQueueDepth?: number;
+
+    mergeQuarantineCount?: number;
+
+    compressionQuarantineCount?: number;
+
+  }>;
   runtimeSettings?: Record<string, {
     contextBudgetTokens?: number;
     tailTokens?: number;
@@ -92,14 +174,47 @@ const fmtUptime = (sec: number): string => {
 
 /** Severity → row tone. Quarantine and hard-down are outage-class (rose);
  *  everything else on this channel is at least warning-class (amber). */
+/** Rose = the agent cannot answer right now; amber = degraded / act soon. */
+const HARD_DOWN_KINDS = new Set([
+  'compression-quarantine', 'inference-exhausted', 'hard-down',
+  'quota-spent', 'auth-expired', 'auth-rejected', 'auth-login-required',
+]);
 const alertTone = (kind: string): { row: string; dot: string } =>
-  kind === 'compression-quarantine' || kind === 'inference-exhausted'
+  HARD_DOWN_KINDS.has(kind)
     ? { row: 'bg-rose-950/60 border-rose-900 text-rose-200', dot: 'bg-rose-500 animate-pulse' }
     : { row: 'bg-amber-950/60 border-amber-900 text-amber-200', dot: 'bg-amber-500' };
+
+/** Action buttons on an alert row / the credential section. The host runs
+ *  the action; nothing here is automatic. */
+export function CredentialActionButtons(props: {
+  actions: CredentialAction[] | undefined;
+  onAction(actionId: string): void;
+  disabled?: boolean;
+}) {
+  return (
+    <Show when={props.actions && props.actions.length > 0}>
+      <span class="flex items-center gap-1 shrink-0">
+        <For each={props.actions}>{(act) => (
+          <button
+            type="button"
+            class="px-1.5 py-0.5 rounded border border-current/40 hover:bg-white/10 font-mono text-[10px] disabled:opacity-40"
+            title={act.hint ?? act.label}
+            disabled={props.disabled}
+            onClick={() => props.onAction(act.id)}
+          >
+            {act.label}
+          </button>
+        )}</For>
+      </span>
+    </Show>
+  );
+}
 
 export function OpsAlertStrip(props: {
   alerts: OpsAlert[];
   onDismiss(key: string): void;
+  /** Present when the host can run credential actions for a row. */
+  onAction?(alert: OpsAlert, actionId: string): void;
 }) {
   return (
     <For each={props.alerts}>{(a) => {
@@ -110,6 +225,9 @@ export function OpsAlertStrip(props: {
           <span class="font-mono font-semibold shrink-0">{displayName(a.agent)}</span>
           <span class="font-mono text-[10px] uppercase tracking-wider opacity-70 shrink-0">{a.kind}</span>
           <span class="truncate" title={a.message}>{a.message}</span>
+          <Show when={props.onAction}>
+            <CredentialActionButtons actions={a.actions} onAction={(id) => props.onAction!(a, id)} />
+          </Show>
           <span class="ml-auto shrink-0 opacity-60 font-mono text-[10px]">
             {a.count > 1 ? `×${a.count} · ` : ''}{fmtAgo(a.at)}
           </span>
@@ -127,15 +245,219 @@ export function OpsAlertStrip(props: {
   );
 }
 
+
+const n0 = (v: number) => v.toLocaleString();
+
+function CallStats(props: { rows: LedgerRow[] }) {
+  /** Newest first — the interesting call is the one that just happened. */
+  const recent = () => [...props.rows].reverse().slice(0, 24);
+
+  const clock = (ts: string) => {
+    const d = new Date(ts);
+    return Number.isNaN(d.getTime()) ? '—' : d.toISOString().slice(11, 19);
+  };
+  /** Fraction of the prompt that was reused rather than re-read. */
+  const share = (r: LedgerRow) => {
+    const sent = r.tokens.input + r.tokens.cacheRead;
+    return sent > 0 ? Math.round((100 * r.tokens.cacheRead) / sent) : null;
+  };
+
+  return (
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
+        llm calls — newest first ({props.rows.length} held)
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full font-mono text-[10px] whitespace-nowrap">
+          <thead>
+            <tr class="text-neutral-600 border-b border-neutral-800">
+              <th class="text-left pr-2 font-normal">time</th>
+              <th class="text-left pr-2 font-normal">origin</th>
+              <th class="text-right pr-2 font-normal">msgs</th>
+              <th class="text-right pr-2 font-normal">fresh</th>
+              <th class="text-right pr-2 font-normal">cached</th>
+              <th class="text-right pr-2 font-normal">%c</th>
+              <th class="text-right pr-2 font-normal">write</th>
+              <th class="text-right pr-2 font-normal">out</th>
+              <th class="text-right pr-2 font-normal">bp</th>
+              <th class="text-right pr-2 font-normal">ms</th>
+              <th class="text-left font-normal">verdict</th>
+            </tr>
+          </thead>
+          <tbody>
+            <For each={recent()}>
+              {(r) => {
+                const main = r.originEstimate === 'turn~';
+                return (
+                  <tr class={`border-b border-neutral-900 ${
+                    r.error || r.stopReason === 'refusal' ? 'bg-red-950/30' : ''
+                  }`}>
+                    <td class="pr-2 text-neutral-500">{clock(r.timestamp)}</td>
+                    <td class={`pr-2 ${main ? 'text-cyan-400' : 'text-orange-400'}`}>
+                      {main ? 'turn' : 'compr'}
+                    </td>
+                    <td class="pr-2 text-right text-neutral-400">{r.messages}</td>
+                    <td class="pr-2 text-right text-neutral-100">{n0(r.tokens.input)}</td>
+                    <td class="pr-2 text-right text-sky-300">{n0(r.tokens.cacheRead)}</td>
+                    <td class="pr-2 text-right text-neutral-400">
+                      {share(r) === null ? '—' : `${share(r)}%`}
+                    </td>
+                    <td class="pr-2 text-right text-violet-300">
+                      {r.tokens.cacheWrite ? n0(r.tokens.cacheWrite) : '·'}
+                    </td>
+                    <td class="pr-2 text-right text-neutral-400">{n0(r.tokens.output)}</td>
+                    <td class="pr-2 text-right text-neutral-600">{r.cache.breakpoints ?? '·'}</td>
+                    <td class="pr-2 text-right text-neutral-600">{n0(r.durationMs)}</td>
+                    <td class={verdictTone(r.verdict)} title={r.cause}>
+                      {r.verdict}
+                      <Show when={r.stopReason === 'refusal'}>
+                        <span class="text-red-300"> refusal</span>
+                      </Show>
+                      <Show when={r.error}>
+                        <span class="text-red-300"> err</span>
+                      </Show>
+                    </td>
+                  </tr>
+                );
+              }}
+            </For>
+          </tbody>
+        </table>
+      </div>
+      <div class="text-[9px] text-neutral-600 mt-1 leading-relaxed">
+        <span class="text-cyan-400">turn</span> = main inference,
+        <span class="text-orange-400"> compr</span> = compression/summarizer — inferred from
+        stream-vs-complete, not a definitive tag (hence <span class="font-mono">~</span> upstream).
+        One turn may appear as a turn row plus several compr rows.
+        <span class="font-mono"> fresh</span> = tokens billed as new input;
+        <span class="font-mono"> cached</span> = read from cache;
+        <span class="font-mono"> %c</span> = cached ÷ (fresh+cached);
+        <span class="font-mono"> bp</span> = cache breakpoints.
+      </div>
+    </div>
+  );
+}
+
+/** Verdict colouring: reuse is good, rewrites cost a full re-read. */
+function verdictTone(v: string): string {
+  if (v === 'HIT' || v === 'hit+extend') return 'text-emerald-300';
+  if (v === 'first-write') return 'text-violet-300';
+  if (v === 'uncached') return 'text-neutral-400';
+  if (v === 'ERROR' || v === 'empty') return 'text-red-300';
+  return 'text-amber-300';
+}
+
+function CompositionBlock(props: { c: ContextComposition }) {
+  const rows = () => {
+    const c = props.c;
+    const out: Array<[string, number]> = [
+      ['head (verbatim)', c.head?.tokens ?? 0],
+      ['middle raw', c.middleRaw?.tokens ?? 0],
+    ];
+    for (const [lvl, v] of Object.entries(c.summaries ?? {})) {
+      out.push([`summaries ${lvl.toUpperCase()}`, v?.tokens ?? 0]);
+    }
+    out.push(['tail (verbatim)', c.tail?.tokens ?? 0]);
+    return out;
+  };
+  const total = () => props.c.total?.tokens ?? rows().reduce((s, [, v]) => s + v, 0);
+
+  return (
+    <div>
+      <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
+        context composition (last compile)
+      </div>
+      <table class="w-full font-mono text-[10px]">
+        <tbody>
+          <For each={rows()}>
+            {([k, v]) => (
+              <tr>
+                <td class="text-neutral-500 pr-2">{k}</td>
+                <td class="text-neutral-200 text-right tabular-nums">{n0(v)}</td>
+                <td class="text-neutral-600 text-right pl-2 w-10">
+                  {total() > 0 ? `${Math.round((100 * v) / total())}%` : ''}
+                </td>
+                <td class="pl-2 w-1/3">
+                  <span class="inline-block h-1.5 bg-cyan-800 rounded"
+                        style={{ width: `${total() > 0 ? Math.round((100 * v) / total()) : 0}%` }} />
+                </td>
+              </tr>
+            )}
+          </For>
+          <tr class="border-t border-neutral-800">
+            <td class="text-neutral-400 pr-2">total rendered</td>
+            <td class="text-neutral-100 text-right tabular-nums">{n0(total())}</td>
+            <td colSpan={2} />
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/** Credential block for the Health tab: state, expiry, last action, buttons. */
+export function CredentialSection(props: {
+  credential: CredentialInfo | undefined;
+  onAction(actionId: string): void;
+}) {
+  const c = () => props.credential;
+  const kind = () => c()?.kind ?? 'ok';
+  const tone = () => kind() === 'ok' ? 'text-emerald-400' : HARD_DOWN_KINDS.has(kind()) ? 'text-rose-300' : 'text-amber-300';
+  const iso = (ms: number) => new Date(ms).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  return (
+    <Show when={c()?.subscription !== false && c()}>
+      <section class="border border-neutral-800 rounded px-2.5 py-2 space-y-1">
+        <div class="flex items-center gap-2 flex-wrap">
+          <span class="text-neutral-100">credential</span>
+          <span class="text-neutral-500">{c()!.provider ?? '?'}</span>
+          <span class={tone()}>{kind()}</span>
+          <span class="ml-auto">
+            <CredentialActionButtons
+              actions={kind() === 'ok' ? [{ id: 'recheck', label: 'Re-check' }] : c()!.actions}
+              onAction={props.onAction}
+            />
+          </span>
+        </div>
+        <Show when={kind() !== 'ok'}>
+          <div class={`${tone()} break-words`}>{c()!.message}</div>
+        </Show>
+        <div class="text-neutral-500">
+          {c()!.expiresAt !== undefined
+            ? `expires ${iso(c()!.expiresAt!)} · ${c()!.rotatable ? 'host can refresh' : 'no refresh token — paste a new one when it expires'}`
+            : `expiry unknown · ${c()!.rotatable ? 'host can refresh' : 'not host-rotatable'}`}
+        </div>
+        <Show when={c()!.login}>
+          <div class="text-amber-200">
+            login: open <a class="underline" href={c()!.login!.verificationUrl} target="_blank" rel="noreferrer">{c()!.login!.verificationUrl}</a>
+            {' '}and enter code <span class="font-semibold">{c()!.login!.userCode}</span>
+          </div>
+        </Show>
+        <Show when={c()!.lastAction}>
+          <div class={c()!.lastAction!.ok ? 'text-neutral-400' : 'text-rose-300'}>
+            last action: {c()!.lastAction!.id} {c()!.lastAction!.ok ? 'ok' : 'FAILED'} {fmtAgo(c()!.lastAction!.at)} — {c()!.lastAction!.message}
+          </div>
+        </Show>
+      </section>
+    </Show>
+  );
+}
+
 export function HealthPanel(props: {
   health: HealthSnapshot | null;
+  /** Recent provider calls. Already on the client via the call-ledger frame. */
+  ledger?: LedgerRow[];
   /** Non-null when the last /healthz fetch failed; '403' means scope-denied. */
   error: string | null;
   onRefresh(): void;
+  /** Credential state (live frame wins over the health poll) + action sink. */
+  credential?: CredentialInfo | null;
+  onCredentialAction?(actionId: string): void;
 }) {
   const agents = () => props.health?.agents ?? [];
   const quarantine = (name: string) => props.health?.compressionQuarantine?.[name];
+  const debt = (name: string) => props.health?.compressionDebt?.[name];
   const settings = (name: string) => props.health?.runtimeSettings?.[name];
+  const composition = (name: string) => props.health?.contextComposition?.[name];
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -176,12 +498,22 @@ export function HealthPanel(props: {
             <span>up {fmtUptime(props.health!.uptimeSec!)}</span>
           </Show>
           <Show when={props.health!.pendingRequests !== undefined}>
-            <span>{props.health!.pendingRequests} queued</span>
+            {/* the INFERENCE queue (requests waiting to run) — not compression
+                debt; that lives per-agent below. A bare "queued" invited the
+                misread, hence the explicit label. */}
+            <span>{props.health!.pendingRequests} inference queued</span>
           </Show>
           <Show when={props.health!.activeStreams !== undefined}>
             <span>{props.health!.activeStreams!.length} streaming</span>
           </Show>
         </div>
+
+        <Show when={props.onCredentialAction}>
+          <CredentialSection
+            credential={props.credential ?? props.health!.credential}
+            onAction={(id) => props.onCredentialAction!(id)}
+          />
+        </Show>
 
         <For each={agents()}>{(a) => (
           <section class="border border-neutral-800 rounded px-2.5 py-2 space-y-1.5">
@@ -217,6 +549,32 @@ export function HealthPanel(props: {
                   <div class="text-rose-400/70 truncate" title={quarantine(a.name)!.keys!.join(', ')}>
                     {quarantine(a.name)!.keys!.join(', ')}
                   </div>
+                </Show>
+              </div>
+            </Show>
+
+            {/* Compression debt: the organ's QUEUE, not the render composition.
+                An old stack that reports nothing must say so — absence
+                rendered as zero invites misreads. */}
+            <Show when={debt(a.name)} fallback={
+              <div class="text-neutral-600">compression debt: not reported by this stack</div>
+            }>
+              <div class={
+                debt(a.name)!.state === 'critical' ? 'text-rose-300'
+                : debt(a.name)!.state === 'degraded' ? 'text-amber-300/90'
+                : 'text-neutral-500'
+              }>
+                compression debt: {debt(a.name)!.state ?? '?'}
+                {' · '}{debt(a.name)!.pendingChunks ?? 0} chunk(s) pending
+                <Show when={(debt(a.name)!.pendingChunks ?? 0) > 0}>
+                  <span>
+                    {debt(a.name)!.oldestPendingAgeMs != null
+                      ? ` · oldest ${Math.round(debt(a.name)!.oldestPendingAgeMs! / 60000)}m`
+                      : ' · age unknown'}
+                  </span>
+                </Show>
+                <Show when={(debt(a.name)!.mergeQueueDepth ?? 0) > 0}>
+                  <span> · merge queue {debt(a.name)!.mergeQueueDepth}</span>
                 </Show>
               </div>
             </Show>
@@ -262,6 +620,23 @@ export function HealthPanel(props: {
                   </Show>
                 </div>
               )}
+            </Show>
+
+            {/* What was actually SENT, and how it split. Composition is
+                in-process render stats (free); call stats come from the ledger
+                the client already holds. */}
+            <Show when={composition(a.name)}>
+              {(c) => (
+                <div class="border-t border-neutral-900 pt-1.5">
+                  <CompositionBlock c={c()} />
+                </div>
+              )}
+            </Show>
+
+            <Show when={(props.ledger?.length ?? 0) > 0}>
+              <div class="border-t border-neutral-900 pt-1.5">
+                <CallStats rows={props.ledger!} />
+              </div>
             </Show>
           </section>
         )}</For>

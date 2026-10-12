@@ -88,6 +88,14 @@ export interface WelcomeMessage {
       agentModel?: string;
     };
   }>;
+  /**
+   * Optional host capabilities the SPA feature-detects before showing an
+   * affordance: 'rollback' | 'suppress' | 'quiesce' | 'media' |
+   * 'operator-log'. Absent on older hosts (nothing shown).
+   */
+  features?: string[];
+  /** Host serving state when the framework supports quiesce (see HostModeSnapshot). */
+  hostMode?: HostModeSnapshot;
   /** Cumulative session-wide token usage at connect time. */
   usage: TokenUsage;
   /** Per-agent cost breakdown for the parent process, present when the
@@ -112,8 +120,10 @@ export type MessageBlock =
   | { kind: 'redacted_thinking'; bytes: number }
   | { kind: 'tool_use'; id: string; name: string; inputJson: string; truncated?: boolean }
   | { kind: 'tool_result'; toolUseId: string; text: string; isError?: boolean; truncated?: boolean }
-  /** Image/document/audio/video or un-inflated blob_ref placeholder. */
-  | { kind: 'media'; mediaType: string };
+  /** Image/document/audio/video or un-inflated blob_ref placeholder. `ref`
+   *  is present for images the host can serve lazily at `/media/<ref>` —
+   *  bytes never ride the WebSocket. */
+  | { kind: 'media'; mediaType: string; ref?: string };
 
 export interface WelcomeMessageEntry {
   /** Stable id from the message store; clients can use this for keys. */
@@ -129,6 +139,9 @@ export interface WelcomeMessageEntry {
   text: string;
   /** Epoch-millis timestamp if available. */
   timestamp?: number;
+  /** Sequence number within the branch — used as scroll anchor for
+   *  branch-point navigation from graph/timeline views. */
+  seq?: number;
 }
 
 /** Verbatim framework TraceEvent. Clients typically pipe these into the
@@ -263,6 +276,31 @@ export interface TokenUsage {
   cost?: { total: number; currency: string };
 }
 
+/** `/quota` answer. `subscription: false` = pay-per-token host: keep showing
+ *  dollars and stop polling. Windows are provider-neutral, longest first. */
+export interface QuotaSnapshotData {
+  subscription: boolean;
+  provider?: string;
+  windows: Array<{
+    key: string;
+    label: string;
+    /** Percent used, 0–100. */
+    utilization: number;
+    /** Epoch ms. */
+    resetsAt?: number;
+    model?: string;
+    advisory?: boolean;
+  }>;
+  fetchedAt?: number;
+  error?: string;
+  /** Epoch ms at which the last spent window resets, else null. A spent
+   *  window is not by itself a parked agent — see `parked`. */
+  blockedUntil?: number | null;
+  /** The framework is holding an agent on the host's quota verdict. null when
+   *  the framework predates the hook and cannot say. */
+  parked?: boolean | null;
+}
+
 /** Per-agent cost slice used by the WebUI usage panel to label rows. Only
  *  surfaces parent-process agents — fleet-child agents track their own
  *  usage in their own UsageTracker and aren't aggregated cross-process. */
@@ -305,6 +343,23 @@ export interface BranchesListMessage {
   currentId: string;
 }
 
+/** Read-only user/model projection for the conversation branch graph. */
+export interface ConversationGraphMessage {
+  type: 'conversation-graph';
+  branches: BranchRow[];
+  currentId: string;
+  nodes: Array<{
+    id: string;
+    sequence: number;
+    participant: 'user' | 'assistant';
+    text: string;
+    timestamp?: number;
+    branchId: string;
+    forkPoint?: number;
+    forkAnchorId?: string;
+  }>;
+}
+
 /** Sent when the active session changes. Clients should soft-reconnect. */
 export interface SessionChangedMessage {
   type: 'session-changed';
@@ -323,6 +378,10 @@ export interface PeekMessage {
  *  surface a "module not loaded" hint rather than appearing broken. */
 export interface LessonsListMessage {
   type: 'lessons-list';
+  /** Which process this snapshot describes: 'local' or a fleet-child name.
+   *  Lets the SPA drop stale replies after a scope switch instead of
+   *  rendering child A's data under child B's header. */
+  scope?: string;
   loaded: boolean;
   lessons: Array<{
     id: string;
@@ -339,6 +398,8 @@ export interface LessonsListMessage {
 /** Workspace mount summary — response to request-workspace-mounts. */
 export interface WorkspaceMountsMessage {
   type: 'workspace-mounts';
+  /** Process this snapshot describes ('local' or fleet-child name). */
+  scope?: string;
   /** True iff WorkspaceModule is loaded in the recipe. */
   loaded: boolean;
   mounts: Array<{
@@ -353,6 +414,8 @@ export interface WorkspaceMountsMessage {
 /** Recursive file listing for one mount — response to request-workspace-tree. */
 export interface WorkspaceTreeMessage {
   type: 'workspace-tree';
+  /** Process this listing came from ('local' or fleet-child name). */
+  scope?: string;
   mount: string;
   entries: Array<{ path: string; size: number }>;
 }
@@ -361,6 +424,8 @@ export interface WorkspaceTreeMessage {
  *  line-numbered (cat -n style) as returned by the workspace `read` tool. */
 export interface WorkspaceFileMessage {
   type: 'workspace-file';
+  /** Process this file came from ('local' or fleet-child name). */
+  scope?: string;
   path: string;
   totalLines: number;
   fromLine: number;
@@ -376,6 +441,10 @@ export interface WorkspaceFileMessage {
  *  changes are file-only and require restart anyway. */
 export interface McplListMessage {
   type: 'mcpl-list';
+  /** Process whose MCPL view this is ('local' or fleet-child name). The
+   *  registry FILE is shared cwd-wide, but which entries a process actually
+   *  loads is per-recipe — see `live`. */
+  scope?: string;
   /** Path to the config file (informational — operator may want to grep
    *  for it locally). */
   configPath: string;
@@ -389,6 +458,125 @@ export interface McplListMessage {
     enabledFeatureSets?: string[];
     disabledFeatureSets?: string[];
   }>;
+  /** Servers the scoped process actually LOADED (recipe opt-in + agent
+   *  overlay), with live connection status from its framework. Absent on
+   *  older hosts. This is the per-scope truth the file registry can't give:
+   *  a conductor with zero MCPLs and a clerk with five share one file. */
+  live?: Array<{
+    id: string;
+    connected: boolean;
+    toolCount: number;
+    toolPrefix?: string;
+    /** command or url — whatever the transport targets. */
+    target?: string;
+  }>;
+  /** Every tool the scoped process offers, with its effective MCPL class
+   *  (RFC-008) and the source that decided it: `override` (recipe
+   *  toolClassOverrides), `host` (this host's or the framework's own table),
+   *  `server` (the MCPL server's `_meta`), `none` (unclassed). Sorted by tool
+   *  name. Absent on hosts or frameworks that don't report classes. */
+  toolClasses?: Array<{
+    tool: string;
+    /** Empty for an unclassed tool. */
+    class: string[];
+    source: 'override' | 'host' | 'server' | 'none';
+    /** The providing MCPL server, for MCPL tools. */
+    serverId?: string;
+  }>;
+}
+
+/**
+ * Protected ranges (pins / documents) for one agent.
+ *
+ * BROADCAST on change: pins alter what the next compile folds, so two operators
+ * must not hold divergent views of them.
+ */
+export interface PinsListMessage {
+  type: 'pins-list';
+  /** Process these pins live in ('local' or fleet-child name). */
+  scope?: string;
+  agent: string;
+  pins: Array<{
+    id: string;
+    firstMessageId: string;
+    lastMessageId: string;
+    kind: 'pin' | 'document';
+    name?: string;
+    created: number;
+    /** Pinned AT exactly this fold level (0 = raw). */
+    level?: number;
+    /** Hard cap on fold depth. */
+    maxLevel?: number;
+  }>;
+  /** False when the active strategy has no pin support — panel goes read-only. */
+  pinsSupported: boolean;
+  /** False when `level` would silently degrade to raw (non-kv-stable folding). */
+  levelHonored: boolean;
+  /** Deepest fold level currently present, so the UI can bound level inputs. */
+  deepestLevel?: number;
+  /** Recent pinnable messages (REAL store ids) from the scoped process.
+   *  Shipped for fleet-child scopes, where the SPA has no message window of
+   *  its own to build a picker from; local scope keeps using the client-side
+   *  candidate list. */
+  candidates?: Array<{ id: string; index: number; participant: string; text: string }>;
+}
+
+/**
+ * Runtime context-settings snapshot.
+ *
+ * BROADCAST to every welcomed client on change — unlike `mcpl-list`, these are
+ * live process state, not a config file, so two operators must not see
+ * divergent values.
+ */
+/** Credential state of one process (see src/credential-state.ts). The
+ *  `credential` fields are absent on an API-key host (`subscription: false`). */
+export interface CredentialStateMessage {
+  type: 'credential-state';
+  scope?: string;
+  subscription: boolean;
+  /** Agent name the host's credential alerts are keyed on. */
+  agent?: string;
+  kind?: string;
+  provider?: string;
+  message?: string;
+  since?: number;
+  until?: number;
+  windows?: string[];
+  rotatable?: boolean;
+  expiresAt?: number;
+  actions?: Array<{ id: string; label: string; hint?: string }>;
+  login?: { verificationUrl: string; userCode: string };
+  lastAction?: { id: string; at: number; ok: boolean; message: string };
+}
+
+export interface SettingsStateMessage {
+  type: 'settings-state';
+  /** Process these settings belong to ('local' or fleet-child name). */
+  scope?: string;
+  agent: string;
+  /** Live values. `transition` is 'converging' while a paced descent runs. */
+  settings: {
+    contextBudgetTokens: number;
+    tailTokens?: number;
+    transitionPaceTokens?: number;
+    sameRoundThinkTextPolicy?: string;
+    sameRoundThinkTextPolicySource?: string;
+    transition: 'stable' | 'converging' | 'blocked';
+    /** Why a descent is stuck: pace below floor, or protected context too big. */
+    transitionReason?: string;
+  };
+  /** Keys currently overridden away from the recipe (i.e. persisted). */
+  overrides: string[];
+  /** Which keys this build can apply live. Everything else needs a restart —
+   *  the UI must show that split rather than implying all knobs are hot. */
+  hotKeys: string[];
+  /** False when the strategy is not hot-configurable at all (e.g. passthrough):
+   *  the panel should go read-only rather than offer controls that will throw. */
+  hotConfigurable: boolean;
+  /** True when this build's context-manager exposes dry-run preview. Older
+   *  context-manager versions resolve without it, and the panel must say
+   *  "preview unavailable" rather than silently showing nothing. */
+  previewAvailable: boolean;
 }
 
 /** A page of older history — response to `request-history`, routed only to
@@ -459,6 +647,69 @@ export interface InboundTriggerMessage {
   timestamp: number;
 }
 
+// ---------------------------------------------------------------------------
+// Live operator surgery (rollback / suppress), host quiesce, operator log.
+// ---------------------------------------------------------------------------
+
+/** Host serving state, projected from the framework's host-mode status. */
+export interface HostModeSnapshot {
+  /** 'serving' | 'quiescing' | 'quiesced' — or whatever the framework reports. */
+  mode: string;
+  /** Epoch millis when the current mode was entered, if known. */
+  since?: number;
+  /** Operator-supplied reason for a quiesce, if any. */
+  reason?: string;
+  /** Turns still draining while quiescing, if reported. */
+  activeTurns?: number;
+  /** Everything else the framework reported, for the detail tooltip. */
+  detail?: Record<string, unknown>;
+}
+
+export interface HostModeMessage {
+  type: 'host-mode';
+  corrId?: string;
+  hostMode: HostModeSnapshot;
+}
+
+/** Outcome of a `rollback` / `suppress` request. On success the server also
+ *  broadcasts `branch-changed` and re-welcomes every client with the new
+ *  branch's messages. */
+export interface SurgeryResultMessage {
+  type: 'surgery-result';
+  corrId?: string;
+  op: 'rollback' | 'suppress';
+  ok: boolean;
+  error?: string;
+  /** Framework refusal code when `ok` is false: 'agent-busy' means quiesce
+   *  (or wait for idle) and retry; others are input problems. */
+  code?: string;
+  agent?: string;
+  sourceBranch?: string;
+  targetBranch?: string;
+  messagesRemoved?: number;
+  lastVisible?: { participant?: string; role?: string; preview?: string } | null;
+}
+
+/** One durable operator-log record (mirrors the framework's OperatorLogEntry). */
+export interface OperatorLogEntryWire {
+  at: string;
+  kind: string;
+  agent?: string;
+  requester?: { via: string; name?: string; id?: string };
+  note?: string;
+  params?: Record<string, unknown>;
+  result?: Record<string, unknown>;
+  error?: string;
+}
+
+export interface OperatorLogMessage {
+  type: 'operator-log';
+  corrId?: string;
+  entries: OperatorLogEntryWire[];
+  /** Where the host writes the log, when enabled. */
+  path?: string;
+}
+
 export type WebUiServerMessage =
   | WelcomeMessage
   | TraceMessage
@@ -468,12 +719,16 @@ export type WebUiServerMessage =
   | CallLedgerMessage
   | BranchChangedMessage
   | BranchesListMessage
+  | ConversationGraphMessage
   | SessionChangedMessage
   | PeekMessage
   | InboundTriggerMessage
   | QuitConfirmRequiredMessage
   | LessonsListMessage
   | McplListMessage
+  | SettingsStateMessage
+  | CredentialStateMessage
+  | PinsListMessage
   | WorkspaceMountsMessage
   | WorkspaceTreeMessage
   | WorkspaceFileMessage
@@ -481,6 +736,9 @@ export type WebUiServerMessage =
   | MessageAppendedMessage
   | ObserverAuthRequiredMessage
   | ObserverAckMessage
+  | HostModeMessage
+  | SurgeryResultMessage
+  | OperatorLogMessage
   | ErrorMessage;
 
 // ---------------------------------------------------------------------------
@@ -595,11 +853,14 @@ export interface RequestLessonsMessage {
   scope?: string;
 }
 
-/** Pull the configured MCPL servers from mcpl-servers.json. Response is an
- *  `mcpl-list` envelope. Recipe-defined servers are excluded — those live in
+/** Pull the MCPL server view: the shared file registry plus the scoped
+ *  process's LIVE loaded servers. Response is an `mcpl-list` envelope.
+ *  Recipe-defined servers appear only in `live` — their definitions live in
  *  the recipe file and aren't editable from here. */
 export interface RequestMcplMessage {
   type: 'request-mcpl';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
 }
 
 /** Pull the Chronicle branch listing. Response is a `branches-list` envelope
@@ -607,6 +868,11 @@ export interface RequestMcplMessage {
  *  through the `/checkout` command (full-auth clients only). */
 export interface RequestBranchesMessage {
   type: 'request-branches';
+}
+
+/** Pull the user/model-only conversation graph projection. */
+export interface RequestConversationGraphMessage {
+  type: 'request-conversation-graph';
 }
 
 /** Add or overwrite an MCPL server entry in mcpl-servers.json. Restart is
@@ -631,6 +897,140 @@ export interface McplSetEnvMessage {
   id: string;
   /** Replaces the existing env block in full. Empty object clears it. */
   env: Record<string, string>;
+}
+
+/** Pull the agent's protected ranges. Response is a `pins-list` envelope.
+ *  With a fleet-child `scope` the child also ships picker `candidates`
+ *  (recent real store ids) since the SPA has no window into its store. */
+export interface RequestPinsMessage {
+  type: 'request-pins';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+}
+
+/**
+ * Create a protected range.
+ *
+ * Three distinct semantics, deliberately not collapsed into one "pin":
+ *  - neither `level` nor `maxLevel` → classic pin: forced RAW, never folded
+ *  - `maxLevel: k` → fold no deeper than L_k (`0` is equivalent to a classic pin)
+ *  - `level: k`    → pin AT exactly L_k; the frontier cut passes through that
+ *                    node, neither deeper nor shallower
+ *
+ * `kind: 'document'` marks a single message as a document instead of pinning a
+ * range, and ignores `lastMessageId`.
+ *
+ * NOTE: `level` is honored only by `foldingStrategy: 'kv-stable'`. Other
+ * strategies degrade it to raw — a safe superset, but not what was asked for.
+ * `pins-list.levelHonored` reports which case the live agent is in.
+ */
+export interface PinAddMessage {
+  type: 'pin-add';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+  kind?: 'pin' | 'document';
+  firstMessageId: string;
+  /** Ignored for `kind: 'document'`; defaults to `firstMessageId` for a pin. */
+  lastMessageId?: string;
+  level?: number;
+  maxLevel?: number;
+  name?: string;
+}
+
+export interface PinRemoveMessage {
+  type: 'pin-remove';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+  pinId: string;
+}
+
+/** Pull the current runtime context settings for an agent, plus which knobs are
+ *  live-appliable vs restart-only. Response is a `settings-state` envelope. */
+export interface RequestSettingsMessage {
+  type: 'request-settings';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  /** Agent name; defaults to the scoped process's primary agent. */
+  agent?: string;
+}
+
+/**
+ * Apply runtime context settings live.
+ *
+ * Semantics that the UI must not misrepresent:
+ *  - RAISING contextBudgetTokens applies immediately.
+ *  - LOWERING it starts a PACED convergence (`transition: 'converging'`)
+ *    rather than folding everything at once; it can be cancelled.
+ *  - Only these keys are hot. Chunk size, head window, merge threshold and
+ *    friends are recipe-and-restart only.
+ *
+ * `persist: false` makes the change ephemeral — live now, gone on restart —
+ * which is the mode for operator experiments. Default persists.
+ *
+ * `notify: true` pushes a notice into the agent's context. OFF by default and
+ * deliberately so: the notice is new text in the very context being tuned, so
+ * it invalidates the KV prefix and can itself trip a refusal classifier. The
+ * agent can always PULL current settings via its own `agent_settings` tool.
+ */
+export interface SettingsUpdateMessage {
+  type: 'settings-update';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+  contextBudgetTokens?: number;
+  tailTokens?: number;
+  transitionPaceTokens?: number;
+  /** Apply a budget DECREASE immediately (one-shot fold-down, KV
+   *  invalidation paid this turn) instead of starting a paced descent.
+   *  The emergency lever for refusal streaks / over-wall wedges. */
+  immediate?: boolean;
+  persist?: boolean;
+  notify?: boolean;
+}
+
+/** Ask for the credential state (subscription hosts). Answered with
+ *  `credential-state`; an API-key host answers `subscription: false`. */
+export interface RequestCredentialMessage {
+  type: 'request-credential';
+  scope?: string;
+}
+
+/**
+ * Run one operator credential action — the buttons on a `quota-spent` /
+ * `auth-expired` / `auth-login-required` alert row, or the Health panel.
+ * `token` is only read for `set-token`; it is applied in memory (and to the
+ * credentials file when the host loaded one), never logged or echoed. The
+ * answer is a `credential-state` broadcast: credentials are process state,
+ * every operator sees the same outcome.
+ */
+export interface CredentialActionMessage {
+  type: 'credential-action';
+  scope?: string;
+  action: 'refresh' | 'login' | 'set-token' | 'recheck';
+  token?: string;
+}
+
+/** Revert named settings to their recipe values (all four when omitted). */
+export interface SettingsResetMessage {
+  type: 'settings-reset';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+  keys?: string[];
+  persist?: boolean;
+  notify?: boolean;
+}
+
+/** Abandon an in-flight paced descent, holding the current frontier. */
+export interface SettingsCancelTransitionMessage {
+  type: 'settings-cancel-transition';
+  /** Fleet child name, or 'local'/undefined for the parent process. */
+  scope?: string;
+  agent?: string;
+  persist?: boolean;
 }
 
 /** Pull the list of workspace mounts. Response is `workspace-mounts`.
@@ -688,9 +1088,62 @@ export interface ObserverHelloMessage {
   };
 }
 
+/** Roll the live branch back so `messageId` (a store id from a wire entry)
+ *  becomes its tail. Forks first; the source branch keeps everything. */
+export interface RollbackMessage {
+  type: 'rollback';
+  messageId: string;
+  /** Agent name; defaults to the recipe's primary agent. */
+  agent?: string;
+  /** Free-text reason, recorded in the operator log. */
+  note?: string;
+  corrId?: string;
+}
+
+/** Suppress specific messages from the live context: fork at head, redact
+ *  them on the fork, switch to it. */
+export interface SuppressMessage {
+  type: 'suppress';
+  messageIds: string[];
+  agent?: string;
+  note?: string;
+  corrId?: string;
+}
+
+/** Pause serving (drain turns, hold wakes, keep maintenance hot). */
+export interface HostQuiesceMessage {
+  type: 'host-quiesce';
+  reason?: string;
+  corrId?: string;
+}
+
+/** Resume serving after a quiesce. */
+export interface HostResumeMessage {
+  type: 'host-resume';
+  corrId?: string;
+}
+
+export interface RequestHostModeMessage {
+  type: 'request-host-mode';
+  corrId?: string;
+}
+
+export interface RequestOperatorLogMessage {
+  type: 'request-operator-log';
+  /** Newest N entries (default 100, max 1000). */
+  limit?: number;
+  corrId?: string;
+}
+
 export type WebUiClientMessage =
   | UserMessageMessage
   | ObserverHelloMessage
+  | RollbackMessage
+  | SuppressMessage
+  | HostQuiesceMessage
+  | HostResumeMessage
+  | RequestHostModeMessage
+  | RequestOperatorLogMessage
   | RequestHistoryMessage
   | CommandMessage
   | RouteToChildMessage
@@ -703,9 +1156,19 @@ export type WebUiClientMessage =
   | RequestLessonsMessage
   | RequestMcplMessage
   | RequestBranchesMessage
+  | RequestConversationGraphMessage
   | McplAddMessage
   | McplRemoveMessage
   | McplSetEnvMessage
+  | RequestPinsMessage
+  | PinAddMessage
+  | PinRemoveMessage
+  | RequestSettingsMessage
+  | SettingsUpdateMessage
+  | SettingsResetMessage
+  | SettingsCancelTransitionMessage
+  | RequestCredentialMessage
+  | CredentialActionMessage
   | RequestWorkspaceMountsMessage
   | RequestWorkspaceTreeMessage
   | RequestWorkspaceFileMessage
@@ -729,9 +1192,31 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
   switch (v.type) {
     case 'ping':
     case 'interrupt':
-    case 'request-mcpl':
     case 'request-branches':
+    case 'request-conversation-graph':
       return true;
+    case 'rollback':
+      return isNonEmptyString(v.messageId)
+        && (v.agent === undefined || isNonEmptyString(v.agent))
+        && (v.note === undefined || typeof v.note === 'string')
+        && (v.corrId === undefined || typeof v.corrId === 'string');
+    case 'suppress':
+      return Array.isArray(v.messageIds) && v.messageIds.length > 0
+        && v.messageIds.every((id) => isNonEmptyString(id))
+        && (v.agent === undefined || isNonEmptyString(v.agent))
+        && (v.note === undefined || typeof v.note === 'string')
+        && (v.corrId === undefined || typeof v.corrId === 'string');
+    case 'host-quiesce':
+      return (v.reason === undefined || typeof v.reason === 'string')
+        && (v.corrId === undefined || typeof v.corrId === 'string');
+    case 'host-resume':
+    case 'request-host-mode':
+      return v.corrId === undefined || typeof v.corrId === 'string';
+    case 'request-operator-log':
+      return (v.limit === undefined || (typeof v.limit === 'number' && Number.isFinite(v.limit)))
+        && (v.corrId === undefined || typeof v.corrId === 'string');
+    case 'request-mcpl':
+      return isOptionalScope(v.scope);
     case 'user-message':
       return typeof v.content === 'string';
     case 'observer-hello': {
@@ -768,6 +1253,66 @@ export function isClientMessage(value: unknown): value is WebUiClientMessage {
       return isValidMcplId(v.id);
     case 'mcpl-set-env':
       return isValidMcplId(v.id) && isStringMap(v.env);
+    case 'request-pins':
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent);
+    case 'pin-add': {
+      if (!isOptionalScope(v.scope)) return false;
+      if (!isOptionalNonEmptyString(v.agent)) return false;
+      if (!isNonEmptyString(v.firstMessageId)) return false;
+      if (v.lastMessageId !== undefined && !isNonEmptyString(v.lastMessageId)) return false;
+      if (v.kind !== undefined && v.kind !== 'pin' && v.kind !== 'document') return false;
+      if (v.name !== undefined && !isNonEmptyString(v.name)) return false;
+      // Fold levels are small non-negative integers (0 = raw). Reject strings
+      // and fractions before they reach the strategy's pin normalizer.
+      for (const k of ['level', 'maxLevel']) {
+        const x = v[k];
+        if (x === undefined) continue;
+        if (typeof x !== 'number' || !Number.isSafeInteger(x) || x < 0 || x > 32) return false;
+      }
+      // level and maxLevel are different semantics; asking for both is ambiguous.
+      if (v.level !== undefined && v.maxLevel !== undefined) return false;
+      return true;
+    }
+    case 'pin-remove':
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent) && isNonEmptyString(v.pinId);
+    case 'request-settings':
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent);
+    case 'settings-update': {
+      if (!isOptionalScope(v.scope)) return false;
+      if (!isOptionalNonEmptyString(v.agent)) return false;
+      if (!isOptionalBool(v.persist) || !isOptionalBool(v.notify) || !isOptionalBool(v.immediate)) return false;
+      // Positive-integer-or-absent for each knob. The semantic gate (budget must
+      // exceed max response tokens; tail/pace need a hot-configurable strategy)
+      // lives in Agent.validateRuntimeSettingsPatch — this only guarantees the
+      // shape so that gate gets numbers instead of strings.
+      for (const k of ['contextBudgetTokens', 'tailTokens', 'transitionPaceTokens']) {
+        if (!isOptionalPositiveInt(v[k])) return false;
+      }
+      // Require at least one actual knob: an empty patch would throw downstream.
+      return v.contextBudgetTokens !== undefined
+        || v.tailTokens !== undefined
+        || v.transitionPaceTokens !== undefined;
+    }
+    case 'settings-reset':
+      return isOptionalScope(v.scope)
+        && isOptionalNonEmptyString(v.agent)
+        && isOptionalBool(v.persist)
+        && isOptionalBool(v.notify)
+        && isOptionalStringArray(v.keys);
+    case 'settings-cancel-transition':
+      return isOptionalScope(v.scope) && isOptionalNonEmptyString(v.agent) && isOptionalBool(v.persist);
+    case 'request-credential':
+      return isOptionalScope(v.scope);
+    case 'credential-action': {
+      if (!isOptionalScope(v.scope)) return false;
+      if (v.action !== 'refresh' && v.action !== 'login' && v.action !== 'set-token' && v.action !== 'recheck') return false;
+      // A token is meaningful only for set-token, where it is mandatory. Bound
+      // its size: a bearer is a few hundred bytes, not a payload.
+      if (v.action === 'set-token') {
+        return typeof v.token === 'string' && v.token.trim().length > 0 && v.token.length <= 8192;
+      }
+      return v.token === undefined;
+    }
     case 'request-workspace-mounts':
       return v.scope === undefined || typeof v.scope === 'string';
     case 'request-workspace-tree':
@@ -821,4 +1366,25 @@ function isOptionalStringArray(v: unknown): v is string[] | undefined {
   if (v === undefined) return true;
   if (!Array.isArray(v)) return false;
   return v.every((x) => typeof x === 'string');
+}
+
+function isOptionalNonEmptyString(v: unknown): v is string | undefined {
+  return v === undefined || isNonEmptyString(v);
+}
+
+/** Scope fields: 'local' or a fleet-child name. Same lax shape the existing
+ *  lessons/workspace requests use — the server resolves unknown children to
+ *  a clean error rather than the validator guessing the fleet roster. */
+function isOptionalScope(v: unknown): v is string | undefined {
+  return v === undefined || typeof v === 'string';
+}
+
+function isOptionalBool(v: unknown): v is boolean | undefined {
+  return v === undefined || typeof v === 'boolean';
+}
+
+/** Token counts: safe positive integers only. Rejects strings, NaN, Infinity,
+ *  fractions and negatives before they reach the settings validator. */
+function isOptionalPositiveInt(v: unknown): v is number | undefined {
+  return v === undefined || (typeof v === 'number' && Number.isSafeInteger(v) && v > 0);
 }

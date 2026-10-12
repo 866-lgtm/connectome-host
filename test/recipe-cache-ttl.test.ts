@@ -34,7 +34,7 @@ describe('recipe agent.cacheTtl validation', () => {
   });
 
   test('rejects a typo\'d TTL at load time', () => {
-    expect(() => validateRecipe(recipeWithCacheTtl('1hr'))).toThrow(/cacheTtl must be '5m' or '1h'/);
+    expect(() => validateRecipe(recipeWithCacheTtl('1hr'))).toThrow(/cacheTtl must be '5m', '1h', or '24h'/);
     expect(() => validateRecipe(recipeWithCacheTtl('60m'))).toThrow(/cacheTtl/);
     expect(() => validateRecipe(recipeWithCacheTtl(3600))).toThrow(/cacheTtl/);
   });
