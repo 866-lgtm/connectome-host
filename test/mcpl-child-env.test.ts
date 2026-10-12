@@ -24,7 +24,7 @@ describe('composeMcplChildEnv', () => {
     expect(env.DISCORD_SUPPRESSED_REACTIONS_BASELINE).toBe('🈲');
   });
 
-  test('operator empty-string baseline is preserved, not re-defaulted', () => {
+  test("passes an operator's empty baseline through unchanged, for the framework to read as unset", () => {
     const env = composeMcplChildEnv(
       { DISCORD_SUPPRESSED_REACTIONS_BASELINE: '' },
       'UTC',

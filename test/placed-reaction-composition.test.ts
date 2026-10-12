@@ -13,7 +13,9 @@ import { composeMcplChildEnv } from '../src/mcpl-config.js';
 
 const CHILD = fileURLToPath(new URL('./fixtures/placed-reaction-child.cjs', import.meta.url));
 
-for (const override of [undefined, '🟪', '']) {
+// A blank baseline counts as unset at the framework, which supplies its
+// default: the Discord adapter would read an empty value as no tokens.
+for (const override of [undefined, '🟪', '', ' ']) {
   test('host and AF compose the child reaction baseline: ' + JSON.stringify(override), async () => {
     const dir = mkdtempSync(join(tmpdir(), 'host-reaction-composition-'));
     let framework: AgentFramework | undefined;
@@ -40,7 +42,7 @@ for (const override of [undefined, '🟪', '']) {
       }).mcplServerRegistry;
       const result = await registry.getServer('probe').sendToolsCall('read_env', {});
       const env = JSON.parse(result.content[0]!.text!);
-      if (override === undefined) {
+      if (override === undefined || override.trim() === '') {
         expect(new Set(env.baseline?.split(','))).toEqual(new Set([...REFUSAL_REACTION_BASELINE, '💤', '🔕']));
       } else {
         expect(env.baseline).toBe(override);

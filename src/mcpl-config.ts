@@ -363,8 +363,9 @@ export function saveMcplServers(configPath: string, servers: Record<string, Serv
  * AgentFramework supplies DISCORD_SUPPRESSED_REACTIONS_BASELINE later,
  * where it knows the configured awareness marker and retained recovery
  * outbox emojis. A host-side refusal-only default would override that
- * complete default. Explicit operator env, including empty values, passes
- * through unchanged and takes precedence at the framework boundary.
+ * complete default. Explicit operator env passes through unchanged. The
+ * framework then lets a non-blank baseline replace its default and treats a
+ * blank one as unset, since the Discord adapter would read it as no tokens.
  */
 export function composeMcplChildEnv(
   serverEnv: Record<string, string> | undefined,

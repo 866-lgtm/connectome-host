@@ -8,7 +8,7 @@ release time — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 ### Changed
 
-- Reaction-suppression defaults are now supplied by AgentFramework at child-connection time, including configured and retained awareness markers. The host preserves explicit server env (including empty baselines) and the recipe timezone. Requires the AgentFramework release containing the fix for agent-framework#95; this companion stays draft until its dependency floor is updated to that published version.
+- Reaction-suppression defaults are now supplied by AgentFramework at child-connection time, including configured and retained awareness markers. The host passes explicit server env through unchanged, apart from `AGENT_TIMEZONE`, which stays the recipe's; AgentFramework lets a non-blank `DISCORD_SUPPRESSED_REACTIONS_BASELINE` replace its default and treats a blank one as unset. Deriving the default reads the awareness ledger when a stdio child without a baseline connects, so that connect is refused while the ledger exists but can't be read. Requires the AgentFramework release containing the fix for anima-research/agent-framework#95; this companion stays draft until its dependency floor is updated to that published version.
 
 ## 0.9.0 — 2026-09-21
 

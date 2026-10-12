@@ -459,9 +459,10 @@ async function createFramework(
     const withEnv: { id: string; command?: string; url?: string; [k: string]: unknown } = {
       ...server,
       // Stdio MCPL children share the recipe's agent-facing wall clock.
-      // The framework derives reaction-suppression defaults at connection
-      // time; explicit server env stays authoritative. Protocol timestamps
-      // remain UTC; only their rendered text uses AGENT_TIMEZONE.
+      // The framework derives the reaction-suppression default at
+      // connection time; a non-blank baseline in the server's env replaces
+      // it. Protocol timestamps remain UTC; only their rendered text uses
+      // AGENT_TIMEZONE.
       env: composeMcplChildEnv(server.env as Record<string, string> | undefined, timeZone),
     };
     // `access` is a declarative name (recipe/file/overlay); the credential
