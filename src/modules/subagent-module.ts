@@ -115,7 +115,8 @@ interface DetachableHandle {
 /**
  * A launch refused before its stream sends anything: its stream wouldn't
  * read what the launch promises, or its prompt is over the size limit. It's
- * the launch's outcome, not a provider failure, so it's never retried.
+ * the launch's outcome, not a provider failure, so neither the retry gate
+ * nor the rate-limit backoff reads it, whatever words its text holds.
  */
 export class SubagentLaunchRefused extends Error {
   constructor(message: string) {
@@ -1649,7 +1650,7 @@ export class SubagentModule implements Module {
   }
 
   private isRateLimitError(err: unknown): boolean {
-    if (!(err instanceof Error)) return false;
+    if (!(err instanceof Error) || err instanceof SubagentLaunchRefused) return false;
     const msg = err.message.toLowerCase();
     return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
   }

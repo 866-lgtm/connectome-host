@@ -1346,6 +1346,29 @@ describe('what a stream first reads is what its launch promises', () => {
     expect(refuse('spawn', 's', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
   });
 
+  test('a refusal leaves the rate-limit backoff alone, even when its text holds "rate"', async () => {
+    for (const kind of ['spawn', 'parentless'] as const) {
+      const h = await realHarness({ parentless: kind === 'parentless' });
+      const state = h.subagent as unknown as { rateLimitCooldownMs: number; effectiveConcurrent: number; lastRateLimitAt: number };
+      state.rateLimitCooldownMs = 0;
+      try {
+        const before = state.effectiveConcurrent;
+        // "generate" holds "rate".
+        const result = await h.subagent.handleToolCall({
+          id: 'call-rate', name: kind === 'spawn' ? 'spawn' : 'fork',
+          input: { name: 'generate-report', task: LONG_TASK, model: `mock-rate-${kind}`, sync: true, ...(kind === 'spawn' ? { systemPrompt: 'p' } : {}) },
+          ...(kind === 'spawn' ? { callerAgentName: 'parent' } : {}),
+        } as never);
+        expect(result.success).toBe(false);
+        expect(h.requestFor(`mock-rate-${kind}`)).toBeUndefined();
+        expect(state.effectiveConcurrent).toBe(before);
+        expect(state.lastRateLimitAt).toBe(0);
+      } finally {
+        await h.cleanup();
+      }
+    }
+  });
+
   test('a short task and a modest surface launch as before, the orientation first and the task last', async () => {
     const h = await realHarness();
     try {
