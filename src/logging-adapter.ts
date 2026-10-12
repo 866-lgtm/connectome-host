@@ -29,6 +29,11 @@
 // changes what the caller gets, with one older exception: the capture hook
 // keeps an error thrown by a caller's own onRequest hook from failing the
 // call. Logging runs after the provider call, outside its try.
+// A keepalive row also carries `keepalive: { key, lane, startedAt, request? }`:
+// the lineage it refreshed, its lane, when its send began, and for a failed or
+// refused poke the replayed request's identity (a hash of its bytes). The
+// first such row for a lineage and request keeps the request whole, and later
+// ones name it by that identity (a lineage forgotten among many is kept again).
 
 import { AnthropicAdapter } from '@animalabs/membrane';
 import type {
@@ -39,6 +44,7 @@ import type {
   KeepaliveCall,
   KeepaliveUsage,
 } from '@animalabs/membrane';
+import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { describeErrorObject } from './logging-error-fields.js';
@@ -109,6 +115,71 @@ function envFlag(value: string | undefined, name = 'LLM_CALLS_FULL_PAYLOADS'): b
     );
   }
   return false;
+}
+
+/** How many lineages a LineageRequests remembers. membrane tracks four by
+ *  default. Forgetting one costs a repeated alert or one more whole copy of
+ *  its request, never a reference to a row that isn't there. */
+const LINEAGES_REMEMBERED = 16;
+
+/**
+ * Per keepalive lineage, the replayed request something was last recorded
+ * for: a refusal the dragnet heard, or a row that kept the request whole.
+ * Bounded, the lineage noted longest ago forgotten first.
+ */
+class LineageRequests {
+  private readonly requests = new Map<string, string>();
+
+  /** Whether `request` is the one last noted for `lineage`. */
+  has(lineage: string, request: string): boolean {
+    return this.requests.get(lineage) === request;
+  }
+
+  note(lineage: string, request: string): void {
+    this.requests.delete(lineage);
+    this.requests.set(lineage, request);
+    if (this.requests.size > LINEAGES_REMEMBERED) {
+      this.requests.delete(this.requests.keys().next().value as string);
+    }
+  }
+}
+
+/** A replayed request's identity in llm-calls rows: a hash of its bytes. */
+function requestId(request: Record<string, unknown>): string {
+  return createHash('sha256').update(JSON.stringify(request)).digest('hex').slice(0, 16);
+}
+
+/** What the off-path refusal dragnet hears of one refused call. */
+export interface OffPathRefusal {
+  kind: 'complete' | 'stream' | 'keepalive';
+  category?: string;
+  model: string;
+  messages: number;
+  /** The whole prompt the call sent: uncached input, cache reads and cache writes. */
+  inputTokens: number;
+  /** A keepalive poke's replayed request, as its llm-calls rows name it. */
+  request?: string;
+}
+
+/**
+ * The ops alert for an off-path refusal: its kind, its message, and its data.
+ * The data names the call's kind `call`, since failures.log spreads the data
+ * after the alert's own `kind`, which must stay 'refusal-offpath'.
+ */
+export function offPathRefusalAlert(info: OffPathRefusal): {
+  kind: 'refusal-offpath';
+  message: string;
+  data: Record<string, unknown>;
+} {
+  const category = info.category ?? 'unknown';
+  const size = `~${Math.round(info.inputTokens / 1000)}k tok`;
+  const message = info.kind === 'keepalive'
+    ? `off-path refusal (category=${category}) on a cache keepalive poke, which replays a ` +
+      `${info.messages}-message request (${size}): a turn sending that context would likely be refused too`
+    : `off-path refusal (category=${category}) on a ${info.messages}-message complete() call ` +
+      `(${size}) — likely compression/summarizer`;
+  const { kind: call, ...rest } = info;
+  return { kind: 'refusal-offpath', message, data: { call, ...rest } };
 }
 
 export class LoggingAnthropicAdapter extends AnthropicAdapter {
@@ -254,19 +325,22 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     };
   }
 
-  /** Keepalive lineages whose latest pokes were refused: the refusal
-   *  dragnet has heard each once, and hears it again only after one of its
-   *  pokes succeeds. */
-  private readonly refusedKeepaliveLineages = new Set<string>();
+  /** Per lineage, the replayed request whose refusal the dragnet last heard. */
+  private readonly heardKeepaliveRefusals = new LineageRequests();
+  /** Per lineage, the replayed request a written row last kept whole. */
+  private readonly keptKeepaliveRequests = new LineageRequests();
 
   private readonly warnedEffort = new Set<string>();
   private readonly warnedThinking = new Set<string>();
 
-  private log(record: Record<string, unknown>): void {
+  /** Append one record; true when it was written. Never throws. */
+  private log(record: Record<string, unknown>): boolean {
     try {
       appendFileSync(this.logPath, JSON.stringify(record) + '\n');
+      return true;
     } catch {
       // never throw from logging
+      return false;
     }
   }
 
@@ -275,16 +349,26 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const raw = call.request;
     const cache = summarizeCacheControls(raw);
     const response = call.outcome === 'success' ? call.response : undefined;
+    const refused = response?.stop_reason === 'refusal';
     // A failed poke's error takes the shape complete and stream rows give
     // theirs: bounded text, with the classification a membrane error carries.
     const errorFields = call.outcome === 'error' ? describeErrorObject(call.error, true) : undefined;
+    // membrane replays a lineage's latest real request on every poke until a
+    // newer real request replaces it, so a lineage whose pokes fail or are
+    // refused would repeat one request in row after row. Such a row names
+    // what it replayed by a hash of the request's bytes, and keeps the
+    // request whole unless it remembers a row of this lineage that already
+    // did (with full payloads on, every row keeps it).
+    const request = errorFields || refused ? requestId(raw) : undefined;
+    const keepWhole = this.fullPayloads
+      || (request !== undefined && !this.keptKeepaliveRequests.has(call.key, request));
     const effort = (raw.output_config as { effort?: unknown } | undefined)?.effort;
     const record: Record<string, unknown> = {
       type: call.outcome === 'success' ? 'call' : 'error',
       kind: 'keepalive',
       timestamp: new Date(call.startedAt + call.durationMs).toISOString(),
       durationMs: call.durationMs,
-      keepalive: { key: call.key, lane: call.lane, startedAt: call.startedAt },
+      keepalive: { key: call.key, lane: call.lane, startedAt: call.startedAt, ...(request ? { request } : {}) },
       requestSummary: {
         model: raw.model,
         maxTokens: raw.max_tokens,
@@ -294,45 +378,48 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         cacheBreakpoints: cache.count,
         cacheTtls: cache.ttls,
       },
-      rawRequest: this.fullPayloads || call.outcome === 'error' || response?.stop_reason === 'refusal'
-        ? raw : undefined,
+      rawRequest: keepWhole ? raw : undefined,
       ...(response ? { rawResponse: response } : {}),
       ...errorFields,
     };
-    this.log(record);
+    // A request counts as kept once its row is written, so a later row never
+    // names a request whose whole copy was lost with its row.
+    if (this.log(record) && keepWhole && request !== undefined) {
+      this.keptKeepaliveRequests.note(call.key, request);
+    }
     // A poke spends the same credential as a turn, so the credential monitor
     // hears it too: an idle resident's rejected credential shows at its next
-    // poke rather than at its next turn (membrane pokes a lineage for up to a
-    // day after its last real request), and a poke that succeeds settles an
-    // auth alert as a turn would.
+    // poke rather than at its next turn (membrane pokes an idle lineage for a
+    // day after its last real request by default: cacheKeepalive.maxIdleHours),
+    // and a poke that succeeds settles an auth alert as a turn would.
     try {
       if (call.outcome === 'error') this.onProviderError?.(call.error, 'keepalive');
       else this.onProviderSuccess?.('keepalive');
     } catch { /* observers never affect provider traffic */ }
-    // A refused poke is the earliest sign that the context the resident's
-    // next turn would send is refused, and nothing on the turn path sees it,
-    // so the refusal dragnet hears it. Membrane keeps poking a refused lineage
-    // (a refusal is a success to its breaker) every refresh interval for up to
-    // a day, longer than the alert cooldown, so the dragnet hears a lineage
-    // once when its pokes turn refused, and again only after one succeeds.
-    if (response?.stop_reason === 'refusal') {
-      if (!this.refusedKeepaliveLineages.has(call.key)) {
-        this.refusedKeepaliveLineages.add(call.key);
-        const usage = response.usage as KeepaliveUsage | undefined;
-        try {
-          this.onRefusal?.({
-            kind: 'keepalive',
-            category: (response as { stop_details?: { category?: string } }).stop_details?.category,
-            model: typeof raw.model === 'string' ? raw.model : String(raw.model),
-            messages: Array.isArray(raw.messages) ? raw.messages.length : 0,
-            // The whole prompt the poke replayed: most of it is read from cache.
-            inputTokens: (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0)
-              + (usage?.cache_creation_input_tokens ?? 0),
-          });
-        } catch { /* observers never affect provider traffic */ }
-      }
-    } else if (call.outcome === 'success') {
-      this.refusedKeepaliveLineages.delete(call.key);
+    // A refused poke tells an idle resident's operator that the context its
+    // next turn would send is refused, before that turn. The dragnet hears
+    // each refused request once per lineage. membrane keeps replaying the
+    // same request every refresh interval (a refusal is a success to its
+    // breaker), and another alert about the same bytes asks nothing new of
+    // the operator, even after a poke of them succeeded. A real call reseeds
+    // the lineage, usually with other bytes, whose refusal is heard afresh.
+    // An observer that throws hasn't heard it, so the next refused poke of
+    // that request tries again.
+    if (refused && request !== undefined && !this.heardKeepaliveRefusals.has(call.key, request)) {
+      const usage = response?.usage as KeepaliveUsage | undefined;
+      try {
+        this.onRefusal?.({
+          kind: 'keepalive',
+          category: (response as { stop_details?: { category?: string } }).stop_details?.category,
+          model: typeof raw.model === 'string' ? raw.model : String(raw.model),
+          messages: Array.isArray(raw.messages) ? raw.messages.length : 0,
+          // The whole prompt the poke replayed: most of it is read from cache.
+          inputTokens: (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0)
+            + (usage?.cache_creation_input_tokens ?? 0),
+          request,
+        });
+        this.heardKeepaliveRefusals.note(call.key, request);
+      } catch { /* observers never affect provider traffic */ }
     }
     // Share the log decoder so live and rehydrated spend use identical vendor
     // fields (including cache-write buckets, geography, and service tier).
@@ -367,15 +454,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * mythos cascade STARTED there and alerted nowhere. Fired for
    * kind==='complete' (agent turns stream, so this never double-reports a
    * refusal the main driver already escalated), and for kind==='keepalive'
-   * when a cache keepalive lineage's pokes turn refused.
+   * when a poke's replayed request is refused, once per lineage and request.
    */
-  onRefusal?: (info: {
-    kind: 'complete' | 'stream' | 'keepalive';
-    category?: string;
-    model: string;
-    messages: number;
-    inputTokens: number;
-  }) => void;
+  onRefusal?: (info: OffPathRefusal) => void;
 
   /** Credential-monitor taps: every failed call (auth verdicts are what the
    *  monitor keys on) and every successful one (clears a standing auth
@@ -421,7 +502,9 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
           category: raw0.stop_details?.category,
           model: request.model,
           messages: request.messages.length,
-          inputTokens: response?.usage.inputTokens ?? 0,
+          // The whole prompt the call sent, as a keepalive refusal reports it.
+          inputTokens: (response?.usage.inputTokens ?? 0) + (response?.usage.cacheReadTokens ?? 0)
+            + (response?.usage.cacheCreationTokens ?? 0),
         });
       } catch { /* observers never affect provider traffic */ }
     }

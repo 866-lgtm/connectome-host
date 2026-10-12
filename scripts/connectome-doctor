@@ -238,6 +238,13 @@ if records:
 stages.append(("chronicle ingest (+gate)", rec_ts, rec_detail))
 
 # 4c. inference: newest llm-calls file, last model call's stop_reason
+def err_text(err):
+    """An llm-calls error as text: a { name, message, ... } object or a string."""
+    if isinstance(err, dict):
+        return str(err.get("message") or err.get("name") or err)
+    return str(err)
+
+
 llm_ts = None
 llm_detail = ""
 llm_files = sorted(
@@ -246,31 +253,58 @@ llm_files = sorted(
 )
 if llm_files:
     newest = os.path.join(data_dir, llm_files[-1])
-    # last complete JSON line from tail (lines can be multi-MB)
+    # last complete JSON line from tail (lines can be multi-MB). Split at
+    # newlines only: splitlines() also splits at U+2028, U+2029 and U+0085,
+    # which JSON.stringify leaves unescaped inside a row.
     raw = tail_bytes(newest, 30_000_000).decode("utf-8", "replace")
-    for ln in reversed(raw.splitlines()):
+    lines = raw.split("\n")
+    if os.path.getsize(newest) > 30_000_000:
+        lines = lines[1:]  # the window starts inside a row
+    poke = None      # the newest keepalive poke after the call reported
+    pokes = 0
+    unreadable = 0   # rows after the call reported that couldn't be parsed
+    for ln in reversed(lines):
         ln = ln.strip()
         if not ln.startswith("{"):
             continue
         try:
             r = json.loads(ln)
         except Exception:
+            unreadable += 1
             continue
         # Cache keepalive pokes write rows here too, while the agent is idle,
         # so neither the file's mtime nor its last row says when it last
         # inferred: take the newest row that isn't a poke, and its own time.
         if r.get("kind") == "keepalive":
+            pokes += 1
+            poke = poke or r
             continue
         llm_ts = parse_iso(str(r.get("timestamp", "")))
         resp = r.get("rawResponse") or {}
         resp = resp.get("response") or resp
         sr = resp.get("stop_reason")
         err = resp.get("error") or r.get("error")
-        llm_detail = f"stop={sr}" + (f"  {C_RED}err={str(err)[:80]}{C_OFF}" if err else "")
+        llm_detail = f"stop={sr}" + (f"  {C_RED}err={err_text(err)[:80]}{C_OFF}" if err else "")
         if sr == "refusal":
             warn("last model response was a REFUSAL — check context contamination "
                  "(see project_mythos: contextBudgetTokens fix)")
         break
+    if llm_ts is None and pokes:
+        llm_detail = f"only keepalive pokes ({pokes}) in the newest file's last 30 MB"
+    if unreadable:
+        llm_detail += f"  {C_YEL}{unreadable} {'newer ' if llm_ts else ''}row(s) unreadable{C_OFF}"
+    # A poke replays the context the agent's next turn would send, so a
+    # refused or failed one after its last call is worth seeing here.
+    if poke is not None:
+        p_resp = poke.get("rawResponse") or {}
+        p_when = hhmm(parse_iso(str(poke.get("timestamp", ""))))
+        if p_resp.get("stop_reason") == "refusal":
+            llm_detail += f"  {C_RED}keepalive poke {p_when} REFUSED{C_OFF}"
+            warn("the newest cache keepalive poke was REFUSED: the context the agent's "
+                 "next turn sends would likely be refused too (see project_mythos: "
+                 "contextBudgetTokens fix)")
+        elif poke.get("error"):
+            llm_detail += f"  {C_RED}keepalive poke {p_when} failed: {err_text(poke.get('error'))[:80]}{C_OFF}"
 stages.append(("inference (llm call)", llm_ts, llm_detail))
 
 # 4d. delivery: last routeSpeech in agent log

@@ -34,7 +34,7 @@ import {
   OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
-import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { LoggingAnthropicAdapter, offPathRefusalAlert } from './logging-adapter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
@@ -1368,17 +1368,8 @@ async function main() {
       const fw = app.framework as unknown as {
         notifyOpsAlert?: (kind: string, agent: string, msg: string, data?: Record<string, unknown>) => void;
       };
-      fw.notifyOpsAlert?.(
-        'refusal-offpath',
-        app.agentName,
-        info.kind === 'keepalive'
-          ? `off-path refusal (category=${info.category ?? 'unknown'}) on a cache keepalive poke, which ` +
-            `replays a ${info.messages}-message request (~${Math.round(info.inputTokens / 1000)}k tok): ` +
-            `a turn sending that context would likely be refused too`
-          : `off-path refusal (category=${info.category ?? 'unknown'}) on a ${info.messages}-message ` +
-            `complete() call (~${Math.round(info.inputTokens / 1000)}k tok) — likely compression/summarizer`,
-        { ...info },
-      );
+      const alert = offPathRefusalAlert(info);
+      fw.notifyOpsAlert?.(alert.kind, app.agentName, alert.message, alert.data);
     };
   }
 

@@ -324,11 +324,11 @@ function CallStats(props: { rows: LedgerRow[] }) {
         </table>
       </div>
       <div class="text-[9px] text-neutral-600 mt-1 leading-relaxed">
-        <span class="text-cyan-400">turn</span> = main inference,
-        <span class="text-orange-400"> compr</span> = compression/summarizer — inferred from
+        <span class={callOriginTone('turn~')}>{callOriginLabel('turn~')}</span> = main inference,
+        <span class={callOriginTone('aux~')}> {callOriginLabel('aux~')}</span> = compression/summarizer — inferred from
         stream-vs-complete, not a definitive tag (hence <span class="font-mono">~</span> upstream).
         One turn may appear as a turn row plus several compr rows.
-        <span class="text-neutral-400"> keepalive</span> = a cache keepalive poke, which replays a lineage's
+        <span class={callOriginTone('keepalive')}> {callOriginLabel('keepalive')}</span> = a cache keepalive poke, which replays a lineage's
         last request while the agent is idle; exact, from its receipt.
         <span class="font-mono"> fresh</span> = tokens billed as new input;
         <span class="font-mono"> cached</span> = read from cache;
