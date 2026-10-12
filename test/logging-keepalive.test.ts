@@ -1,4 +1,5 @@
 import { describe, expect, test } from 'bun:test';
+import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -341,6 +342,13 @@ describe('keepalive calls reach the normal logs and spend ledger', () => {
     expect(result.events.filter(event => event === 'refreshed')).toHaveLength(2);
   });
 
+  test("a refused row's request and its name are the bytes sent, whatever the caller's observer does to its copy", async () => {
+    const result = await exercise({ pokeOutcomes: ['refusal'], observer(call) { call.request.system = 'mutated'; } });
+    const row = result.logs[1];
+    expect(JSON.stringify(row.rawRequest)).toBe(result.wire[1]);
+    expect(row.keepalive.request).toBe(createHash('sha256').update(result.wire[1]).digest('hex').slice(0, 16));
+  });
+
   test("the caller's onCall runs as membrane's method, with its config as this", async () => {
     const result = await exercise();
     // membrane calls onCall on its own copy of the keepalive config, which
@@ -422,6 +430,23 @@ describe('the keepalive refusal dragnet and request retention, poke by poke', ()
     });
   });
 
+  test('a lineage still replaying its refused request stays remembered past sixteen others', () => {
+    withAdapter(({ log, refusals, rows }) => {
+      for (let i = 0; i < 16; i++) log(receipt(`L${i}`, 1, 'refusal'));
+      // L0 is refused again on the same request: no alert, but it counts as used.
+      log(receipt('L0', 1, 'refusal'));
+      expect(refusals).toHaveLength(16);
+      log(receipt('L16', 1, 'refusal'));
+      log(receipt('L0', 1, 'refusal'));
+      expect(refusals).toHaveLength(17);
+      log(receipt('L1', 1, 'refusal'));
+      expect(refusals).toHaveLength(18);
+      // The kept requests are forgotten in the same order.
+      const tail = rows().slice(-3);
+      expect(tail.map(r => [r.keepalive.key, r.rawRequest !== undefined])).toEqual([['L16', true], ['L0', false], ['L1', true]]);
+    });
+  });
+
   test('a lineage noted again with a new request is the last to be forgotten', () => {
     withAdapter(({ log, refusals }) => {
       for (let i = 0; i < 16; i++) log(receipt(`L${i}`, 1, 'refusal'));
@@ -429,7 +454,7 @@ describe('the keepalive refusal dragnet and request retention, poke by poke', ()
       log(receipt('L0', 2, 'refusal'));
       log(receipt('L16', 1, 'refusal'));
       expect(refusals).toHaveLength(18);
-      // L1 was forgotten in L0's place, so L0's new request is still heard.
+      // L1 was forgotten, not L0, so L0's new request is still remembered.
       log(receipt('L0', 2, 'refusal'));
       expect(refusals).toHaveLength(18);
       log(receipt('L1', 1, 'refusal'));

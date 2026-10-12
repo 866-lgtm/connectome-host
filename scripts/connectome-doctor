@@ -241,28 +241,37 @@ stages.append(("chronicle ingest (+gate)", rec_ts, rec_detail))
 def err_text(err):
     """An llm-calls error as text: a { name, message, ... } object or a string."""
     if isinstance(err, dict):
-        return str(err.get("message") or err.get("name") or err)
-    return str(err)
+        return str(err.get("message") or err.get("name") or "")
+    return "" if err is None else str(err)
 
 
 llm_ts = None
 llm_detail = ""
+llm_window_from = None  # the oldest row's time, when no model call was found
+LLM_WINDOW = 30_000_000
 llm_files = sorted(
     (f for f in os.listdir(data_dir) if f.startswith("llm-calls.")),
     key=lambda f: os.path.getmtime(os.path.join(data_dir, f)),
 )
 if llm_files:
     newest = os.path.join(data_dir, llm_files[-1])
-    # last complete JSON line from tail (lines can be multi-MB). Split at
-    # newlines only: splitlines() also splits at U+2028, U+2029 and U+0085,
-    # which JSON.stringify leaves unescaped inside a row.
-    raw = tail_bytes(newest, 30_000_000).decode("utf-8", "replace")
+    # The file's tail, split at newlines only: splitlines() also splits at
+    # U+2028, U+2029 and U+0085, which JSON.stringify leaves unescaped inside
+    # a row. One byte more than the window is read, so where the window cuts
+    # a file, the first piece is the part of a row before it, or empty when
+    # the cut falls between rows, and is dropped either way.
+    raw = tail_bytes(newest, LLM_WINDOW + 1).decode("utf-8", "replace")
     lines = raw.split("\n")
-    if os.path.getsize(newest) > 30_000_000:
-        lines = lines[1:]  # the window starts inside a row
-    poke = None      # the newest keepalive poke after the call reported
+    if os.path.getsize(newest) > LLM_WINDOW + 1:
+        lines = lines[1:]
+    # A last row with no newline after it is being written now, or was cut
+    # off when its process stopped.
+    incomplete = lines.pop().strip() != "" if lines else False
+    call = None        # the newest model call: the row reported
+    refused = None     # the newest refused keepalive poke since the last turn
+    failed = None      # the newest failed keepalive poke since the last turn
     pokes = 0
-    unreadable = 0   # rows after the call reported that couldn't be parsed
+    unreadable = 0     # rows newer than the call reported that couldn't be parsed
     for ln in reversed(lines):
         ln = ln.strip()
         if not ln.startswith("{"):
@@ -270,41 +279,57 @@ if llm_files:
         try:
             r = json.loads(ln)
         except Exception:
-            unreadable += 1
+            if call is None:
+                unreadable += 1
             continue
+        llm_window_from = parse_iso(str(r.get("timestamp", ""))) or llm_window_from
         # Cache keepalive pokes write rows here too, while the agent is idle,
         # so neither the file's mtime nor its last row says when it last
-        # inferred: take the newest row that isn't a poke, and its own time.
+        # inferred: report the newest row that isn't a poke, at its own time.
+        # A poke replays a turn's request (the host keeps only the turns'
+        # lane warm), so the scan goes on past other calls to the last turn,
+        # gathering the pokes since: a refused one means a turn sending the
+        # context it replays would likely be refused too.
         if r.get("kind") == "keepalive":
             pokes += 1
-            poke = poke or r
+            if r.get("type") == "error":
+                failed = failed or r
+            elif ((r.get("rawResponse") or {}).get("stop_reason")) == "refusal":
+                refused = refused or r
             continue
-        llm_ts = parse_iso(str(r.get("timestamp", "")))
-        resp = r.get("rawResponse") or {}
+        if call is None:
+            call = r
+        if r.get("kind") == "stream":
+            break
+    if call is not None:
+        llm_window_from = None
+        llm_ts = parse_iso(str(call.get("timestamp", "")))
+        resp = call.get("rawResponse") or {}
         resp = resp.get("response") or resp
         sr = resp.get("stop_reason")
-        err = resp.get("error") or r.get("error")
-        llm_detail = f"stop={sr}" + (f"  {C_RED}err={err_text(err)[:80]}{C_OFF}" if err else "")
+        err = resp.get("error") or call.get("error")
+        if call.get("type") == "error" or err:
+            llm_detail = f"stop={sr}  {C_RED}err={err_text(err)[:80] or '(no text)'}{C_OFF}"
+        else:
+            llm_detail = f"stop={sr}"
         if sr == "refusal":
             warn("last model response was a REFUSAL — check context contamination "
                  "(see project_mythos: contextBudgetTokens fix)")
-        break
-    if llm_ts is None and pokes:
-        llm_detail = f"only keepalive pokes ({pokes}) in the newest file's last 30 MB"
+    else:
+        llm_detail = "no readable model call in the newest file's last 30 MB" + (
+            f": {pokes} keepalive poke(s)" if pokes else "")
     if unreadable:
-        llm_detail += f"  {C_YEL}{unreadable} {'newer ' if llm_ts else ''}row(s) unreadable{C_OFF}"
-    # A poke replays the context the agent's next turn would send, so a
-    # refused or failed one after its last call is worth seeing here.
-    if poke is not None:
-        p_resp = poke.get("rawResponse") or {}
-        p_when = hhmm(parse_iso(str(poke.get("timestamp", ""))))
-        if p_resp.get("stop_reason") == "refusal":
-            llm_detail += f"  {C_RED}keepalive poke {p_when} REFUSED{C_OFF}"
-            warn("the newest cache keepalive poke was REFUSED: the context the agent's "
-                 "next turn sends would likely be refused too (see project_mythos: "
-                 "contextBudgetTokens fix)")
-        elif poke.get("error"):
-            llm_detail += f"  {C_RED}keepalive poke {p_when} failed: {err_text(poke.get('error'))[:80]}{C_OFF}"
+        llm_detail += f"  {C_YEL}{unreadable} {'newer ' if call else ''}row(s) unreadable{C_OFF}"
+    if incomplete:
+        llm_detail += f"  {C_YEL}last row incomplete (being written, or cut off){C_OFF}"
+    if refused is not None:
+        llm_detail += f"  {C_RED}keepalive poke {hhmm(parse_iso(str(refused.get('timestamp', ''))))} REFUSED{C_OFF}"
+        warn("a cache keepalive poke since the agent's last turn was REFUSED: a turn "
+             "sending the context it replays would likely be refused too (see "
+             "project_mythos: contextBudgetTokens fix)")
+    if failed is not None:
+        f_text = err_text(failed.get("error"))[:80] or "(no text)"
+        llm_detail += f"  {C_RED}keepalive poke {hhmm(parse_iso(str(failed.get('timestamp', ''))))} failed: {f_text}{C_OFF}"
 stages.append(("inference (llm call)", llm_ts, llm_detail))
 
 # 4d. delivery: last routeSpeech in agent log
@@ -338,8 +363,11 @@ for name, ts, detail in stages:
     if ts:
         prev_ts = ts
 
-# triggered ingest but no inference since -> the tonight signature
-if globals().get("_last_ingest_triggered") and rec_ts and (llm_ts is None or llm_ts < rec_ts - 120):
+# triggered ingest but no inference since -> the tonight signature. With no
+# model call in the window, that holds only if the window reaches back past
+# the ingest.
+inference_unknown = llm_ts is None and llm_window_from is not None and rec_ts is not None and rec_ts < llm_window_from
+if globals().get("_last_ingest_triggered") and rec_ts and not inference_unknown and (llm_ts is None or llm_ts < rec_ts - 120):
     warn("a gate-TRIGGERED event was ingested but NO inference followed — "
          "events are dying between the gate and the model (check inference "
          "policy drops / budget failures / [diagnostics] dump below)")
@@ -375,7 +403,8 @@ if pid not in ("0", "", None) and active in ("active", "running"):
     if os.path.exists(agent_log):
         with open(agent_log, "rb") as f:
             f.seek(before)
-            for ln in f.read().decode("utf-8", "replace").splitlines():
+            # Split at newlines only: the dump is JSON, which can hold U+2028.
+            for ln in f.read().decode("utf-8", "replace").split("\n"):
                 if "[diagnostics]" in ln:
                     dump = ln
     print()
