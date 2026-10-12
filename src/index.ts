@@ -981,11 +981,19 @@ function countLines(path: string): number {
 
 async function main() {
   const recipe = await resolveRecipe();
-  // Recipe wins; LLM_PROVIDER env keeps working for deployments that predate
-  // the recipe-level `agent.provider` field (e.g. openai-compatible gateways).
-  const provider =
-    recipe.agent.provider ??
-    (process.env.LLM_PROVIDER === 'openai-compatible' ? 'openai-compatible' : 'anthropic');
+  // The provider is the recipe's. The fork-era LLM_PROVIDER env selector
+  // can no longer work on its own: the openai-compatible endpoint now comes
+  // from agent.baseUrl, which validation only accepts beside
+  // agent.provider "openai-compatible". Fail with the fix instead of a bare
+  // "requires baseURL" from the adapter.
+  if (!recipe.agent.provider && process.env.LLM_PROVIDER === 'openai-compatible') {
+    console.error(
+      'LLM_PROVIDER=openai-compatible is no longer read. Set agent.provider "openai-compatible" and ' +
+      'agent.baseUrl in the recipe, and the key in OPENAI_COMPATIBLE_API_KEY.',
+    );
+    process.exit(1);
+  }
+  const provider = recipe.agent.provider ?? 'anthropic';
 
   if (provider === 'openrouter' && !config.openrouterApiKey) {
     console.error('Missing OPENROUTER_API_KEY for recipe provider "openrouter".');
