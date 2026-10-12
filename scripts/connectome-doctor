@@ -390,18 +390,20 @@ for name, ts, detail in stages:
     if ts:
         prev_ts = ts
 
-# triggered ingest but no inference since -> the tonight signature.
-# The turn is what follows an ingest; a compression call is not one. With no
-# llm-calls file there was no inference at all. With one, an unreadable or
-# incomplete row might be the turn, and with no turn in the window, no turn
-# followed only if the window reaches back past the ingest.
+# triggered ingest but no turn recorded since -> the tonight signature.
+# The turn is what follows an ingest; a compression call is not one. Logging
+# is best-effort, so this says what was recorded, not that the model never
+# ran. With no llm-calls file no turn was recorded. With one, an unreadable
+# or incomplete row might be the turn, and with no turn in the window, none
+# was recorded after the ingest only if the window reaches back past it.
+NO_TURN = "NO turn was recorded after it"
 no_turn_after = turn_ts is None or (rec_ts is not None and turn_ts < rec_ts - 120)
 turn_unknown = bool(llm_files) and (llm_unsure or (turn_ts is None and (
     llm_window_from is None or (rec_ts is not None and rec_ts < llm_window_from))))
 if globals().get("_last_ingest_triggered") and rec_ts and no_turn_after and not turn_unknown:
-    warn("a gate-TRIGGERED event was ingested but NO inference followed — "
-         "events are dying between the gate and the model (check inference "
-         "policy drops / budget failures / [diagnostics] dump below)")
+    warn(f"a gate-TRIGGERED event was ingested but {NO_TURN} — events may be "
+         "dying between the gate and the model (check inference policy drops / "
+         "budget failures / [diagnostics] dump below)")
 
 # ---------------------------------------------------------------------------
 # 5. Recent failures (agent.log + failures.log)
@@ -449,9 +451,9 @@ if pid not in ("0", "", None) and active in ("active", "running"):
             if g.get("sleepUntil", 0) > NOW * 1000:
                 warn(f"agent is ASLEEP until {hhmm(g['sleepUntil']/1000)}")
             if d.get("activeStreams"):
-                # a turn is running right now — the "no inference followed"
+                # a turn is running right now — the "no turn recorded"
                 # heuristic is premature; the model is just still thinking.
-                WARNINGS[:] = [w for w in WARNINGS if "NO inference followed" not in w]
+                WARNINGS[:] = [w for w in WARNINGS if NO_TURN not in w]
                 print(f"  {C_GRN}turn in-flight for: {', '.join(d['activeStreams'])}{C_OFF}")
         except Exception:
             pass
