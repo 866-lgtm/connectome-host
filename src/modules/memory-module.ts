@@ -29,6 +29,13 @@
  * `metadata.triggered === true`. If two wake-triggering messages land before
  * a queued turn runs, the newest one decides — acceptable for a single-user
  * gate.
+ *
+ * Places (ROUTING_STRICT): the framework passes the place of the turn being
+ * compiled, and only a message of that place can be the gate. A block
+ * retrieved for the user's message in one place (a private channel) is never
+ * injected into, or replayed for, a turn of another place (a stranger's
+ * mention in a public channel, a DM). Without a scope (flag off, or an older
+ * framework) the gate is chosen as before.
  */
 
 import type {
@@ -66,6 +73,13 @@ export interface MemoryModuleConfig {
   saveRecentCount?: number;
   /** Per-request timeout for memory-service calls (default: 3500ms) */
   requestTimeoutMs?: number;
+}
+
+/** The turn scope the framework passes to gatherContext under ROUTING_STRICT
+ *  (structural: the module also runs on a framework that passes none). */
+interface TurnScope {
+  /** Whether a stored message belongs to the turn's place. */
+  includes(metadata: Record<string, unknown> | undefined): boolean;
 }
 
 interface MemoryModuleState {
@@ -139,12 +153,18 @@ export class MemoryModule implements Module {
   // Retrieve
   // =========================================================================
 
-  async gatherContext(_agentName: string): Promise<ContextInjection[]> {
+  async gatherContext(_agentName: string, scope?: TurnScope): Promise<ContextInjection[]> {
     if (!this.ctx) return [];
 
     try {
       const discordMessages = this.recentDiscordMessages();
-      const gate = this.findTriggerMessage(discordMessages);
+      // Only a message of this turn's own place can be its wake cause: a
+      // turn of another place gets nothing, fresh or replayed from the cache.
+      const gate = this.findTriggerMessage(
+        scope
+          ? discordMessages.filter(m => scope.includes(m.metadata as Record<string, unknown> | undefined))
+          : discordMessages,
+      );
       if (!gate) {
         this.userTurnLive = false;
         return [];
