@@ -24,17 +24,15 @@
  */
 
 import {
-  AnthropicXmlFormatter,
   BedrockAdapter,
   Membrane,
   MockAdapter,
-  NativeFormatter,
   OpenAIResponsesAPIAdapter,
-  OpenAIResponsesFormatter,
   OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { recipeFormatter } from './recipe-formatter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
@@ -1270,11 +1268,7 @@ async function main() {
     // gives generic retryable errors — e.g. a gateway 502 — zero retries; only
     // 529/overloaded_error has a dedicated schedule.
     ...(recipe.agent.retry ? { retry: recipe.agent.retry } : {}),
-    formatter: provider === 'openai-responses' || provider === 'openai-codex'
-      ? new OpenAIResponsesFormatter()
-      : recipe.agent.formatter === 'anthropic-xml'
-        ? new AnthropicXmlFormatter()
-        : new NativeFormatter(),
+    formatter: recipeFormatter(recipe.agent.formatter, provider),
     // Caching default for internal callers (autobio compression,
     // executeMerge), which read Membrane's defaultPromptCaching rather
     // than the per-agent flag. Applies on EVERY provider whenever the
