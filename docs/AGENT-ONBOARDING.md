@@ -298,6 +298,15 @@ model scale the three window numbers down together — e.g. `contextBudgetTokens
 and keep everything under `strategy` as is; chunk size, merge fan-in and the
 fallback rungs are window-independent.
 
+For Anthropic streaming turns, add `"effort": "medium"` to `agent.thinking` to
+set the recipe baseline; `enabled` is still required and can be `false`.
+Explicit `agent_settings` effort overrides the recipe until reset. Unrelated
+settings updates preserve the baseline, and compression calls are unaffected.
+A model that doesn't accept the effort level (Sonnet 4.5, Haiku 4.5, Claude 3
+models, and some levels on Opus 4.5 and 4.6) gets no effort, and its default
+applies, with a line on stderr.
+Other providers ignore this field; OpenAI recipes use `agent.responses.reasoningEffort`.
+
 Use `"cacheTtl": "1h"` for Connectome deployments. This is also the runtime
 default when the field is omitted. Set `"5m"` only for intentionally rapid
 workloads whose cache is normally reused within five minutes.
