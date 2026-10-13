@@ -1171,7 +1171,7 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
   const payload = buildCountTokensPayload(
     request as unknown as CountablePreview,
     agentName,
-    xml ? new AnthropicXmlFormatter() : new NativeFormatter(),
+    xml ? new AnthropicXmlFormatter({ toolMode: 'xml' }) : new NativeFormatter(),
     xml ? 'xml' : 'native',
   );
   // What the provider actually billed for the last call (fresh + cache read +
