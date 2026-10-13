@@ -1,1 +1,0 @@
-- The context curve page gives a summary's first and last dates by time. It used to order them by their text, weekday first, so a summary of a Wednesday's and a Friday's messages showed the Friday as its first date.
