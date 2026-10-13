@@ -1415,11 +1415,19 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
       const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
-      const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
+      // The store gives each timestamp as a Date, which the default sort orders
+      // by its text, weekday first. Take the earliest and latest by time, of
+      // the timestamps that are times.
+      const times = leafIds.map((id) => msgById.get(id)!.timestamp)
+        .filter((t) => t !== undefined && t !== null)
+        .map((t) => new Date(t as Date | string | number).getTime())
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => a - b);
       entries.push({
         i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
         rendered, rawCovered, msgCount: leafIds.length, nImages,
-        dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
+        dateFirst: times.length > 0 ? new Date(times[0]) : null,
+        dateLast: times.length > 0 ? new Date(times[times.length - 1]) : null, text,
       });
     } else {
       const src = e.sourceMessageId ? msgById.get(e.sourceMessageId) : null;
