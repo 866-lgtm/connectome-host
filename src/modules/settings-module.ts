@@ -237,14 +237,15 @@ export class SettingsModule implements Module {
  * older version or a hand edit can leave a value the API rejects, and since
  * display and effort are sent on every turn, one bad value would fail every
  * turn, leaving the agent no turn to fix the setting with. Such a value falls
- * back to its default, and the host says so.
+ * back to the baseline, which is the default except for an effort the recipe
+ * sets, and the host logs the value it uses instead.
  */
 function restoreReasoning(saved: unknown, baseline = DEFAULTS.reasoning): ReasoningSettings {
   const restored = clone(baseline);
   if (!saved || typeof saved !== 'object') return restored;
   const s = saved as Record<string, unknown>;
-  const ignore = (field: string, value: unknown) => console.error(
-    `[settings] ignoring saved reasoning.${field}=${JSON.stringify(value)}: not a valid value; using the default`,
+  const ignore = (field: keyof ReasoningSettings, value: unknown) => console.error(
+    `[settings] ignoring saved reasoning.${field}=${JSON.stringify(value)}: not a valid value; using ${JSON.stringify(restored[field])}`,
   );
   if (s.enabled !== undefined) {
     if (typeof s.enabled === 'boolean') restored.enabled = s.enabled;

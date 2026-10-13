@@ -291,19 +291,21 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
 }
 ```
 
-For Anthropic streaming turns, add `"effort": "medium"` to `agent.thinking` to
-set the recipe baseline; `enabled` is still required and can be `false`.
-Explicit `agent_settings` effort overrides the recipe until reset. Unrelated
-settings updates preserve the baseline, and compression calls are unaffected.
-Other providers ignore this field; OpenAI recipes use `agent.responses.reasoningEffort`.
-
-
 These are the values the long-running production residents converge on for a
 ≥500k-window model (300k budget / 100k recent tail / 32k reply). For a **200k-window**
 model scale the three window numbers down together — e.g. `contextBudgetTokens:
 160000`, `maxStreamTokens: 180000`, `recentWindowTokens: 60000`, `maxTokens: 16384` —
 and keep everything under `strategy` as is; chunk size, merge fan-in and the
 fallback rungs are window-independent.
+
+For Anthropic streaming turns, add `"effort": "medium"` to `agent.thinking` to
+set the recipe baseline; `enabled` is still required and can be `false`.
+Explicit `agent_settings` effort overrides the recipe until reset. Unrelated
+settings updates preserve the baseline, and compression calls are unaffected.
+A model that doesn't accept the effort level (Sonnet 4.5, Haiku 4.5, Claude 3
+models, and some levels on Opus 4.5 and 4.6) gets no effort, and its default
+applies, with a line on stderr.
+Other providers ignore this field; OpenAI recipes use `agent.responses.reasoningEffort`.
 
 Use `"cacheTtl": "1h"` for Connectome deployments. This is also the runtime
 default when the field is omitted. Set `"5m"` only for intentionally rapid
