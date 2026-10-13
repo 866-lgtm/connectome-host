@@ -163,14 +163,26 @@ describe('buildCountTokensPayload', () => {
     expect(JSON.stringify(payload)).not.toContain('PREFILL SCAFFOLD');
   });
 
-  test('a native agent\'s count ignores a prefill, as the native formatter does', () => {
+  // Since membrane 0.5.87 the native formatter uses prefillUserMessage as the
+  // synthetic user turn it puts before assistant-first history (it used to be
+  // `[continuing]` whatever the caller passed), so a native agent's count
+  // carries the prefill exactly where inference sends it.
+  test('a native agent\'s count carries a prefill where the native formatter puts it: the leading user turn', () => {
     const messages: NormalizedMessage[] = [
       { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
       { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
     ];
+    const reference = (extra: Record<string, unknown>) => new NativeFormatter().buildMessages(messages, {
+      participantMode: 'multiuser', assistantParticipant: 'agent', toolMode: 'native',
+      promptCaching: false, cacheMarkers: 'membrane-system', ...extra,
+    }).messages as unknown[];
     const withPrefill = buildCountTokensPayload({ messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent');
-    expect(withPrefill).toEqual(buildCountTokensPayload({ messages }, 'agent'));
-    expect(JSON.stringify(withPrefill)).not.toContain('PREFILL SCAFFOLD');
+    expect(withPrefill.messages).toEqual(reference({ prefillUserMessage: 'PREFILL SCAFFOLD' }));
+    expect(roleOf(withPrefill.messages[0])).toBe('user');
+    expect(blocksOf(withPrefill.messages[0]).map((b) => b.text)).toEqual(['PREFILL SCAFFOLD']);
+    const without = buildCountTokensPayload({ messages }, 'agent');
+    expect(without.messages).toEqual(reference({}));
+    expect(JSON.stringify(without)).not.toContain('PREFILL SCAFFOLD');
   });
 
   // An empty system, as text or as a list, and an empty tool list send
