@@ -708,7 +708,8 @@ blocks; expect folds to interact with this on the next model generation.
   — stopped store, cold backup first
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
-  `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`
+  `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`, and
+  `readFailures` (by agent and section, any of those reads that threw, with its message)
 - **Import guides:** [`claude-code-ingest.md`](./claude-code-ingest.md) ·
   [`claudeai-evacuation.md`](./claudeai-evacuation.md)
 - **Identity is the user's call. The mechanics are yours. Check everything. Be kind about who you're setting up.**

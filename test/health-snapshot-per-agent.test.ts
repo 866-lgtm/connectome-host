@@ -79,6 +79,21 @@ describe('health snapshot per agent', () => {
     expect(snapshot.readFailures).toBeUndefined();
   });
 
+  test("a thrown value that can't be described still loses only its agent", () => {
+    const opaque = { toString() { throw new Error('no string'); } };
+    const odd = Object.assign(new Error('x'), { message: 42 as unknown as string });
+    const snapshot = buildHealthSnapshot(appWith([
+      agentStub('opaque', { debt: () => { throw opaque; } }),
+      agentStub('odd', { debt: () => { throw odd; } }),
+      agentStub('steady'),
+    ]));
+    expect(snapshot.compressionDebt).toEqual({ steady: { level: 'healthy' } });
+    expect(snapshot.readFailures).toEqual({
+      opaque: { compressionDebt: 'the read failed, and its error has no message' },
+      odd: { compressionDebt: 'the read failed, and its error has no message' },
+    });
+  });
+
   test("a failure's message is cut to 300 characters", () => {
     const long = 'x'.repeat(1000);
     const snapshot = buildHealthSnapshot(appWith([agentStub('noisy', { debt: () => { throw new Error(long); } })]));

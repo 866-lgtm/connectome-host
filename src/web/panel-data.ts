@@ -780,6 +780,19 @@ type FrameworkAgent = ReturnType<AgentFramework['getAllAgents']>[number];
 /** A failed health read's message, cut to a length a health poll can carry. */
 const READ_FAILURE_MAX_CHARS = 300;
 
+/** What a thrown value says, for readFailures. Describing it can't throw
+ *  itself: a value with no usable string, or an Error whose message isn't a
+ *  string, gets a fixed text, so a strange throw still loses only its agent. */
+function describeReadFailure(error: unknown): string {
+  try {
+    const message = error instanceof Error ? error.message : String(error);
+    if (typeof message === 'string') return message.slice(0, READ_FAILURE_MAX_CHARS);
+  } catch {
+    // Fall through to the fixed text.
+  }
+  return 'the read failed, and its error has no message';
+}
+
 /** One health section's entries by agent name. Each agent is read on its own,
  *  so an agent whose read throws (such as one whose context manager a store
  *  surgery left uninitialized) doesn't hide the others. Its failure goes in
@@ -798,8 +811,7 @@ function perAgentHealth(
       const value = read(agent);
       if (value) entries[name] = value;
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      (failures[name] ??= {})[section] = message.slice(0, READ_FAILURE_MAX_CHARS);
+      (failures[name] ??= {})[section] = describeReadFailure(error);
     }
   }
   return entries;
