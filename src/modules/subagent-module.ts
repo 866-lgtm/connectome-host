@@ -107,6 +107,14 @@ interface DetachableHandle {
   detach: () => void;
 }
 
+/** The two endings agent-framework's `statedWaitNotSlept` appends to an
+ *  ephemeral run's failure when it ends the run over a provider's stated
+ *  wait, each at the end of the message (see isUnsleptProviderWait). */
+const UNSLEPT_PROVIDER_WAIT_ENDINGS: readonly RegExp[] = [
+  /\(the provider asked to wait [^()]*; an ephemeral run doesn't sleep a stated wait longer than \d+ s, so it ends now\)\s*$/,
+  /\(the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of \d+ s or less, so it ends now\)\s*$/,
+];
+
 /**
  * Non-retryable termination of a subagent. All abnormal-but-expected exits
  * (user cancel, zombie reclaim, depth limit, etc.) use this so the catch
@@ -1076,8 +1084,21 @@ export class SubagentModule implements Module {
     return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
   }
 
+  /** The framework ended the run rather than sleep a provider's stated wait
+   *  (agent-framework 0.22.1 on): one longer than an ephemeral run sleeps,
+   *  or one it can't read as a number. Either way the provider asked for a
+   *  wait the run won't sit out, so a restart would only call it again too
+   *  soon. The framework says so only in the message, as one of the two
+   *  endings its `statedWaitNotSlept` appends. Each is matched at the end of
+   *  the message, where the framework puts it, so the same words echoed
+   *  earlier in a provider's text don't count. */
+  private isUnsleptProviderWait(err: Error): boolean {
+    return UNSLEPT_PROVIDER_WAIT_ENDINGS.some((ending) => ending.test(err.message));
+  }
+
   /** Transient = worth retrying the whole subagent from scratch. */
   private isTransientError(err: Error): boolean {
+    if (this.isUnsleptProviderWait(err)) return false;
     const msg = err.message.toLowerCase();
     return (
       msg.includes('timeout') ||
