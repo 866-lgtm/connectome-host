@@ -458,14 +458,18 @@ export function HealthPanel(props: {
   onCredentialAction?(actionId: string): void;
 }) {
   const agents = () => props.health?.agents ?? [];
-  const quarantine = (name: string) => props.health?.compressionQuarantine?.[name];
-  const debt = (name: string) => props.health?.compressionDebt?.[name];
-  const settings = (name: string) => props.health?.runtimeSettings?.[name];
-  const composition = (name: string) => props.health?.contextComposition?.[name];
+  // The snapshot's sections are keyed by agent name, and JSON.parse gives them
+  // Object.prototype: look an agent up by own key, so a name such as
+  // `constructor` that's missing from a section reads as missing.
   const own = (record: object | undefined, key: string): boolean =>
     record !== undefined && Object.prototype.hasOwnProperty.call(record, key);
-  const failures = (name: string) =>
-    own(props.health?.readFailures, name) ? props.health!.readFailures![name] : undefined;
+  const byAgent = <T,>(record: Record<string, T> | undefined, name: string): T | undefined =>
+    own(record, name) ? record![name] : undefined;
+  const quarantine = (name: string) => byAgent(props.health?.compressionQuarantine, name);
+  const debt = (name: string) => byAgent(props.health?.compressionDebt, name);
+  const settings = (name: string) => byAgent(props.health?.runtimeSettings, name);
+  const composition = (name: string) => byAgent(props.health?.contextComposition, name);
+  const failures = (name: string) => byAgent(props.health?.readFailures, name);
 
   const statusTone = (status?: string): string => {
     switch (status) {
