@@ -142,9 +142,10 @@ never do.
   once that's happened, or if it no longer applies. When what has to
   happen is a fix that this package itself must release, close the hold
   once the fix is merged, then release. While one is open, `npm version`
-  stops before it bumps anything, `npm publish` refuses, and the publish
-  workflow refuses both its npm publish and its GitHub release notes,
-  each checking when it runs. The check also stops a release when it
+  stops before it bumps anything, `npm publish` refuses (bun's
+  `bun pm version` and `bun publish` run the same hooks, and stop too), and
+  the publish workflow refuses both its npm publish and its GitHub release
+  notes, each checking when it runs. The check also stops a release when it
   can't read the holds from GitHub, and says why. npm's `--ignore-scripts`
   skips it, as it skips every lifecycle script, and so does publishing a
   tarball made earlier with `npm pack`, which runs no lifecycle script.
