@@ -775,6 +775,25 @@ export async function applyCredentialAction(app: PanelAppRef, params: Record<str
   return { subscription: true, agent: resolveAgent(app), ...state };
 }
 
+type FrameworkAgent = ReturnType<AgentFramework['getAllAgents']>[number];
+
+/** One health section's entries by agent name. Each agent is read on its own,
+ *  so an agent whose read throws (such as one whose context manager a store
+ *  surgery left uninitialized) is left out, and the others are still reported.
+ *  An agent with nothing to report is left out too. */
+function perAgentHealth(app: PanelAppRef, read: (agent: FrameworkAgent) => unknown): Record<string, unknown> {
+  const entries: Record<string, unknown> = {};
+  for (const agent of app.framework.getAllAgents()) {
+    try {
+      const value = read(agent);
+      if (value) entries[(agent as unknown as { name: string }).name] = value;
+    } catch {
+      // This agent's read failed; the others still report.
+    }
+  }
+  return entries;
+}
+
 export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
   if (typeof fw.healthSnapshot !== 'function') {
@@ -796,15 +815,10 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // here so the fleet hub and connectome-doctor can alarm on it — it
   // must never be observable only in agent.log.
   try {
-    const quarantine: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const strategy = (agent.getContextManager() as unknown as {
+    (snapshot as Record<string, unknown>).compressionQuarantine = perAgentHealth(app, (agent) =>
+      (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionQuarantineStatus?: () => unknown };
-      }).getStrategy?.();
-      const status = strategy?.getCompressionQuarantineStatus?.();
-      if (status) quarantine[(agent as unknown as { name: string }).name] = status;
-    }
-    (snapshot as Record<string, unknown>).compressionQuarantine = quarantine;
+      }).getStrategy?.()?.getCompressionQuarantineStatus?.());
   } catch {
     // Health reads never throw.
   }
@@ -815,15 +829,10 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // lets fleet-watch (and later the resident notice, af #99) catch the
   // debt while it is still cheap.
   try {
-    const debt: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const strategy = (agent.getContextManager() as unknown as {
+    (snapshot as Record<string, unknown>).compressionDebt = perAgentHealth(app, (agent) =>
+      (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionDebt?: () => unknown };
-      }).getStrategy?.();
-      const d = strategy?.getCompressionDebt?.();
-      if (d) debt[(agent as unknown as { name: string }).name] = d;
-    }
-    (snapshot as Record<string, unknown>).compressionDebt = debt;
+      }).getStrategy?.()?.getCompressionDebt?.());
   } catch {
     // Health reads never throw.
   }
@@ -832,16 +841,8 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // the strategy's own render stats (already computed in-process), so it is
   // safe on the 15s /healthz poll.
   try {
-    const composition: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const name = (agent as unknown as { name: string }).name;
-      const cm = agent.getContextManager() as unknown as {
-        getRenderStats?: () => unknown;
-      };
-      const rs = cm.getRenderStats?.();
-      if (rs) composition[name] = rs;
-    }
-    (snapshot as Record<string, unknown>).contextComposition = composition;
+    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, (agent) =>
+      (agent.getContextManager() as unknown as { getRenderStats?: () => unknown }).getRenderStats?.());
   } catch {
     // Health reads never throw.
   }
@@ -853,13 +854,10 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
     const fw2 = app.framework as unknown as {
       getAgentRuntimeSettings?: (name: string) => unknown;
     };
-    if (typeof fw2.getAgentRuntimeSettings === 'function') {
-      const settings: Record<string, unknown> = {};
-      for (const agent of app.framework.getAllAgents()) {
-        const name = (agent as unknown as { name: string }).name;
-        settings[name] = fw2.getAgentRuntimeSettings(name);
-      }
-      (snapshot as Record<string, unknown>).runtimeSettings = settings;
+    const getSettings = fw2.getAgentRuntimeSettings;
+    if (typeof getSettings === 'function') {
+      (snapshot as Record<string, unknown>).runtimeSettings = perAgentHealth(app, (agent) =>
+        getSettings.call(app.framework, (agent as unknown as { name: string }).name));
     }
   } catch {
     // Health reads never throw.
