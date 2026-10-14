@@ -425,6 +425,33 @@ function npm(dir: string, args: string[], api: string) {
   });
 }
 
+/** bun, kept to the throwaway directory as npm is: under `bun test`, the
+ *  running binary. */
+function bun(dir: string, args: string[], api: string) {
+  return exec(process.execPath, args, dir, {
+    HOME: dir,
+    BUN_INSTALL_CACHE_DIR: join(dir, ".bun-cache"),
+    npm_config_registry: api,
+    GITHUB_API_URL: api,
+  });
+}
+
+test("bun's version and publish commands run this repository's hooks, so a hold stops them too", async () => {
+  const gh = await github(200, [HOLD]);
+  try {
+    const dir = wiredProject();
+    const version = await bun(dir, ["pm", "version", "patch", "--no-git-tag-version"], gh.url);
+    assert.notEqual(version.code, 0);
+    assert.match(version.stderr, /#300 DefaultErrorPolicy/);
+    assert.equal(JSON.parse(readFileSync(join(dir, "package.json"), "utf8")).version, "1.0.0");
+    const publish = await bun(dir, ["publish", "--dry-run"], gh.url);
+    assert.notEqual(publish.code, 0);
+    assert.match(publish.stderr, /#300 DefaultErrorPolicy/);
+  } finally {
+    await gh.close();
+  }
+}, 30_000);
+
 test("this repository's preversion stops npm version before the bump while a hold is open", async () => {
   const gh = await github(200, [HOLD]);
   try {
