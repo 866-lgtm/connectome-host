@@ -96,6 +96,13 @@ describe('health snapshot per agent', () => {
     });
   });
 
+  test('an object whose message getter throws gets the fixed text, and only its agent is left out', () => {
+    const trap = { get message(): string { throw new Error('no message here'); } };
+    const snapshot = buildHealthSnapshot(appWith([agentStub('trap', { debt: () => { throw trap; } }), agentStub('steady')]));
+    expect(snapshot.compressionDebt).toEqual({ steady: { level: 'healthy' } });
+    expect(snapshot.readFailures).toEqual({ trap: { compressionDebt: UNDESCRIBED } });
+  });
+
   test('a thrown primitive is its own text, an object gives its message, and one without a message gets the fixed text', () => {
     const snapshot = buildHealthSnapshot(appWith([
       agentStub('text', { debt: () => { throw 'disk gone'; } }),
@@ -158,6 +165,15 @@ describe('health panel lookups', () => {
     // The readable agent is found, and its debt read has no failure.
     expect(healthEntry(parsed.compressionDebt, 'steady')).toEqual({ level: 'healthy' });
     expect(healthEntry(parsed.readFailures, 'steady')).toBeUndefined();
+  });
+
+  test('readable agents named constructor and toString are found by name', () => {
+    const snapshot = buildHealthSnapshot(appWith([agentStub('constructor'), agentStub('toString')]));
+    const parsed = JSON.parse(JSON.stringify(snapshot)) as Record<string, Record<string, unknown>>;
+    for (const name of ['constructor', 'toString']) {
+      expect(healthEntry(parsed.compressionDebt, name)).toEqual({ level: 'healthy' });
+      expect(healthEntry(parsed.runtimeSettings, name)).toEqual({ contextBudgetTokens: 100_000 });
+    }
   });
 
   test('a missing or null map has no entries', () => {

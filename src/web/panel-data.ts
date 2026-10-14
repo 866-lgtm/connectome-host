@@ -777,8 +777,8 @@ const READ_FAILURE_MAX_CHARS = 300;
 const READ_FAILURE_UNDESCRIBED = "the read failed, and its error couldn't be described";
 
 /** What a thrown value says, for readFailures: an object's `message`, such
- *  as an Error's, or a thrown primitive as a string, cut to 300 characters
- *  (code points, so a character is never split). An object with no
+ *  as an Error's, or a thrown primitive as a string, cut to its first 300
+ *  code points, so no code point is split. An object with no
  *  non-empty string message, such as an Error with an empty one or a plain
  *  object with none, gets a fixed text, and so does anything whose reading
  *  throws: describing a failure can't throw, so a strange throw still loses
@@ -789,7 +789,14 @@ function describeReadFailure(error: unknown): string {
       ? (error as { message?: unknown }).message
       : String(error);
     if (typeof message === 'string' && message.length > 0) {
-      return Array.from(message).slice(0, READ_FAILURE_MAX_CHARS).join('');
+      // Walk only as far as the cut, however long the message is.
+      let kept = '';
+      let count = 0;
+      for (const codePoint of message) {
+        if (count++ === READ_FAILURE_MAX_CHARS) break;
+        kept += codePoint;
+      }
+      return kept;
     }
   } catch {
     // Fall through to the fixed text.

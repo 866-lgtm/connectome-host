@@ -68,11 +68,6 @@ export const CREDENTIAL_ALERT_KINDS = [
   'quota-spent', 'quota-unreadable', 'auth-expiring', 'auth-expired', 'auth-rejected', 'auth-login-required',
 ] as const;
 
-/** Shape of GET /healthz — framework healthSnapshot() plus the host's
- *  extensions: credential, the per-agent compressionQuarantine,
- *  compressionDebt, contextComposition and runtimeSettings, readFailures,
- *  and callLedger. All fields optional and defensively read: health
- *  rendering must survive version skew. */
 /** Rendered composition of the last compile — what was actually SENT. */
 export interface ContextComposition {
   head?: { messages: number; tokens: number };
@@ -86,6 +81,11 @@ export interface ContextComposition {
  *  the fields this panel aggregates are read. */
 export type LedgerRow = CallLedgerRow;
 
+/** Shape of GET /healthz — framework healthSnapshot() plus the host's
+ *  extensions: credential, the per-agent compressionQuarantine,
+ *  compressionDebt, contextComposition and runtimeSettings, readFailures,
+ *  and callLedger. All fields optional and defensively read: health
+ *  rendering must survive version skew. */
 export interface HealthSnapshot {
   at?: string;
   credential?: CredentialInfo;
