@@ -131,10 +131,17 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers
-  CI, which refuses a tag with no matching changelog section, publishes
-  `@animalabs/connectome-host` to npm, and creates the GitHub release with
-  that section as its notes. The two release jobs are independent: some
+  release; npm then commits and tags. `git push --follow-tags` triggers the
+  publish workflow, which refuses a tag with no matching changelog section,
+  checks in a job of its own that the packed release installs and runs on
+  its own (`node scripts/pack-installs-alone.mjs`: npm installs the tarball
+  alone into an empty directory, install scripts included, so the Web UI
+  builds; bun resolves `src/index.ts`'s imports there; and the offline
+  mock-recipe smoke run answers; CI runs it on pull requests too, and by
+  hand it runs from the repository root, for example before
+  `git push --follow-tags`), publishes `@animalabs/connectome-host` to npm
+  once that check has passed, and creates the GitHub release with that
+  section as its notes. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
   when npm publish fails. Both need the build job, so a failed build stops
   both; past it, so do a tag with no changelog section, which neither can
@@ -174,6 +181,23 @@ carries both platforms' native binaries. It resolves every web dependency
 afresh, so review the lock's diff. Then regenerate `web/bun.lock` from it:
 delete `web/bun.lock` and run `bun install --lockfile-only` in `web/`, which
 builds Bun's lock from the npm lock, so both pin the same versions.
+
+The root has two lockfiles as well: `bun.lock`, which `bun install` reads
+when a checkout is installed as the README says, and `package-lock.json`,
+which npm reads, as CI and the publish workflow install. CI's `Lockfiles
+agree` job fails when `bun.lock` doesn't match `package.json`
+(`bun install --frozen-lockfile`) or when the two resolve the stack's
+packages (`@animalabs/*`) differently (`node scripts/lockfiles-agree.mjs`,
+which follows the stack's dependencies from the root, through each stack
+package's own; other packages may differ). So when you change a
+dependency, update `package-lock.json` with npm, then make `bun.lock`
+follow it as for `web/`: delete `bun.lock` and run
+`bun install --lockfile-only`.
+
+CI also runs the pack check described under Releases, on ubuntu. Its
+install resolves dependencies from the registry as it stands, not from
+the lockfiles, so a new upstream release can turn it red on a change that
+touched nothing it installs: rerunning it on `main` tells the two apart.
 
 See `docs/DEV-ENVIRONMENT.md` for the full dev setup, `ARCHITECTURE.md` for
 how the host is built, and `docs/README.md` for the index of operations and
