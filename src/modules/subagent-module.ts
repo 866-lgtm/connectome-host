@@ -31,6 +31,7 @@ import type { Agent, AgentFramework } from '@animalabs/agent-framework';
 import { KnowledgeStrategy } from '@animalabs/agent-framework';
 import { isToolResultContent, isToolUseContent } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
+import { emptyUsage, foldUsageSample, type UsageCounts, type UsageSample } from '../state/stream-usage.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -115,6 +116,14 @@ interface DetachableHandle {
   detach: () => void;
 }
 
+/** The two endings agent-framework's `statedWaitNotSlept` appends to an
+ *  ephemeral run's failure when it ends the run over a provider's stated
+ *  wait, each at the end of the message (see isUnsleptProviderWait). */
+const UNSLEPT_PROVIDER_WAIT_ENDINGS: readonly RegExp[] = [
+  /\(the provider asked to wait [^()]*; an ephemeral run doesn't sleep a stated wait longer than \d+ s, so it ends now\)\s*$/,
+  /\(the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of \d+ s or less, so it ends now\)\s*$/,
+];
+
 /**
  * Non-retryable termination of a subagent. All abnormal-but-expected exits
  * (user cancel, zombie reclaim, depth limit, etc.) use this so the catch
@@ -194,6 +203,8 @@ interface LiveSubagentState {
    *  contexts routinely exceed 30s TTFT) get reaped mid-request. Cleared
    *  on first token, completion, failure, or new tool yield. */
   requestInFlightSince?: number;
+  /** The current stream's usage as of its latest sample (see stream-usage.ts). */
+  streamUsage?: UsageCounts;
 }
 
 /** Streaming event pushed to peek subscribers. */
@@ -450,7 +461,7 @@ export class SubagentModule implements Module {
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
-  private lastInputTokens = new Map<string, number>();  // displayName → last known input token count
+  private lastInputTokens = new Map<string, number>();  // displayName → context size: its latest call's prompt
   private cancellationHandles = new Map<string, { reject: (err: Error) => void }>();  // displayName → cancel
   private agentDepths = new Map<string, number>();  // framework agent name → fork depth
 
@@ -495,8 +506,7 @@ export class SubagentModule implements Module {
 
         // inference:usage is emitted at runtime but not in the TraceEvent union — handle it first
         if ((event as { type: string }).type === 'inference:usage') {
-          const roundUsage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
-          if (roundUsage?.input) this.lastInputTokens.set(displayName, roundUsage.input);
+          this.noteUsageSample(live, (event as { tokenUsage?: UsageSample }).tokenUsage);
           return;
         }
 
@@ -512,6 +522,8 @@ export class SubagentModule implements Module {
             live.pendingToolCalls = [];
             live.activeCallIds.clear();
             live.requestInFlightSince = Date.now();
+            // A new stream: its usage samples count from zero.
+            live.streamUsage = emptyUsage();
             this.emit(displayName, { type: 'inference:started' });
             break;
           case 'inference:tokens': {
@@ -541,8 +553,7 @@ export class SubagentModule implements Module {
             this.emit(displayName, { type: 'stream_resumed' });
             break;
           case 'inference:completed': {
-            const usage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
-            if (usage?.input) this.lastInputTokens.set(displayName, usage.input);
+            this.noteUsageSample(live, (event as { tokenUsage?: UsageSample }).tokenUsage);
             live.requestInFlightSince = undefined;
             this.emit(displayName, { type: 'inference:completed' });
             break;
@@ -1082,8 +1093,21 @@ export class SubagentModule implements Module {
     return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
   }
 
+  /** The framework ended the run rather than sleep a provider's stated wait
+   *  (agent-framework 0.22.1 on): one longer than an ephemeral run sleeps,
+   *  or one it can't read as a number. Either way the provider asked for a
+   *  wait the run won't sit out, so a restart would only call it again too
+   *  soon. The framework says so only in the message, as one of the two
+   *  endings its `statedWaitNotSlept` appends. Each is matched at the end of
+   *  the message, where the framework puts it, so the same words echoed
+   *  earlier in a provider's text don't count. */
+  private isUnsleptProviderWait(err: Error): boolean {
+    return UNSLEPT_PROVIDER_WAIT_ENDINGS.some((ending) => ending.test(err.message));
+  }
+
   /** Transient = worth retrying the whole subagent from scratch. */
   private isTransientError(err: Error): boolean {
+    if (this.isUnsleptProviderWait(err)) return false;
     const msg = err.message.toLowerCase();
     return (
       msg.includes('timeout') ||
@@ -1250,6 +1274,16 @@ export class SubagentModule implements Module {
     }
     this.liveSubagents.delete(displayName);
     this.frameworkNameIndex.delete(frameworkAgentName);
+  }
+
+  /** Fold a usage sample into the subagent's context size (`lastInputTokens`).
+   *  A sample is the stream's usage so far, so the context size is the prompt
+   *  of the call it adds (see stream-usage.ts). */
+  private noteUsageSample(live: LiveSubagentState, sample: UsageSample | undefined): void {
+    if (!sample) return;
+    const step = foldUsageSample(live.streamUsage, sample);
+    live.streamUsage = step.total;
+    if (step.prompt !== undefined) this.lastInputTokens.set(live.displayName, step.prompt);
   }
 
   /** Fan out a stream event to all subscribers for this subagent + wildcard. */
@@ -2109,7 +2143,13 @@ export class SubagentModule implements Module {
 
     // Use per-agent depth (from caller) rather than the module's static depth
     if (callerDepth + 1 >= this.maxDepth) {
-      const allTools = this.getFramework().getAllTools();
+      const framework = this.getFramework();
+      // Published older Framework releases have only the collapsed utils surface.
+      // The paired permission release exposes each utility's own allowlist name.
+      const utilities = (framework as AgentFramework & {
+        getAllUtilities?: () => ToolDefinition[];
+      }).getAllUtilities?.() ?? [];
+      const allTools = [...framework.getAllTools(), ...utilities];
       const filtered = allTools
         .filter(t => !t.name.startsWith('subagent--'))
         .map(t => t.name);

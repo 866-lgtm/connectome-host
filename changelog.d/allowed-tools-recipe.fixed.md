@@ -1,1 +1,3 @@
 - Recipes now validate and forward `agent.allowedTools` (`"all"` or an array of exact tool names), preserving omitted-field defaults and explicit empty lists. Spawned and forked subagents inherit the caller's tool restriction; explicit spawn lists can only narrow it, with `subagent--return` always included. This configures Agent Framework tool visibility; dispatch enforcement remains the framework's responsibility.
+
+- At maximum spawn depth, retain permitted utility names alongside the collapsed `utils` tool. Explicit lists must name each allowed utility; naming only `utils` grants no individual utility permission. Adopt this correction together with the Framework release from #220. Older Framework releases retain their existing collapsed surface.

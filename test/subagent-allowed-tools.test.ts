@@ -334,3 +334,42 @@ describe('subagent allowed-tools inheritance', () => {
     } finally { await h.cleanup(); }
   });
 });
+
+// This is the public read-only catalogue contract added by Framework #220.
+// Inject that contract so this Host suite also runs with published older releases.
+describe('maximum-depth utility permissions', () => {
+  const utilityNames = ['probe--allowed_util', 'probe--denied_util'];
+  const surface = (framework: AgentFramework, utilities = true) => {
+    const catalogue = utilityNames.map(name => ({name, description: 'Inert utility', inputSchema: {type:'object',properties:{}}}));
+    Object.assign(framework, { getAllUtilities: utilities ? () => catalogue : undefined });
+  };
+  for (const [label, parent, requested, expected] of [
+    ['all', 'all', undefined, utilityNames],
+    ['explicit utility', 'all', ['utils','probe--allowed_util'], ['probe--allowed_util']],
+    ['inherited utility', ['utils','probe--allowed_util'], undefined, ['probe--allowed_util']],
+    ['parent restriction', ['utils','probe--allowed_util'], ['utils', ...utilityNames], ['probe--allowed_util']],
+    ['utils only', 'all', ['utils'], []],
+  ] as Array<[string,'all'|string[],string[]|undefined,string[]]>) {
+    test(label + ' preserves the per-utility policy at the depth limit', async () => {
+      const h = await harness(parent,1);
+      try {
+        surface(h.framework);
+        expect((await h.call('spawn',requested)).success).toBe(true);
+        const child=h.captured[0];
+        for(const name of utilityNames) expect(child.canUseTool(name)).toBe(expected.includes(name));
+        expect(child.canUseTool('subagent--spawn')).toBe(false);
+        expect(child.canUseTool('subagent--return')).toBe(true);
+      } finally { await h.cleanup(); }
+    });
+  }
+  test('published Framework without the catalogue keeps its existing tool surface',async()=>{
+    const h=await harness('all',1);
+    try {
+      surface(h.framework,false);
+      expect((await h.call('spawn')).success).toBe(true);
+      expect(h.captured[0].canUseTool('probe--allowed')).toBe(true);
+      expect(h.captured[0].canUseTool('subagent--spawn')).toBe(false);
+      expect(h.captured[0].canUseTool('subagent--return')).toBe(true);
+    } finally { await h.cleanup(); }
+  });
+});
