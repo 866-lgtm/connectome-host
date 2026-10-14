@@ -9,6 +9,7 @@ import { describe, test, expect } from 'bun:test';
 import { buildHealthSnapshot, type PanelAppRef } from '../src/web/panel-data.js';
 
 const NOT_READY = 'context manager is not initialized';
+const UNDESCRIBED = "the read failed, and its error couldn't be described";
 const notReady = (): never => { throw new Error(NOT_READY); };
 
 type Reads = { quarantine?: () => unknown; debt?: () => unknown; render?: () => unknown; settings?: () => unknown };
@@ -89,9 +90,38 @@ describe('health snapshot per agent', () => {
     ]));
     expect(snapshot.compressionDebt).toEqual({ steady: { level: 'healthy' } });
     expect(snapshot.readFailures).toEqual({
-      opaque: { compressionDebt: 'the read failed, and its error has no message' },
-      odd: { compressionDebt: 'the read failed, and its error has no message' },
+      opaque: { compressionDebt: UNDESCRIBED },
+      odd: { compressionDebt: UNDESCRIBED },
     });
+  });
+
+  test('a thrown string, an object with a message, and an Error with none are each described', () => {
+    const snapshot = buildHealthSnapshot(appWith([
+      agentStub('text', { debt: () => { throw 'disk gone'; } }),
+      agentStub('carrier', { debt: () => { throw { message: 'quota exhausted' }; } }),
+      agentStub('silent', { debt: () => { throw new Error(); } }),
+    ]));
+    expect(snapshot.readFailures).toEqual({
+      text: { compressionDebt: 'disk gone' },
+      carrier: { compressionDebt: 'quota exhausted' },
+      silent: { compressionDebt: UNDESCRIBED },
+    });
+  });
+
+  test("agents named __proto__ and constructor are recorded under their own names, and Object's prototype is untouched", () => {
+    const snapshot = buildHealthSnapshot(appWith([
+      agentStub('__proto__', { debt: notReady }),
+      agentStub('constructor', { debt: notReady }),
+    ]));
+    const failures = snapshot.readFailures as Record<string, Record<string, string>>;
+    expect(Object.keys(failures).sort()).toEqual(['__proto__', 'constructor']);
+    expect(Object.prototype.hasOwnProperty.call(failures, '__proto__')).toBe(true);
+    expect(failures['__proto__']!.compressionDebt).toBe(NOT_READY);
+    expect(failures['constructor']!.compressionDebt).toBe(NOT_READY);
+    expect(({} as Record<string, unknown>).compressionDebt).toBeUndefined();
+    expect((Object as unknown as Record<string, unknown>).compressionDebt).toBeUndefined();
+    // Their readable sections are keyed by their names too.
+    expect(Object.keys(snapshot.runtimeSettings as object).sort()).toEqual(['__proto__', 'constructor']);
   });
 
   test("a failure's message is cut to 300 characters", () => {

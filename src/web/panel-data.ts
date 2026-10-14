@@ -712,12 +712,6 @@ export function applyPinRemove(app: PanelAppRef, agentName: string, pinId: strin
 // ---------------------------------------------------------------------------
 
 /**
- * Liveness/health snapshot — the /healthz assembly. framework.healthSnapshot
- * plus compression quarantine, rendered context composition, per-agent
- * runtime settings, and (when a ledger is wired) recent provider calls.
- * Everything is read-only and cheap: no compile, no count_tokens.
- */
-/**
  * Subscription quota windows. The request IS the poll: a client asks only
  * while its page is visible, and the meter's refresh floor keeps any number
  * of viewers down to one provider read per interval. `subscription: false`
@@ -779,18 +773,25 @@ type FrameworkAgent = ReturnType<AgentFramework['getAllAgents']>[number];
 
 /** A failed health read's message, cut to a length a health poll can carry. */
 const READ_FAILURE_MAX_CHARS = 300;
+/** What readFailures says for a thrown value that yields no message. */
+const READ_FAILURE_UNDESCRIBED = "the read failed, and its error couldn't be described";
 
-/** What a thrown value says, for readFailures. Describing it can't throw
- *  itself: a value with no usable string, or an Error whose message isn't a
- *  string, gets a fixed text, so a strange throw still loses only its agent. */
+/** What a thrown value says, for readFailures: an Error's message, or another
+ *  object's string `message`, or else the value as a string. Describing it
+ *  can't throw itself. A value that yields no non-empty string, such as one
+ *  whose conversion throws or an Error whose message isn't a string, gets a
+ *  fixed text, so a strange throw still loses only its agent. */
 function describeReadFailure(error: unknown): string {
   try {
-    const message = error instanceof Error ? error.message : String(error);
-    if (typeof message === 'string') return message.slice(0, READ_FAILURE_MAX_CHARS);
+    const carried = typeof error === 'object' && error !== null
+      ? (error as { message?: unknown }).message
+      : undefined;
+    const message = error instanceof Error || typeof carried === 'string' ? carried : String(error);
+    if (typeof message === 'string' && message.length > 0) return message.slice(0, READ_FAILURE_MAX_CHARS);
   } catch {
     // Fall through to the fixed text.
   }
-  return 'the read failed, and its error has no message';
+  return READ_FAILURE_UNDESCRIBED;
 }
 
 /** One health section's entries by agent name. Each agent is read on its own,
@@ -804,19 +805,28 @@ function perAgentHealth(
   failures: Record<string, Record<string, string>>,
   read: (agent: FrameworkAgent) => unknown,
 ): Record<string, unknown> {
-  const entries: Record<string, unknown> = {};
+  // Keyed by agent name, so with no prototype: any name is an own key.
+  const entries: Record<string, unknown> = Object.create(null);
   for (const agent of app.framework.getAllAgents()) {
     const name = (agent as unknown as { name: string }).name;
     try {
       const value = read(agent);
       if (value) entries[name] = value;
     } catch (error) {
-      (failures[name] ??= {})[section] = describeReadFailure(error);
+      (failures[name] ??= Object.create(null) as Record<string, string>)[section] = describeReadFailure(error);
     }
   }
   return entries;
 }
 
+/**
+ * Liveness/health snapshot, the /healthz assembly: framework.healthSnapshot
+ * plus, by agent, compression quarantine, compression debt, rendered context
+ * composition and runtime settings, each read on its own (perAgentHealth),
+ * with readFailures naming the reads that threw, and (when a ledger is wired)
+ * recent provider calls. Everything is read-only and cheap: no compile, no
+ * count_tokens.
+ */
 export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
   if (typeof fw.healthSnapshot !== 'function') {
@@ -824,7 +834,7 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   }
   const snapshot = fw.healthSnapshot();
   // Per-agent reads that threw, by agent and then section (see perAgentHealth).
-  const readFailures: Record<string, Record<string, string>> = {};
+  const readFailures: Record<string, Record<string, string>> = Object.create(null);
   // Credential state rides along so a WebUI opened mid-incident (or the
   // fleet hub / doctor) sees an expired token or spent quota without waiting
   // for the next alert transition. Health reads never throw.

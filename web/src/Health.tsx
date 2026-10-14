@@ -148,9 +148,10 @@ export interface HealthSnapshot {
     transition?: string;
     transitionReason?: string;
   }>;
-  /** Per-agent reads that threw, by agent and then section, with the error's
-   *  message. Such an agent is missing from that section, unlike an agent
-   *  with nothing to report there. */
+  /** Per-agent reads that threw, by agent and then section, with what the
+   *  error said. Present only when one threw. Such an agent is missing from
+   *  that section, as an agent with nothing to report there is, but only a
+   *  failed read has an entry here. */
   readFailures?: Record<string, Record<string, string>>;
 }
 
@@ -461,7 +462,10 @@ export function HealthPanel(props: {
   const debt = (name: string) => props.health?.compressionDebt?.[name];
   const settings = (name: string) => props.health?.runtimeSettings?.[name];
   const composition = (name: string) => props.health?.contextComposition?.[name];
-  const failures = (name: string) => props.health?.readFailures?.[name];
+  const own = (record: object | undefined, key: string): boolean =>
+    record !== undefined && Object.prototype.hasOwnProperty.call(record, key);
+  const failures = (name: string) =>
+    own(props.health?.readFailures, name) ? props.health!.readFailures![name] : undefined;
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -576,7 +580,7 @@ export function HealthPanel(props: {
                 rendered as zero invites misreads. A failed read is listed
                 above instead. */}
             <Show when={debt(a.name)} fallback={
-              <Show when={!failures(a.name)?.compressionDebt}>
+              <Show when={!own(failures(a.name), 'compressionDebt')}>
                 <div class="text-neutral-600">compression debt: not reported by this stack</div>
               </Show>
             }>

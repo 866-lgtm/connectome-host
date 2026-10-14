@@ -709,7 +709,8 @@ blocks; expect folds to interact with this on the next model generation.
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
   `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`, and
-  `readFailures` (by agent and section, any of those reads that threw, with its message)
+  `readFailures`, present only when one of those reads threw: by agent, then section, what the
+  error said, cut to 300 characters
 - **Import guides:** [`claude-code-ingest.md`](./claude-code-ingest.md) ·
   [`claudeai-evacuation.md`](./claudeai-evacuation.md)
 - **Identity is the user's call. The mechanics are yours. Check everything. Be kind about who you're setting up.**
