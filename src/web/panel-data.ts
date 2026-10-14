@@ -711,12 +711,6 @@ export function applyPinRemove(app: PanelAppRef, agentName: string, pinId: strin
 // Health
 // ---------------------------------------------------------------------------
 
-/**
- * Subscription quota windows. The request IS the poll: a client asks only
- * while its page is visible, and the meter's refresh floor keeps any number
- * of viewers down to one provider read per interval. `subscription: false`
- * tells the client to keep showing dollars.
- */
 /** Whether the framework is actually holding an agent on a host verdict. A
  *  spent window alone parks nothing: the hold arms on a 429, and only on a
  *  framework that has the `providerHold` hook. null = framework cannot say. */
@@ -734,6 +728,12 @@ function hostHoldActive(app: PanelAppRef): boolean | null {
   }
 }
 
+/**
+ * Subscription quota windows. The request IS the poll: a client asks only
+ * while its page is visible, and the meter's refresh floor keeps any number
+ * of viewers down to one provider read per interval. `subscription: false`
+ * tells the client to keep showing dollars.
+ */
 export async function buildQuotaSnapshot(app: PanelAppRef): Promise<Record<string, unknown>> {
   if (!app.quotaMeter) return { subscription: app.subscriptionUnmetered === true, windows: [] };
   const snapshot = await app.quotaMeter.refresh();
@@ -776,18 +776,21 @@ const READ_FAILURE_MAX_CHARS = 300;
 /** What readFailures says for a thrown value that yields no message. */
 const READ_FAILURE_UNDESCRIBED = "the read failed, and its error couldn't be described";
 
-/** What a thrown value says, for readFailures: an Error's message, or another
- *  object's string `message`, or else the value as a string. Describing it
- *  can't throw itself. A value that yields no non-empty string, such as one
- *  whose conversion throws or an Error whose message isn't a string, gets a
- *  fixed text, so a strange throw still loses only its agent. */
+/** What a thrown value says, for readFailures: an object's `message`, such
+ *  as an Error's, or a thrown primitive as a string, cut to 300 characters
+ *  (code points, so a character is never split). An object with no
+ *  non-empty string message, such as an Error with an empty one or a plain
+ *  object with none, gets a fixed text, and so does anything whose reading
+ *  throws: describing a failure can't throw, so a strange throw still loses
+ *  only its agent. */
 function describeReadFailure(error: unknown): string {
   try {
-    const carried = typeof error === 'object' && error !== null
+    const message = typeof error === 'object' && error !== null
       ? (error as { message?: unknown }).message
-      : undefined;
-    const message = error instanceof Error || typeof carried === 'string' ? carried : String(error);
-    if (typeof message === 'string' && message.length > 0) return message.slice(0, READ_FAILURE_MAX_CHARS);
+      : String(error);
+    if (typeof message === 'string' && message.length > 0) {
+      return Array.from(message).slice(0, READ_FAILURE_MAX_CHARS).join('');
+    }
   } catch {
     // Fall through to the fixed text.
   }
@@ -813,7 +816,7 @@ function perAgentHealth(
       const value = read(agent);
       if (value) entries[name] = value;
     } catch (error) {
-      (failures[name] ??= Object.create(null) as Record<string, string>)[section] = describeReadFailure(error);
+      (failures[name] ??= {})[section] = describeReadFailure(error);
     }
   }
   return entries;
@@ -821,11 +824,11 @@ function perAgentHealth(
 
 /**
  * Liveness/health snapshot, the /healthz assembly: framework.healthSnapshot
- * plus, by agent, compression quarantine, compression debt, rendered context
- * composition and runtime settings, each read on its own (perAgentHealth),
- * with readFailures naming the reads that threw, and (when a ledger is wired)
- * recent provider calls. Everything is read-only and cheap: no compile, no
- * count_tokens.
+ * plus the credential state (on a subscription); by agent, compression
+ * quarantine, compression debt, rendered context composition and runtime
+ * settings, each read on its own (perAgentHealth), with readFailures naming
+ * the reads that threw; and (when a ledger is wired) recent provider calls.
+ * Everything is read-only and cheap: no compile, no count_tokens.
  */
 export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };

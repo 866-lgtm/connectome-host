@@ -18,6 +18,7 @@
 
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
+import { healthEntry } from '@conhost/web/health-lookup';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -68,8 +69,10 @@ export const CREDENTIAL_ALERT_KINDS = [
 ] as const;
 
 /** Shape of GET /healthz — framework healthSnapshot() plus the host's
- *  compressionQuarantine / runtimeSettings extensions. All fields optional
- *  and defensively read: health rendering must survive version skew. */
+ *  extensions: credential, the per-agent compressionQuarantine,
+ *  compressionDebt, contextComposition and runtimeSettings, readFailures,
+ *  and callLedger. All fields optional and defensively read: health
+ *  rendering must survive version skew. */
 /** Rendered composition of the last compile — what was actually SENT. */
 export interface ContextComposition {
   head?: { messages: number; tokens: number };
@@ -458,18 +461,13 @@ export function HealthPanel(props: {
   onCredentialAction?(actionId: string): void;
 }) {
   const agents = () => props.health?.agents ?? [];
-  // The snapshot's sections are keyed by agent name, and JSON.parse gives them
-  // Object.prototype: look an agent up by own key, so a name such as
-  // `constructor` that's missing from a section reads as missing.
-  const own = (record: object | undefined, key: string): boolean =>
-    record !== undefined && Object.prototype.hasOwnProperty.call(record, key);
-  const byAgent = <T,>(record: Record<string, T> | undefined, name: string): T | undefined =>
-    own(record, name) ? record![name] : undefined;
-  const quarantine = (name: string) => byAgent(props.health?.compressionQuarantine, name);
-  const debt = (name: string) => byAgent(props.health?.compressionDebt, name);
-  const settings = (name: string) => byAgent(props.health?.runtimeSettings, name);
-  const composition = (name: string) => byAgent(props.health?.contextComposition, name);
-  const failures = (name: string) => byAgent(props.health?.readFailures, name);
+  // Each section is looked up by own key (healthEntry), so an agent whose name
+  // is also an Object.prototype member reads as missing when it is.
+  const quarantine = (name: string) => healthEntry(props.health?.compressionQuarantine, name);
+  const debt = (name: string) => healthEntry(props.health?.compressionDebt, name);
+  const settings = (name: string) => healthEntry(props.health?.runtimeSettings, name);
+  const composition = (name: string) => healthEntry(props.health?.contextComposition, name);
+  const failures = (name: string) => healthEntry(props.health?.readFailures, name);
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -584,7 +582,7 @@ export function HealthPanel(props: {
                 rendered as zero invites misreads. A failed read is listed
                 above instead. */}
             <Show when={debt(a.name)} fallback={
-              <Show when={!own(failures(a.name), 'compressionDebt')}>
+              <Show when={healthEntry(failures(a.name), 'compressionDebt') === undefined}>
                 <div class="text-neutral-600">compression debt: not reported by this stack</div>
               </Show>
             }>

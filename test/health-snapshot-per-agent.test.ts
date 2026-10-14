@@ -7,6 +7,7 @@
  */
 import { describe, test, expect } from 'bun:test';
 import { buildHealthSnapshot, type PanelAppRef } from '../src/web/panel-data.js';
+import { healthEntry } from '../src/web/health-lookup.js';
 
 const NOT_READY = 'context manager is not initialized';
 const UNDESCRIBED = "the read failed, and its error couldn't be described";
@@ -95,16 +96,20 @@ describe('health snapshot per agent', () => {
     });
   });
 
-  test('a thrown string, an object with a message, and an Error with none are each described', () => {
+  test('a thrown primitive is its own text, an object gives its message, and one without a message gets the fixed text', () => {
     const snapshot = buildHealthSnapshot(appWith([
       agentStub('text', { debt: () => { throw 'disk gone'; } }),
+      agentStub('nothing', { debt: () => { throw undefined; } }),
       agentStub('carrier', { debt: () => { throw { message: 'quota exhausted' }; } }),
       agentStub('silent', { debt: () => { throw new Error(); } }),
+      agentStub('coded', { debt: () => { throw { code: 'ETIMEDOUT' }; } }),
     ]));
     expect(snapshot.readFailures).toEqual({
       text: { compressionDebt: 'disk gone' },
+      nothing: { compressionDebt: 'undefined' },
       carrier: { compressionDebt: 'quota exhausted' },
       silent: { compressionDebt: UNDESCRIBED },
+      coded: { compressionDebt: UNDESCRIBED },
     });
   });
 
@@ -124,9 +129,39 @@ describe('health snapshot per agent', () => {
     expect(Object.keys(snapshot.runtimeSettings as object).sort()).toEqual(['__proto__', 'constructor']);
   });
 
-  test("a failure's message is cut to 300 characters", () => {
+  test("a failure's message is cut to 300 characters, never inside one", () => {
     const long = 'x'.repeat(1000);
-    const snapshot = buildHealthSnapshot(appWith([agentStub('noisy', { debt: () => { throw new Error(long); } })]));
-    expect((snapshot.readFailures as Record<string, Record<string, string>>).noisy.compressionDebt).toBe('x'.repeat(300));
+    const emoji = '\u{1F600}'.repeat(400);
+    const snapshot = buildHealthSnapshot(appWith([
+      agentStub('noisy', { debt: () => { throw new Error(long); } }),
+      agentStub('wide', { debt: () => { throw new Error(emoji); } }),
+    ]));
+    const failures = snapshot.readFailures as Record<string, Record<string, string>>;
+    expect(failures.noisy!.compressionDebt).toBe('x'.repeat(300));
+    expect(failures.wide!.compressionDebt).toBe('\u{1F600}'.repeat(300));
+  });
+});
+
+describe('health panel lookups', () => {
+  test('a JSON-parsed snapshot is read by own key, so names that Object.prototype also has read as missing when they are', () => {
+    const snapshot = buildHealthSnapshot(appWith([agentStub('constructor', { debt: notReady }), agentStub('steady')]));
+    const parsed = JSON.parse(JSON.stringify(snapshot)) as Record<string, Record<string, unknown>>;
+    // The panel's debt line: absent for the agent whose read failed, with its failure recorded.
+    expect(healthEntry(parsed.compressionDebt, 'constructor')).toBeUndefined();
+    expect(healthEntry(healthEntry(parsed.readFailures, 'constructor') as Record<string, string>, 'compressionDebt')).toBe(NOT_READY);
+    // Names that are Object.prototype members, and absent from every section.
+    for (const name of ['toString', '__proto__', 'hasOwnProperty']) {
+      for (const section of ['compressionQuarantine', 'compressionDebt', 'contextComposition', 'runtimeSettings', 'readFailures']) {
+        expect(healthEntry(parsed[section], name)).toBeUndefined();
+      }
+    }
+    // The readable agent is found, and its debt read has no failure.
+    expect(healthEntry(parsed.compressionDebt, 'steady')).toEqual({ level: 'healthy' });
+    expect(healthEntry(parsed.readFailures, 'steady')).toBeUndefined();
+  });
+
+  test('a missing or null map has no entries', () => {
+    expect(healthEntry(undefined, 'steady')).toBeUndefined();
+    expect(healthEntry(null, 'steady')).toBeUndefined();
   });
 });
