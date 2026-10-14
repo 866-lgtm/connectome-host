@@ -172,12 +172,12 @@ the layout's other repositories have no holds. So:
 - **To update,** note the commit each checkout is on with
   `git rev-parse HEAD`, and first stop every agent that runs from these
   checkouts, with the shell daemon if its checkout will move. Stopping an
-  agent stops the fleet children it launched. One left running, after a
-  TUI quit that detached it or a parent that was killed outright, stops by
-  the PID in `headless.pid` in its data directory. bun runs the host's
-  `src/` directly and imports some modules only when they're first
-  needed, so files that change under a running agent can mix new code
-  into it. The daemon serves every agent on the box, so stopping it ends
+  agent stops the fleet children it launched. For one left running, after
+  a TUI quit that detached it or a parent that was killed outright, `kill`
+  the PID in `headless.pid` in its data directory, which shuts it down as
+  a stop does. bun runs the host's `src/` directly and imports some
+  modules only when they're first needed, so files that change under a
+  running agent can mix new code into it. The daemon serves every agent on the box, so stopping it ends
   their shell sessions too. If the entries say data the newer code writes
   doesn't read back on the older code, copy what each agent keeps while
   it's stopped: its data directory (`DATA_DIR`), its fleet children's data
