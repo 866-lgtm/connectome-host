@@ -1,3 +1,10 @@
+// A copy of agent-framework's scripts/release-holds.mjs
+// (https://github.com/anima-research/agent-framework), taken from commit
+// 9c5e4e3 (pull request #347), and the same apart from this opening comment.
+// A change to the check lands there first, with its tests, and is then
+// ported here with this commit updated; this repository tests only its own
+// wiring (test/release-holds.test.ts).
+//
 // Runs as npm's `preversion` lifecycle hook (see package.json), before
 // `npm version` bumps anything; as `prepublishOnly`, before `npm publish`;
 // and in the publish workflow for a pushed tag: in its build job, and in
