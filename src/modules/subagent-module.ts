@@ -1076,8 +1076,19 @@ export class SubagentModule implements Module {
     return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
   }
 
+  /** The framework ended the run rather than sleep a provider's stated wait
+   *  longer than an ephemeral run sleeps (agent-framework 0.22.1 on). The
+   *  provider asked for that wait, so a restart would only call it again
+   *  inside it. The framework says so only in the message: the two endings
+   *  of its `statedWaitNotSlept`. */
+  private isUnsleptProviderWait(err: Error): boolean {
+    return err.message.includes("an ephemeral run doesn't sleep a stated wait") ||
+      err.message.includes('an ephemeral run sleeps only a stated wait');
+  }
+
   /** Transient = worth retrying the whole subagent from scratch. */
   private isTransientError(err: Error): boolean {
+    if (this.isUnsleptProviderWait(err)) return false;
     const msg = err.message.toLowerCase();
     return (
       msg.includes('timeout') ||

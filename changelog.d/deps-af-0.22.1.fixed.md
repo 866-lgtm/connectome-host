@@ -7,6 +7,14 @@
     alert. agent-framework's `release-provider-wait` host command lifts a
     wait; connectome-host has no TUI or Web UI command for it, so it is sent
     by an MCPL server allowed to send host commands.
+  - **Subagents:** a subagent is an ephemeral run, which sleeps a provider's
+    stated wait of up to ten minutes and now ends at once on a longer one,
+    its error naming the wait. Under agent-framework 0.22.0 it slept the
+    whole wait. The subagent module now fails such a subagent without
+    restarting it, since a restart would only call the provider again
+    inside the wait it asked for. Other rate-limit errors are still retried.
+  - **A misspelled model:** its 404 no longer sheds the agent's newest
+    exchanges.
   - **Failure text:** a provider error that echoes the whole request no
     longer lands in the agent's context whole: the `[inference-failed]`
     marker carries an excerpt of at most 600 characters.
