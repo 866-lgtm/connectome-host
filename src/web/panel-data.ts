@@ -777,18 +777,29 @@ export async function applyCredentialAction(app: PanelAppRef, params: Record<str
 
 type FrameworkAgent = ReturnType<AgentFramework['getAllAgents']>[number];
 
+/** A failed health read's message, cut to a length a health poll can carry. */
+const READ_FAILURE_MAX_CHARS = 300;
+
 /** One health section's entries by agent name. Each agent is read on its own,
  *  so an agent whose read throws (such as one whose context manager a store
- *  surgery left uninitialized) is left out, and the others are still reported.
- *  An agent with nothing to report is left out too. */
-function perAgentHealth(app: PanelAppRef, read: (agent: FrameworkAgent) => unknown): Record<string, unknown> {
+ *  surgery left uninitialized) doesn't hide the others. Its failure goes in
+ *  `failures`, under its name and the section's, so a reader can tell it from
+ *  an agent with nothing to report, which is simply left out. */
+function perAgentHealth(
+  app: PanelAppRef,
+  section: string,
+  failures: Record<string, Record<string, string>>,
+  read: (agent: FrameworkAgent) => unknown,
+): Record<string, unknown> {
   const entries: Record<string, unknown> = {};
   for (const agent of app.framework.getAllAgents()) {
+    const name = (agent as unknown as { name: string }).name;
     try {
       const value = read(agent);
-      if (value) entries[(agent as unknown as { name: string }).name] = value;
-    } catch {
-      // This agent's read failed; the others still report.
+      if (value) entries[name] = value;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      (failures[name] ??= {})[section] = message.slice(0, READ_FAILURE_MAX_CHARS);
     }
   }
   return entries;
@@ -800,6 +811,8 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
     throw new PanelError('framework lacks healthSnapshot()', 501);
   }
   const snapshot = fw.healthSnapshot();
+  // Per-agent reads that threw, by agent and then section (see perAgentHealth).
+  const readFailures: Record<string, Record<string, string>> = {};
   // Credential state rides along so a WebUI opened mid-incident (or the
   // fleet hub / doctor) sees an expired token or spent quota without waiting
   // for the next alert transition. Health reads never throw.
@@ -815,7 +828,7 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // here so the fleet hub and connectome-doctor can alarm on it — it
   // must never be observable only in agent.log.
   try {
-    (snapshot as Record<string, unknown>).compressionQuarantine = perAgentHealth(app, (agent) =>
+    (snapshot as Record<string, unknown>).compressionQuarantine = perAgentHealth(app, 'compressionQuarantine', readFailures, (agent) =>
       (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionQuarantineStatus?: () => unknown };
       }).getStrategy?.()?.getCompressionQuarantineStatus?.());
@@ -829,7 +842,7 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // lets fleet-watch (and later the resident notice, af #99) catch the
   // debt while it is still cheap.
   try {
-    (snapshot as Record<string, unknown>).compressionDebt = perAgentHealth(app, (agent) =>
+    (snapshot as Record<string, unknown>).compressionDebt = perAgentHealth(app, 'compressionDebt', readFailures, (agent) =>
       (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionDebt?: () => unknown };
       }).getStrategy?.()?.getCompressionDebt?.());
@@ -841,7 +854,7 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // the strategy's own render stats (already computed in-process), so it is
   // safe on the 15s /healthz poll.
   try {
-    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, (agent) =>
+    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, 'contextComposition', readFailures, (agent) =>
       (agent.getContextManager() as unknown as { getRenderStats?: () => unknown }).getRenderStats?.());
   } catch {
     // Health reads never throw.
@@ -856,11 +869,14 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
     };
     const getSettings = fw2.getAgentRuntimeSettings;
     if (typeof getSettings === 'function') {
-      (snapshot as Record<string, unknown>).runtimeSettings = perAgentHealth(app, (agent) =>
+      (snapshot as Record<string, unknown>).runtimeSettings = perAgentHealth(app, 'runtimeSettings', readFailures, (agent) =>
         getSettings.call(app.framework, (agent as unknown as { name: string }).name));
     }
   } catch {
     // Health reads never throw.
+  }
+  if (Object.keys(readFailures).length > 0) {
+    (snapshot as Record<string, unknown>).readFailures = readFailures;
   }
   // Recent provider calls. The WebUI host streams these over its own WS;
   // for a fleet child this snapshot is the only path, so ship them here.

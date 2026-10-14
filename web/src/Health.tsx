@@ -148,6 +148,10 @@ export interface HealthSnapshot {
     transition?: string;
     transitionReason?: string;
   }>;
+  /** Per-agent reads that threw, by agent and then section, with the error's
+   *  message. Such an agent is missing from that section, unlike an agent
+   *  with nothing to report there. */
+  readFailures?: Record<string, Record<string, string>>;
 }
 
 const fmtTokens = (n: number): string => {
@@ -457,6 +461,7 @@ export function HealthPanel(props: {
   const debt = (name: string) => props.health?.compressionDebt?.[name];
   const settings = (name: string) => props.health?.runtimeSettings?.[name];
   const composition = (name: string) => props.health?.contextComposition?.[name];
+  const failures = (name: string) => props.health?.readFailures?.[name];
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -552,11 +557,28 @@ export function HealthPanel(props: {
               </div>
             </Show>
 
+            {/* A section this agent couldn't be read for is missing from the
+                snapshot; say so, rather than show it as nothing to report. */}
+            <Show when={failures(a.name)}>
+              {(f) => (
+                <div class="text-rose-300/90">
+                  <For each={Object.entries(f())}>
+                    {([section, message]) => (
+                      <div class="truncate" title={message}>{section} couldn't be read: {message}</div>
+                    )}
+                  </For>
+                </div>
+              )}
+            </Show>
+
             {/* Compression debt: the organ's QUEUE, not the render composition.
                 An old stack that reports nothing must say so — absence
-                rendered as zero invites misreads. */}
+                rendered as zero invites misreads. A failed read is listed
+                above instead. */}
             <Show when={debt(a.name)} fallback={
-              <div class="text-neutral-600">compression debt: not reported by this stack</div>
+              <Show when={!failures(a.name)?.compressionDebt}>
+                <div class="text-neutral-600">compression debt: not reported by this stack</div>
+              </Show>
             }>
               <div class={
                 debt(a.name)!.state === 'critical' ? 'text-rose-300'
