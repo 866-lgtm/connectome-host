@@ -177,18 +177,19 @@ the layout's other repositories have no holds. So:
   the PID in `headless.pid` in its data directory, which shuts it down as
   a stop does. bun runs the host's `src/` directly and imports some
   modules only when they're first needed, so files that change under a
-  running agent can mix new code into it. The daemon serves every agent on the box, so stopping it ends
-  their shell sessions too. If the entries say data the newer code writes
-  doesn't read back on the older code, copy what each agent keeps while
-  it's stopped: its data directory (`DATA_DIR`), its fleet children's data
-  directories (`data/<child>` under its working directory, unless a
-  launch named another), the MCPL server settings it saves in its working
-  directory (`mcpl-servers.json` and `mcpl-servers.agent.json`), and the
-  files its `.env` names, such as `HEARTBEAT_CONFIG_FILE` and
-  `DISCORD_SUBSCRIPTIONS_FILE`. Then update the host and the libraries it
-  loads together (`git switch main` first in a checkout left detached),
-  since the host's code expects the library versions beside it. Install
-  and build them bottom-up as [DEV-ENVIRONMENT §2](./DEV-ENVIRONMENT.md#2-install--build-bottom-up)
+  running agent can mix new code into it. The daemon serves every agent on
+  the box, so stopping it ends their shell sessions too. If the entries
+  say data the newer code writes doesn't read back on the older code, copy
+  what each agent keeps while it's stopped: its data directory
+  (`DATA_DIR`), its fleet children's data directories (`data/<child>`
+  under its working directory, unless a launch named another), the MCPL
+  server settings it saves in its working directory (`mcpl-servers.json`
+  and `mcpl-servers.agent.json`), and the files its `.env` names, such as
+  `HEARTBEAT_CONFIG_FILE` and `DISCORD_SUBSCRIPTIONS_FILE`. Then update
+  the host and the libraries it loads together (`git switch main` first
+  in a checkout left detached), since the host's code expects the library
+  versions beside it. Install and build them bottom-up as
+  [DEV-ENVIRONMENT §2](./DEV-ENVIRONMENT.md#2-install--build-bottom-up)
   does: each `dist/`, chronicle's native build when chronicle changed, and
   the host's Web UI. An `npm install` in agent-framework or context-manager
   brings back their own `@animalabs/*` copies, so relink them as
