@@ -4,11 +4,15 @@
  * wait of up to ten minutes, and ends at once on a longer one or on one it
  * can't read as a number) fails without a restart, since a restart would
  * call the provider again too soon. Other rate-limit errors stay transient.
+ * agent-framework 0.22.1 marks such an ending only in its message's last
+ * words; agent-framework #343 rejects with its own class,
+ * ProviderWaitNotSleptError, which the module reads by name.
  */
 import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import * as AgentFrameworkPackage from '@animalabs/agent-framework';
 import { AgentFramework } from '@animalabs/agent-framework';
 import type { Module, ToolCall } from '@animalabs/agent-framework';
 import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
@@ -83,6 +87,41 @@ describe("a provider's stated wait that the framework won't sleep", () => {
     }
   }
 
+  for (const tool of ['spawn', 'fork'] as const) {
+    test(`fails a ${tool} without a restart when the framework's error is named ProviderWaitNotSleptError, whatever its words`, async () => {
+      // agent-framework #343 rejects with this class; its name is the mark.
+      // These words, without the endings, would otherwise be transient.
+      const words = '503 overloaded: socket hang up';
+      const marked = () => Object.assign(new Error(words), {
+        name: 'ProviderWaitNotSleptError', retryAfterMs: 7_200_000,
+      });
+      const h = await harness(marked);
+      try {
+        const res = await h.subagent.handleToolCall(call(tool, `marked-waiter-${tool}`));
+        expect(res.success).toBe(false);
+        expect(h.runs()).toBe(1);
+        expect(JSON.stringify(res)).toContain(words);
+      } finally {
+        await h.cleanup();
+      }
+    }, 15_000);
+  }
+
+  // The framework's own class. agent-framework 0.22.1 has none, and its
+  // statedWaitNotSlept returns the text; from #343 on, it returns an object
+  // and the class is exported. So where it returns an object, the class has
+  // to be there, under the name the module reads. (statedWaitNotSlept uses
+  // no instance state in either release.)
+  const FrameworkClass = (AgentFrameworkPackage as unknown as Record<string, unknown>).ProviderWaitNotSleptError as
+    (new (message: string, retryAfterMs: number) => Error) | undefined;
+  const textShaped = typeof (AgentFramework.prototype as unknown as { statedWaitNotSlept(error: Error): unknown })
+    .statedWaitNotSlept.call(undefined, new Error('probe')) === 'string';
+  test.skipIf(textShaped)("reads agent-framework's own ProviderWaitNotSleptError, from the release whose statedWaitNotSlept returns an object", () => {
+    expect(FrameworkClass).toBeDefined();
+    const mod = new SubagentModule({ parentAgentName: 'parent', defaultModel: 'mock' }) as unknown as Classifier;
+    expect(mod.isTransientError(new FrameworkClass!('503 overloaded', 7_200_000))).toBe(false);
+  });
+
   test('is read from the end of the message, so the same words echoed earlier leave an error transient', () => {
     const mod = new SubagentModule({ parentAgentName: 'parent', defaultModel: 'mock' }) as unknown as Classifier;
     expect(mod.isTransientError(new Error(UNSLEPT))).toBe(false);
@@ -98,7 +137,9 @@ describe("a provider's stated wait that the framework won't sleep", () => {
     try {
       // The framework's own text, from the installed package: if a release
       // rewords it, this fails, and the check above needs the new wording.
-      const fw = h.framework as unknown as { statedWaitNotSlept(error: Error): string };
+      // agent-framework 0.22.1 returns the text; #343 on returns it as
+      // `error`, beside the stated wait.
+      const fw = h.framework as unknown as { statedWaitNotSlept(error: Error): string | { error: string } };
       const mod = h.subagent as unknown as Classifier;
       const stated = (retryAfterMs: number) => Object.assign(new Error('429 rate_limit_error: try again later'), {
         name: 'MembraneError', type: 'rate_limit', retryable: true, retryAfterMs,
@@ -110,7 +151,8 @@ describe("a provider's stated wait that the framework won't sleep", () => {
         [Number.POSITIVE_INFINITY, 'the provider asked to wait longer than can be represented'],
         [Number.NaN, "the provider's stated wait is not a number"],
       ] as const) {
-        const text = fw.statedWaitNotSlept(stated(wait));
+        const out = fw.statedWaitNotSlept(stated(wait));
+        const text = typeof out === 'string' ? out : out.error;
         expect(text.startsWith('429 rate_limit_error: try again later (')).toBe(true);
         expect(text).toContain(words);
         expect(mod.isTransientError(new Error(text))).toBe(false);

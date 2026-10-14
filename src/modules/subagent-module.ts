@@ -1084,16 +1084,20 @@ export class SubagentModule implements Module {
     return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
   }
 
-  /** The framework ended the run rather than sleep a provider's stated wait
-   *  (agent-framework 0.22.1 on): one longer than an ephemeral run sleeps,
-   *  or one it can't read as a number. Either way the provider asked for a
-   *  wait the run won't sit out, so a restart would only call it again too
-   *  soon. The framework says so only in the message, as one of the two
-   *  endings its `statedWaitNotSlept` appends. Each is matched at the end of
-   *  the message, where the framework puts it, so the same words echoed
-   *  earlier in a provider's text don't count. */
+  /** The framework ended the run rather than sleep the stated wait of a
+   *  retryable failure (agent-framework 0.22.1 on): one longer than an
+   *  ephemeral run sleeps, or one it can't read as a number. Either way the
+   *  provider asked for a wait the run won't sit out, so a restart would
+   *  only call it again too soon. agent-framework 0.22.1 says so only in the
+   *  message, as one of the two endings its `statedWaitNotSlept` appends.
+   *  Each is matched at the end of the message, where the framework puts
+   *  it, so the same words echoed earlier in a provider's text don't count.
+   *  agent-framework #343 rejects with its own error class instead,
+   *  `ProviderWaitNotSleptError`, keeping those words; the class is read
+   *  here by name, since 0.22.1 doesn't export it. */
   private isUnsleptProviderWait(err: Error): boolean {
-    return UNSLEPT_PROVIDER_WAIT_ENDINGS.some((ending) => ending.test(err.message));
+    return err.name === 'ProviderWaitNotSleptError' ||
+      UNSLEPT_PROVIDER_WAIT_ENDINGS.some((ending) => ending.test(err.message));
   }
 
   /** Transient = worth retrying the whole subagent from scratch. */
