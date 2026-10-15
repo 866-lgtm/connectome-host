@@ -19,7 +19,7 @@
  * The server verifies signature, freshness (±5 min), and that the key has a
  * live grant — then the connection carries that grant's scope mask.
  */
-import { readFileSync, renameSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { readFileSync, renameSync, statSync, lstatSync, realpathSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { createPublicKey, verify as cryptoVerify, randomBytes } from 'node:crypto';
 
@@ -28,12 +28,16 @@ export const OBSERVER_SCOPES = ['health', 'ops', 'messages', 'tools', 'thinking'
 export type ObserverScope = typeof OBSERVER_SCOPES[number];
 
 export interface ObserverGrant {
-  /** `ed25519:<base64url of the raw 32-byte public key>` */
+  /** `ed25519:<base64url of the raw 32-byte public key>`. The registry holds
+   *  each usable grant's key in this canonical form (canonicalKey); the file
+   *  may spell the same key in either base64 alphabet, padded or not. */
   key: string;
   /** Human-readable label. Testimony, not identity — never treat as verified naming. */
   label: string;
   scopes: ObserverScope[];
-  /** ISO expiry; null/absent = no expiry. */
+  /** Expiry, as the tools write it an ISO timestamp or null. The file may
+   *  hold any value Date.parse reads, which verifyHello reads the same way;
+   *  absent, null, empty or any other falsy value means no expiry. */
   expires?: string | null;
   /** Protected grants cannot be revoked via the agent-facing tools
    *  (recipe-designated operator baseline). File edits can still remove them. */
@@ -70,6 +74,19 @@ function b64urlToBuf(s: string): Buffer | null {
   }
 }
 
+/** A key in canonical form: `ed25519:` and its 32 bytes as unpadded
+ *  base64url. Either base64 alphabet, padded or not, reads as the same key,
+ *  as b64urlToBuf decodes it; anything that isn't `ed25519:` and 32 bytes
+ *  gives null. Grants are compared, and hellos looked up, in this form, so
+ *  one key never counts as two. */
+export function canonicalKey(key: unknown): string | null {
+  if (typeof key !== 'string' || !key.startsWith('ed25519:')) return null;
+  const body = key.slice('ed25519:'.length);
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(body)) return null;
+  const raw = b64urlToBuf(body);
+  return raw && raw.length === 32 ? `ed25519:${raw.toString('base64url')}` : null;
+}
+
 /** Raw 32-byte ed25519 public key → node KeyObject (SPKI DER wrap). */
 export function ed25519PublicKey(raw: Buffer) {
   const SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
@@ -80,26 +97,181 @@ export function ed25519PublicKey(raw: Buffer) {
 // File ops — the discord-mcpl filters.ts pattern, verbatim mechanics.
 // ---------------------------------------------------------------------------
 
-export function loadObserversFile(path: string): ObserversFile | null {
+/** A grants file as read. A file that parses is read grant by grant: `file`
+ *  holds the grants the host can use, `problems` names each entry it can't,
+ *  and `doc` is the document as found, so a writer can change one entry and
+ *  keep every other entry and field. A file that isn't valid JSON may be an
+ *  editor's save read halfway, so it's told apart from one that can't be
+ *  read or isn't a grants file at all. */
+export type ObserversFileRead =
+  | { kind: 'ok'; file: ObserversFile; problems: string[]; doc: GrantsDocument }
+  | { kind: 'missing' }
+  | { kind: 'unparsed'; problem: string }
+  /** `readFailed`: reading the file failed, which may not happen again. */
+  | { kind: 'unreadable'; problem: string; readFailed?: true };
+
+/** A grants document as found: an object whose `observers` entries may be
+ *  of any shape, with whatever other fields it holds. */
+export type GrantsDocument = Record<string, unknown> & { observers: unknown[] };
+
+/** `problem` completes a sentence whose subject is the file, such as
+ *  "isn't valid JSON (…)". This never throws: the registry reads the file
+ *  from a timer, where a throw would end the process. */
+export function readObserversFile(path: string): ObserversFileRead {
+  let text: string;
   try {
-    const parsed = JSON.parse(readFileSync(path, 'utf-8')) as ObserversFile;
-    if (!parsed || !Array.isArray(parsed.observers)) return null;
-    for (const g of parsed.observers) {
-      if (typeof g.key !== 'string' || !g.key.startsWith('ed25519:')) return null;
-      if (!Array.isArray(g.scopes)) return null;
-      if (!g.scopes.every((s) => (OBSERVER_SCOPES as readonly string[]).includes(s))) return null;
+    text = readFileSync(path, 'utf-8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException | null)?.code === 'ENOENT') {
+      // A link whose target is gone reads as ENOENT too, but the path is
+      // there, and writing would replace the link rather than make a first file.
+      return isLink(path)
+        ? { kind: 'unreadable', problem: `is a link to a file that can't be read (${errorText(err)})`, readFailed: true }
+        : { kind: 'missing' };
     }
-    return parsed;
-  } catch {
-    return null; // parse/validation error → caller keeps previous (fail-safe)
+    return { kind: 'unreadable', problem: `can't be read (${errorText(err)})`, readFailed: true };
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch (err) {
+    // Only a syntax error can be a save read halfway. A parse that gives out
+    // on a value nested too deep means the file can't be checked.
+    return err instanceof SyntaxError
+      ? { kind: 'unparsed', problem: `isn't valid JSON (${errorText(err)})` }
+      : { kind: 'unreadable', problem: `can't be checked (${errorText(err)})` };
+  }
+  return checkObserversFile(parsed);
+}
+
+/** A parsed grants document read as readObserversFile reads a file. Never
+ *  throws. */
+export function checkObserversFile(parsed: unknown): Exclude<ObserversFileRead, { kind: 'missing' | 'unparsed' }> {
+  try {
+    return checkGrants(parsed);
+  } catch (err) {
+    // The checks read plain JSON values, but one nested deeply enough still
+    // overflows JSON.stringify.
+    return { kind: 'unreadable', problem: `can't be checked (${errorText(err)})` };
   }
 }
 
+function isLink(path: string): boolean {
+  try {
+    return lstatSync(path).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+function checkGrants(parsed: unknown): Exclude<ObserversFileRead, { kind: 'missing' | 'unparsed' }> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { kind: 'unreadable', problem: `isn't a grants file: it holds ${jsonKind(parsed)}, not an object with an "observers" list` };
+  }
+  const found = parsed as Record<string, unknown>;
+  const observers = found.observers === undefined ? [] : found.observers;
+  if (!Array.isArray(observers)) return { kind: 'unreadable', problem: 'has an "observers" that isn\'t a list' };
+  const usable: ObserverGrant[] = [];
+  const problems: string[] = [];
+  // verifyHello takes the first grant for a key, so a later one for the same
+  // key would never apply: an operator who added a narrower grant to restrict
+  // a key would get the wider one without a word.
+  const firstFor = new Map<string, number>();
+  for (const [i, g] of (observers as unknown[]).entries()) {
+    const wrong = entryProblems(i, g);
+    // Two spellings of one key are one key.
+    const key = canonicalKey(g && typeof g === 'object' ? (g as { key?: unknown }).key : undefined);
+    if (key !== null) {
+      const first = firstFor.get(key);
+      if (first === undefined) firstFor.set(key, i);
+      else wrong.push(`${entryName(i, g)} repeats the key of grant ${first + 1}, so it isn't used`);
+    }
+    if (wrong.length === 0 && key !== null) usable.push({ ...(g as ObserverGrant), key });
+    else problems.push(...wrong);
+  }
+  return { kind: 'ok', file: { observers: usable }, problems, doc: { ...found, observers } };
+}
+
+/** What makes one entry unusable, each naming the entry by position and
+ *  label; none for a grant the host can use. */
+function entryProblems(i: number, g: unknown): string[] {
+  if (!g || typeof g !== 'object') return [`grant ${i + 1} isn't an object`];
+  const grant = g as { key?: unknown; label?: unknown; scopes?: unknown; expires?: unknown };
+  const which = entryName(i, g);
+  const problems: string[] = [];
+  if (typeof grant.key !== 'string' || !grant.key.startsWith('ed25519:')) {
+    problems.push(`${which} has no "ed25519:" key`);
+  } else if (canonicalKey(grant.key) === null) {
+    problems.push(`${which} has a key that doesn't decode to 32 bytes`);
+  }
+  // verifyHello reads a falsy expiry as no end, and expires a grant once
+  // Date.parse(expires) is past, so an expiry it can't parse would never
+  // take effect. This check reads it the same way.
+  const { expires } = grant;
+  if (expires && !Number.isFinite(parseDate(expires))) {
+    problems.push(`${which} has an expiry that isn't a date: ${JSON.stringify(expires)}`);
+  }
+  if (!Array.isArray(grant.scopes)) {
+    problems.push(`${which} has no list of scopes`);
+    return problems;
+  }
+  if (grant.scopes.length === 0) {
+    // A grant of nothing would still turn the observer gate on.
+    problems.push(`${which} has no scopes`);
+    return problems;
+  }
+  const unknown = grant.scopes.filter((s) => !(OBSERVER_SCOPES as readonly unknown[]).includes(s));
+  if (unknown.length > 0) {
+    const what = unknown.length === 1 ? "a scope that doesn't exist" : "scopes that don't exist";
+    problems.push(
+      `${which} names ${what}: ${unknown.map((s) => JSON.stringify(s)).join(', ')} (the scopes are ${OBSERVER_SCOPES.join(', ')})`,
+    );
+  }
+  return problems;
+}
+
+/** Date.parse, which converts an object through its own toString or valueOf
+ *  and throws when neither can be called; such a value is no date. */
+function parseDate(value: unknown): number {
+  try {
+    return Date.parse(value as string);
+  } catch {
+    return NaN;
+  }
+}
+
+/** An entry as the problems name it: by position, and by label if it has one. */
+function entryName(i: number, g: unknown): string {
+  const label = g && typeof g === 'object' ? (g as { label?: unknown }).label : undefined;
+  return `grant ${i + 1}${typeof label === 'string' ? ` (${JSON.stringify(label)})` : ''}`;
+}
+
+function jsonKind(value: unknown): string {
+  if (value === null) return 'null';
+  if (Array.isArray(value)) return 'a list';
+  if (typeof value === 'number') return 'a number';
+  if (typeof value === 'string') return 'a string';
+  return String(value);
+}
+
+/** The usable grants, or null for a file that's missing, can't be read or
+ *  checked, isn't valid JSON or isn't a grants file. */
+export function loadObserversFile(path: string): ObserversFile | null {
+  const read = readObserversFile(path);
+  return read.kind === 'ok' ? read.file : null;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 export function saveObserversFile(path: string, file: ObserversFile): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  // Through a link, write the file it points to, so the link stays a link.
+  const target = isLink(path) ? realpathSync(path) : path;
+  mkdirSync(dirname(target), { recursive: true });
+  const tmp = `${target}.tmp`;
   writeFileSync(tmp, JSON.stringify(file, null, 2) + '\n');
-  renameSync(tmp, path); // atomic — mtime pollers never read a half-write
+  renameSync(tmp, target); // atomic — mtime pollers never read a half-write
 }
 
 export function observersFileMtime(path: string): number | null {
@@ -123,28 +295,66 @@ export class ObserverRegistry {
   private file: ObserversFile | null = null;
   private lastMtime: number | null = null;
   private poll: ReturnType<typeof setInterval> | null = null;
+  /** The last problem logged, so a file read again at every check is named
+   *  once rather than every 3 s. */
+  private lastSaid: string | null = null;
 
-  constructor(private readonly path: string) {}
+  /** `pollMs` is how often the file's mtime is checked; tests shorten it. */
+  constructor(private readonly path: string, private readonly pollMs = 3000) {}
 
   start(): void {
     this.lastMtime = observersFileMtime(this.path);
-    if (this.lastMtime !== null) {
-      this.file = loadObserversFile(this.path);
-      if (!this.file) console.error(`[webui-observers] ${this.path} unparseable — observers disabled until fixed`);
+    if (this.lastMtime === null && isLink(this.path)) {
+      console.error(`[webui-observers] ${this.path} is a link to a file that can't be read — observers disabled until it's fixed`);
     }
+    if (this.lastMtime !== null) this.load(this.lastMtime, 'start');
     this.poll = setInterval(() => {
       const m = observersFileMtime(this.path);
       if (m === null || m === this.lastMtime) return; // missing/mid-rename or unchanged
-      this.lastMtime = m;
-      const next = loadObserversFile(this.path);
-      if (!next) {
-        console.error(`[webui-observers] ${this.path} unparseable — keeping previous grants`);
-        return;
-      }
-      this.file = next;
-      console.error(`[webui-observers] reloaded ${next.observers.length} grant(s)`);
-    }, 3000);
+      this.load(m, 'reload');
+    }, this.pollMs);
     this.poll.unref();
+  }
+
+  /** Read the file at mtime `m` and take what the read gives. A read that
+   *  failed, or JSON a save in progress left half-written, is read again at
+   *  the next check, since the write that finishes it can keep the same
+   *  mtime; anything else waits for the file to change. */
+  private load(m: number, when: 'start' | 'reload'): void {
+    const read = readObserversFile(this.path);
+    const again = read.kind === 'unparsed' || (read.kind === 'unreadable' && read.readFailed === true);
+    this.lastMtime = again ? null : m;
+    this.take(read, when);
+  }
+
+  /** Take what a read of the file gives. A file that parses gives exactly its
+   *  usable grants, and the log names each entry it can't use. A file that
+   *  isn't valid JSON keeps the grants a reload had, since an editor's save
+   *  can be read halfway and the next check reads it whole; at start it gives
+   *  none. Anything else gives none, and says so, a file removed between the
+   *  stat and the read included. */
+  private take(read: ObserversFileRead, when: 'start' | 'reload'): void {
+    const where = `[webui-observers] ${this.path}`;
+    const say = (line: string) => {
+      if (line !== this.lastSaid) console.error(line);
+      this.lastSaid = line;
+    };
+    if (read.kind === 'ok') {
+      this.file = read.file;
+      this.lastSaid = null;
+      const unused = read.doc.observers.length - read.file.observers.length;
+      if (unused > 0) console.error(`${where}: ${unused} grant(s) not used: ${read.problems.join('; ')}`);
+      if (when === 'reload') console.error(`[webui-observers] reloaded ${read.file.observers.length} grant(s)`);
+      return;
+    }
+    if (read.kind === 'unparsed' && when === 'reload' && this.file) {
+      say(`${where} ${read.problem} — keeping the previous grants until it parses`);
+      return;
+    }
+    this.file = null;
+    if (read.kind === 'missing') say(`${where} is gone — admitting no grants from it`);
+    else if (read.kind === 'unparsed') say(`${where} ${read.problem} — admitting no grants until it parses`);
+    else say(`${where} ${read.problem} — admitting no grants from it`);
   }
 
   stop(): void {
@@ -178,12 +388,15 @@ export class ObserverRegistry {
     if (!Number.isFinite(ts)) return fail('bad timestamp');
     if (Math.abs(now - ts) > FRESHNESS_MS) return fail('stale timestamp');
 
-    const grant = this.grants().find((g) => g.key === identity.id);
+    // The registry holds canonical keys, so a client's spelling of its key
+    // finds the grant however the file spelled it.
+    const key = canonicalKey(identity.id);
+    if (!key) return fail('malformed public key');
+    const grant = this.grants().find((g) => g.key === key);
     if (!grant) return fail('no grant for key');
     if (grant.expires && Date.parse(grant.expires) < now) return fail('grant expired');
 
-    const raw = b64urlToBuf(identity.id.slice('ed25519:'.length));
-    if (!raw || raw.length !== 32) return fail('malformed public key');
+    const raw = b64urlToBuf(key.slice('ed25519:'.length))!;
     const sig = b64urlToBuf(identity.proof ?? '');
     if (!sig || sig.length !== 64) return fail('malformed signature');
 
