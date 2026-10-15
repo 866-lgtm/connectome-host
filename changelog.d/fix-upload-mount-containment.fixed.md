@@ -1,10 +1,3 @@
-- `identity--request` with `fromFile` sends only what the workspace mount
-  allows. Before, a symbolic link inside a mount let an upload send a file
-  from outside the mount to a configured service, since the disk read
-  checked only the path's text and followed any link. Uploads now read
-  through agent-framework's `readFileFromDisk`, which keeps the mount's
-  `followSymlinks` policy (off unless the mount sets it) and reads only
-  inside the mount. A link it refuses, a link leading out of the mount, a
-  directory, or a file over the 64 MiB upload limit is refused, with nothing
-  sent. The workspace's stored copy goes only for a file disk doesn't have.
-  Operators running 0.10.2 or earlier should upgrade.
+- `identity--request` with `fromFile` sends only what the workspace mount allows. Before, a symbolic link inside a mount let an upload send a file from outside the mount to a configured service, since the disk read checked only the path's text and followed any link. Uploads now read through agent-framework's `readFileFromDisk`, which keeps the mount's `followSymlinks` policy (off unless the mount sets it) and reads a file only if its canonical path lies inside the mount. A link it refuses, a link leading out of the mount, a directory, or a file over the 64 MiB upload limit is refused, with nothing sent. The workspace's stored copy goes only where disk has no file at the path, and the store holds only what the workspace wrote or took in from inside the mount. Operators running 0.10.2 or earlier should upgrade.
+
+- **Operators with links inside a mount:** an upload of a link to another file in the same mount is now refused unless the mount sets `followSymlinks`, where 0.10.2 sent the file it pointed to. Upload the file by its own path, or set `followSymlinks` on the mount. Until agent-framework's next release fixes it (its F13), an upload of a FIFO in a mount waits for something to write to it, where 0.10.2 refused it.

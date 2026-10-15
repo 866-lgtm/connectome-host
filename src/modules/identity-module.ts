@@ -48,12 +48,18 @@ import {
 import { unknownToolResult } from './unknown-tool.js';
 
 /** A disk read's refusal that means disk has no file at the path, where
- *  the workspace's own copy stands in: nothing there (ENOENT; ENOTDIR, a
- *  parent that's a file; ENAMETOOLONG, a path disk can't hold), or a mount
- *  whose directory is gone. */
+ *  the workspace's own copy stands in: not_found with ENOENT (nothing there,
+ *  a link that leads nowhere, or a mount whose directory is gone, since the
+ *  read's lstat of the path comes first), ENOTDIR (a parent that's a file)
+ *  or ENAMETOOLONG (a name disk can't hold). mount_unavailable comes only
+ *  after that lstat found an entry, when the mount root's realpath then
+ *  fails, so it means no file only with ENOENT or ENOTDIR, the root gone
+ *  between the two; with any other errno, disk has an entry it couldn't
+ *  resolve. */
 function diskHasNoFile(error: WorkspaceReadError): boolean {
-  return error.code === 'mount_unavailable'
-    || (error.code === 'not_found' && ['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.errno ?? ''));
+  const gone = ['ENOENT', 'ENOTDIR'];
+  if (error.code === 'mount_unavailable') return gone.includes(error.errno ?? '');
+  return error.code === 'not_found' && [...gone, 'ENAMETOOLONG'].includes(error.errno ?? '');
 }
 
 export interface IdentityModuleConfig {
