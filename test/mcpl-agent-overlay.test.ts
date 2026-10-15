@@ -13,6 +13,7 @@ import {
   saveAgentOverlay,
   saveMcplServers,
   readMcplServersFile,
+  loadMcplServers,
   applyAgentOverlay,
   resolveOverlayEntry,
   serverProvisions,
@@ -56,16 +57,38 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
 
   // JSON.parse's own message names no file, and can quote the text (Bun
   // names the token it didn't expect, V8 quotes a stretch), which can hold
-  // credentials: the operator's /mcp commands and mcpl_list showed it.
-  test("the operator's servers file that isn't JSON is named, never quoted", () => {
+  // credentials: the boot, the operator's /mcp commands and mcpl_list
+  // showed it. A root of null threw a TypeError naming nothing.
+  test("the operator's servers file that isn't JSON, or holds null, is named and never quoted, at the boot and in an edit", () => {
     withTmp((dir) => {
       const path = join(dir, 'mcpl-servers.json');
       writeFileSync(path, '{ "mcplServers": { "chat": { "env": { "TOKEN": s3cret } } } }');
-      expect(() => readMcplServersFile(path)).toThrow(`${path} isn't valid JSON`);
-      try { readMcplServersFile(path); } catch (error) {
-        expect(String(error)).not.toContain('s3cret');
+      for (const read of [readMcplServersFile, loadMcplServers]) {
+        expect(() => read(path)).toThrow(`${path} isn't valid JSON`);
+        try { read(path); } catch (error) {
+          // Still a SyntaxError, the class a bug report names.
+          expect(error).toBeInstanceOf(SyntaxError);
+          expect(String(error)).not.toContain('s3cret');
+        }
+      }
+      writeFileSync(path, 'null');
+      for (const read of [readMcplServersFile, loadMcplServers]) {
+        expect(() => read(path)).toThrow(`${path} holds null, not an object with mcplServers`);
       }
     });
+  });
+
+  // Each check of the strict reading joins the others, so a regression to
+  // stopping at the first problem fails here.
+  test('the strict reading names every problem of an entry at once, a list read for an empty name whatever else it holds', () => {
+    expect(overlayEntryProblem(
+      { command: 5, transport: 'ws', args: 'x', env: { A: null }, enabledTools: [1, ''], reconnect: 'yes' },
+      { strict: true },
+    )).toBe(
+      "its command isn't text; its transport is neither stdio nor websocket; its args aren't a list of text; its env A " +
+      "isn't text, a number or true/false; its enabledTools isn't a list of names; its enabledTools holds an empty name, " +
+      'which matches nothing; its reconnect is neither true nor false',
+    );
   });
 
   // Both servers files keep the root's other keys on a save; a root that

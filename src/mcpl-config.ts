@@ -14,6 +14,27 @@ import { validateToolLifecycle } from './tool-lifecycle-config.js';
 export const DEFAULT_CONFIG_PATH = resolve(process.cwd(), 'mcpl-servers.json');
 
 /**
+ * The operator's servers file's root, as JSON.parse reads it, for the boot
+ * (loadMcplServers) and for editing (readMcplServersFile). A file that isn't
+ * valid JSON throws a SyntaxError naming the file, never JSON.parse's own
+ * message, which can quote a stretch of the text, and the file can hold a
+ * token in an env block. A root of null, which neither reader can take
+ * entries from, throws naming the file too.
+ */
+function parseServersFile(path: string): unknown {
+  const raw = readFileSync(path, 'utf-8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new SyntaxError(`${path} isn't valid JSON`);
+    throw error;
+  }
+  if (parsed === null) throw new Error(`${path} holds null, not an object with mcplServers`);
+  return parsed;
+}
+
+/**
  * Serializable subset of McplServerConfig (everything except callbacks and scopes).
  */
 export interface ServerFileEntry {
@@ -60,8 +81,7 @@ export type LoadedServerConfig = ServerFileEntry & { id: string };
 export function loadMcplServers(configPath: string): LoadedServerConfig[] {
   if (!existsSync(configPath)) return [];
 
-  const raw = readFileSync(configPath, 'utf-8');
-  const parsed = JSON.parse(raw) as McplServersFile;
+  const parsed = parseServersFile(configPath) as McplServersFile;
   if (!parsed.mcplServers || typeof parsed.mcplServers !== 'object') return [];
 
   const configDir = dirname(resolve(configPath));
@@ -301,6 +321,10 @@ export type OverlayEntryReading =
 const isPlain = (v: unknown): v is string | number | boolean =>
   typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
 
+/** The problem readOverlayEntry gives an entry with neither a command nor a
+ *  url, which mcpl_deploy says in its own words. */
+export const NAMES_NOTHING = 'it names no command to run and no url to dial';
+
 /**
  * Read one agent overlay entry as the boot reads it. Every reader takes this
  * reading (the boot, the startup warnings, mcpl_list, mcpl_restart's note,
@@ -332,8 +356,9 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  *
  * Skipped, so the operator's definition, if any, stays: an entry that isn't
  * an object, and `args` that aren't a list of text, numbers or true/false,
- * on which main stopped the start; an entry that names nothing to run or
- * dial; and a `disabled` that's truthy but not `true`, which main neither
+ * on which main stopped the start; an entry that names no command to run
+ * and no url to dial (NAMES_NOTHING); and a `disabled` that's truthy but not
+ * `true`, which main neither
  * loaded nor took as a tombstone. `disabled: true` is a tombstone, whatever
  * else the entry holds, as main's applyAgentOverlay read it.
  *
@@ -375,11 +400,16 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
     }
     for (const k of OVERLAY_NAME_LIST_FIELDS) {
       if (e[k] === undefined) continue;
-      if (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string')) {
+      if (!Array.isArray(e[k])) {
         problems.push(`its ${k} isn't a list of names`);
-      } else if ((e[k] as string[]).some((x) => x.trim() === '')) {
-        // An empty name matches nothing, so in an allow-list it's the
-        // deny-all that an empty list is kept from being.
+        continue;
+      }
+      const items = e[k] as unknown[];
+      if (!items.every((x) => typeof x === 'string')) problems.push(`its ${k} isn't a list of names`);
+      // An empty name matches nothing, so in an allow-list it's the deny-all
+      // that an empty list is kept from being. Checked among the names a
+      // list holds, whatever else it holds.
+      if (items.some((x) => typeof x === 'string' && x.trim() === '')) {
         problems.push(`its ${k} holds an empty name, which matches nothing`);
       }
     }
@@ -421,7 +451,7 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   // operator definition with one the framework fails to open.
   if (e.transport === 'websocket' && !e.url && e.command) notes.push('its transport is websocket, with no url to dial, so the framework can\'t open it');
   if (e.transport === 'stdio' && !e.command && e.url) notes.push('its transport is stdio, with no command to spawn, so the framework can\'t open it');
-  if (!e.command && !e.url) return { problem: 'it names no command to run and no url to dial' };
+  if (!e.command && !e.url) return { problem: NAMES_NOTHING };
   return { entry: e as AgentOverlayEntry, notes };
 }
 
@@ -914,21 +944,12 @@ export function overlayWarnings(
 
 /**
  * Read the raw server entries from the config file (for editing).
- * Returns empty object if file doesn't exist. A file that isn't valid JSON
- * throws an error naming it, which never quotes it: JSON.parse's own message
- * can quote the text, and the file can hold credentials.
+ * Returns empty object if file doesn't exist. A file that isn't valid JSON,
+ * or whose root is null, throws as parseServersFile says.
  */
 export function readMcplServersFile(configPath: string): Record<string, ServerFileEntry> {
   if (!existsSync(configPath)) return {};
-  const raw = readFileSync(configPath, 'utf-8');
-  let parsed: McplServersFile;
-  try {
-    parsed = JSON.parse(raw) as McplServersFile;
-  } catch (error) {
-    if (error instanceof SyntaxError) throw new Error(`${configPath} isn't valid JSON`);
-    throw error;
-  }
-  return parsed.mcplServers ?? {};
+  return (parseServersFile(configPath) as McplServersFile).mcplServers ?? {};
 }
 
 /**
