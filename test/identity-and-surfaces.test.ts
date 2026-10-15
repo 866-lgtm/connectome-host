@@ -6,7 +6,7 @@
 // accept_invite, no tokens in any result); credentials exist only on the
 // HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
-import { describe, it, expect } from 'bun:test';
+import { afterEach, describe, it, expect } from 'bun:test';
 import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -498,14 +498,23 @@ describe('observers surface flag', () => {
 describe('identity request: fromFile reads only what the mount allows', () => {
   const CAP = 64 * 1024 * 1024;
 
+  // Each fixture's teardown, registered as it makes its tree and store, and
+  // run after every test, passed or failed: the store closed, the tree removed.
+  const teardowns: Array<() => void> = [];
+  afterEach(() => {
+    for (const teardown of teardowns.splice(0).reverse()) teardown();
+  });
+
   async function mounted(opts: { followSymlinks?: boolean } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'ident-mount-'));
+    teardowns.push(() => rmSync(dir, { recursive: true, force: true }));
     const mountDir = join(dir, 'files');
     const outside = join(dir, 'outside');
     mkdirSync(mountDir);
     mkdirSync(outside);
     writeFileSync(join(outside, 'host-secret.txt'), 'the host\'s own file');
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    teardowns.push(() => store.close?.());
     const workspace = new WorkspaceModule({
       mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never', ...(opts.followSymlinks ? { followSymlinks: true } : {}) }],
     });
@@ -549,6 +558,29 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     await putInStore('files/grid.png', 'store bytes');
     expect((await upload('files/grid.png')).success).toBe(true);
     expect(bodies.map(String)).toEqual(['disk bytes']);
+  });
+
+  // A link that stays inside the mount is the mount's to allow: followed where
+  // the mount sets followSymlinks, refused where it doesn't, whatever the
+  // workspace holds at the link's path.
+  it('sends the file a link names when that file is in the same mount and the mount follows links', async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted({ followSymlinks: true });
+    writeFileSync(join(mountDir, 'v2.png'), 'the file the link names');
+    symlinkSync('v2.png', join(mountDir, 'latest.png'));
+    await putInStore('files/latest.png', 'store bytes');
+    expect((await upload('files/latest.png')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['the file the link names']);
+  });
+
+  it("refuses a link to a file in the same mount when the mount doesn't follow links", async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'v2.png'), 'the file the link names');
+    symlinkSync('v2.png', join(mountDir, 'latest.png'));
+    await putInStore('files/latest.png', 'store bytes');
+    const res = await upload('files/latest.png');
+    expect(res.error).toContain('Nothing was sent: "files/latest.png" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlinks are not allowed: files/latest.png');
+    expect(bodies).toEqual([]);
   });
 
   it('refuses a link in the mount to a file outside it, sends nothing, and names no host path', async () => {
