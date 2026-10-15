@@ -27,7 +27,6 @@
  * src/statements.ts is the source of truth — re-copy, don't fork).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { lstat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
   createPrivateKey,
@@ -37,15 +36,25 @@ import {
   createHash,
   type KeyObject,
 } from 'node:crypto';
-import type {
-  Module,
-  ModuleContext,
-  ToolCall,
-  ToolResult,
-  ToolDefinition,
-  WorkspaceModule,
+import {
+  WorkspaceReadError,
+  type Module,
+  type ModuleContext,
+  type ToolCall,
+  type ToolResult,
+  type ToolDefinition,
+  type WorkspaceModule,
 } from '@animalabs/agent-framework';
 import { unknownToolResult } from './unknown-tool.js';
+
+/** A disk read's refusal that means disk has no file at the path, where
+ *  the workspace's own copy stands in: nothing there (ENOENT; ENOTDIR, a
+ *  parent that's a file; ENAMETOOLONG, a path disk can't hold), or a mount
+ *  whose directory is gone. */
+function diskHasNoFile(error: WorkspaceReadError): boolean {
+  return error.code === 'mount_unavailable'
+    || (error.code === 'not_found' && ['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.errno ?? ''));
+}
 
 export interface IdentityModuleConfig {
   /** ed25519 PKCS#8 PEM, generated on first use, 0600. dataDir-anchored:
@@ -668,69 +677,63 @@ export class IdentityModule implements Module {
    * The bytes `fromFile` names, for an upload. Disk first, store second. An
    * upload is egress: reading it through the append-only store would retain
    * every byte forever and refuse anything binary or over the mount's
-   * maxFileSize, which is most media; disk has neither problem. The store's
-   * copy stands in only for a file disk doesn't have: one the resident wrote
-   * through the workspace and never materialized, or one whose mount's
-   * directory is gone. A file that's on disk but can't be read from there
-   * (over the cap, unreadable, a directory) is refused, since the store's
-   * copy can differ from it, and an upload never sends a different file
-   * than the one the agent named without saying so: `from` says which went.
+   * maxFileSize, which is most media; disk has neither problem. The disk read
+   * is readFileFromDisk, which keeps the mount's link policy and reads only
+   * inside the mount (it checks the canonical path it opened), so an upload
+   * sends only what the mount allows, and its errors name the mount-prefixed
+   * path, never the host's. The store's copy stands in only where disk has no
+   * file (diskHasNoFile): one the resident wrote through the workspace and
+   * never materialized, or one whose mount's directory is gone. Any other
+   * refusal (a link the mount refuses or one leading out of it, a directory,
+   * a file disk can't read) stops the upload, since the store's copy can
+   * differ from disk's: an upload never sends another file than the one the
+   * agent named without saying so, and `from` says which copy went.
    */
   private async readUpload(
     workspace: WorkspaceModule,
     path: string,
     service: string,
   ): Promise<{ bytes: Buffer; from: string } | { refusal: string }> {
-    const fromDisk = await workspace.readBinaryFromDisk(path, { maxBytes: UPLOAD_BODY_MAX });
-    if (!('error' in fromDisk)) {
-      // The disk read checks its size before reading, and a file can grow
-      // in between, so the bound is held here too.
-      if (fromDisk.data.byteLength > UPLOAD_BODY_MAX) {
-        return {
-          refusal: `Nothing was sent to "${service}": "${path}" is ${fromDisk.data.byteLength} bytes, over the ` +
-            `${UPLOAD_BODY_MAX}-byte upload limit.`,
-        };
+    const nothingSent = `Nothing was sent to "${service}":`;
+    const overLimit = (size: number, whose: string): { refusal: string } => ({
+      refusal: `${nothingSent} ${whose} is ${size} bytes, over the ${UPLOAD_BODY_MAX}-byte upload limit.`,
+    });
+    let onDisk: WorkspaceReadError;
+    try {
+      const fromDisk = await workspace.readFileFromDisk(path, { maxBytes: UPLOAD_BODY_MAX });
+      // A read cut at the cap is of a file over it. A file that grows after
+      // the read's size check is read whole, so the bound is held here too.
+      if (fromDisk.truncated || fromDisk.bytes.byteLength > UPLOAD_BODY_MAX) {
+        return overLimit(Math.max(fromDisk.size, fromDisk.bytes.byteLength), `"${path}"`);
       }
-      return { bytes: fromDisk.data, from: 'disk' };
+      return { bytes: fromDisk.bytes, from: 'disk' };
+    } catch (err) {
+      if (!(err instanceof WorkspaceReadError)) throw err;
+      onDisk = err;
     }
-    if (await this.diskHolds(workspace, path)) {
+    // A path no mount holds, or one leading out of its mount, has no copy anywhere.
+    if (onDisk.code === 'unknown_mount' || onDisk.code === 'traversal') {
+      return { refusal: `${nothingSent} ${sentence(onDisk.message)}` };
+    }
+    const diskReason = sentence(`${onDisk.message}${onDisk.errno ? ` (${onDisk.errno})` : ''}`);
+    if (!diskHasNoFile(onDisk)) {
       return {
-        refusal: `Nothing was sent to "${service}": "${path}" is on disk but couldn't be read from there, and the ` +
-          `workspace's copy wasn't sent in its place, since it can differ from disk's. On disk: ${sentence(fromDisk.error)}`,
+        refusal: `${nothingSent} "${path}" couldn't be read from disk, and the workspace's copy wasn't sent in its ` +
+          `place, since it can differ from disk's. On disk: ${diskReason}`,
       };
     }
     const fromStore = await workspace.readBinary(path);
     if ('error' in fromStore) {
-      // The same reason from both reads, such as an unknown mount, is said once.
-      const reasons = fromDisk.error === fromStore.error
+      // The same reason from both reads, such as a file neither holds, is said once.
+      const reasons = onDisk.message === fromStore.error
         ? sentence(fromStore.error)
-        : `On disk: ${sentence(fromDisk.error)} In the workspace: ${sentence(fromStore.error)}`;
-      return { refusal: `Nothing was sent to "${service}": "${path}" couldn't be read. ${reasons}` };
+        : `On disk: ${diskReason} In the workspace: ${sentence(fromStore.error)}`;
+      return { refusal: `${nothingSent} "${path}" couldn't be read. ${reasons}` };
     }
     if (fromStore.data.byteLength > UPLOAD_BODY_MAX) {
-      return {
-        refusal: `Nothing was sent to "${service}": the workspace's copy of "${path}" is ${fromStore.data.byteLength} bytes, ` +
-          `over the ${UPLOAD_BODY_MAX}-byte upload limit.`,
-      };
+      return overLimit(fromStore.data.byteLength, `the workspace's copy of "${path}"`);
     }
     return { bytes: fromStore.data, from: 'the workspace, since disk has no file at this path' };
-  }
-
-  /** Whether anything is at a workspace path on disk, read without following
-   *  a link: nothing is there when the path can't be resolved to a mount, or
-   *  lstat finds no entry (ENOENT, or ENOTDIR for a parent that's a file).
-   *  A mount whose directory is gone holds nothing. Any other answer, an
-   *  unreadable parent included, counts as something there. */
-  private async diskHolds(workspace: WorkspaceModule, path: string): Promise<boolean> {
-    const absolute = workspace.resolveAbsolutePath(path);
-    if (absolute === null) return false;
-    try {
-      await lstat(absolute);
-      return true;
-    } catch (err) {
-      const code = (err as { code?: unknown }).code;
-      return code !== 'ENOENT' && code !== 'ENOTDIR';
-    }
   }
 
   private async acceptInvite(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {

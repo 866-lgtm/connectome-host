@@ -7,10 +7,12 @@
 // HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
 import { describe, it, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { JsStore } from '@animalabs/chronicle';
+import { WorkspaceModule, WorkspaceReadError } from '@animalabs/agent-framework';
 
 import { IdentityModule } from '../src/modules/identity-module.ts';
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
@@ -201,8 +203,7 @@ describe('identity module', () => {
     let sentType = '';
     // The resident wrote the file through the workspace, and disk has no copy.
     const workspace = {
-      resolveAbsolutePath: (path: string) => join(dir, path),
-      readBinaryFromDisk: async (path: string) => ({ error: `File not found on disk: ${path}` }),
+      readFileFromDisk: async (path: string) => { throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT'); },
       readBinary: async (path: string) =>
         path === 'files/music/track.mp3' ? { data: audio } : { error: `File not found: ${path}` },
       writeBinary: async () => ({ success: true }),
@@ -262,9 +263,10 @@ describe('identity module', () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
     const sent: Array<{ url: string; method: string; type: string; auth: string; body: unknown }> = [];
     const workspace = {
-      resolveAbsolutePath: (path: string) => join(dir, path),
-      readBinaryFromDisk: async (path: string) =>
-        path === 'files/artifacts/grid.png' ? { data: png, absolutePath: join(dir, path) } : { error: `File not found on disk: ${path}` },
+      readFileFromDisk: async (path: string) => {
+        if (path === 'files/artifacts/grid.png') return { bytes: png, size: png.byteLength, truncated: false };
+        throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT');
+      },
       readBinary: async (path: string) =>
         path === 'files/artifacts/grid.png' ? { data: png } : { error: `File not found: ${path}` },
       writeBinary: async () => ({ success: true }),
@@ -489,12 +491,16 @@ describe('identity: what the agent reads when a call fails', () => {
   // a copy that may differ from disk's without saying so.
   describe('fromFile', () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-    const workspaceFor = (abs: string | null, diskError: string | null, storeError: string | null = null) => {
+    // What agent-framework's readFileFromDisk throws where disk has no file.
+    const notOnDisk = (errno = 'ENOENT') => new WorkspaceReadError('not_found', 'File not found: files/grid.png', 'lstat', errno);
+    const workspaceFor = (disk: WorkspaceReadError | null, storeError: string | null = null) => {
       const calls = { store: 0 };
       return {
         calls,
-        resolveAbsolutePath: () => abs,
-        readBinaryFromDisk: async () => (diskError === null ? { data: png, absolutePath: abs! } : { error: diskError }),
+        readFileFromDisk: async () => {
+          if (disk) throw disk;
+          return { bytes: png, size: png.byteLength, truncated: false };
+        },
         readBinary: async () => { calls.store++; return storeError === null ? { data: png } : { error: storeError }; },
         writeBinary: async () => ({ success: true }),
       };
@@ -503,15 +509,13 @@ describe('identity: what the agent reads when a call fails', () => {
       mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile: 'files/grid.png' }));
 
     it("sends disk's copy, and says so", async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
-      const { mod, ready } = registeredModule({ workspace: workspaceFor(join(dir, 'grid.png'), null) });
+      const { mod, ready } = registeredModule({ workspace: workspaceFor(null) });
       await ready;
       expect(((await upload(mod)).data as any).sent.from).toBe('disk');
     });
 
     it("sends the workspace's copy of a file disk doesn't have, and says it was the workspace's", async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
-      const ws = workspaceFor(join(dir, 'grid.png'), 'File not found on disk: files/grid.png');
+      const ws = workspaceFor(notOnDisk());
       const { mod, ready, seen } = registeredModule({ workspace: ws });
       await ready;
       const res = await upload(mod);
@@ -520,31 +524,14 @@ describe('identity: what the agent reads when a call fails', () => {
       expect(seen.orrery).toBe(1);
     });
 
-    // The mount's directory is gone: the workspace's copy is the only one
-    // there is, and it's what the resident wrote, so it goes.
-    it("sends the workspace's copy when the mount's directory is gone", async () => {
-      const mount = mkdtempSync(join(tmpdir(), 'ident-mount-'));
-      rmSync(mount, { recursive: true });
-      const ws = workspaceFor(join(mount, 'grid.png'), 'File not found on disk: files/grid.png');
-      const { mod, ready, seen } = registeredModule({ workspace: ws });
-      await ready;
-      const res = await upload(mod);
-      expect(res.success).toBe(true);
-      expect((res.data as any).sent.from).toBe('the workspace, since disk has no file at this path');
-      expect(ws.calls.store).toBe(1);
-      expect(seen.orrery).toBe(1);
-    });
-
-    it("refuses a file that's on disk but can't be read there, naming disk's reason, and sends nothing", async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
-      writeFileSync(join(dir, 'grid.png'), png);
-      const ws = workspaceFor(join(dir, 'grid.png'), 'File too large: 70000000 > 67108864 bytes');
+    it("refuses a file disk can't read, naming disk's reason, and sends nothing", async () => {
+      const ws = workspaceFor(new WorkspaceReadError('not_found', 'Unable to read file: files/grid.png', 'open', 'EACCES'));
       const { mod, ready, seen } = registeredModule({ workspace: ws });
       await ready;
       const res = await upload(mod);
       expectSays(
-        res.error, 'Nothing was sent to "orrery"', '"files/grid.png" is on disk but couldn\'t be read from there',
-        'the workspace\'s copy wasn\'t sent in its place', 'On disk: File too large: 70000000 > 67108864 bytes.',
+        res.error, 'Nothing was sent to "orrery"', '"files/grid.png" couldn\'t be read from disk',
+        'the workspace\'s copy wasn\'t sent in its place', 'On disk: Unable to read file: files/grid.png (EACCES).',
       );
       expect(ws.calls.store).toBe(0);
       expect(seen.orrery).toBe(0);
@@ -552,10 +539,9 @@ describe('identity: what the agent reads when a call fails', () => {
 
     // The disk read checks the size before it reads, and a file can grow in between.
     it("holds the upload limit on what the disk read returns", async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
       const ws = {
-        ...workspaceFor(join(dir, 'grid.png'), null),
-        readBinaryFromDisk: async () => ({ data: { byteLength: 64 * 1024 * 1024 + 1 } as Buffer, absolutePath: join(dir, 'grid.png') }),
+        ...workspaceFor(null),
+        readFileFromDisk: async () => ({ bytes: { byteLength: 64 * 1024 * 1024 + 1 } as Buffer, size: 8, truncated: false }),
       };
       const { mod, ready, seen } = registeredModule({ workspace: ws });
       await ready;
@@ -564,25 +550,20 @@ describe('identity: what the agent reads when a call fails', () => {
     });
 
     it('gives a reason both reads share once, and each where they differ', async () => {
-      const unknownMount = 'Unknown mount: "nope". Available: files';
-      const same = registeredModule({ workspace: workspaceFor(null, unknownMount, unknownMount) });
+      const same = registeredModule({ workspace: workspaceFor(notOnDisk(), 'File not found: files/grid.png') });
       await same.ready;
-      expect((await upload(same.mod)).error).toBe(`Nothing was sent to "orrery": "files/grid.png" couldn't be read. ${unknownMount}.`);
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
-      const differ = registeredModule({
-        workspace: workspaceFor(join(dir, 'grid.png'), 'File not found on disk: files/grid.png', 'File not found: files/grid.png'),
-      });
+      expect((await upload(same.mod)).error).toBe('Nothing was sent to "orrery": "files/grid.png" couldn\'t be read. File not found: files/grid.png.');
+      const differ = registeredModule({ workspace: workspaceFor(notOnDisk('ENOTDIR'), 'Blob not found for: files/grid.png') });
       await differ.ready;
       expect((await upload(differ.mod)).error).toBe(
-        'Nothing was sent to "orrery": "files/grid.png" couldn\'t be read. On disk: File not found on disk: files/grid.png. ' +
-        'In the workspace: File not found: files/grid.png.',
+        'Nothing was sent to "orrery": "files/grid.png" couldn\'t be read. On disk: File not found: files/grid.png (ENOTDIR). ' +
+        'In the workspace: Blob not found for: files/grid.png.',
       );
     });
 
     it('says which copy went whatever the response: saved with saveAs, or binary', async () => {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-disk-'));
       const { mod, ready } = registeredModule({
-        workspace: workspaceFor(join(dir, 'grid.png'), null),
+        workspace: workspaceFor(null),
         orrery: () => new Response(png, { status: 200, headers: { 'content-type': 'image/png' } }),
       });
       await ready;
@@ -789,5 +770,99 @@ describe('observers surface flag', () => {
     expect(asTools.getTools().map((t) => t.name)).toEqual(asUtils.getUtilities().map((u) => u.name));
     expect(asTools.getUtilities().length).toBe(0);
     expect(asUtils.getTools().length).toBe(0);
+  });
+});
+
+// An upload reads only what the workspace mount allows. agent-framework's
+// readFileFromDisk keeps the mount's link policy and reads only inside it;
+// the disk read this used before checked the path's text alone and followed
+// any link, so a link in the mount sent a file from outside it to the
+// service. These run agent-framework's own WorkspaceModule on a real mount;
+// only the store's copy is set by the test.
+describe('identity request: fromFile reads only what the mount allows', () => {
+  async function mounted(opts: { followSymlinks?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-mount-'));
+    const mountDir = join(dir, 'files');
+    const outside = join(dir, 'outside');
+    mkdirSync(mountDir);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'host-secret.txt'), 'the host\'s own file');
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const workspace = new WorkspaceModule({
+      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never', ...(opts.followSymlinks ? { followSymlinks: true } : {}) }],
+    });
+    workspace.initStore(store);
+    // The store's copy of a path, as the resident would have written it through the workspace.
+    const stored = new Map<string, Buffer>();
+    (workspace as unknown as { readBinary: (p: string) => Promise<unknown> }).readBinary = async (p: string) =>
+      (stored.has(p) ? { data: stored.get(p)! } : { error: `File not found: ${p}` });
+    const bodies: Buffer[] = [];
+    const mod = new IdentityModule({
+      keyPath: join(dir, 'k.pem'),
+      home: 'id.test',
+      services: { orrery: 'https://orrery.test' },
+      fetchImpl: (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.includes('/enroll')) return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+        if (u.includes('/token')) return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
+        if (u.includes('/services')) return new Response(JSON.stringify({ services: {} }), { status: 200 });
+        bodies.push(Buffer.from(init?.body as Uint8Array));
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch,
+    });
+    (mod as any).ctx = { getModule: (n: string) => (n === 'workspace' ? workspace : null) };
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+    const upload = (fromFile: string) =>
+      mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile }));
+    return { dir, mountDir, outside, stored, bodies, upload };
+  }
+
+  it('sends a file in the mount from disk', async () => {
+    const { mountDir, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'grid.png'), 'disk bytes');
+    expect((await upload('files/grid.png')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['disk bytes']);
+  });
+
+  it('refuses a link in the mount to a file outside it, sends nothing, and names no host path', async () => {
+    const { dir, mountDir, outside, stored, bodies, upload } = await mounted();
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    // Even with a copy in the store, the refusal stands: it isn't sent in the link's place.
+    stored.set('files/link.txt', Buffer.from('store bytes'));
+    const res = await upload('files/link.txt');
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Nothing was sent to "orrery": "files/link.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlinks are not allowed: files/link.txt');
+    expect(res.error).not.toContain(dir);
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a link leading out of the mount where the mount follows links', async () => {
+    const { mountDir, outside, bodies, upload } = await mounted({ followSymlinks: true });
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    const res = await upload('files/link.txt');
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Symlink escape detected: files/link.txt');
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a directory, and a file over the upload cap, reading no more of it than the cap', async () => {
+    const { mountDir, bodies, upload } = await mounted();
+    mkdirSync(join(mountDir, 'album'));
+    expect((await upload('files/album')).error).toContain('Path is a directory: files/album');
+    // A sparse file one byte over the cap: nothing that large is written to the test's disk.
+    writeFileSync(join(mountDir, 'huge.bin'), '');
+    truncateSync(join(mountDir, 'huge.bin'), 64 * 1024 * 1024 + 1);
+    expect((await upload('files/huge.bin')).error).toContain(`"files/huge.bin" is ${64 * 1024 * 1024 + 1} bytes, over the ${64 * 1024 * 1024}-byte upload limit`);
+    expect(bodies).toEqual([]);
+  });
+
+  it("sends the workspace's copy of a file disk doesn't have, and when the mount's directory is gone", async () => {
+    const { mountDir, stored, bodies, upload } = await mounted();
+    stored.set('files/notes.txt', Buffer.from('written through the workspace'));
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    rmSync(mountDir, { recursive: true, force: true });
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['written through the workspace', 'written through the workspace']);
   });
 });
