@@ -10,8 +10,8 @@
  *   wrong key / stale timestamp / wrong host → rejected
  *   observer is read-only (user-message → forbidden)
  */
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
@@ -115,6 +115,171 @@ describe('ObserverRegistry.verifyHello', () => {
     saveObserversFile(path, file); // restore
   });
 });
+
+describe('ObserverRegistry when the grants file is removed', () => {
+  test('the next check admits no one the file had admitted, says so once, and reads a file put back', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'observers-removed-'));
+    const path = join(tmp, 'observers.json');
+    const kp = makeKeypair();
+    const HOST = 'agent.example:7342';
+    const grants: ObserversFile = { observers: [{ key: kp.id, label: 'device', scopes: ['health'], protected: true }] };
+    saveObserversFile(path, grants);
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    const registry = new ObserverRegistry(path, 20);
+    const until = async (done: () => boolean) => {
+      const end = Date.now() + 3_000;
+      while (!done() && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    };
+    const admits = () => registry.verifyHello(helloFor(kp, HOST), HOST) !== null;
+    const gone = `[webui-observers] ${path} is gone — admitting no grants from it`;
+    try {
+      registry.start();
+      expect(admits()).toBe(true);
+      rmSync(path);
+      await until(() => !registry.active());
+      for (let i = 0; i < 5; i++) check(registry); // five more checks find it gone
+      expect(admits()).toBe(false);
+      expect(registry.active()).toBe(false);
+      expect(lines.filter((l) => l.includes('admitting no grants'))).toEqual([gone]);
+      saveObserversFile(path, grants);
+      await until(() => registry.active());
+      expect(admits()).toBe(true);
+      // Removed again after a good read, it's said again.
+      rmSync(path);
+      await until(() => !registry.active());
+      expect(lines.filter((l) => l.includes('admitting no grants'))).toEqual([gone, gone]);
+    } finally {
+      registry.stop();
+      spy.mockRestore();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('grants kept while the file wasn\'t valid JSON go too when it\'s removed', async () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'observers-removed-'));
+    const path = join(tmp, 'observers.json');
+    const kp = makeKeypair();
+    saveObserversFile(path, { observers: [{ key: kp.id, label: 'device', scopes: ['health'] }] });
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    const registry = new ObserverRegistry(path, 20);
+    const until = async (done: () => boolean) => {
+      const end = Date.now() + 3_000;
+      while (!done() && Date.now() < end) await new Promise((r) => setTimeout(r, 10));
+    };
+    try {
+      registry.start();
+      writeFileSync(path, '{"observers": [');
+      const later = new Date(Date.now() + 5_000);
+      utimesSync(path, later, later);
+      await until(() => lines.some((l) => l.endsWith('keeping the previous grants until it parses')));
+      expect(lines.some((l) => l.endsWith('keeping the previous grants until it parses'))).toBe(true);
+      expect(registry.active()).toBe(true);
+      rmSync(path);
+      await until(() => !registry.active());
+      expect(registry.active()).toBe(false);
+      expect(lines).toContain(`[webui-observers] ${path} is gone — admitting no grants from it`);
+    } finally {
+      registry.stop();
+      spy.mockRestore();
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('ObserverRegistry checks', () => {
+  const setup = () => {
+    const tmp = mkdtempSync(join(tmpdir(), 'observers-checks-'));
+    const path = join(tmp, 'observers.json');
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    const registry = new ObserverRegistry(path, 60_000); // checks driven by hand
+    const done = () => { registry.stop(); spy.mockRestore(); rmSync(tmp, { recursive: true, force: true }); };
+    return { tmp, path, lines, registry, done };
+  };
+
+  test('a host that never had the file says nothing about it', () => {
+    const { lines, registry, done } = setup();
+    try {
+      registry.start();
+      for (let i = 0; i < 5; i++) check(registry);
+      expect(lines).toEqual([]);
+      expect(registry.active()).toBe(false);
+    } finally { done(); }
+  });
+
+  test('a file back by the second check, as after a save that removes it first, changes nothing', () => {
+    const { path, lines, registry, done } = setup();
+    const kp = makeKeypair();
+    try {
+      saveObserversFile(path, { observers: [{ key: kp.id, label: 'device', scopes: ['health'] }] });
+      registry.start();
+      rmSync(path);
+      check(registry); // the first check to miss it takes nothing away
+      expect(registry.grants().map((g) => g.label)).toEqual(['device']);
+      saveObserversFile(path, { observers: [{ key: kp.id, label: 'device', scopes: ['health'] }] });
+      check(registry);
+      check(registry);
+      expect(registry.grants().map((g) => g.label)).toEqual(['device']);
+      expect(lines.filter((l) => l.includes('admitting no grants'))).toEqual([]);
+    } finally { done(); }
+  });
+
+  test('removing a file the viewer couldn\'t use is said too', () => {
+    const { path, lines, registry, done } = setup();
+    try {
+      writeFileSync(path, '{"observers": [');
+      registry.start();
+      rmSync(path);
+      check(registry);
+      check(registry);
+      expect(lines.at(-1)).toBe(`[webui-observers] ${path} is gone — admitting no grants from it`);
+    } finally { done(); }
+  });
+
+  test('a file put back with its old mtime, or replaced by one with the same mtime, is read again', () => {
+    const { path, registry, done } = setup();
+    const a = makeKeypair();
+    const b = makeKeypair();
+    try {
+      saveObserversFile(path, { observers: [{ key: a.id, label: 'a', scopes: ['health'] }] });
+      const was = statSync(path).mtime;
+      registry.start();
+      rmSync(path);
+      check(registry);
+      check(registry);
+      expect(registry.active()).toBe(false);
+      saveObserversFile(path, { observers: [{ key: a.id, label: 'a', scopes: ['health'] }] });
+      utimesSync(path, was, was);
+      check(registry);
+      expect(registry.grants().map((g) => g.label)).toEqual(['a']);
+      // Between two checks, a file with other grants and the same mtime.
+      saveObserversFile(path, { observers: [{ key: b.id, label: 'b', scopes: ['health'] }] });
+      utimesSync(path, was, was);
+      check(registry);
+      expect(registry.grants().map((g) => g.label)).toEqual(['b']);
+    } finally { done(); }
+  });
+
+  test('a file there but unreadable is named with why', () => {
+    const { path, lines, registry, done } = setup();
+    try {
+      saveObserversFile(path, { observers: [] });
+      registry.start();
+      rmSync(path);
+      symlinkSync(path, path); // a link to itself: ELOOP
+      check(registry);
+      check(registry);
+      expect(lines.at(-1)).toBe(`[webui-observers] ${path} can't be read (ELOOP) — admitting no grants from it`);
+    } finally { done(); }
+  });
+});
+
+/** Run one of the registry's checks now, as its timer would. */
+function check(registry: ObserverRegistry): void {
+  (registry as unknown as { check(): void }).check();
+}
 
 // ---------------------------------------------------------------------------
 // Unit: scope filters + sessions
@@ -276,6 +441,17 @@ describe('WebUiModule observer flow (e2e)', () => {
   });
 
   const base = () => `http://127.0.0.1:${port}`;
+  /** The static shell's status once it is `want`, or the last one seen when
+   *  `ms` runs out: the registry's checks come on its own timer, which a
+   *  loaded host can delay. */
+  const shellStatusBecomes = async (want: number, ms = 12_000): Promise<number> => {
+    const end = Date.now() + ms;
+    for (;;) {
+      const status = (await fetch(`${base()}/`)).status;
+      if (status === want || Date.now() >= end) return status;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  };
 
   test('no grants: static requires basic auth, unauthenticated WS upgrade 401', async () => {
     expect((await fetch(`${base()}/`)).status).toBe(401);
@@ -289,10 +465,9 @@ describe('WebUiModule observer flow (e2e)', () => {
     saveObserversFile(observersPath, {
       observers: [{ key: kp.id, label: 'e2e-device', scopes: ['health', 'ops', 'debug'] }],
     });
-    await new Promise((r) => setTimeout(r, 3600)); // registry poll is 3s
-
-    // Static app shell now public (carries no data).
-    expect((await fetch(`${base()}/`)).status).toBe(200);
+    // The registry's next check, within about 3 s, admits it, and the static
+    // app shell, which carries no data, is public from then on.
+    expect(await shellStatusBecomes(200)).toBe(200);
     // But data routes still gated — including the credential state, scoped
     // to a fleet child or not (it can carry a pending device-code login).
     expect((await fetch(`${base()}/healthz`)).status).toBe(401);
@@ -356,7 +531,7 @@ describe('WebUiModule observer flow (e2e)', () => {
     expect((await fetch(`${base()}/healthz`, { headers: { authorization: BASIC } })).status).toBe(503);
 
     ws.close();
-  }, 15_000);
+  }, 25_000);
 
   test('password sign-in mints a full-session cookie the WS upgrade honors', async () => {
     // /auth/basic with valid credentials → 302 + full-session cookie.
@@ -383,8 +558,22 @@ describe('WebUiModule observer flow (e2e)', () => {
     const host = `127.0.0.1:${port}`;
     const ws = new WebSocket(`ws://${host}/ws`);
     const closed = new Promise<number>((r) => ws.addEventListener('close', (ev) => r(ev.code)));
-    await new Promise<void>((r) => ws.addEventListener('open', () => r()));
+    // An upgrade refused (no grant active yet) closes without opening; say so
+    // rather than wait for an open that won't come.
+    const opened = await new Promise<boolean>((r) => {
+      ws.addEventListener('open', () => r(true));
+      ws.addEventListener('close', () => r(false));
+    });
+    expect(opened).toBe(true);
     ws.send(JSON.stringify({ type: 'observer-hello', identity: helloFor(stranger, host) }));
     expect(await closed).toBe(4401);
   }, 10_000);
+
+  // Last: it takes the grants away for the rest of this block.
+  test('file removed (hot-reload): the static shell needs the password again', async () => {
+    expect((await fetch(`${base()}/`)).status).toBe(200);
+    rmSync(observersPath);
+    // Two checks 3 s apart take the grants away.
+    expect(await shellStatusBecomes(401)).toBe(401);
+  }, 20_000);
 });
