@@ -14,7 +14,7 @@ import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
 import { JsStore } from '@animalabs/chronicle';
 import { WorkspaceModule, WorkspaceReadError } from '@animalabs/agent-framework';
 
-import { IdentityModule } from '../src/modules/identity-module.ts';
+import { IdentityError, IdentityModule } from '../src/modules/identity-module.ts';
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
 import { ObserversModule } from '../src/modules/observers-module.ts';
 
@@ -401,12 +401,10 @@ describe('identity module', () => {
     expect(JSON.stringify(described.data)).not.toContain('�PNG');
 
     await mod.start({
-      getModule: (name: string) => name === 'workspace' ? {
-        writeBinary: async (path: string, data: Buffer, mime: string) => {
-          saved = { path, data: Buffer.from(data), mime };
-          return { success: true, data: { path, size: data.length, mimeType: mime } };
-        },
-      } : null,
+      getModule: (name: string) => name === 'workspace' ? keepingWorkspace(async (path: string, data: Buffer, mime: string) => {
+        saved = { path, data: Buffer.from(data), mime };
+        return { success: true, data: { path, size: data.length, mimeType: mime } };
+      }) : null,
     } as any);
     const written = await mod.handleToolCall(call('request', {
       service: 'orrery', path: '/api/assets/img/file', saveAs: 'files/artifacts/candidate.png',
@@ -451,20 +449,49 @@ function expectSays(text: unknown, ...parts: string[]): void {
   for (const part of parts) expect(String(text)).toContain(part);
 }
 
+/** A workspace fake that says what mounts it has (`files` writable, `docs`
+ *  read-only), as `saveAs` is checked against them before anything is sent,
+ *  and keeps a response with the given write. */
+function keepingWorkspace(
+  writeBinary: (path: string, data: Buffer, mime: string) => Promise<unknown> = async () => ({ success: true }),
+  rest: Record<string, unknown> = {},
+) {
+  return {
+    getMounts: () => [{ name: 'files', mode: 'read-write' }, { name: 'docs', mode: 'read-only' }],
+    resolveAbsolutePath: (path: string) => (path.split('/').includes('..') ? null : `/mounts/${path}`),
+    writeBinary,
+    ...rest,
+  };
+}
+
+/** What console.error writes while `run` runs: the operator's log. */
+async function logged(run: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+  try {
+    await run();
+  } finally {
+    console.error = original;
+  }
+  return lines;
+}
+
 /**
  * An identity module registered with a fake identity service, its `/token`
  * and `/enroll` answers chosen per test, and one service, orrery, whose
- * answer the test chooses too. `seen` counts the calls that reached orrery.
+ * answer the test chooses too. `seen` counts the calls that reached orrery
+ * and keeps the bodies they carried.
  */
 function registeredModule(opts: {
   token?: () => Response;
-  enroll?: () => Response;
+  enroll?: () => Response | Promise<Response>;
   orrery?: (init?: RequestInit) => Response | Promise<Response>;
   workspace?: unknown;
   register?: boolean;
 } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'ident-'));
-  const seen = { orrery: 0 };
+  const seen = { orrery: 0, bodies: [] as Buffer[] };
   const mod = new IdentityModule({
     keyPath: join(dir, 'k.pem'),
     home: 'id.test',
@@ -472,10 +499,11 @@ function registeredModule(opts: {
     fetchImpl: (async (url: any, init?: any) => {
       const u = String(url);
       if (u.includes('/services')) return new Response(JSON.stringify({ services: {} }), { status: 200 });
-      if (u.includes('/enroll')) return opts.enroll?.() ?? new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+      if (u.includes('/enroll')) return (await opts.enroll?.()) ?? new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
       if (u.includes('/token')) return opts.token?.() ?? new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
       if (u.startsWith('https://orrery.test/')) {
         seen.orrery++;
+        if (init?.body !== undefined) seen.bodies.push(Buffer.from(init.body as Uint8Array));
         return opts.orrery?.(init) ?? new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
       }
       return new Response('{}', { status: 404 });
@@ -485,43 +513,48 @@ function registeredModule(opts: {
   return { mod, dir, seen, ready: opts.register === false ? Promise.resolve() : mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' })) };
 }
 
+const cutStream = () => new Response(new ReadableStream({ start(c) { c.error(new Error('stream cut')); } }), { status: 201 });
+
 describe('identity: what the agent reads when a call fails', () => {
   // The workspace's copy stands in for a file disk doesn't have, and a file
-  // that's on disk but can't be read there is refused: an upload never sends
-  // a copy that may differ from disk's without saying so.
+  // disk has but can't read is refused: an upload never sends a copy that
+  // may differ from disk's without saying so. Disk's and the workspace's
+  // copies differ here, so each test can tell which went.
   describe('fromFile', () => {
-    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const onDisk = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const inWorkspace = Buffer.from('the workspace\'s copy');
     // What agent-framework's readFileFromDisk throws where disk has no file.
     const notOnDisk = (errno = 'ENOENT') => new WorkspaceReadError('not_found', 'File not found: files/grid.png', 'lstat', errno);
     const workspaceFor = (disk: WorkspaceReadError | null, storeError: string | null = null) => {
       const calls = { store: 0 };
       return {
+        ...keepingWorkspace(),
         calls,
         readFileFromDisk: async () => {
           if (disk) throw disk;
-          return { bytes: png, size: png.byteLength, truncated: false };
+          return { bytes: onDisk, size: onDisk.byteLength, truncated: false };
         },
-        readBinary: async () => { calls.store++; return storeError === null ? { data: png } : { error: storeError }; },
-        writeBinary: async () => ({ success: true }),
+        readBinary: async () => { calls.store++; return storeError === null ? { data: inWorkspace } : { error: storeError }; },
       };
     };
     const upload = (mod: IdentityModule) =>
       mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile: 'files/grid.png' }));
 
     it("sends disk's copy, and says so", async () => {
-      const { mod, ready } = registeredModule({ workspace: workspaceFor(null) });
+      const { mod, ready, seen } = registeredModule({ workspace: workspaceFor(null) });
       await ready;
       expect(((await upload(mod)).data as any).sent.from).toBe('disk');
+      expect(seen.bodies).toEqual([onDisk]);
     });
 
     it("sends the workspace's copy of a file disk doesn't have, and says it was the workspace's", async () => {
-      const ws = workspaceFor(notOnDisk());
-      const { mod, ready, seen } = registeredModule({ workspace: ws });
-      await ready;
-      const res = await upload(mod);
-      expect(res.success).toBe(true);
-      expect((res.data as any).sent.from).toBe('the workspace, since disk has no file at this path');
-      expect(seen.orrery).toBe(1);
+      for (const errno of ['ENOENT', 'ENOTDIR', 'ENAMETOOLONG']) {
+        const { mod, ready, seen } = registeredModule({ workspace: workspaceFor(notOnDisk(errno)) });
+        await ready;
+        const res = await upload(mod);
+        expect((res.data as any).sent.from).toBe('the workspace, since disk has no file at this path');
+        expect(seen.bodies).toEqual([inWorkspace]);
+      }
     });
 
     it("refuses a file disk can't read, naming disk's reason, and sends nothing", async () => {
@@ -537,7 +570,23 @@ describe('identity: what the agent reads when a call fails', () => {
       expect(seen.orrery).toBe(0);
     });
 
-    // The disk read checks the size before it reads, and a file can grow in between.
+    it("says what to do about each of disk's refusals", async () => {
+      const cases: Array<[WorkspaceReadError, string]> = [
+        [new WorkspaceReadError('directory', 'Path is a directory: files/grid.png', 'lstat'), 'Name a file, not a directory.'],
+        [new WorkspaceReadError('symlink', 'Symlinks are not allowed: files/grid.png', 'lstat'), 'name the file it points to by its own path'],
+        [new WorkspaceReadError('escape', 'Symlink escape detected: files/grid.png', 'realpath'), 'your operator can put it in the workspace'],
+        [new WorkspaceReadError('changed', 'File changed during read: files/grid.png', 'stat', 'ENOENT'), 'calling again reads it afresh'],
+        [new WorkspaceReadError('mount_unavailable', 'Mount unavailable: files', 'realpath_root', 'EACCES'), 'ask your operator, giving them this reason'],
+      ];
+      for (const [refusal, remedy] of cases) {
+        const { mod, ready, seen } = registeredModule({ workspace: workspaceFor(refusal) });
+        await ready;
+        expectSays((await upload(mod)).error, 'couldn\'t be read from disk', remedy);
+        expect(seen.orrery).toBe(0);
+      }
+    });
+
+    // A file can grow after the disk read's size check, and is then read whole.
     it("holds the upload limit on what the disk read returns", async () => {
       const ws = {
         ...workspaceFor(null),
@@ -561,11 +610,9 @@ describe('identity: what the agent reads when a call fails', () => {
       );
     });
 
-    it('says which copy went whatever the response: saved with saveAs, or binary', async () => {
-      const { mod, ready } = registeredModule({
-        workspace: workspaceFor(null),
-        orrery: () => new Response(png, { status: 200, headers: { 'content-type': 'image/png' } }),
-      });
+    it('says which copy went whatever the response: saved with saveAs, binary, or empty', async () => {
+      let answer = () => new Response(onDisk, { status: 200, headers: { 'content-type': 'image/png' } });
+      const { mod, ready } = registeredModule({ workspace: workspaceFor(null), orrery: () => answer() });
       await ready;
       const saved = await mod.handleToolCall(call('request', {
         service: 'orrery', path: '/api/up', method: 'PUT', fromFile: 'files/grid.png', saveAs: 'files/thumb.png',
@@ -576,6 +623,38 @@ describe('identity: what the agent reads when a call fails', () => {
       const binary = await upload(mod);
       expect((binary.data as any).binary.contentType).toBe('image/png');
       expect((binary.data as any).sent).toMatchObject({ path: 'files/grid.png', from: 'disk' });
+      answer = () => new Response(null, { status: 204 });
+      expect((await upload(mod)).data).toMatchObject({ status: 204, body: '', sent: { path: 'files/grid.png', from: 'disk' } });
+    });
+
+    it("names the workspace's copy in a failure after an upload of it went out, and disk's copy not at all", async () => {
+      const fromWorkspace = registeredModule({ workspace: workspaceFor(notOnDisk()), orrery: cutStream });
+      await fromWorkspace.ready;
+      expectSays(
+        (await upload(fromWorkspace.mod)).error, 'was answered with status 201',
+        'The upload sent the workspace\'s copy of "files/grid.png", since disk has no file at this path.',
+        'Anything the PUT changed on the service stays changed',
+      );
+      const noReply = registeredModule({ workspace: workspaceFor(notOnDisk()), orrery: () => { throw new Error('connection reset'); } });
+      await noReply.ready;
+      expectSays((await upload(noReply.mod)).error, 'got no reply', 'The upload sent the workspace\'s copy of "files/grid.png"');
+      const fromDisk = registeredModule({ workspace: workspaceFor(null), orrery: cutStream });
+      await fromDisk.ready;
+      expect((await upload(fromDisk.mod)).error).not.toContain('workspace\'s copy');
+    });
+
+    // A failure the module doesn't expect from the read comes before anything
+    // is sent, and the agent gets what names it, never its words.
+    it("says a read that failed unexpectedly is the host's, by the error's class, before anything was sent", async () => {
+      for (const thrown of [new TypeError('/srv/host/private/path'), null]) {
+        const ws = { ...workspaceFor(null), readFileFromDisk: async () => { throw thrown; } };
+        const { mod, ready, seen } = registeredModule({ workspace: ws });
+        await ready;
+        const res = await upload(mod);
+        expectSays(res.error, 'identity--request failed before anything was sent (', 'It\'s the host\'s to fix', 'ask your operator');
+        expect(res.error).not.toContain('/srv/host');
+        expect(seen.orrery).toBe(0);
+      }
     });
   });
 
@@ -600,6 +679,18 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(seen.orrery).toBe(0);
   });
 
+  it('refuses saveAs before anything is sent where no writable mount would keep the response', async () => {
+    const { mod, ready, seen } = registeredModule({ workspace: keepingWorkspace() });
+    await ready;
+    const send = async (saveAs: string) =>
+      (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }))).error;
+    expectSays(await send('nope/out.json'), 'Nothing was sent: `saveAs` names no mount the workspace has: "nope/out.json"', 'a mount it can write to (files)');
+    expectSays(await send('files'), 'names the mount "files" but no file in it');
+    expectSays(await send('files/../../etc/out.json'), 'leads out of the mount "files"');
+    expectSays(await send('docs/out.json'), 'names the read-only mount "docs"', 'a mount it can write to (files)');
+    expect(seen.orrery).toBe(0);
+  });
+
   it('tells a request that got no reply from one whose reply came back but couldn\'t be read or saved', async () => {
     const noReply = registeredModule({ orrery: () => { throw new Error('connection reset'); } });
     await noReply.ready;
@@ -608,24 +699,35 @@ describe('identity: what the agent reads when a call fails', () => {
     const read = await noReply.mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }));
     expectSays(read.error, 'got no reply', 'a GET only reads, so it can be sent again');
 
-    const cut = registeredModule({
-      orrery: () => new Response(new ReadableStream({ start(c) { c.error(new Error('stream cut')); } }), { status: 201 }),
-    });
+    const cut = registeredModule({ orrery: cutStream });
     await cut.ready;
     const cutWrite = await cut.mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'PATCH', body: {} }));
     expectSays(
-      cutWrite.error, 'The request to "orrery" went through (status 201), but its response couldn\'t be read or kept',
+      cutWrite.error, 'The request to "orrery" was answered with status 201, but its response couldn\'t be read or kept',
       'Anything the PATCH changed on the service stays changed',
     );
 
-    const unsaved = registeredModule({ workspace: { writeBinary: async () => ({ success: false, error: 'Mount "files" is read-only' }) } });
+    const unsaved = registeredModule({
+      workspace: keepingWorkspace(async () => ({ success: false, error: 'Content exceeds max file size (5242880 bytes)' })),
+    });
     await unsaved.ready;
     const saved = await unsaved.mod.handleToolCall(call('request', {
       service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/out.json',
     }));
     expectSays(
-      saved.error, 'went through (status 200), but its response couldn\'t be saved to "files/out.json": Mount "files" is read-only.',
+      saved.error, 'was answered with status 200, but its response couldn\'t be saved to "files/out.json": Content exceeds max file size (5242880 bytes).',
       'Anything the POST changed on the service stays changed, so check before sending it again',
+    );
+  });
+
+  it("says a response over the limit wasn't kept, and that what the write changed stays changed", async () => {
+    const big = { status: 200, headers: new Headers(), arrayBuffer: async () => new ArrayBuffer(64 * 1024 * 1024 + 1) } as unknown as Response;
+    const { mod, ready } = registeredModule({ orrery: () => big });
+    await ready;
+    expectSays(
+      (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {} }))).error,
+      'was answered with status 200, but its response is 67108865 bytes, over the 67108864-byte limit, so it wasn\'t kept.',
+      'Anything the POST changed on the service stays changed',
     );
   });
 
@@ -634,7 +736,7 @@ describe('identity: what the agent reads when a call fails', () => {
   it('counts a response the workspace stored as saved when only its copy on disk failed, and says what disk lacks', async () => {
     const diskFailed = '"files/out.json" is saved in the workspace, but updating its copy on disk didn\'t complete: EACCES.';
     const { mod, ready } = registeredModule({
-      workspace: { writeBinary: async () => ({ success: false, isError: true, error: diskFailed, data: { inChronicle: true } }) },
+      workspace: keepingWorkspace(async () => ({ success: false, isError: true, error: diskFailed, data: { inChronicle: true } })),
     });
     await ready;
     const res = await mod.handleToolCall(call('request', {
@@ -644,16 +746,52 @@ describe('identity: what the agent reads when a call fails', () => {
     expect((res.data as any).saved).toMatchObject({ path: 'files/out.json', diskCopyError: diskFailed });
   });
 
-  it("words the identity service's answers by their status: retry a 429 or 5xx, and not another refusal", async () => {
-    let answer = new Response(JSON.stringify({ error: 'busy' }), { status: 503 });
-    const { mod, ready, seen } = registeredModule({ token: () => answer });
+  it("words the identity service's answers by their status: retry a 429, a 5xx or an unread 200, and not a refusal", async () => {
+    let answer = () => new Response(JSON.stringify({ error: 'busy' }), { status: 503 });
+    const { mod, ready, seen } = registeredModule({ token: () => answer() });
     await ready;
-    const busy = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }));
-    expectSays(busy.error, 'Nothing was sent to "orrery"', 'couldn\'t give access to "orrery" just now (503: busy)', 'try again shortly');
-    answer = new Response(JSON.stringify({ error: 'audience not allowed' }), { status: 403 });
-    const refused = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }));
-    expectSays(refused.error, 'refused access to "orrery" (403: audience not allowed)', 'Calling again won\'t change that', 'identity--status');
-    expect(refused.error).not.toContain('try again');
+    const ask = async () => (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }))).error;
+    expectSays(await ask(), 'Nothing was sent to "orrery"', 'couldn\'t give access to "orrery" just now (503: busy)', 'Try again shortly');
+    answer = () => new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
+    expectSays(await ask(), 'just now (429: rate limited)', 'Try again shortly');
+    answer = () => new Response('<html>', { status: 200 });
+    expectSays(await ask(), 'answered 200 for access to "orrery", but its reply couldn\'t be read', 'Try again shortly');
+    answer = () => new Response(JSON.stringify({ error: 'audience not allowed' }), { status: 403 });
+    const refused = await ask();
+    expectSays(refused, 'refused access to "orrery" (403: audience not allowed)', 'identity--status', 'ask your operator, giving them the reason');
+    expect(refused).not.toContain('Try again');
+    expect(seen.orrery).toBe(0);
+  });
+
+  // accessFor's two readers: the agent through request, and whoever runs the
+  // host through the MCPL dial's log line, which shows the error's message.
+  it("gives the agent and the operator's log each their own sentence when access can't be had", async () => {
+    let token = (): Response => { throw new Error('connect ECONNREFUSED'); };
+    const { mod, dir, ready, seen } = registeredModule({ token: () => token() });
+    await ready;
+    const ask = async () => (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }))).error;
+    expectSays(
+      await ask(), 'Nothing was sent to "orrery": the identity service at id.test couldn\'t be reached for access to "orrery" (connect ECONNREFUSED).',
+      'Try again shortly',
+    );
+    const unreachable = await mod.accessFor('orrery').catch((err: unknown) => err);
+    expect(unreachable).toBeInstanceOf(IdentityError);
+    expect((unreachable as Error).message).toBe('the identity service at id.test couldn\'t be reached for access to "orrery" (connect ECONNREFUSED)');
+    token = () => new Response(JSON.stringify({ error: 'audience not allowed' }), { status: 403 });
+    const refused = await mod.accessFor('orrery').catch((err: unknown) => err) as IdentityError;
+    expect(refused.message).toBe('the identity service at id.test refused access to "orrery" (403: audience not allowed)');
+    expectSays(refused.forAgent, 'identity--status', 'ask your operator');
+    const noAudience = await mod.accessFor().catch((err: unknown) => err) as IdentityError;
+    expectSays(noAudience.message, 'modules.identity.audience');
+    expect(noAudience.message).not.toContain('identity:');
+    // The key can't be read: the log gets its path and the error, the agent neither.
+    writeFileSync(join(dir, 'k.pem'), 'not a key at all');
+    let keyless = '';
+    const lines = await logged(async () => { keyless = String(await ask()); });
+    expectSays(keyless, 'Nothing was sent to "orrery": this host\'s identity couldn\'t be loaded', 'ask your operator', 'host\'s log');
+    expect(keyless).not.toContain(dir);
+    expect(keyless.toLowerCase()).not.toContain('key');
+    expect(lines.some((line) => line.includes(join(dir, 'k.pem')))).toBe(true);
     expect(seen.orrery).toBe(0);
   });
 
@@ -665,13 +803,48 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(seen.orrery).toBe(0);
   });
 
-  it("accept_invite: a refused name, a busy service, no reply, and a registration this host couldn't record", async () => {
+  // A record that can't be read leaves whether this host is registered
+  // unknown, and registering again would be refused if it is.
+  it("says whether this host is registered is unknown when its record can't be read, never that it isn't", async () => {
+    const { mod, dir, seen } = registeredModule({ register: false });
+    writeFileSync(join(dir, 'k.json'), '{ not json');
+    const status = await mod.handleToolCall(call('status', {}));
+    expectSays(
+      status.error, 'identity--status failed: this host\'s registration record couldn\'t be read (it isn\'t JSON)',
+      'whether this host is registered is unknown', 'ask your operator',
+    );
+    const request = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }));
+    expectSays(request.error, 'Nothing was sent to "orrery": this host\'s registration record couldn\'t be read');
+    const register = await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    expectSays(register.error, 'identity--accept_invite failed before anything was sent: this host\'s registration record couldn\'t be read');
+    for (const text of [status.error, request.error, register.error]) {
+      expect(text).not.toContain(dir);
+      expect(text).not.toContain('accept_invite with');
+    }
+    rmSync(join(dir, 'k.json'));
+    mkdirSync(join(dir, 'k.json'));
+    expectSays((await mod.handleToolCall(call('status', {}))).error, 'couldn\'t be read (EISDIR)');
+    expect(seen.orrery).toBe(0);
+  });
+
+  it('accept_invite: a refused name, a busy service, no reply or a fault of its own, and a registration this host couldn\'t record', async () => {
     let enroll = () => new Response(JSON.stringify({ error: 'name taken' }), { status: 403 });
     const { mod, dir } = registeredModule({ register: false, enroll: () => enroll() });
     const join_ = (name = 'A') => mod.handleToolCall(call('accept_invite', { invite: 'inv', name }));
-    expectSays((await join_()).error, 'Nothing was registered', 'refused it (403: name taken)', 'call identity--accept_invite again with another');
+    const refused = (await join_()).error;
+    expectSays(
+      refused, 'refused the registration (403: name taken)', 'If an earlier call got no reply or a fault of the service\'s own',
+      'don\'t try another name', 'if it refused the name, call identity--accept_invite again with another',
+    );
+    expect(refused).not.toContain('Nothing was registered');
+    enroll = () => new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
+    expectSays((await join_()).error, 'Nothing was registered', 'couldn\'t take it just now (429: rate limited)', 'Try again shortly');
+    // A fault of its own can come after the service registered the host, as a lost reply can.
     enroll = () => new Response(JSON.stringify({ error: 'internal error' }), { status: 500 });
-    expectSays((await join_()).error, 'Nothing was registered', 'couldn\'t take it just now (500: internal error)', 'Try again shortly');
+    expectSays(
+      (await join_()).error, 'answered with a fault of its own (500: internal error)', 'whether it registered this host is unknown',
+      'don\'t try another name',
+    );
     enroll = () => { throw new Error('connection reset'); };
     expectSays(
       (await join_()).error, 'gave no reply (connection reset)', 'whether it registered this host is unknown',
@@ -683,10 +856,41 @@ describe('identity: what the agent reads when a call fails', () => {
     const unrecorded = await join_();
     expectSays(
       unrecorded.error, 'registered this host as "A" (agent:a@guest), but this host couldn\'t record that (EISDIR)',
-      'Don\'t call identity--accept_invite again', 'Ask your operator',
+      'holds the registration until it restarts', 'Don\'t call identity--accept_invite again', 'Ask your operator',
     );
     expect(unrecorded.error).not.toContain(dir);
     expect(unrecorded.error).not.toContain('key');
+    // Held for this session: status shows it, access works, and registering again is refused here.
+    const status = await mod.handleToolCall(call('status', {}));
+    expect(status.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+    expectSays((status.data as any).note, 'only until it restarts', 'ask them to');
+    expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
+    expectSays((await join_('B')).error, 'Nothing changed: this host is already registered as "A"');
+  });
+
+  it("holds a registration whose reply couldn't be read, and asks the operator to record it", async () => {
+    const { mod, dir } = registeredModule({ register: false, enroll: () => new Response('<html>registered</html>', { status: 200 }) });
+    expectSays(
+      (await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error,
+      'answered that it registered this host as "A" (200), but its reply couldn\'t be read', 'holds the registration until it restarts',
+      'Don\'t call identity--accept_invite again', 'record this registration on this host by hand',
+    );
+    expect(existsSync(join(dir, 'k.json'))).toBe(false);
+    expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: null });
+    expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
+  });
+
+  it('refuses a second registration while one is under way', async () => {
+    let answer!: (res: Response) => void;
+    const { mod } = registeredModule({ register: false, enroll: () => new Promise<Response>((resolve) => { answer = resolve; }) });
+    const first = mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    expectSays(
+      (await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
+      'Nothing was sent: a registration is already under way on this host', 'identity--status',
+    );
+    answer(new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 }));
+    expect((await first).success).toBe(true);
+    expectSays((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error, 'already registered as "A"');
   });
 
   it('names what a call lacks: the service, the path as given, both of invite and name', async () => {
@@ -694,7 +898,9 @@ describe('identity: what the agent reads when a call fails', () => {
     await ready;
     expectSays((await mod.handleToolCall(call('request', { path: '/x' }))).error, 'needs `service`', 'orrery');
     expectSays((await mod.handleToolCall(call('request', { service: 'orrery', path: 'api/ops' }))).error, 'starting with "/"', 'it was "api/ops"');
-    expectSays((await mod.handleToolCall(call('accept_invite', { invite: 'x' }))).error, 'Nothing was registered', 'both `invite`', '`name`');
+    for (const lacking of [{ invite: 'x' }, { name: 'A' }]) {
+      expectSays((await mod.handleToolCall(call('accept_invite', lacking))).error, 'Nothing was registered', 'both `invite`', '`name`');
+    }
   });
 
   it('points a body over the limit at fromFile only where there is a workspace to read one from', async () => {
@@ -704,19 +910,19 @@ describe('identity: what the agent reads when a call fails', () => {
     const noWorkspace = await bare.mod.handleToolCall(call('request', { service: 'orrery', path: '/x', method: 'POST', body: big }));
     expectSays(noWorkspace.error, 'Nothing was sent: the body is', 'over the 262144-character limit');
     expect(noWorkspace.error).not.toContain('fromFile');
-    const withWs = registeredModule({ workspace: { writeBinary: async () => ({ success: true }) } });
+    const withWs = registeredModule({ workspace: keepingWorkspace() });
     await withWs.ready;
     expectSays((await withWs.mod.handleToolCall(call('request', { service: 'orrery', path: '/x', method: 'POST', body: big }))).error, '`fromFile`');
   });
 
-  // A key file that can't be read is the host's to fix, and the agent gets
-  // the error's code, not a message that can name the host's paths.
+  // A key file that can't be read is the host's to fix; the log has why, and
+  // the agent gets neither its words nor its code, which can name the key.
   it("says a failure before anything is sent is the host's, without its paths", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-'));
     writeFileSync(join(dir, 'k.pem'), 'not a key at all');
     const mod = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
     const res = await mod.handleToolCall(call('status', {}));
-    expectSays(res.error, 'identity--status failed (', 'It\'s the host\'s to fix', 'ask your operator');
+    expectSays(res.error, 'identity--status failed: this host\'s identity couldn\'t be loaded', 'It\'s the host\'s to fix', 'ask your operator');
     expect(res.error).not.toContain(dir);
   });
 
