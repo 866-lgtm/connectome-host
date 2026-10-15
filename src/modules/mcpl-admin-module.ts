@@ -50,9 +50,11 @@ import {
   overlayEntryReplaces,
   overlayEntryTombstones,
   hostVariableReferences,
+  OverlayUnreadableError,
   type AgentOverlayEntry,
   type ServerProvisions,
 } from '../mcpl-config.js';
+import { unknownToolResult } from './unknown-tool.js';
 
 export interface McplAdminModuleConfig {
   /** IANA zone propagated to newly deployed stdio servers. */
@@ -76,8 +78,39 @@ function fail(text: string): ToolResult {
   return { success: false, error: text, isError: true };
 }
 
+/** The module's name. The framework prefixes each of its tools with it, so
+ *  the agent calls `mcpl-admin--mcpl_list`, and every result names the tools
+ *  that way, so a remedy can be followed as written. */
+const MODULE_NAME = 'mcpl-admin';
+const tool = (name: string): string => `${MODULE_NAME}--${name}`;
+const LIST = tool('mcpl_list');
+const DEPLOY = tool('mcpl_deploy');
+const RESTART = tool('mcpl_restart');
+const UNLOAD = tool('mcpl_unload');
+
+/** A clause as a sentence's end: one full stop, whatever it ended with. */
+const sentence = (text: string): string => `${text.trim().replace(/\.+$/, '')}.`;
+
+/** What an error says, for the agent: an unreadable overlay in the agent's
+ *  terms (its message is the operator's, for the boot), anything else as it
+ *  says itself. */
+function reasonText(error: unknown): string {
+  if (error instanceof OverlayUnreadableError) {
+    return `your overlay file, ${error.path}, ` +
+      (error.problem === 'not-json' ? 'isn\'t valid JSON' : 'holds null, not an object with mcplServers');
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+/** What to do about an unreadable overlay, after the call `name` it stopped.
+ *  Some agents can edit the file, most can't. */
+function overlayRepair(name: string): string {
+  return `Fix it, or ask your operator to if you can't edit it, then call ${name} again. ` +
+    'Don\'t move it aside: that would load every server you unloaded and drop your deployments.';
+}
+
 export class McplAdminModule implements Module {
-  readonly name = 'mcpl-admin';
+  readonly name = MODULE_NAME;
 
   private framework: AgentFramework | null = null;
   private overlayPath: string;
@@ -137,8 +170,8 @@ export class McplAdminModule implements Module {
    */
   private skippedAdvice(id: string): string {
     return this.operatorServers.has(id)
-      ? 'redeploy with mcpl_deploy to replace it; mcpl_unload would tombstone the operator\'s definition, so it stays unloaded'
-      : 'redeploy with mcpl_deploy, or mcpl_unload it';
+      ? `redeploy with ${DEPLOY} to replace it; ${UNLOAD} would tombstone the operator's definition, so it stays unloaded`
+      : `redeploy with ${DEPLOY}, or ${UNLOAD} it`;
   }
 
   /**
@@ -149,8 +182,8 @@ export class McplAdminModule implements Module {
    */
   private tombstoneAdvice(id: string): string {
     return this.operatorServers.has(id)
-      ? 'mcpl_deploy would load your own entry in its place, and removing the tombstone from your overlay file loads the operator\'s definition again'
-      : 'redeploy with mcpl_deploy to restore it';
+      ? `${DEPLOY} would load your own entry in its place, and removing the tombstone from your overlay file loads the operator's definition again`
+      : `redeploy with ${DEPLOY} to restore it`;
   }
 
   /**
@@ -186,12 +219,15 @@ export class McplAdminModule implements Module {
         `Your overlay entry replaces the operator's definition of "${id}" and lacks its ${replacement.lost}, ` +
         'so the server runs without the operator\'s values for them.',
         literal || 'An overlay entry can\'t name host variables.',
-        `To go back to the operator's definition, mcpl_unload "${id}": that removes your entry, and the ` +
+        `To go back to the operator's definition, ${UNLOAD} "${id}": that removes your entry, and the ` +
         'operator\'s loads again at the next host start.',
       );
     } else {
       if (replacement && onDeploy) sentences.push(`Your overlay entry replaces the operator's definition of "${id}".`);
-      if (literal) sentences.push(literal);
+      if (literal) {
+        sentences.push(literal, 'If the server needs the variable\'s value, ask your operator to add the server to the recipe, ' +
+          'which fills host variables in.');
+      }
     }
     return sentences.length > 0 ? ` ${sentences.join(' ')}` : '';
   }
@@ -312,11 +348,17 @@ export class McplAdminModule implements Module {
         case 'mcpl_unload':
           return await this.forServer(input, () => this.handleUnload(input));
         default:
-          return fail(`Unknown tool: ${call.name}`);
+          return unknownToolResult(this, call.name);
       }
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      return fail(`${call.name} failed: ${err.message}`);
+      // Every step that changes something (the overlay's save, a connect, a
+      // disconnect, the unload's record) catches its own failure and says
+      // what it changed, so a throw that reaches here came before any change.
+      // A new step that changes something has to catch its own failure too,
+      // or this would say nothing changed when something did.
+      const failed = call.name === 'mcpl_list' ? 'failed' : 'failed, and nothing was changed';
+      const repair = error instanceof OverlayUnreadableError ? ` ${overlayRepair(tool(call.name))}` : '';
+      return fail(`${tool(call.name)} ${failed}: ${sentence(reasonText(error))}${repair}`);
     }
   }
 
@@ -350,8 +392,13 @@ export class McplAdminModule implements Module {
   // --------------------------------------------------------------------------
 
   private requireFramework(): AgentFramework {
+    // No framework before index.ts wires it, which is before the agent's
+    // first turn, or after stop().
     if (!this.framework) {
-      throw new Error('mcpl-admin module is not wired to the framework yet');
+      throw new Error(
+        'the MCPL admin tools aren\'t running, since this host is starting up or shutting down. ' +
+        'Try again once it\'s running; if this keeps happening, ask your operator',
+      );
     }
     return this.framework;
   }
@@ -378,7 +425,17 @@ export class McplAdminModule implements Module {
       }
     >;
     const overlay = readAgentOverlay(this.overlayPath);
-    const fileServers = readMcplServersFile(this.configPath);
+    let fileServers: ReturnType<typeof readMcplServersFile>;
+    try {
+      fileServers = readMcplServersFile(this.configPath);
+    } catch (error) {
+      // The operator's file, which the boot read at its start. Of these
+      // tools, only this listing reads it again, for each server's source.
+      return fail(
+        `${LIST} failed: the operator's server file couldn't be read (${reasonText(error)}). ` +
+        `It's theirs to fix, so ask your operator. ${DEPLOY}, ${RESTART} and ${UNLOAD} don't read it, and still work.`,
+      );
+    }
 
     const lines: string[] = [];
     for (const s of live) {
@@ -431,12 +488,12 @@ export class McplAdminModule implements Module {
           ? `${id}: TOMBSTONED in your overlay, still connected this session; the next host start leaves it unloaded — ${this.tombstoneAdvice(id)}`
           : `${id}: UNLOADED (tombstoned in your overlay — ${this.tombstoneAdvice(id)})`);
       } else if (!liveIds.has(id)) {
-        lines.push(`${id}: NOT LOADED (in your overlay but not connected — try mcpl_deploy again)`);
+        lines.push(`${id}: NOT LOADED (in your overlay but not connected — try ${DEPLOY} again)`);
       }
     }
 
     if (lines.length === 0) {
-      return ok('No MCPL servers configured. Use mcpl_deploy to add one.');
+      return ok(`No MCPL servers configured. Use ${DEPLOY} to add one.`);
     }
     return ok(`MCPL servers (${lines.length}):\n` + lines.map(l => `  ${l}`).join('\n'));
   }
@@ -444,14 +501,29 @@ export class McplAdminModule implements Module {
   private async handleDeploy(input: Record<string, unknown>): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail('mcpl_deploy requires a non-empty string `id`.');
+    if (!id) {
+      return fail(
+        `Nothing was deployed: ${DEPLOY} needs \`id\`, the server's name as text, such as "my-server", ` +
+        'in letters, digits, _ and -, since it becomes part of its tools\' names.',
+      );
+    }
     if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
-      return fail('`id` must match [a-zA-Z0-9_-]+ (it becomes part of tool names).');
+      // The id with each run of other characters as one -, as a name to copy.
+      const cleaned = id.replace(/[^a-zA-Z0-9_-]+/g, '-').replace(/^-+|-+$/g, '');
+      return fail(
+        `Nothing was deployed: the id ${JSON.stringify(id)} has characters other than letters, digits, _ and -, ` +
+        `and it becomes part of tool names. Use one such as ${JSON.stringify(cleaned && cleaned !== '__proto__' ? cleaned : 'my-server')}.`,
+      );
     }
     // The one name the pattern admits that JavaScript doesn't take as a key:
     // `overlay["__proto__"] = entry` sets the overlay's prototype, so the
     // entry would never be saved.
-    if (id === '__proto__') return fail('`id` can\'t be __proto__, which JavaScript reads as an object\'s prototype rather than a name.');
+    if (id === '__proto__') {
+      return fail(
+        'Nothing was deployed: "__proto__" can\'t be a server id, since JavaScript reads it as an object\'s prototype ' +
+        'rather than a name. Choose another id.',
+      );
+    }
 
     // Each field the caller gives is judged as given, by the strict reading
     // below, rather than dropped or coerced into shape first, so a wrong kind
@@ -475,8 +547,18 @@ export class McplAdminModule implements Module {
 
     const command = givenText(input.command) ? input.command : undefined;
     const url = givenText(input.url) ? input.url : undefined;
-    if (command === undefined && url === undefined) return fail('mcpl_deploy requires either `command` (stdio) or `url` (websocket).');
-    if (command !== undefined && url !== undefined) return fail('`command` and `url` are mutually exclusive.');
+    if (command === undefined && url === undefined) {
+      return fail(
+        'Nothing was deployed: give `command`, the executable to spawn for a stdio server, or `url`, the ws:// or ' +
+        'wss:// address of a WebSocket server. Neither was given, or both were empty.',
+      );
+    }
+    if (command !== undefined && url !== undefined) {
+      return fail(
+        'Nothing was deployed: give `command` or `url`, not both. A server is either spawned from a command (stdio) ' +
+        'or dialled at a url (WebSocket).',
+      );
+    }
 
     const fields: Record<string, unknown> = {};
     if (command !== undefined) fields.command = command;
@@ -487,8 +569,9 @@ export class McplAdminModule implements Module {
     if (typeof input.access === 'string' ? input.access.trim() !== '' : given(input.access)) {
       if (typeof input.access === 'string' && !this.identity) {
         return fail(
-          '`access` names a host-managed access grant, but this deployment has no identity ' +
-          'configured — ask your operator to enable it (recipe `identity`), or supply a `token` (over wss://, or ws:// to this machine).',
+          'Nothing was deployed: `access` names a host-managed access grant, but this host has no identity configured ' +
+          'to supply its credential. Leave `access` out, give the server\'s `token` instead (taken only over wss://, ' +
+          'or ws:// to this machine), or ask your operator to enable identity (recipe `identity`).',
         );
       }
       fields.access = typeof input.access === 'string' ? input.access.trim() : input.access;
@@ -505,7 +588,12 @@ export class McplAdminModule implements Module {
     // after saving. A new write is held to
     // the plain shapes (strict), though the boot reads older files leniently.
     const problem = overlayEntryProblem(fields, { strict: true });
-    if (problem) return fail(`mcpl_deploy refused: the entry would be malformed (${problem}), so nothing was saved.`);
+    if (problem) {
+      return fail(
+        `Nothing was deployed: the entry would be malformed (${problem}), so nothing was saved. Correct each field ` +
+        `named (or leave it out, if the server doesn't need it) and call ${DEPLOY} again.`,
+      );
+    }
     const entry = fields as AgentOverlayEntry;
 
     // A credential sent over ws:// to another machine (cleartextCredential
@@ -517,10 +605,10 @@ export class McplAdminModule implements Module {
     if (cleartext) {
       const configured = framework.listMcplServers().some(s => s.id === id);
       return fail(
-        `mcpl_deploy refused: ${cleartextCarrierText(cleartext.carrier, entry.access)} would go to ${cleartext.host} ` +
-        'over unencrypted ws://, where anyone on the network between can read it. Use a wss:// url, or, if that ' +
-        'network is private, ask your operator to add the server to the recipe. Nothing was saved.' +
-        (configured ? ` The server already configured as "${id}" is unchanged.` : ''),
+        `Nothing was deployed: ${cleartextCarrierText(cleartext.carrier, entry.access)} would go to ${cleartext.host} ` +
+        'over unencrypted ws://, where anyone on the network between can read it, so nothing was saved.' +
+        (configured ? ` The server already configured as "${id}" is unchanged.` : '') +
+        ' Use a wss:// url, or, if that network is private, ask your operator to add the server to the recipe.',
       );
     }
 
@@ -528,7 +616,14 @@ export class McplAdminModule implements Module {
     // in place so the agent can fix the server and mcpl_restart it.
     const overlay = readAgentOverlay(this.overlayPath);
     overlay[id] = entry;
-    saveAgentOverlay(this.overlayPath, overlay);
+    try {
+      saveAgentOverlay(this.overlayPath, overlay);
+    } catch (error) {
+      return fail(
+        `Nothing was deployed: your overlay couldn't be saved (${reasonText(error)}), so "${id}" wasn't connected. ` +
+        `Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your operator.`,
+      );
+    }
 
     const config = resolveOverlayEntry(id, entry, this.overlayPath) as unknown as McplServerConfig;
     // The child's env as the boot composes it for every server
@@ -545,6 +640,10 @@ export class McplAdminModule implements Module {
 
     const alreadyLoaded = framework.listMcplServers().some(s => s.id === id);
     const note = this.overlayNote(id, overlay, true);
+    // A restart reconnects with the saved entry, so a wrong command or url is
+    // corrected by deploying again, and a server rebuilt in place by a restart.
+    const remedy = `If its command, args or url is wrong, call ${DEPLOY} again with the right one; if the server ` +
+      `itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD} removes it.`;
     try {
       if (alreadyLoaded) {
         await framework.restartMcplServer(id, config);
@@ -552,11 +651,7 @@ export class McplAdminModule implements Module {
         await framework.connectMcplServer(config);
       }
     } catch (error) {
-      const err = error instanceof Error ? error : new Error(String(error));
-      return fail(
-        `Server "${id}" was saved to your overlay but failed to connect: ${err.message}. ` +
-        `Fix the server (check command/path/build) and run mcpl_restart, or mcpl_unload to remove it.${note}`,
-      );
+      return fail(`Server "${id}" was saved to your overlay, but it failed to connect: ${sentence(reasonText(error))} ${remedy}${note}`);
     }
 
     // A server with reconnect whose first dial failed comes back as a stub
@@ -564,8 +659,9 @@ export class McplAdminModule implements Module {
     const status = framework.listMcplServers().find(s => s.id === id);
     if (!status?.connected) {
       return fail(
-        `Server "${id}" was saved to your overlay but isn't connected${status?.retrying ? ' (it keeps retrying)' : ''}. ` +
-        `Fix the server (check command/path/build) and run mcpl_restart, or mcpl_unload to remove it.${note}`,
+        `Server "${id}" was saved to your overlay, but it isn't connected` +
+        `${status?.retrying ? `; it keeps retrying on its own, so it may still connect, which ${LIST} shows` : ''}. ` +
+        `${remedy}${note}`,
       );
     }
     return ok(
@@ -578,7 +674,7 @@ export class McplAdminModule implements Module {
   private async handleRestart(input: Record<string, unknown>): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail('mcpl_restart requires `id`.');
+    if (!id) return fail(`Nothing was restarted: ${RESTART} needs \`id\`, the server's id as ${LIST} shows it.`);
 
     // The note is read before the restart, so a restart that throws still
     // carries it, and an overlay file that can't be read costs only the
@@ -596,8 +692,8 @@ export class McplAdminModule implements Module {
       // reconnect with once unloaded.
       if (note && overlayEntryReplaces(Object.hasOwn(overlay, id) ? overlay[id] : undefined)) {
         note += ' That describes your overlay file as it is now. The restart reconnects with the configuration of the ' +
-          'server\'s last connect, at this host\'s start or your last mcpl_deploy of it, so a hand edit made since then ' +
-          'takes effect at the next host start, unless a later mcpl_deploy replaces it.';
+          `server's last connect, at this host's start or your last ${DEPLOY} of it, so a hand edit made since then ` +
+          `takes effect at the next host start, unless a later ${DEPLOY} replaces it.`;
       }
     } catch {
       // readAgentOverlay throws only where the boot does too: a file it
@@ -606,14 +702,31 @@ export class McplAdminModule implements Module {
       note = ' Your overlay file couldn\'t be read as an overlay, so nothing is said here about your entry, ' +
         'and the next host start will stop on it until the file is fixed.';
     }
+    // agent-framework restarts only a server it holds a configuration for,
+    // and listMcplServers lists exactly those, so this is its own test, made
+    // first so the refusal can say what is loaded.
+    const loaded = framework.listMcplServers().map((s) => s.id);
+    if (!loaded.includes(id)) {
+      return fail(
+        `Nothing was restarted: no server "${id}" is loaded in this session. ` +
+        `${loaded.length > 0 ? `Loaded: ${loaded.map((s) => `"${s}"`).join(', ')}.` : 'None is loaded.'}${note}`,
+      );
+    }
     try {
       await framework.restartMcplServer(id);
     } catch (error) {
-      return fail(`mcpl_restart failed: ${error instanceof Error ? error.message : String(error)}.${note}`);
+      return fail(
+        `The restart of "${id}" didn't complete: ${sentence(reasonText(error))} It may now be disconnected; ` +
+        `${LIST} shows its state. Once the cause is fixed, call ${RESTART} again.${note}`,
+      );
     }
     const status = framework.listMcplServers().find(s => s.id === id);
     if (!status?.connected) {
-      return fail(`Restarted server "${id}", but it isn't connected${status?.retrying ? ' (it keeps retrying)' : ''}.${note}`);
+      return fail(
+        `Restarted server "${id}", but it isn't connected${status?.retrying ? '; it keeps retrying on its own, so it may still connect' : ''}. ` +
+        `${LIST} shows its state. If it stays disconnected, fix the server (its command, path or build) and call ` +
+        `${RESTART} again, or ${UNLOAD} removes it.${note}`,
+      );
     }
     return ok(`Restarted server "${id}" — connected, ${status.toolCount} tools.${note}`);
   }
@@ -631,13 +744,19 @@ export class McplAdminModule implements Module {
   private async handleUnload(input: Record<string, unknown>): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail('mcpl_unload requires `id`.');
+    if (!id) return fail(`Nothing was unloaded: ${UNLOAD} needs \`id\`, the server's id as ${LIST} shows it.`);
     // As for mcpl_deploy: `overlay["__proto__"] = …` would set the prototype,
     // so a tombstone for it would never be saved.
-    if (id === '__proto__') return fail('`id` can\'t be __proto__, which JavaScript reads as an object\'s prototype rather than a name.');
+    if (id === '__proto__') {
+      return fail(
+        'Nothing was unloaded: your overlay can\'t record "__proto__", which JavaScript reads as an object\'s ' +
+        'prototype rather than a name, so no server by that id can be unloaded here.',
+      );
+    }
     const persist = input.persist !== false;
 
-    const known = framework.listMcplServers().some(s => s.id === id);
+    const loaded = framework.listMcplServers().map((s) => s.id);
+    const known = loaded.includes(id);
     const operator = this.operatorServers.has(id);
     // Read before anything changes: a file the boot would stop on refuses
     // the unload here, with the server still loaded. An operator's server
@@ -646,7 +765,10 @@ export class McplAdminModule implements Module {
     // disconnected it but couldn't save.
     const overlay = readAgentOverlay(this.overlayPath);
     if (!known && !operator && entryOf(overlay, id) === undefined) {
-      return fail(`Server "${id}" is not loaded and not in your overlay.`);
+      return fail(
+        `Nothing was unloaded: no server "${id}" is loaded, defined by your operator, or in your overlay. ` +
+        `${loaded.length > 0 ? `Loaded: ${loaded.map((s) => `"${s}"`).join(', ')}.` : 'None is loaded.'}`,
+      );
     }
 
     // Only a listed server is disconnected: an id the overlay alone names
@@ -657,8 +779,9 @@ export class McplAdminModule implements Module {
         await framework.disconnectMcplServer(id);
       } catch (error) {
         return fail(
-          `Server "${id}" couldn't be disconnected: ${error instanceof Error ? error.message : String(error)}. ` +
-          'It may still be loaded in this session, and this unload changed nothing in your overlay.',
+          `Server "${id}" couldn't be disconnected: ${sentence(reasonText(error))} It may still be loaded in this ` +
+          `session, and this unload changed nothing in your overlay. ${LIST} shows whether it's loaded; call ` +
+          `${UNLOAD} again to retry.`,
         );
       }
     }
@@ -693,8 +816,8 @@ export class McplAdminModule implements Module {
       return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
     } catch (error) {
       return fail(
-        `${head} But your overlay couldn't be updated (${error instanceof Error ? error.message : String(error)}), ` +
-        `so nothing was recorded: ${this.nextStart(id, overlay)} mcpl_unload "${id}" again records it once the file can be read and written.`,
+        `${head} But your overlay couldn't be updated (${reasonText(error)}), so nothing was recorded: ` +
+        `${this.nextStart(id, overlay)} ${UNLOAD} "${id}" again records it once the file can be read and written.`,
       );
     }
   }

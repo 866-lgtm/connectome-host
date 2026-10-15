@@ -203,6 +203,21 @@ export interface AgentOverlayFile {
 }
 
 /**
+ * The agent overlay can't be read as an overlay: it isn't valid JSON, or its
+ * root is `null`. Its message is the operator's, for the boot, which stops on
+ * it; the mcpl-admin tools say it to the agent from `path` and `problem`.
+ * Neither quotes the file, which can hold credentials.
+ */
+export class OverlayUnreadableError extends Error {
+  constructor(readonly path: string, readonly problem: 'not-json' | 'null-root') {
+    super(
+      `the agent overlay ${path} ${problem === 'not-json' ? 'isn\'t valid JSON' : 'isn\'t an object with mcplServers'}: ` +
+        'fix it: moving it aside would load every server the agent unloaded and drop its deployments',
+    );
+  }
+}
+
+/**
  * Read the agent overlay file: its entries by id, the root's keys other than
  * `mcplServers`, and `notes` on a file read differently from how it's
  * written, which the startup warnings log.
@@ -219,10 +234,10 @@ export interface AgentOverlayFile {
  *   with a note (main iterated a text's characters, each an entry naming
  *   nothing to run, so nothing loaded).
  *
- * A file that isn't valid JSON, or whose root is `null`, throws an error
- * naming the file, as main threw on both. The boot stops on it until the
- * file is fixed: the file carries the agent's tombstones, so reading past it
- * would load servers the agent unloaded.
+ * A file that isn't valid JSON, or whose root is `null`, throws an
+ * OverlayUnreadableError naming the file, as main threw on both. The boot
+ * stops on it until the file is fixed: the file carries the agent's
+ * tombstones, so reading past it would load servers the agent unloaded.
  * No writer produces those shapes: saveAgentOverlay writes an object root
  * whose `mcplServers` is a map. The error never quotes the file, which can
  * hold credentials.
@@ -234,16 +249,13 @@ export function readAgentOverlayFile(overlayPath: string): {
 } {
   if (!existsSync(overlayPath)) return { servers: {}, otherKeys: [], notes: [] };
   const raw = readFileSync(overlayPath, 'utf-8');
-  const fixIt = 'fix it: moving it aside would load every server the agent unloaded and drop its deployments';
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error(`the agent overlay ${overlayPath} isn't valid JSON: ${fixIt}`);
+    throw new OverlayUnreadableError(overlayPath, 'not-json');
   }
-  if (parsed === null) {
-    throw new Error(`the agent overlay ${overlayPath} isn't an object with mcplServers: ${fixIt}`);
-  }
+  if (parsed === null) throw new OverlayUnreadableError(overlayPath, 'null-root');
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { servers: {}, otherKeys: [], notes: ['has a root that isn\'t an object, so it holds no entries, as main read it'] };
   }
@@ -400,7 +412,7 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   // operator definition with one the framework fails to open.
   if (e.transport === 'websocket' && !e.url && e.command) notes.push('its transport is websocket, with no url to dial, so the framework can\'t open it');
   if (e.transport === 'stdio' && !e.command && e.url) notes.push('its transport is stdio, with no command to spawn, so the framework can\'t open it');
-  if (!e.command && !e.url) return { problem: 'it names nothing to run or dial' };
+  if (!e.command && !e.url) return { problem: 'it names no command to run and no url to dial' };
   return { entry: e as AgentOverlayEntry, notes };
 }
 
@@ -893,12 +905,20 @@ export function overlayWarnings(
 
 /**
  * Read the raw server entries from the config file (for editing).
- * Returns empty object if file doesn't exist.
+ * Returns empty object if file doesn't exist. A file that isn't valid JSON
+ * throws an error naming it, which never quotes it: JSON.parse's own message
+ * can quote the text, and the file can hold credentials.
  */
 export function readMcplServersFile(configPath: string): Record<string, ServerFileEntry> {
   if (!existsSync(configPath)) return {};
   const raw = readFileSync(configPath, 'utf-8');
-  const parsed = JSON.parse(raw) as McplServersFile;
+  let parsed: McplServersFile;
+  try {
+    parsed = JSON.parse(raw) as McplServersFile;
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new Error(`${configPath} isn't valid JSON`);
+    throw error;
+  }
   return parsed.mcplServers ?? {};
 }
 

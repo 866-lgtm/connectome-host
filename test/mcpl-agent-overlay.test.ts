@@ -12,6 +12,7 @@ import {
   readAgentOverlay,
   saveAgentOverlay,
   saveMcplServers,
+  readMcplServersFile,
   applyAgentOverlay,
   resolveOverlayEntry,
   serverProvisions,
@@ -50,6 +51,20 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
       };
       saveAgentOverlay(path, entries);
       expect(readAgentOverlay(path)).toEqual(entries);
+    });
+  });
+
+  // JSON.parse's own message names no file, and can quote the text (Bun
+  // names the token it didn't expect, V8 quotes a stretch), which can hold
+  // credentials: the operator's /mcp commands and mcpl_list showed it.
+  test("the operator's servers file that isn't JSON is named, never quoted", () => {
+    withTmp((dir) => {
+      const path = join(dir, 'mcpl-servers.json');
+      writeFileSync(path, '{ "mcplServers": { "chat": { "env": { "TOKEN": s3cret } } } }');
+      expect(() => readMcplServersFile(path)).toThrow(`${path} isn't valid JSON`);
+      try { readMcplServersFile(path); } catch (error) {
+        expect(String(error)).not.toContain('s3cret');
+      }
     });
   });
 
@@ -531,7 +546,7 @@ describe('what an overlay replacement lacks of the operator definition', () => {
   });
 
   test('an entry naming nothing is skipped, and one the framework fails to open passes on, as on main', () => {
-    expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names nothing to run or dial');
+    expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names no command to run and no url to dial');
     // The framework logs the failed connect, and main loaded these the same way.
     expect(overlayEntryProblem({ transport: 'websocket', command: 'node' })).toBeNull();
     expect(overlayEntryProblem({ transport: 'stdio', url: 'wss://w/mcpl' })).toBeNull();
@@ -569,10 +584,10 @@ describe('what an overlay replacement lacks of the operator definition', () => {
     withTmp((dir) => {
       const path = join(dir, 'mcpl-servers.agent.json');
       writeFileSync(path, JSON.stringify({ mcplServers: { shell: { toolPrefix: 'y' } } }));
-      expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names nothing to run or dial');
+      expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names no command to run and no url to dial');
       expect(applyAgentOverlay([shell], path)).toEqual([shell]);
       expect(overlayWarnings([shell], path)).toEqual([
-        `[mcpl] server "shell": the agent overlay (${path}) entry is malformed (it names nothing to run or dial), so the boot skips it and the operator's definition loads`,
+        `[mcpl] server "shell": the agent overlay (${path}) entry is malformed (it names no command to run and no url to dial), so the boot skips it and the operator's definition loads`,
       ]);
     });
   });
