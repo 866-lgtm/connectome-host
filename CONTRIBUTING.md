@@ -128,13 +128,31 @@ never do.
   (subsections emitted in `### Breaking` / `### Added` / `### Changed` /
   `### Fixed` order), deletes the consumed fragments, keeps a fresh empty
   `Unreleased` above, and refuses to release when there is nothing to
-  release; npm then commits and tags. `git push --follow-tags` triggers CI,
-  which refuses a tag with no matching changelog section, publishes
+  release; npm then commits and tags. `git push --follow-tags` triggers
+  CI, which refuses a tag with no matching changelog section, publishes
   `@animalabs/connectome-host` to npm, and creates the GitHub release with
   that section as its notes. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
-  when npm publish fails. Version bumps are a maintainer release-time
-  action, not part of feature PRs.
+  when npm publish fails. Both need the build job, so a failed build stops
+  both; past it, so do a tag with no changelog section, which neither can
+  release, and an open release hold (below), which each checks. Version
+  bumps are a maintainer release-time action, not part of feature PRs.
+- **Release holds.** When releasing `main` as it stands would harm
+  someone running it, open an issue that says what has to happen first
+  and label it `release-hold`, or ask a maintainer to label it. Close it
+  once that's happened, or if it no longer applies. When what has to
+  happen is a fix that this package itself must release, close the hold
+  once the fix is merged, then release. While one is open, `npm version`
+  stops before it bumps anything, `npm publish` refuses (bun's
+  `bun pm version` and `bun publish` run the same hooks, and stop too), and
+  the publish workflow refuses both its npm publish and its GitHub release
+  notes, each checking when it runs. The check also stops a release when it
+  can't read the holds from GitHub, and says why. Closing the hold is the
+  way past it. npm's `--ignore-scripts` skips the check, but on `npm version`
+  it skips the changelog fold too, so the tag lands without its changelog
+  section and the publish workflow's changelog check fails it. Publishing a
+  tarball made earlier with `npm pack` runs no lifecycle script, so no check
+  sees it.
 
 ## Building and testing
 
@@ -145,10 +163,14 @@ bunx tsc --noEmit   # typecheck
 bun src/index.ts    # run (generic assistant)
 ```
 
-Push-time CI (`ci.yml`) builds and tests every push and PR on ubuntu and
-macos, installing the web app with a strict lockfile (`npm ci`) — if you
-touched `web/` dependencies, regenerate the lock with `npm run relock:web`
-so it carries both platforms' native binaries.
+CI (`ci.yml`) runs on every pull request and every push to `main`, on ubuntu
+and macOS. Both install the web app with a strict lockfile (`npm ci`) and
+build it; the test suite runs on ubuntu only. If you touched `web/`
+dependencies, regenerate the npm lock with `npm run relock:web`, so it
+carries both platforms' native binaries. It resolves every web dependency
+afresh, so review the lock's diff. Then regenerate `web/bun.lock` from it:
+delete `web/bun.lock` and run `bun install --lockfile-only` in `web/`, which
+builds Bun's lock from the npm lock, so both pin the same versions.
 
 See `docs/DEV-ENVIRONMENT.md` for the full dev setup, `ARCHITECTURE.md` for
 how the host is built, and `docs/README.md` for the index of operations and

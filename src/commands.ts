@@ -22,16 +22,19 @@
  *   /newtopic      — Reset head window (auto-summarize or with user context)
  *   /export        — Export lessons to ./output/ (JSON + markdown)
  *   /usage         — Show session token usage and costs
+ *   /bug <text>    — Assemble a bug report to file on GitHub (nothing is sent)
  *   /help          — List commands
  */
 
 import { writeFileSync, mkdirSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { AgentFramework } from '@animalabs/agent-framework';
 import type { ContextManager } from '@animalabs/context-manager';
 import type { Recipe } from './recipe.js';
 import type { CredentialActionId, CredentialState } from './credential-state.js';
-import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH } from './mcpl-config.js';
+import { readMcplServersFile, saveMcplServers, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
+import { buildBugReport, composedServerConfigs, gatherBugReportFacts, runtimeMode, type LiveSetup } from './bug-report.js';
+import { parseCommand } from './command-name.js';
 import { fmtTokens } from './tui.js';
 import { formatToolClassRows, readToolClasses } from './tool-lifecycle-config.js';
 import { type FleetModule, formatChildRow } from './modules/fleet-module.js';
@@ -163,7 +166,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
   // otherwise leave an empty last token, and name-taking commands that join
   // the rest of the line would look up "name " instead of "name".
   const parts = command.slice(1).trim().split(/\s+/);
-  const cmd = parts[0]!;
+  const cmd = parseCommand(command).name;
   const args = parts.slice(1);
   const framework = app.framework;
 
@@ -218,6 +221,7 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
           { text: '  /recipe                Show current recipe info', style: 'system' },
           { text: '  /newtopic [context]    Reset head window (auto-summarize if empty)', style: 'system' },
           { text: '  /usage                 Show session token usage and costs', style: 'system' },
+          { text: '  /bug <text>            Assemble a bug report to file on GitHub: shown first, nothing sent', style: 'system' },
           { text: '  /fleet                 Show / peek / stop / restart cross-process children', style: 'system' },
           { text: '                         (subcommands: list | status [name] | view | peek <name> | stop <name> | restart <name>)', style: 'system' },
         ],
@@ -300,6 +304,9 @@ export function handleCommand(command: string, app: AppContext): CommandResult {
 
     case 'newtopic':
       return inFlightGuard(app, cmd) ?? handleNewTopic(app, args);
+
+    case 'bug':
+      return handleBug(command, app);
 
     case 'usage':
       return handleUsage(app);
@@ -606,6 +613,85 @@ function handleRecipe(app: AppContext): CommandResult {
 // ---------------------------------------------------------------------------
 // /usage — session token usage and cost breakdown
 // ---------------------------------------------------------------------------
+
+/**
+ * `/bug <text>`: assemble a report for connectome-host's public issues
+ * (bug-report.ts), show it, save it under DATA_DIR, and give the link that
+ * opens GitHub's new-issue form with it filled in. Nothing is sent: the
+ * reporter reads it in the form and submits it themselves.
+ */
+function handleBug(command: string, app: AppContext): CommandResult {
+  const text = parseCommand(command).rest.trim();
+  if (text === '') {
+    return {
+      lines: [
+        { text: 'Usage: /bug <what happened, in your own words>', style: 'system' },
+        { text: '  Assembles a report for connectome-host\'s public issues: your words, the versions, the setup', style: 'system' },
+        { text: '  as structure, and errors as kinds and code locations. It shows you the report and a link', style: 'system' },
+        { text: '  that opens it on GitHub; nothing is sent until you submit it there.', style: 'system' },
+      ],
+    };
+  }
+  const dataDir = resolve(process.env.DATA_DIR || './data');
+  // Each server's configuration as startup composes it, by the same
+  // functions; a stage that fails is named in the report, without a path.
+  const servers = composedServerConfigs(app.recipe.mcpServers, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH);
+  // The running setup: the main agent's own fields (MODEL and defaults
+  // resolve the model, settings change live) and the modules registered.
+  const framework = app.framework;
+  const agent = (app.agentName ? framework.getAgent(app.agentName) : undefined) ?? framework.getAllAgents()[0];
+  const facts = gatherBugReportFacts({
+    mode: runtimeMode(),
+    dataDir,
+    recipe: app.recipe,
+    liveServers: framework.listMcplServers(),
+    serverConfig: servers.configFor,
+    configNotes: servers.notes,
+    live: {
+      agent: agent as unknown as NonNullable<LiveSetup['agent']> | undefined,
+      modules: framework.getAllModules().map((module) => module.name),
+      // The wake gate is a framework option, on unless a recipe turns it off (index.ts).
+      wake: (app.recipe.modules as { wake?: unknown } | undefined)?.wake !== false,
+    },
+  });
+  const { full, url, cut } = buildBugReport(text, facts);
+  const path = join(dataDir, `bug-report-${facts.now.toISOString().replace(/[:.]/g, '-')}.txt`);
+  let saved: string | null = null;
+  let saveError = '';
+  try {
+    mkdirSync(dataDir, { recursive: true });
+    writeFileSync(path, `${full.title}\n\nWhat happened:\n${full.what}\n\nReport:\n${full.report}\n\nFile it here:\n${url}\n`);
+    saved = path;
+  } catch (err) {
+    saveError = err instanceof Error ? err.message : String(err);
+  }
+  const lines: Line[] = [
+    { text: '--- Bug report: nothing has been sent ---', style: 'system' },
+    { text: `Title: ${full.title}`, style: 'system' },
+    { text: 'What happened (your words):', style: 'system' },
+    ...full.what.split('\n').map((line) => ({ text: `  ${line}`, style: 'system' as const })),
+    { text: '', style: 'system' },
+    ...full.report.split('\n').map((line) => ({ text: line, style: 'system' as const })),
+    { text: '', style: 'system' },
+  ];
+  // Say only what holds: whether the file was written, and whether the
+  // link carries the whole report.
+  if (cut.length > 0) {
+    lines.push({
+      text: saved
+        ? `To fit the link, it leaves out ${cut.join(' and ')}. The saved file holds the full report.`
+        : `To fit the link, it leaves out ${cut.join(' and ')}. The file couldn't be saved, so copy the full report above into the issue.`,
+      style: 'system',
+    });
+  }
+  lines.push({
+    text: saved ? `Saved to ${saved}` : `Couldn't save it to a file (${saveError}).${cut.length > 0 ? '' : ' The link below holds the whole report.'}`,
+    style: 'system',
+  });
+  lines.push({ text: 'To file it, open this link, read the report there, and submit it on GitHub:', style: 'system' });
+  lines.push({ text: url, style: 'system' });
+  return { lines };
+}
 
 function handleUsage(app: AppContext): CommandResult {
   const snapshot = app.framework.getSessionUsage();
