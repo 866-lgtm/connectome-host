@@ -27,6 +27,7 @@
  * src/statements.ts is the source of truth — re-copy, don't fork).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
+import { lstat } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import {
   createPrivateKey,
@@ -44,6 +45,7 @@ import type {
   ToolDefinition,
   WorkspaceModule,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 
 export interface IdentityModuleConfig {
   /** ed25519 PKCS#8 PEM, generated on first use, 0600. dataDir-anchored:
@@ -123,6 +125,27 @@ function ok(data: unknown): ToolResult {
 }
 function fail(text: string): ToolResult {
   return { success: false, error: text, isError: true };
+}
+
+/** A clause as a sentence's end: one full stop, whatever it ended with. */
+const sentence = (text: string): string => `${text.trim().replace(/\.+$/, '')}.`;
+const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err));
+
+/** An answer the identity service may give differently on a later try: it's
+ *  rate limited, or the fault is its own. Any other refusal stands. Read
+ *  from the status, never from the error's words. */
+const transient = (status: number): boolean => status === 429 || status >= 500;
+
+/** A value an argument was given, quoted back short enough to read. */
+function shown(value: unknown): string {
+  if (value === undefined) return 'nothing';
+  let text: string;
+  try {
+    text = JSON.stringify(value) ?? String(value);
+  } catch {
+    text = String(value);
+  }
+  return text.length > 80 ? `${text.slice(0, 77)}...` : text;
 }
 
 export class IdentityModule implements Module {
@@ -209,10 +232,22 @@ export class IdentityModule implements Module {
         case 'request':
           return await this.request(call.input as { service?: unknown; path?: unknown; method?: unknown; body?: unknown; saveAs?: unknown });
         default:
-          return fail(`Unknown identity utility: ${call.name}`);
+          return unknownToolResult(this, call.name);
       }
     } catch (err) {
-      return fail(err instanceof Error ? err.message : String(err));
+      // request and accept_invite catch what fails once they've sent
+      // anything (the call to a service, the registration), each saying what
+      // it knows of the outcome, so a throw that reaches here came before
+      // anything was sent: a key that can't be read or made, say, or the
+      // workspace failing a read. Such an error can name a host path, so the
+      // agent gets its code where it has one, and the log the whole of it.
+      console.error(`[identity] ${call.name} failed: ${errorText(err)}`);
+      const code = (err as { code?: unknown }).code;
+      const before = call.name === 'status' ? '' : ' before anything was sent';
+      return fail(
+        `identity--${call.name} failed${before} (${typeof code === 'string' ? code : errorText(err)}). It's the host's to ` +
+        'fix, so if it keeps happening, ask your operator.',
+      );
     }
   }
 
@@ -240,23 +275,44 @@ export class IdentityModule implements Module {
    * Exchange a key-proof for a fresh aid1 token for `audience`. Called per
    * MCPL dial (connect + every reconnect) and by HTTP helpers — which is
    * what lets audience tokens be short-lived. Throws with an actionable
-   * message when unregistered or refused.
+   * message when unregistered, unreachable or refused. Its messages have two
+   * readers: the agent, through `request` and an MCPL deploy's connect
+   * failure, and whoever runs the host, through the dial's log. So they
+   * name the identity service in the sentence rather than in a prefix, and
+   * address neither reader as "you".
    */
   async accessFor(audience?: string): Promise<string> {
     const aud = audience ?? this.config.defaultAudience;
+    const home = this.config.home;
     if (!aud) throw new Error('identity: no audience named and none configured');
     if (!this.record()) {
       throw new Error(
-        `identity: not registered with ${this.config.home} — the agent needs to accept an operator invite first (utils run identity--accept_invite)`,
+        `this host isn't registered with the identity service at ${home}, so it has no access to give "${aud}". ` +
+        'Registering takes an invitation code from whoever runs this host: run identity--accept_invite through ' +
+        'utils with the code and a name',
       );
     }
     const key = this.loadOrCreateKey();
     const timestamp = new Date().toISOString();
-    const statement = `archipelago-token|v1|${this.config.home}|${aud}|${timestamp}`;
+    const statement = `archipelago-token|v1|${home}|${aud}|${timestamp}`;
     const proof = cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url');
-    const { status, json } = await this.post('/token', { id: key.id, audience: aud, timestamp, proof });
+    let reply: { status: number; json: Record<string, unknown> };
+    try {
+      reply = await this.post('/token', { id: key.id, audience: aud, timestamp, proof });
+    } catch (err) {
+      throw new Error(`the identity service at ${home} couldn't be reached for access to "${aud}" (${errorText(err)}); try again shortly`);
+    }
+    const { status, json } = reply;
     if (status !== 200 || typeof json.token !== 'string') {
-      throw new Error(`identity: ${this.config.home} refused access to "${aud}" (${status}): ${String(json.error ?? 'unknown')}`);
+      const error = String(json.error ?? 'no reason given');
+      if (transient(status)) {
+        throw new Error(`the identity service at ${home} couldn't give access to "${aud}" just now (${status}: ${error}); try again shortly`);
+      }
+      throw new Error(
+        `the identity service at ${home} refused access to "${aud}" (${status}: ${error}). Calling again won't ` +
+        'change that: identity--status shows this host\'s registration, and if this host needs that access, ' +
+        'whoever runs it is the one to ask',
+      );
     }
     return json.token;
   }
@@ -318,11 +374,11 @@ export class IdentityModule implements Module {
             id: rec.sub,
             recognizedBy: rec.home,
             since: rec.enrolledAt,
-            note: 'Access to services is handled by the host automatically (e.g. mcpl_deploy with an `access` name).',
+            note: 'Access to services is handled by the host automatically (e.g. mcpl-admin--mcpl_deploy with an `access` name).',
           }
         : {
             registeredAs: null,
-            note: `Not registered with ${this.config.home} yet — ask your operator for an invitation code, then use accept_invite.`,
+            note: `Not registered with ${this.config.home} yet: ask your operator for an invitation code, then run identity--accept_invite through utils with it.`,
           },
     );
   }
@@ -383,7 +439,9 @@ export class IdentityModule implements Module {
   /** The agent-facing HTTP seam for non-MCPL services (Orrery et al.): the
    *  host resolves the base URL from the directory, fetches fresh access,
    *  attaches it, and returns only {status, body}. The credential exists
-   *  for the duration of one fetch, outside model context. */
+   *  for the duration of one fetch, outside model context. Every refusal
+   *  before the fetch says nothing was sent; once the request may have gone
+   *  out, each failure says what is known of its outcome. */
   private async request(input: {
     service?: unknown;
     path?: unknown;
@@ -405,74 +463,86 @@ export class IdentityModule implements Module {
       base = services[service];
     }
     if (!base) {
-      return fail(`Unknown service "${service}". Available: ${Object.keys(services).join(', ')}`);
+      // The layered directory always holds the built-in services, so the
+      // list is never empty.
+      const known = Object.keys(services).join(', ');
+      return fail(service
+        ? `Nothing was sent: there's no service "${service}" here. The services are ${known}.`
+        : `Nothing was sent: identity--request needs \`service\`, the name of one of the services: ${known}.`);
     }
     if (typeof input.path !== 'string' || !input.path.startsWith('/')) {
-      return fail('`path` must be a string starting with "/"');
+      return fail(
+        'Nothing was sent: `path` must be text starting with "/", the part of the address after the service\'s, ' +
+        `such as "/api/ops"; it was ${shown(input.path)}.`,
+      );
     }
     const method = typeof input.method === 'string' ? input.method.toUpperCase() : 'GET';
-    if (!(REQUEST_METHODS as readonly string[]).includes(method)) return fail(`unsupported method ${method}`);
+    if (!(REQUEST_METHODS as readonly string[]).includes(method)) {
+      return fail(
+        `Nothing was sent: method "${method}" isn't one this utility sends. Use ${REQUEST_METHODS.slice(0, -1).join(', ')} ` +
+        `or ${REQUEST_METHODS[REQUEST_METHODS.length - 1]}.`,
+      );
+    }
     // A body or an upload with GET would be dropped while the call reports
     // success, and `method` defaults to GET, so a write that forgot its verb
     // would silently read instead. Refuse it, naming the verbs that carry one.
     const carrying = REQUEST_METHODS.filter((m) => m !== 'GET').join(', ');
+    const isGet = `the method is GET${typeof input.method === 'string' ? '' : ' by default'}`;
     if (method === 'GET' && input.body !== undefined) {
-      return fail(`\`body\` needs a method that sends one (${carrying}); method is GET${typeof input.method === 'string' ? '' : ' by default'}`);
+      return fail(
+        `Nothing was sent: \`body\` needs a method that sends one (${carrying}), and ${isGet}. Pass one of those as ` +
+        '`method`, or leave `body` out to read.',
+      );
     }
+    const workspace = this.ctx?.getModule<WorkspaceModule>('workspace');
     let bodyStr: string | undefined;
     if (input.body !== undefined) {
       bodyStr = typeof input.body === 'string' ? input.body : JSON.stringify(input.body);
-      if (bodyStr.length > REQUEST_BODY_MAX) return fail(`body too large (${bodyStr.length} > ${REQUEST_BODY_MAX})`);
+      if (bodyStr.length > REQUEST_BODY_MAX) {
+        return fail(
+          `Nothing was sent: the body is ${bodyStr.length} characters, over the ${REQUEST_BODY_MAX}-character limit for \`body\`.` +
+          (workspace
+            ? ' To send more, write it to a workspace file and pass that file\'s path as `fromFile` instead, which takes up to 64 MiB.'
+            : ''),
+        );
+      }
+    }
+    // saveAs writes the response to the workspace, so without one the
+    // request isn't sent: a write would otherwise go out with its answer lost.
+    const saveAs = typeof input.saveAs === 'string' && input.saveAs.length > 0 ? input.saveAs : undefined;
+    if (saveAs !== undefined && !workspace) {
+      return fail(
+        'Nothing was sent: `saveAs` writes the response to the workspace, and this host has no workspace. Leave ' +
+        '`saveAs` out to have a text response returned to you, or ask your operator to enable the workspace.',
+      );
     }
 
     // Uploads: the agent names a workspace file, the host sends its bytes. The
     // mirror of saveAs — a file too big to write into a turn is exactly the
     // case that needs this, so the bytes never enter model context, and the
     // small JSON body cap does not apply to them.
-    let upload: { bytes: Buffer; contentType: string; path: string } | undefined;
+    let upload: { bytes: Buffer; contentType: string; path: string; from: string } | undefined;
     if (typeof input.fromFile === 'string' && input.fromFile.length > 0) {
-      if (bodyStr !== undefined) return fail('pass either `body` or `fromFile`, not both');
+      if (bodyStr !== undefined) return fail('Nothing was sent: pass `body` or `fromFile`, not both.');
       if (method === 'GET') {
-        return fail(`\`fromFile\` needs a method that sends a body (${carrying}); method is GET${typeof input.method === 'string' ? '' : ' by default'}`);
+        return fail(`Nothing was sent: \`fromFile\` needs a method that sends a body (${carrying}), and ${isGet}. Pass one of those as \`method\`.`);
       }
-      const workspace = this.ctx?.getModule<WorkspaceModule>('workspace');
-      if (!workspace) return fail('identity request: workspace module is not available for fromFile');
-      // Disk first, store second. An upload is egress: reading it through the
-      // append-only store would retain every byte forever and refuse anything
-      // binary or over the mount's maxFileSize — which is most media. Disk
-      // has neither problem. The store remains the fallback for a file the
-      // resident wrote through the workspace and never materialized.
-      const diskRead = (workspace as WorkspaceModule & {
-        readBinaryFromDisk?: (
-          path: string,
-          opts?: { maxBytes?: number },
-        ) => Promise<{ data: Buffer; absolutePath: string } | { error: string }>;
-      }).readBinaryFromDisk;
-      const fromDisk = diskRead
-        ? await diskRead.call(workspace, input.fromFile, { maxBytes: UPLOAD_BODY_MAX })
-        : { error: 'this host has no disk read path' };
-      let bytes: Buffer;
-      if (!('error' in fromDisk)) {
-        bytes = fromDisk.data;
-      } else {
-        const fromStore = await workspace.readBinary(input.fromFile);
-        if ('error' in fromStore) {
-          return fail(
-            `identity request: could not read ${input.fromFile}: ${fromDisk.error}; ${fromStore.error}`,
-          );
-        }
-        bytes = fromStore.data;
+      if (!workspace) {
+        return fail(
+          'Nothing was sent: `fromFile` reads a workspace file, and this host has no workspace, so it can\'t be used ' +
+          'here. Send JSON content as `body` instead; a binary file can\'t be uploaded from this host.',
+        );
       }
-      if (bytes.byteLength > UPLOAD_BODY_MAX) {
-        return fail(`file too large (${bytes.byteLength} > ${UPLOAD_BODY_MAX})`);
-      }
+      const read = await this.readUpload(workspace, input.fromFile, service);
+      if ('refusal' in read) return fail(read.refusal);
       upload = {
-        bytes,
+        bytes: read.bytes,
         contentType:
           typeof input.contentType === 'string' && input.contentType
             ? input.contentType
             : guessContentType(input.fromFile),
         path: input.fromFile,
+        from: read.from,
       };
     }
 
@@ -480,11 +550,12 @@ export class IdentityModule implements Module {
     try {
       access = await this.accessFor(service); // service name == audience name
     } catch (err) {
-      return fail(err instanceof Error ? err.message : String(err));
+      return fail(`Nothing was sent to "${service}": ${sentence(errorText(err))}`);
     }
     const f = this.config.fetchImpl ?? fetch;
+    let res: Response;
     try {
-      const res = await f(`${base}${input.path}`, {
+      res = await f(`${base}${input.path}`, {
         method,
         headers: {
           authorization: `Bearer ${access}`,
@@ -495,22 +566,50 @@ export class IdentityModule implements Module {
         // Uint8Array view, not the Buffer itself: Buffer is not a BodyInit.
         ...(upload ? { body: new Uint8Array(upload.bytes) } : {}),
       });
+    } catch (err) {
+      // No reply, so whether the request reached the service is unknown.
+      return fail(
+        `The request to "${service}" got no reply: ${sentence(errorText(err))} Whether it reached the service is ` +
+        (method === 'GET' ? 'unknown; a GET only reads, so it can be sent again.' : `unknown, so check whether the ${method} took effect before sending it again.`),
+      );
+    }
+    // From here the request went through, with this status: only reading or
+    // keeping its response can fail, and what it changed stays changed.
+    const wentThrough = `The request to "${service}" went through (status ${res.status})`;
+    const changed = method === 'GET'
+      ? ''
+      : ` Anything the ${method} changed on the service stays changed, so check before sending it again.`;
+    // A receipt for what left the house, so an upload is verifiable from the
+    // turn that made it without re-reading the file, and says which copy of
+    // the file went. Every success of an upload carries it.
+    const sent = upload
+      ? { sent: { path: upload.path, size: upload.bytes.byteLength, contentType: upload.contentType, from: upload.from } }
+      : {};
+    try {
       const bytes = Buffer.from(await res.arrayBuffer());
       if (bytes.byteLength > RESPONSE_BODY_MAX) {
-        return fail(`response too large (${bytes.byteLength} > ${RESPONSE_BODY_MAX})`);
+        return fail(`${wentThrough}, but its response is ${bytes.byteLength} bytes, over the ${RESPONSE_BODY_MAX}-byte limit, so it wasn't kept.${changed}`);
       }
       const declaredType = res.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase() || '';
       const contentType = declaredType || 'application/octet-stream';
       const sha256 = createHash('sha256').update(bytes).digest('hex');
 
-      if (typeof input.saveAs === 'string' && input.saveAs.length > 0) {
-        const workspace = this.ctx?.getModule<WorkspaceModule>('workspace');
-        if (!workspace) return fail('identity request: workspace module is not available for saveAs');
-        const written = await workspace.writeBinary(input.saveAs, bytes, contentType);
-        if (!written.success) return fail(`identity request: could not save response: ${written.error ?? 'unknown'}`);
+      if (saveAs !== undefined && workspace) {
+        const written = await workspace.writeBinary(saveAs, bytes, contentType);
+        // A file the workspace stored, with only its copy on disk failed, is
+        // saved: the workspace's tools read it from the store. The receipt
+        // says what disk lacks, as agent-framework's save_recent_image does.
+        const stored = written.success || (written.data as { inChronicle?: boolean } | undefined)?.inChronicle === true;
+        if (!stored) {
+          return fail(`${wentThrough}, but its response couldn't be saved to "${saveAs}": ${sentence(written.error ?? 'no reason given')}${changed}`);
+        }
         return ok({
           status: res.status,
-          saved: { path: input.saveAs, size: bytes.byteLength, contentType, sha256 },
+          saved: {
+            path: saveAs, size: bytes.byteLength, contentType, sha256,
+            ...(written.success ? {} : { diskCopyError: written.error ?? 'its copy on disk failed' }),
+          },
+          ...sent,
         });
       }
 
@@ -535,13 +634,7 @@ export class IdentityModule implements Module {
       // An empty body (a 204, or an empty 200) is an empty success, not an
       // omitted binary: advising a repeat with saveAs would re-send a write.
       if (bytes.byteLength === 0) {
-        return ok({
-          status: res.status,
-          body: '',
-          ...(upload
-            ? { sent: { path: upload.path, size: upload.bytes.byteLength, contentType: upload.contentType } }
-            : {}),
-        });
+        return ok({ status: res.status, body: '', ...sent });
       }
       if (!textual) {
         return ok({
@@ -549,8 +642,14 @@ export class IdentityModule implements Module {
           body: null,
           binary: {
             size: bytes.byteLength, contentType, sha256,
-            note: 'Binary response omitted from text context; repeat the request with saveAs to write it byte-exactly to a workspace mount.',
+            // Only a GET can be sent again to fetch what it answered: any
+            // other method would repeat what it did.
+            note: method === 'GET'
+              ? 'Binary response omitted from text context; repeat the request with saveAs to write it byte-exactly to a workspace mount.'
+              : `Binary response omitted from text context, and not kept: sending this ${method} again with \`saveAs\` would ` +
+                'repeat it. When you need a write\'s binary response, pass `saveAs` with the write itself.',
           },
+          ...sent,
         });
       }
 
@@ -559,43 +658,148 @@ export class IdentityModule implements Module {
       if (raw.length > RESPONSE_INLINE_MAX) {
         body = `${raw.slice(0, RESPONSE_INLINE_MAX)}… [truncated ${raw.length - RESPONSE_INLINE_MAX} chars]`;
       }
-      return ok({
-        status: res.status,
-        body,
-        // A receipt for what left the house, so an upload is verifiable from
-        // the turn that made it without re-reading the file.
-        ...(upload
-          ? { sent: { path: upload.path, size: upload.bytes.byteLength, contentType: upload.contentType } }
-          : {}),
-      });
+      return ok({ status: res.status, body, ...sent });
     } catch (err) {
-      return fail(`${service} request failed: ${err instanceof Error ? err.message : String(err)}`);
+      return fail(`${wentThrough}, but its response couldn't be read or kept: ${sentence(errorText(err))}${changed}`);
+    }
+  }
+
+  /**
+   * The bytes `fromFile` names, for an upload. Disk first, store second. An
+   * upload is egress: reading it through the append-only store would retain
+   * every byte forever and refuse anything binary or over the mount's
+   * maxFileSize, which is most media; disk has neither problem. The store's
+   * copy stands in only for a file disk doesn't have: one the resident wrote
+   * through the workspace and never materialized, or one whose mount's
+   * directory is gone. A file that's on disk but can't be read from there
+   * (over the cap, unreadable, a directory) is refused, since the store's
+   * copy can differ from it, and an upload never sends a different file
+   * than the one the agent named without saying so: `from` says which went.
+   */
+  private async readUpload(
+    workspace: WorkspaceModule,
+    path: string,
+    service: string,
+  ): Promise<{ bytes: Buffer; from: string } | { refusal: string }> {
+    const fromDisk = await workspace.readBinaryFromDisk(path, { maxBytes: UPLOAD_BODY_MAX });
+    if (!('error' in fromDisk)) {
+      // The disk read checks its size before reading, and a file can grow
+      // in between, so the bound is held here too.
+      if (fromDisk.data.byteLength > UPLOAD_BODY_MAX) {
+        return {
+          refusal: `Nothing was sent to "${service}": "${path}" is ${fromDisk.data.byteLength} bytes, over the ` +
+            `${UPLOAD_BODY_MAX}-byte upload limit.`,
+        };
+      }
+      return { bytes: fromDisk.data, from: 'disk' };
+    }
+    if (await this.diskHolds(workspace, path)) {
+      return {
+        refusal: `Nothing was sent to "${service}": "${path}" is on disk but couldn't be read from there, and the ` +
+          `workspace's copy wasn't sent in its place, since it can differ from disk's. On disk: ${sentence(fromDisk.error)}`,
+      };
+    }
+    const fromStore = await workspace.readBinary(path);
+    if ('error' in fromStore) {
+      // The same reason from both reads, such as an unknown mount, is said once.
+      const reasons = fromDisk.error === fromStore.error
+        ? sentence(fromStore.error)
+        : `On disk: ${sentence(fromDisk.error)} In the workspace: ${sentence(fromStore.error)}`;
+      return { refusal: `Nothing was sent to "${service}": "${path}" couldn't be read. ${reasons}` };
+    }
+    if (fromStore.data.byteLength > UPLOAD_BODY_MAX) {
+      return {
+        refusal: `Nothing was sent to "${service}": the workspace's copy of "${path}" is ${fromStore.data.byteLength} bytes, ` +
+          `over the ${UPLOAD_BODY_MAX}-byte upload limit.`,
+      };
+    }
+    return { bytes: fromStore.data, from: 'the workspace, since disk has no file at this path' };
+  }
+
+  /** Whether anything is at a workspace path on disk, read without following
+   *  a link: nothing is there when the path can't be resolved to a mount, or
+   *  lstat finds no entry (ENOENT, or ENOTDIR for a parent that's a file).
+   *  A mount whose directory is gone holds nothing. Any other answer, an
+   *  unreadable parent included, counts as something there. */
+  private async diskHolds(workspace: WorkspaceModule, path: string): Promise<boolean> {
+    const absolute = workspace.resolveAbsolutePath(path);
+    if (absolute === null) return false;
+    try {
+      await lstat(absolute);
+      return true;
+    } catch (err) {
+      const code = (err as { code?: unknown }).code;
+      return code !== 'ENOENT' && code !== 'ENOTDIR';
     }
   }
 
   private async acceptInvite(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {
     if (typeof input.invite !== 'string' || typeof input.name !== 'string') {
-      return fail('accept_invite needs { invite, name }');
+      return fail(
+        'Nothing was registered: identity--accept_invite needs both `invite`, the invitation code from your operator, ' +
+        'and `name`, the name to register as, each as text.',
+      );
     }
     const existing = this.record();
     if (existing) {
-      return fail(`Already registered as "${existing.name}" (${existing.sub}) — registration is one-time.`);
+      return fail(
+        `Nothing changed: this host is already registered as "${existing.name}" (${existing.sub}), and registration ` +
+        'happens once. identity--status shows it.',
+      );
     }
+    const home = this.config.home;
     const key = this.loadOrCreateKey();
     const timestamp = new Date().toISOString();
-    const statement = `archipelago-enroll|v1|${this.config.home}|${input.invite}|${timestamp}`;
+    const statement = `archipelago-enroll|v1|${home}|${input.invite}|${timestamp}`;
     const proof = cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url');
-    const { status, json } = await this.post('/enroll', {
-      invite: input.invite,
-      id: key.id,
-      name: input.name,
-      timestamp,
-      proof,
-    });
-    if (status !== 200 || typeof json.sub !== 'string') {
-      return fail(`Registration refused (${status}): ${String(json.error ?? 'unknown')}`);
+    let reply: { status: number; json: Record<string, unknown> };
+    try {
+      reply = await this.post('/enroll', {
+        invite: input.invite,
+        id: key.id,
+        name: input.name,
+        timestamp,
+        proof,
+      });
+    } catch (err) {
+      // The registration may have reached the service before the reply was
+      // lost, and then the service holds it while this host has no record.
+      // A retry is then refused for its invite or its name, which /enroll
+      // checks before the key, so no one refusal marks that case.
+      return fail(
+        `The identity service at ${home} gave no reply (${errorText(err)}), so whether it registered this host is ` +
+        'unknown. Call identity--accept_invite again shortly with the same code and name. If that\'s refused, the ' +
+        'first call may have registered this host without this host recording it, so don\'t try another name: ask ' +
+        'your operator to check whether the identity service holds this registration, and if it does, to record it ' +
+        'on this host by hand.',
+      );
     }
-    this.saveRecord({ sub: json.sub, name: input.name, home: this.config.home, enrolledAt: timestamp });
+    const { status, json } = reply;
+    if (status !== 200 || typeof json.sub !== 'string') {
+      const error = String(json.error ?? 'no reason given');
+      if (transient(status)) {
+        return fail(`Nothing was registered: the identity service at ${home} couldn't take it just now (${status}: ${error}). Try again shortly.`);
+      }
+      return fail(
+        `Nothing was registered: the identity service at ${home} refused it (${status}: ${error}). If it refused the ` +
+        'name, call identity--accept_invite again with another; otherwise ask your operator, for a new invitation ' +
+        'code, say.',
+      );
+    }
+    try {
+      this.saveRecord({ sub: json.sub, name: input.name, home, enrolledAt: timestamp });
+    } catch (err) {
+      // The operator gets the whole error, path included; the agent the
+      // error's code, which names no path.
+      console.error(`[identity] ${home} registered ${json.sub}, but its record couldn't be saved to ${this.recordPath}: ${errorText(err)}`);
+      const code = (err as { code?: unknown }).code;
+      return fail(
+        `The identity service at ${home} registered this host as "${input.name}" (${json.sub}), but this host ` +
+        `couldn't record that${typeof code === 'string' ? ` (${code})` : ''}, so it doesn't know it's registered and can't get access yet. ` +
+        'Don\'t call identity--accept_invite again: the service would refuse it, since this host is already enrolled. Ask your ' +
+        'operator to fix what stopped the write and to record this registration by hand.',
+      );
+    }
     // Note what is NOT returned: the first token the home node minted. The
     // host fetches its own, fresh, per use — the agent never holds one.
     return ok({
