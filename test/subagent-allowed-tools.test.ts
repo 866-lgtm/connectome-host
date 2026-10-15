@@ -7,6 +7,7 @@ import type { Agent, Module, ToolCall } from '@animalabs/agent-framework';
 import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import { SubagentModule } from '../src/modules/subagent-module.js';
 
+const probeUtilityNames = ['allowed_util', 'denied_util'];
 const restricted = ['subagent--spawn', 'subagent--fork', 'probe--allowed'];
 
 async function harness(allowedTools: 'all' | string[] = restricted, maxDepth = 3, maxRetries = 0, defaultMaxTokens?: number) {
@@ -15,6 +16,7 @@ async function harness(allowedTools: 'all' | string[] = restricted, maxDepth = 3
   const probe = {
     name: 'probe', start: async () => {}, stop: async () => {},
     getTools: () => ['allowed', 'denied'].map(name => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })),
+    getUtilities: () => probeUtilityNames.map(name => ({ name, description: name, inputSchema: { type: 'object', properties: {} } })),
     handleToolCall: async () => ({ success: true, data: 'inert' }),
   } as unknown as Module;
   const framework = await AgentFramework.create({
@@ -338,7 +340,7 @@ describe('subagent allowed-tools inheritance', () => {
 // This is the public read-only catalogue contract added by Framework #220.
 // Inject that contract so this Host suite also runs with published older releases.
 describe('maximum-depth utility permissions', () => {
-  const utilityNames = ['probe--allowed_util', 'probe--denied_util'];
+  const utilityNames = probeUtilityNames.map(name => `probe--${name}`);
   const surface = (framework: AgentFramework, utilities = true) => {
     const catalogue = utilityNames.map(name => ({name, description: 'Inert utility', inputSchema: {type:'object',properties:{}}}));
     Object.assign(framework, { getAllUtilities: utilities ? () => catalogue : undefined });
@@ -354,8 +356,10 @@ describe('maximum-depth utility permissions', () => {
       const h = await harness(parent,1);
       try {
         surface(h.framework);
+        expect(h.framework.getAllTools().some(tool => tool.name === 'utils')).toBe(true);
         expect((await h.call('spawn',requested)).success).toBe(true);
         const child=h.captured[0];
+        expect(child.canUseTool('utils')).toBe(true);
         for(const name of utilityNames) expect(child.canUseTool(name)).toBe(expected.includes(name));
         expect(child.canUseTool('subagent--spawn')).toBe(false);
         expect(child.canUseTool('subagent--return')).toBe(true);
@@ -367,7 +371,10 @@ describe('maximum-depth utility permissions', () => {
     try {
       surface(h.framework,false);
       expect((await h.call('spawn')).success).toBe(true);
+      expect(h.framework.getAllTools().some(tool => tool.name === 'utils')).toBe(true);
       expect(h.captured[0].canUseTool('probe--allowed')).toBe(true);
+      expect(h.captured[0].canUseTool('utils')).toBe(true);
+      for (const name of utilityNames) expect(h.captured[0].canUseTool(name)).toBe(false);
       expect(h.captured[0].canUseTool('subagent--spawn')).toBe(false);
       expect(h.captured[0].canUseTool('subagent--return')).toBe(true);
     } finally { await h.cleanup(); }

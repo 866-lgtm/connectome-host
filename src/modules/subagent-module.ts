@@ -1487,6 +1487,8 @@ export class SubagentModule implements Module {
     return {
       parentAgent,
       allowedTools: this.filterToolNames(requestedTools, callerDepth, parentAgent),
+      // Agent defaults to 'locus'. Inherit a resolved caller's mode so children
+      // of a 'disabled' caller cannot leak prose into its live channel.
       proseRouting: parentAgent?.proseRouting,
       maxTokens: this.resolveMaxTokens(maxTokens, callerAgentName),
       forkSystemPrompt: parentAgent?.systemPrompt ?? 'You are a research assistant.',
