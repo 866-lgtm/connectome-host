@@ -1,14 +1,17 @@
 /**
  * Standard-recipe memory defaults (buildFrameworkStrategy).
  *
- * A recipe that omits strategy tuning must get the fleet-standard shape:
- * autobiographical + adaptiveResolution + kv-stable folding + same-model
- * compression + summaries voiced as the agent itself. Explicit recipe values
- * always win. DEFAULT_RECIPE must not enable the opt-in modules
- * (subagents/lessons/retrieval).
+ * A recipe that omits strategy tuning must get the standard shape:
+ * autobiographical + adaptiveResolution + kv-unified folding with the standard
+ * block (cache prices matched to provider / cacheTtl / model) + a tail of 40%
+ * of the budget + same-model compression + summaries voiced as the agent
+ * itself. Explicit recipe values always win. DEFAULT_RECIPE leaves all of it
+ * to these defaults, has an empty system prompt, and must not enable the
+ * opt-in modules (subagents/lessons/retrieval).
  */
 import { describe, expect, test } from 'bun:test';
-import { buildFrameworkStrategy } from '../src/framework-strategy.js';
+import { buildFrameworkStrategy, standardKvUnifiedConfig } from '../src/framework-strategy.js';
+import { buildFrameworkAgentConfig } from '../src/framework-agent-config.js';
 import { DEFAULT_RECIPE, validateRecipe } from '../src/recipe.js';
 
 function recipe(agent: Record<string, unknown> = {}) {
@@ -26,20 +29,91 @@ function configView(strategy: object): Record<string, unknown> {
 }
 
 describe('standard-recipe memory defaults', () => {
-  test('omitted strategy gets kv-stable folding, same-model compression, and agent-voiced summaries', () => {
-    const strategy = buildFrameworkStrategy(
-      recipe({ name: 'Mira' }),
-      'some-model',
-      'America/Los_Angeles',
-    );
+  test('omitted strategy gets kv-unified with the standard block, a 120k tail, same-model compression, and agent-voiced summaries', () => {
+    const r = recipe({ name: 'Mira' });
+    const strategy = buildFrameworkStrategy(r, 'some-model', 'America/Los_Angeles');
     const config = configView(strategy);
     expect(config.adaptiveResolution).toBe(true);
-    expect(config.foldingStrategy).toBe('kv-stable');
+    expect(config.foldingStrategy).toBe('kv-unified');
+    expect(config.kvUnified).toEqual(standardKvUnifiedConfig(r, 'some-model'));
+    expect(config.recentWindowTokens).toBe(120_000);
     expect(config.compressionModel).toBe('some-model');
     expect(config.summaryParticipant).toBe('Mira');
   });
 
-  test('frontdesk gets adaptive + kv-stable too (2026-08-03 clerk outage: hierarchical saturates)', () => {
+  test('the standard block prices the cache as the provider bills it', () => {
+    const prices = (agent: Record<string, unknown>, model: string) => {
+      const block = standardKvUnifiedConfig(recipe(agent), model);
+      return [block.policy.cacheReadPrice, block.policy.cacheWritePrice];
+    };
+    // 1-hour cache (the default TTL): writes 2x; reads by model
+    expect(prices({}, 'claude-opus-4-6')).toEqual([0.1, 2]);
+    expect(prices({}, 'claude-opus-5-5')).toEqual([0.05, 2]);
+    expect(prices({}, 'claude-fable-5-1')).toEqual([0.025, 2]);
+    expect(prices({ cacheTtl: '5m' }, 'claude-opus-4-6')).toEqual([0.1, 1.25]);
+    // Bedrock has only the 5-minute cache, whatever the recipe asks for
+    expect(prices({ provider: 'bedrock', cacheTtl: '1h' }, 'global.anthropic.claude-opus-4-6')).toEqual([0.1, 1.25]);
+    // OpenAI: no write premium
+    expect(prices({ provider: 'openai-codex' }, 'gpt-5.6-sol')).toEqual([0.1, 1]);
+    expect(prices({ provider: 'openai-responses' }, 'gpt-6')).toEqual([0.1, 1]);
+  });
+
+  test('the standard block is otherwise the production policy', () => {
+    const block = standardKvUnifiedConfig(recipe(), 'claude-opus-4-6');
+    expect(block).toMatchObject({
+      policy: { alpha: 0.7, budgetLowRatio: 0.6, budgetHighRatio: 0.85, cacheScale: 100_000, continuityScale: 100_000 },
+      tokenBucketSize: 50_000,
+      continuityBucketSize: 50_000,
+      fidelityBucketSize: 100_000,
+      labelCeiling: 100_000,
+      adoptEpsilon: 3_000,
+      treeifyNonContiguousSummaries: false,
+      preserveGapBearingSummaries: false,
+      hysteresisCertificate: true,
+    });
+  });
+
+  test('explicit kv-unified without a block gets the standard block; a written block passes through whole', () => {
+    const r = recipe({ name: 'Mira', strategy: { type: 'autobiographical', foldingStrategy: 'kv-unified' } });
+    expect(configView(buildFrameworkStrategy(r, 'claude-opus-5-5', 'UTC')).kvUnified)
+      .toEqual(standardKvUnifiedConfig(r, 'claude-opus-5-5'));
+    const own = { ...standardKvUnifiedConfig(r, 'claude-opus-5-5'), adoptEpsilon: 1_234 };
+    const pinned = recipe({ name: 'Mira', strategy: { type: 'autobiographical', kvUnified: own } });
+    const config = configView(buildFrameworkStrategy(pinned, 'claude-opus-5-5', 'UTC'));
+    expect(config.foldingStrategy).toBe('kv-unified');
+    expect(config.kvUnified).toEqual(own);
+  });
+
+  test('a pinned kv-stable resident stays on kv-stable with no kvUnified block', () => {
+    const config = configView(buildFrameworkStrategy(
+      recipe({ name: 'Mira', strategy: { type: 'autobiographical', foldingStrategy: 'kv-stable' } }),
+      'some-model',
+      'UTC',
+    ));
+    expect(config.foldingStrategy).toBe('kv-stable');
+    expect(config.kvUnified).toBeUndefined();
+  });
+
+  test('the default tail is 40% of the budget; an explicit tail wins', () => {
+    const tail = (agent: Record<string, unknown>) =>
+      configView(buildFrameworkStrategy(recipe(agent), 'some-model', 'UTC')).recentWindowTokens;
+    expect(tail({ contextBudgetTokens: 160_000 })).toBe(64_000);
+    expect(tail({ contextBudgetTokens: 600_000 })).toBe(240_000);
+    expect(tail({ strategy: { type: 'autobiographical', recentWindowTokens: 30_000 } })).toBe(30_000);
+  });
+
+  test('budget defaults to 300k; maxStreamTokens follows it only when the budget is defaulted too', () => {
+    const agentConfig = (agent: Record<string, unknown>) => {
+      const r = recipe(agent);
+      return buildFrameworkAgentConfig(r, 'agent', 'some-model', buildFrameworkStrategy(r, 'some-model', 'UTC'));
+    };
+    expect(agentConfig({})).toMatchObject({ contextBudgetTokens: 300_000, maxStreamTokens: 320_000 });
+    // An explicit budget may be a 200k-window model: the stream keeps the historical 150k.
+    expect(agentConfig({ contextBudgetTokens: 195_000 })).toMatchObject({ contextBudgetTokens: 195_000, maxStreamTokens: 150_000 });
+    expect(agentConfig({ maxStreamTokens: 90_000 })).toMatchObject({ contextBudgetTokens: 300_000, maxStreamTokens: 90_000 });
+  });
+
+  test('frontdesk gets adaptive + kv-unified too (2026-08-03 clerk outage: hierarchical saturates)', () => {
     const strategy = buildFrameworkStrategy(
       recipe({ name: 'Desk', strategy: { type: 'frontdesk' } }),
       'some-model',
@@ -47,7 +121,7 @@ describe('standard-recipe memory defaults', () => {
     );
     const config = configView(strategy);
     expect(config.adaptiveResolution).toBe(true);
-    expect(config.foldingStrategy).toBe('kv-stable');
+    expect(config.foldingStrategy).toBe('kv-unified');
   });
 
   test('frontdesk adaptiveResolution: false is the hierarchical rollback lever', () => {
@@ -141,7 +215,7 @@ describe('standard-recipe memory defaults', () => {
     expect(config.summaryParticipant).toBe('Someone Else');
   });
 
-  test('adaptiveResolution opt-out leaves foldingStrategy unset', () => {
+  test('adaptiveResolution opt-out leaves foldingStrategy and kvUnified unset', () => {
     const strategy = buildFrameworkStrategy(
       recipe({ strategy: { type: 'autobiographical', adaptiveResolution: false } }),
       'some-model',
@@ -150,6 +224,7 @@ describe('standard-recipe memory defaults', () => {
     const config = configView(strategy);
     expect(config.adaptiveResolution).toBe(false);
     expect(config.foldingStrategy).toBeUndefined();
+    expect(config.kvUnified).toBeUndefined();
   });
 
   test("without an agent name the summary voice falls back to the library's 'Claude' default", () => {
@@ -166,6 +241,21 @@ describe('standard-recipe memory defaults', () => {
     expect(modules).not.toHaveProperty('subagents');
     expect(modules).not.toHaveProperty('lessons');
     expect(modules).not.toHaveProperty('retrieval');
+  });
+
+  test('DEFAULT_RECIPE: empty system prompt, kv-unified at 300k / 120k tail / 320k stream, 1-hour cache priced at 2x', () => {
+    const validated = validateRecipe(structuredClone(DEFAULT_RECIPE));
+    expect(validated.agent.systemPrompt).toBe('');
+    expect(validated.agent.cacheTtl).toBe('1h');
+    const strategy = buildFrameworkStrategy(validated, 'claude-opus-4-6', 'UTC');
+    const config = configView(strategy);
+    expect(config.adaptiveResolution).toBe(true);
+    expect(config.foldingStrategy).toBe('kv-unified');
+    expect(config.recentWindowTokens).toBe(120_000);
+    expect(config.kvUnified).toMatchObject({ policy: { cacheReadPrice: 0.1, cacheWritePrice: 2 } });
+    expect(config.summaryParticipant).toBe('agent');
+    expect(buildFrameworkAgentConfig(validated, 'agent', 'claude-opus-4-6', strategy))
+      .toMatchObject({ contextBudgetTokens: 300_000, maxStreamTokens: 320_000 });
   });
 });
 

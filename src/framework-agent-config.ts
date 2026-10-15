@@ -1,5 +1,6 @@
 import { AgentFramework } from '@animalabs/agent-framework';
 import type { Recipe } from './recipe.js';
+import { DEFAULT_CONTEXT_BUDGET_TOKENS, effectiveContextBudgetTokens } from './framework-strategy.js';
 
 type AgentConfig = Parameters<typeof AgentFramework.create>[0]['agents'][number];
 
@@ -78,8 +79,13 @@ export function buildFrameworkAgentConfig(
       ? { allowedTools: recipe.agent.allowedTools }
       : {}),
     maxTokens: recipe.agent.maxTokens ?? 16384,
-    maxStreamTokens: recipe.agent.maxStreamTokens ?? 150000,
-    contextBudgetTokens: recipe.agent.contextBudgetTokens,
+    // An omitted maxStreamTokens follows the budget (+20k) only when the
+    // budget is the host default too. A recipe that sets its own budget may be
+    // on a 200k-window model, where budget + 20k would let a stream grow past
+    // the window; it keeps the framework's historical 150k.
+    maxStreamTokens: recipe.agent.maxStreamTokens
+      ?? (recipe.agent.contextBudgetTokens === undefined ? DEFAULT_CONTEXT_BUDGET_TOKENS + 20_000 : 150_000),
+    contextBudgetTokens: effectiveContextBudgetTokens(recipe),
     // cacheTtl is withheld at the HOST layer on bedrock: the transport
     // only has the default 5m cache, and older membrane releases forward
     // the ttl field Bedrock rejects. Note this is not the whole story —
