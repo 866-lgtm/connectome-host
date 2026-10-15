@@ -715,7 +715,7 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. Utilities are named one by one: to give the subagent a utility, list `utils` and the utility\'s own name (module--name). Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. To give the subagent a utility, list `utils` and the utility\'s own name (module--name). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
             timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
