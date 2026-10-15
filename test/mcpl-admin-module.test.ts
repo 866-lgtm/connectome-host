@@ -204,6 +204,15 @@ describe('mcpl_deploy', () => {
     expect(configs[1]!.env!.AGENT_TIMEZONE).toBe('Pacific/Auckland');
     // The overlay keeps only what the agent gave.
     expect(readAgentOverlay(overlayPath).chat).toEqual({ command: 'node', env: { TOKEN: 'mine' } });
+
+    // A redeploy restarts the child with the same composition.
+    const restarted: Array<{ id: string; env?: Record<string, string> }> = [];
+    const restart = (stub as unknown as { restartMcplServer: (id: string, c?: { id: string; env?: Record<string, string> }) => Promise<void> }).restartMcplServer;
+    (stub as unknown as { restartMcplServer: (id: string, c?: { id: string; env?: Record<string, string> }) => Promise<void> }).restartMcplServer =
+      async (id, c) => { if (c) restarted.push(c); return restart(id, c); };
+    await call(mod, 'mcpl_deploy', { id: 'chat', command: 'node', env: { TOKEN: 'newer' } });
+    expect(restarted).toHaveLength(1);
+    expect(restarted[0]!.env).toEqual({ TOKEN: 'newer', AGENT_TIMEZONE: 'Pacific/Auckland' });
   });
 
   // A field of the wrong kind used to be dropped (or coerced: a null arg

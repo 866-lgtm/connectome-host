@@ -534,7 +534,8 @@ export class McplAdminModule implements Module {
     // The child's env as the boot composes it for every server
     // (composeMcplChildEnv): the entry's own env, with the host's
     // AGENT_TIMEZONE over it. agent-framework adds its reaction-suppression
-    // default when the child spawns, unless the entry sets a baseline.
+    // default when the child spawns, unless the entry sets a baseline with
+    // tokens.
     config.env = composeMcplChildEnv(config.env as Record<string, string> | undefined, this.timeZone);
     if (entry.access && this.identity) {
       const identity = this.identity;

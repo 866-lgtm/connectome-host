@@ -915,11 +915,14 @@ export function saveMcplServers(configPath: string, servers: Record<string, Serv
  * wall clock is resolved per-recipe, not a per-server operator knob.
  *
  * AgentFramework supplies DISCORD_SUPPRESSED_REACTIONS_BASELINE later,
- * where it knows the configured awareness marker and retained recovery
- * outbox emojis. A host-side refusal-only default would override that
- * complete default. Explicit operator env passes through unchanged. The
- * framework then lets a non-blank baseline replace its default and treats a
- * blank one as unset, since the Discord adapter would read it as no tokens.
+ * where it knows its awareness marker and retained recovery outbox emojis.
+ * A host-side refusal-only default would override that complete default.
+ * Explicit operator env passes through unchanged, whatever its type. The
+ * framework then lets a baseline with tokens, as the Discord adapter parses
+ * them, replace its default, and reads any other value (blank, commas
+ * alone, null) as unset. A non-string value counts as its string form, so
+ * `false` or `0` replaces the default. For an inheritEnv entry, a baseline
+ * with tokens in the host's own environment replaces it too.
  */
 export function composeMcplChildEnv(
   serverEnv: Record<string, string> | undefined,

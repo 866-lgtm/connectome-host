@@ -250,7 +250,7 @@ describe('what an overlay replacement lacks of the operator definition', () => {
     const operator = serverProvisions({ ...shell, env: { ...shell.env, AGENT_TIMEZONE: 'UTC' } });
     expect(lostByReplacement(operator, { command: 'node', env: { SESSION_SERVER_PORT: '3101' } })).toBe('env SESSION_SERVER_TOKEN');
     expect(lostByReplacement(serverProvisions({ id: 'tz', command: 'node', env: { AGENT_TIMEZONE: 'UTC' } }), { command: 'node' })).toBeNull();
-    // The reaction baseline is a default the server's own mapping overrides, so it can be lacking.
+    // The host sets no reaction baseline, so a value the entry gave is simply lost on replacement.
     expect(lostByReplacement(serverProvisions({ id: 'd', command: 'node', env: { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'x' } }), { command: 'node' }))
       .toBe('env DISCORD_SUPPRESSED_REACTIONS_BASELINE');
   });

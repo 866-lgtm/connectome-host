@@ -71,8 +71,10 @@ module. Keep it on **loopback** and reach it via SSH tunnel. See
   default `DISCORD_SUPPRESSED_REACTIONS_BASELINE`), unless the entry sets
   `inheritEnv: true`, which passes the host's whole environment: an unmapped
   `DISCORD_GUILD_ID` is unset for discord-mcpl, which then serves every
-  channel the bot is invited to. See DEV-ENVIRONMENT for file-defined
-  servers.
+  channel the bot is invited to. With `inheritEnv`, a
+  `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's
+  environment replaces agent-framework's default. See DEV-ENVIRONMENT for
+  file-defined servers.
 - `data/` — chronicle store + per-session `config/gate.json` (wake policies;
   append-only reconcile, so reorder the **live** file, not just the recipe).
 
