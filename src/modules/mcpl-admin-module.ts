@@ -532,8 +532,9 @@ export class McplAdminModule implements Module {
 
     const config = resolveOverlayEntry(id, entry, this.overlayPath) as unknown as McplServerConfig;
     // The child's env as the boot composes it for every server
-    // (composeMcplChildEnv): the refusal-reaction baseline as a default the
-    // entry's own env overrides, and the host's AGENT_TIMEZONE over both.
+    // (composeMcplChildEnv): the entry's own env, with the host's
+    // AGENT_TIMEZONE over it. agent-framework adds its reaction-suppression
+    // default when the child spawns, unless the entry sets a baseline.
     config.env = composeMcplChildEnv(config.env as Record<string, string> | undefined, this.timeZone);
     if (entry.access && this.identity) {
       const identity = this.identity;

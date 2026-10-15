@@ -7,7 +7,6 @@ import { test, expect, describe, beforeEach, afterEach } from 'bun:test';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import type { AgentFramework } from '@animalabs/agent-framework';
 
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.js';
@@ -182,8 +181,9 @@ describe('mcpl_deploy', () => {
     expect((await call(mod, 'mcpl_deploy', { id: 'bad id!', command: 'a' })).success).toBe(false);
   });
 
-  // A deployed child used to get AGENT_TIMEZONE alone, without the
-  // refusal-reaction baseline every boot-loaded server gets.
+  // A deployed child gets the env the boot composes for every server: the
+  // entry's own env with the host's zone. The host sets no reaction
+  // baseline; agent-framework derives that default when the child spawns.
   test('gives a deployed child the env the boot composes for every server', async () => {
     const { stub } = makeStubFramework();
     const configs: Array<{ id: string; env?: Record<string, string> }> = [];
@@ -196,11 +196,10 @@ describe('mcpl_deploy', () => {
     await call(mod, 'mcpl_deploy', { id: 'quiet', command: 'node', env: { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'own', AGENT_TIMEZONE: 'Mars/Olympus' } });
 
     expect(configs[0]!.env).toEqual({
-      DISCORD_SUPPRESSED_REACTIONS_BASELINE: REFUSAL_REACTION_BASELINE.join(','),
       TOKEN: 'mine',
       AGENT_TIMEZONE: 'Pacific/Auckland',
     });
-    // The entry's own baseline overrides the default; the host's zone wins over the entry's.
+    // The entry's own baseline passes through; the host's zone wins over the entry's.
     expect(configs[1]!.env!.DISCORD_SUPPRESSED_REACTIONS_BASELINE).toBe('own');
     expect(configs[1]!.env!.AGENT_TIMEZONE).toBe('Pacific/Auckland');
     // The overlay keeps only what the agent gave.

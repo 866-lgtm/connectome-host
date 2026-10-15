@@ -201,8 +201,8 @@ HEARTBEAT_CONFIG_FILE=<abs>/data/heartbeat-config.json
 
 The host reads `.env`, but a stdio MCPL server sees only what its entry maps
 in `env`, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`, plus a small
-system allowlist and the two variables the host sets for every server,
-`AGENT_TIMEZONE` and `DISCORD_SUPPRESSED_REACTIONS_BASELINE`. For a server
+system allowlist, the host's `AGENT_TIMEZONE`, and agent-framework's default
+`DISCORD_SUPPRESSED_REACTIONS_BASELINE` unless the entry sets one. For a server
 defined in `mcpl-servers.json`, that is the file's `env`: a recipe can't add
 env to a file server. A variable left only in `.env` is unset for the server,
 unless its entry (in the recipe or `mcpl-servers.json`) sets `inheritEnv:
