@@ -56,6 +56,9 @@ the house default; plain descriptive titles are accepted.
   explicitly labeled as such, with a severity verdict and itemized findings.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   loading a recipe) and paste transcripts. Claims are checked, not trusted.
+- **Greptile** reviews a PR when it's opened, reopened or marked ready, and
+  not again on later pushes (`.greptile/config.json`). Mentioning
+  `@greptileai` on a PR asks it for a review.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
