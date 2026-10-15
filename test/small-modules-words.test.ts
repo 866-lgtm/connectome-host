@@ -361,11 +361,14 @@ describe('settings', () => {
 });
 
 describe('modules that offer no tools of their own', () => {
-  test('instructions names its workspace file and the tools that read and edit it', async () => {
+  test('instructions names its workspace file, says the text in context is current, and names the tools that read and edit it', async () => {
     const r = await new InstructionsModule({ path: 'shared/AGENTS.md' }).handleToolCall(call('edit'));
     expect(r.error).toContain('"instructions--edit"');
-    expect(r.error).toContain('shared/AGENTS.md');
-    expect(r.error).toContain('workspace--read');
+    expect(r.error).toContain('shared/AGENTS.md, so the text you have is the current one');
+    // workspace--read serves the workspace's stored copy, which a read-only
+    // mount doesn't update from disk (README, "Who edits, and how it propagates").
+    expect(r.error).toContain("workspace--read shows the workspace's stored copy, which on a read-only mount can be older");
+    expect(r.error).toContain('workspace--edit');
   });
 
   test('the others say they have none and point to the tools listed', async () => {

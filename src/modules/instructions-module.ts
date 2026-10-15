@@ -130,8 +130,10 @@ export class InstructionsModule implements Module {
     return unknownToolResult(
       this,
       call.name,
-      `Your instructions reach you in context each turn, from the workspace file ${this.path}; ` +
-      'workspace--read reads it, and workspace--edit changes it where its mount allows writing.',
+      `Your instructions reach you in context each turn, read from the workspace file ${this.path}, ` +
+      'so the text you have is the current one. workspace--read shows the workspace\'s stored copy, which ' +
+      'on a read-only mount can be older than that text. workspace--edit changes the file where its mount ' +
+      'allows writing.',
     );
   }
 
