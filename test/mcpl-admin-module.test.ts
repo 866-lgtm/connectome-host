@@ -270,6 +270,23 @@ describe('mcpl_deploy', () => {
     expect(readAgentOverlay(overlayPath)).toEqual({});
   });
 
+  // A refusal that named only the first malformed field cost the agent a
+  // call per field.
+  test('names every malformed field at once, so a deploy is refused once, not field by field', async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    const result = await call(mod, 'mcpl_deploy', {
+      id: 'odd', command: 'node', reconnect: 'yes', enabledTools: 'say', env: { A: null, B: {} }, token: 5,
+    });
+    expectMalformed(
+      result.error,
+      "its token isn't text; its env A, B aren't text, a number or true/false; its enabledTools isn't a list of names; " +
+      'its reconnect is neither true nor false',
+    );
+    expect(calls).toEqual([]);
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+  });
+
   test('leaves out what strict function calling sends as unspecified, and saves list numbers as text', async () => {
     const { stub } = makeStubFramework();
     const mod = makeModule(stub);

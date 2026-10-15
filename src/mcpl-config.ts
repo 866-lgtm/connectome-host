@@ -340,7 +340,11 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  * `strict` is for new writes (mcpl_deploy): what a model writes now is held
  * to the plain shapes, text where text is meant, lists of text, an env map
  * of text, numbers or true/false, a transport of stdio or websocket, and a
- * reconnect of true or false, so anything else is refused, not saved.
+ * reconnect of true or false, so anything else is refused, not saved. It
+ * names every field that breaks them at once, joined by "; ", so a deploy
+ * isn't refused one field at a time; a field's later checks are skipped
+ * only where its first one leaves nothing to check, such as the items of an
+ * env that isn't a map.
  */
 export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}): OverlayEntryReading {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { problem: 'it isn\'t an object' };
@@ -351,31 +355,36 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   if (e.disabled === true) return { entry: { disabled: true }, notes: [] };
   if (e.disabled) return { problem: 'its disabled is neither true nor false' };
   if (opts.strict) {
+    const problems: string[] = [];
     for (const k of ['command', 'url', 'token', 'access', 'toolPrefix']) {
-      if (e[k] !== undefined && typeof e[k] !== 'string') return { problem: `its ${k} isn't text` };
+      if (e[k] !== undefined && typeof e[k] !== 'string') problems.push(`its ${k} isn't text`);
     }
     if (e.transport !== undefined && e.transport !== 'stdio' && e.transport !== 'websocket') {
-      return { problem: 'its transport is neither stdio nor websocket' };
+      problems.push('its transport is neither stdio nor websocket');
     }
     if (e.args !== undefined && (!Array.isArray(e.args) || !e.args.every((a) => typeof a === 'string'))) {
-      return { problem: 'its args aren\'t a list of text' };
+      problems.push('its args aren\'t a list of text');
     }
     if (e.env !== undefined) {
-      if (e.env === null || typeof e.env !== 'object' || Array.isArray(e.env)) return { problem: 'its env isn\'t a map of names to values' };
-      const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlain(v)).map(([k]) => k);
-      if (odd.length > 0) return { problem: `its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false` };
+      if (e.env === null || typeof e.env !== 'object' || Array.isArray(e.env)) {
+        problems.push('its env isn\'t a map of names to values');
+      } else {
+        const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlain(v)).map(([k]) => k);
+        if (odd.length > 0) problems.push(`its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false`);
+      }
     }
     for (const k of OVERLAY_NAME_LIST_FIELDS) {
-      if (e[k] !== undefined && (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string'))) {
-        return { problem: `its ${k} isn't a list of names` };
-      }
-      // An empty name matches nothing, so in an allow-list it's the deny-all
-      // that an empty list is kept from being.
-      if (e[k] !== undefined && (e[k] as string[]).some((x) => x.trim() === '')) {
-        return { problem: `its ${k} holds an empty name, which matches nothing` };
+      if (e[k] === undefined) continue;
+      if (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string')) {
+        problems.push(`its ${k} isn't a list of names`);
+      } else if ((e[k] as string[]).some((x) => x.trim() === '')) {
+        // An empty name matches nothing, so in an allow-list it's the
+        // deny-all that an empty list is kept from being.
+        problems.push(`its ${k} holds an empty name, which matches nothing`);
       }
     }
-    if (e.reconnect !== undefined && typeof e.reconnect !== 'boolean') return { problem: 'its reconnect is neither true nor false' };
+    if (e.reconnect !== undefined && typeof e.reconnect !== 'boolean') problems.push('its reconnect is neither true nor false');
+    if (problems.length > 0) return { problem: problems.join('; ') };
   }
   const notes: string[] = [];
   // main resolved args only when truthy, so a falsy one passes on as it did.

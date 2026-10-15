@@ -6,6 +6,8 @@
     overlay isn't valid JSON, or holds `null`, the agent is told in its own
     terms, with how to repair the file and why not to move it aside. The
     boot, which stops on such a file, keeps its operator message.
+  - `mcpl_deploy` names every malformed field of an entry in one refusal,
+    where it named only the first, so an agent fixes them in one call.
   - A deploy whose overlay can't be saved says nothing was deployed, and
     connects nothing. Before, the raw file-system error came through, and
     nothing said the server wasn't connected.
