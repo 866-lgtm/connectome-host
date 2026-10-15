@@ -686,9 +686,42 @@ describe('identity: what the agent reads when a call fails', () => {
       (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }))).error;
     expectSays(await send('nope/out.json'), 'Nothing was sent: `saveAs` names no mount the workspace has: "nope/out.json"', 'a mount it can write to (files)');
     expectSays(await send('files'), 'names the mount "files" but no file in it');
-    expectSays(await send('files/../../etc/out.json'), 'leads out of the mount "files"');
+    expectSays(await send('files/../../etc/out.json'), 'has a "." or ".." in it', 'such as "files/out.json"');
     expectSays(await send('docs/out.json'), 'names the read-only mount "docs"', 'a mount it can write to (files)');
     expect(seen.orrery).toBe(0);
+  });
+
+  // Every saveAs form agent-framework's own write accepts goes out and is
+  // saved, and every form it would refuse is refused before anything is
+  // sent: none goes out only to have its answer lost.
+  it("sends every saveAs the workspace's write accepts, and nothing it would refuse", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-saveas-'));
+    mkdirSync(join(dir, 'files'));
+    mkdirSync(join(dir, 'docs'));
+    const workspace = new WorkspaceModule({
+      mounts: [
+        { name: 'files', path: join(dir, 'files'), mode: 'read-write', watch: 'never' },
+        { name: 'docs', path: join(dir, 'docs'), mode: 'read-only', watch: 'never' },
+      ],
+    });
+    workspace.initStore(JsStore.openOrCreate({ path: join(dir, 'store') }));
+    const { mod, ready, seen } = registeredModule({ workspace });
+    await ready;
+    const forms = [
+      'files/out.json', 'files/sub/out.json', 'files/out.json/', 'files/./out.json', 'files/sub/../out.json',
+      'files//out.json', 'files/../out.json', 'files/', 'files', '/files/out.json', './files/out.json', 'nope/out.json',
+      'docs/out.json', 'FILES/out.json',
+    ];
+    const outcomes: Record<string, string> = {};
+    for (const saveAs of forms) {
+      const before = seen.orrery;
+      const res = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }));
+      outcomes[saveAs] = res.success ? 'sent and saved' : seen.orrery === before ? 'not sent' : 'sent, answer lost';
+    }
+    expect(Object.values(outcomes)).not.toContain('sent, answer lost');
+    expect(Object.keys(outcomes).filter((form) => outcomes[form] === 'sent and saved')).toEqual(
+      ['files/out.json', 'files/sub/out.json', 'files/out.json/'],
+    );
   });
 
   it('tells a request that got no reply from one whose reply came back but couldn\'t be read or saved', async () => {
@@ -833,7 +866,7 @@ describe('identity: what the agent reads when a call fails', () => {
     const join_ = (name = 'A') => mod.handleToolCall(call('accept_invite', { invite: 'inv', name }));
     const refused = (await join_()).error;
     expectSays(
-      refused, 'refused the registration (403: name taken)', 'If an earlier call got no reply or a fault of the service\'s own',
+      refused, 'answered the registration with 403: name taken.', 'If an earlier call got no reply or a fault of the service\'s own',
       'don\'t try another name', 'if it refused the name, call identity--accept_invite again with another',
     );
     expect(refused).not.toContain('Nothing was registered');

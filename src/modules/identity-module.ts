@@ -72,8 +72,8 @@ function diskRemedy(error: WorkspaceReadError): string {
     case 'symlink':
       return 'It\'s a link, and this mount doesn\'t follow links: name the file it points to by its own path.';
     case 'escape':
-      return 'It\'s a link to a file outside the workspace, and an upload sends only files inside it. If that file ' +
-        'should be sent, your operator can put it in the workspace.';
+      return 'It leads, through a link, to a file outside the workspace, and an upload sends only files inside it. If ' +
+        'that file should be sent, your operator can put it in the workspace.';
     case 'changed':
       return 'It changed while it was being read, and calling again reads it afresh.';
     default:
@@ -413,8 +413,8 @@ export class IdentityModule implements Module {
   // ── key material ──
 
   /** The key, as loadOrCreateKey gives it, or an IdentityError: the log gets
-   *  the key file's path and the error, and the agent neither, since a key
-   *  error's words and even its code can name the key. */
+   *  the key file's path and the whole error. The agent gets neither, nor the
+   *  error's code, since it can't act on any of them: the fix is the host's. */
   private identityKey(): { privateKey: KeyObject; id: string } {
     try {
       return this.loadOrCreateKey();
@@ -820,9 +820,12 @@ export class IdentityModule implements Module {
   /**
    * Why the workspace can't keep a response at `path`, asked before the
    * request goes out, so a write never goes out with nowhere to keep its
-   * answer: no mount has the path, it names a mount but no file, it leads out
-   * of its mount, or its mount is read-only. Null when the workspace can. A
-   * response over the mount's size limit can only be known once it arrives.
+   * answer: no mount has the path, it names a mount but no file, it has a
+   * "." or ".." part, it leads out of its mount, or its mount is read-only.
+   * Null when the workspace can. Each refusal is one agent-framework
+   * 0.22.1's writeBinary makes too, after the request has gone out: its
+   * store refuses a tree path with a "." or ".." part ("Invalid tree path").
+   * A response over the mount's size limit can only be known once it arrives.
    */
   private cannotKeep(workspace: WorkspaceModule, path: string): string | null {
     const mounts = workspace.getMounts();
@@ -836,6 +839,9 @@ export class IdentityModule implements Module {
     const mount = mounts.find((m) => m.name === name);
     if (!mount) return `\`saveAs\` names no mount the workspace has: "${path}".${remedy}`;
     if (slash < 0 || slash === path.length - 1) return `\`saveAs\` names the mount "${name}" but no file in it.${remedy}`;
+    if (path.slice(slash + 1).split('/').some((part) => part === '.' || part === '..')) {
+      return `\`saveAs\` "${path}" has a "." or ".." in it, which the workspace can't save to; name the file by its plain path, such as "${name}/out.json".${remedy}`;
+    }
     // A write target is the use resolveAbsolutePath's doc keeps it for: it
     // answers null for a path that leads out of its mount.
     if (workspace.resolveAbsolutePath(path) === null) return `\`saveAs\` "${path}" leads out of the mount "${name}".${remedy}`;
@@ -970,11 +976,13 @@ export class IdentityModule implements Module {
       // The service's rate limit answers before it looks at the registration.
       return fail(`Nothing was registered: the identity service at ${home} couldn't take it just now (429: ${error}). Try again shortly.`);
     }
+    // Worded as the service's answer, not as a refusal: the reference
+    // service can answer 400 after it has registered the host.
     return fail(
-      `The identity service at ${home} refused the registration (${status}: ${error}). If an earlier call got no ` +
+      `The identity service at ${home} answered the registration with ${status}: ${error}. If an earlier call got no ` +
       'reply or a fault of the service\'s own, that call may have registered this host, so don\'t try another name: ' +
       'ask your operator to check whether the service holds this registration. Otherwise, if it refused the name, ' +
-      'call identity--accept_invite again with another; for any other refusal, ask your operator, giving them the reason.',
+      'call identity--accept_invite again with another; for anything else, ask your operator, giving them the reason.',
     );
   }
 
