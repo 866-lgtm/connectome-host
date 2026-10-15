@@ -88,7 +88,7 @@ A restart can make auxiliary model calls before any user message: agent-framewor
 immediately drains restored Context Manager compression/merge debt. This happens only
 when the store has pending maintenance, and it is visible in the new process's
 `llm-calls.<iso>.jsonl`; it is not an agent wake or a user turn. To avoid it,
-drain the queue offline first with `scripts/compress-fresh.mjs` (see below).
+drain it offline first with `bun scripts/warmup-session.ts <session> --model <compressionModel>`.
 
 **Logs / observability** (`data/` below is `DATA_DIR`, default `./data` under
 the working directory):
