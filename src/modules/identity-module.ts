@@ -36,14 +36,32 @@ import {
   createHash,
   type KeyObject,
 } from 'node:crypto';
-import type {
-  Module,
-  ModuleContext,
-  ToolCall,
-  ToolResult,
-  ToolDefinition,
-  WorkspaceModule,
+import {
+  WorkspaceReadError,
+  type Module,
+  type ModuleContext,
+  type ToolCall,
+  type ToolResult,
+  type ToolDefinition,
+  type WorkspaceModule,
 } from '@animalabs/agent-framework';
+
+/** A disk read's refusal that means disk has no file at the path, where
+ *  the workspace's own copy stands in: not_found with ENOENT (nothing there,
+ *  or a link that leads nowhere), ENOTDIR (a parent that's a file) or
+ *  ENAMETOOLONG (a name disk can't hold), and mount_unavailable with ENOENT
+ *  or ENOTDIR (the mount's directory gone, or a file in its place). A gone
+ *  mount directory reaches agent-framework 0.22.1's read as not_found with
+ *  ENOENT, since it lstats the path before it resolves the root, and a read
+ *  that resolves the root first reports it as mount_unavailable with ENOENT.
+ *  mount_unavailable with any other errno, or none, is a root the read
+ *  couldn't resolve or trust, where disk may hold a file it couldn't reach,
+ *  so the upload is refused. */
+function diskHasNoFile(error: WorkspaceReadError): boolean {
+  const gone = ['ENOENT', 'ENOTDIR'];
+  if (error.code === 'mount_unavailable') return gone.includes(error.errno ?? '');
+  return error.code === 'not_found' && [...gone, 'ENAMETOOLONG'].includes(error.errno ?? '');
+}
 
 export interface IdentityModuleConfig {
   /** ed25519 PKCS#8 PEM, generated on first use, 0600. dataDir-anchored:
@@ -440,25 +458,40 @@ export class IdentityModule implements Module {
       // Disk first, store second. An upload is egress: reading it through the
       // append-only store would retain every byte forever and refuse anything
       // binary or over the mount's maxFileSize — which is most media. Disk
-      // has neither problem. The store remains the fallback for a file the
-      // resident wrote through the workspace and never materialized.
-      const diskRead = (workspace as WorkspaceModule & {
-        readBinaryFromDisk?: (
-          path: string,
-          opts?: { maxBytes?: number },
-        ) => Promise<{ data: Buffer; absolutePath: string } | { error: string }>;
-      }).readBinaryFromDisk;
-      const fromDisk = diskRead
-        ? await diskRead.call(workspace, input.fromFile, { maxBytes: UPLOAD_BODY_MAX })
-        : { error: 'this host has no disk read path' };
+      // has neither problem. The disk read is readFileFromDisk, which keeps
+      // the mount's link policy and reads only inside the mount (it checks the
+      // canonical path it opened), so an upload sends only what the mount
+      // allows; its errors name the mount-prefixed path, never the host's.
+      // readBinaryFromDisk, which this used before, checked the path's text
+      // alone and followed any link, so a link in the mount sent a file from
+      // outside it. The store's copy stands in only where disk has no file
+      // (diskHasNoFile): one the resident wrote through the workspace and
+      // never materialized, one deleted from disk, a link that leads nowhere,
+      // or one whose mount's directory is gone. That copy is the workspace's
+      // own, since agent-framework's sync takes in only regular files inside
+      // the mount, so nothing from outside it goes this way either. Any other
+      // refusal (a link the mount refuses or one leading out of it, a
+      // directory, a file disk can't read) stops the upload, since the
+      // store's copy can differ from disk's.
       let bytes: Buffer;
-      if (!('error' in fromDisk)) {
-        bytes = fromDisk.data;
-      } else {
+      try {
+        const fromDisk = await workspace.readFileFromDisk(input.fromFile, { maxBytes: UPLOAD_BODY_MAX });
+        if (fromDisk.truncated) return fail(`file too large (${fromDisk.size} > ${UPLOAD_BODY_MAX})`);
+        bytes = fromDisk.bytes;
+      } catch (error) {
+        if (!(error instanceof WorkspaceReadError)) throw error;
+        // A path no mount holds has no copy anywhere.
+        if (error.code === 'unknown_mount' || error.code === 'traversal') return fail(`Nothing was sent: ${error.message}.`);
+        if (!diskHasNoFile(error)) {
+          return fail(
+            `Nothing was sent: "${input.fromFile}" couldn't be read from disk, and the workspace's copy wasn't sent in ` +
+            `its place, since it can differ from disk's. On disk: ${error.message}${error.errno ? ` (${error.errno})` : ''}.`,
+          );
+        }
         const fromStore = await workspace.readBinary(input.fromFile);
         if ('error' in fromStore) {
           return fail(
-            `identity request: could not read ${input.fromFile}: ${fromDisk.error}; ${fromStore.error}`,
+            `identity request: could not read ${input.fromFile}: ${error.message}; ${fromStore.error}`,
           );
         }
         bytes = fromStore.data;
