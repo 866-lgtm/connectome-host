@@ -180,7 +180,7 @@ travel over the WebSocket.
 | `/healthz` | health JSON: gate state, queued work, per-agent status and last inference |
 | `/quota` | subscription quota windows (`{"subscription": false}` on API keys) |
 | `/media/<messageId>/<block>[?agent=]` | one inline transcript image |
-| `/files/<mount>/<path>` | a workspace file, within the mount's read permission |
+| `/files/<mount>/<path>` | a workspace file: `403` for a path no mount holds, a file that is itself a link (a recipe's mounts don't follow links) or one whose canonical path leaves its mount, and `404` for a file the read can't give |
 | `/curve` | the context-curve page (reads `/debug/context/curve`) |
 | `/debug/context` and `/debug/context/{makeup,coverage,curve,preview,maintenance}` | context debugging — see [`debug-context-api.md`](./debug-context-api.md) |
 | `/debug/retrieval[/view]` | retrieval traces — see [`retrieval-traces.md`](./retrieval-traces.md) |

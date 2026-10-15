@@ -419,6 +419,22 @@ describe('status channels', () => {
     expect(h.posts[1]!.text).toBe(statusClearText('clerk', 'quota-spent', 'anthropic credential ok'));
   });
 
+  // The instructions module raises this kind when agents run without their
+  // instructions, and its -clear when the file loads again.
+  test('an instructions-unavailable alert reaches the status channels after the quiet window, and its clear follows', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'], quietMs: 60_000 });
+    const lost = 'no instructions injected: "instructions/AGENTS.md" is a link, which its mount doesn\'t follow: put the file itself at that path';
+    h.alert('instructions-unavailable', lost);
+    await h.fireTimers();
+    expect(h.posts.length).toBe(1);
+    expect(h.posts[0]!.channelId).toBe('zulip:ops');
+    expect(h.posts[0]!.text).toContain(`instructions-unavailable: ${lost}`);
+    h.alert('instructions-unavailable-clear', '"instructions/AGENTS.md" loaded again; agents have their instructions');
+    await h.settle();
+    expect(h.posts.length).toBe(2);
+    expect(h.posts[1]!.text).toBe(statusClearText('clerk', 'instructions-unavailable', '"instructions/AGENTS.md" loaded again; agents have their instructions'));
+  });
+
   test('a status channel that also matches the reply scope is told once, as status', async () => {
     const h = await started({ statusChannels: ['zulip:ops'] });
     h.alert('hard-down', 'failing');

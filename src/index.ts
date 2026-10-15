@@ -347,7 +347,8 @@ async function createFramework(
   if (modules.instructions) {
     const instructionsConfig =
       typeof modules.instructions === 'object' ? modules.instructions : {};
-    const instructionsModule = new InstructionsModule(instructionsConfig);
+    // Its alerts carry the agent's name, as the notices module's filter expects.
+    const instructionsModule = new InstructionsModule({ ...instructionsConfig, agentName });
     if (workspaceModule) instructionsModule.setWorkspace(workspaceModule);
     moduleInstances.push(instructionsModule);
   }

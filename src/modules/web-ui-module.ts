@@ -1190,9 +1190,9 @@ export class WebUiModule implements Module {
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
-    // Reads through WorkspaceModule.readFileFromDisk, which keeps the mount's
-    // link policy and reads a file only if its canonical path lies inside the
-    // mount, so it serves only what the workspace's own reads would.
+    // Reads through WorkspaceModule.readFileFromDisk, which refuses a file
+    // that is itself a link unless the mount follows links, and reads a file
+    // only if its canonical path lies inside the mount.
     if (url.pathname.startsWith('/files/')) {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
@@ -1420,23 +1420,26 @@ export class WebUiModule implements Module {
     const inMountPath = decoded.slice(slash + 1);
     const mountPrefixed = `${mount}/${inMountPath}`;
 
-    const ws = sharedServer.app.framework.getModule('workspace') as Partial<WorkspaceModule> | undefined;
-    if (!ws || typeof ws.readFileFromDisk !== 'function') {
-      return new Response('Workspace not mounted', { status: 503 });
-    }
+    const ws = sharedServer.app.framework.getModule('workspace') as WorkspaceModule | undefined;
+    if (!ws) return new Response('Workspace not mounted', { status: 503 });
     try {
-      const { bytes } = await ws.readFileFromDisk(mountPrefixed);
-      // A Uint8Array copy, not the Buffer itself: Buffer is not a BodyInit.
-      return new Response(new Uint8Array(bytes), { headers: { 'content-type': mimeFor(mountPrefixed) } });
+      const { bytes, realPath } = await ws.readFileFromDisk(mountPrefixed);
+      // The read's bytes sit on an ordinary ArrayBuffer, never shared memory,
+      // so they're a BodyInit as they are: the assertion tells the types so,
+      // without copying the file. The type comes from the file the read
+      // opened, so a path spelt with a trailing slash keeps its extension's.
+      return new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { 'content-type': mimeFor(realPath) } });
     } catch (err) {
-      // A path no mount holds or one leading out of its mount, a link the
-      // mount doesn't follow, and one leading outside it are forbidden, as
-      // a path the mount refused always was here; anything else the read
-      // can't give is not found.
+      // A path no mount holds or one leading out of its mount, a file that is
+      // itself a link the mount doesn't follow, and one whose canonical path
+      // lies outside the mount are forbidden. Anything else the read can't
+      // give is not found, a file that changed while it was read among them.
+      // The read's message says why, and names no host path.
+      const why = err instanceof WorkspaceReadError ? `: ${err.message}` : '';
       if (err instanceof WorkspaceReadError && ['unknown_mount', 'traversal', 'symlink', 'escape'].includes(err.code)) {
-        return new Response('Forbidden', { status: 403 });
+        return new Response(`Forbidden${why}`, { status: 403 });
       }
-      return new Response('Not found', { status: 404 });
+      return new Response(`Not found${why}`, { status: 404 });
     }
   }
 

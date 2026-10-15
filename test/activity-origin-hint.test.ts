@@ -7,16 +7,23 @@
  * its text to a real file holding a hint, which a read that went around
  * readFileFromDisk would find instead.
  */
-import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { afterAll, describe, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorkspaceReadError, type ModuleContext, type TraceEvent } from '@animalabs/agent-framework';
 import { ActivityModule } from '../src/modules/activity-module.js';
 
 describe("the origin hint comes only from what the mount's own read gives", () => {
-  test('a file the read gives sets the topic, one it refuses sets nothing, and only the head is asked for', async () => {
+  const dirs: string[] = [];
+  afterAll(() => {
+    for (const dir of dirs) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** An activity module over a stand-in read, with what it asked for and the typing notices it sent. */
+  async function moduleOverStandIn() {
     const dir = mkdtempSync(join(tmpdir(), 'activity-origin-'));
+    dirs.push(dir);
     writeFileSync(join(dir, 'resolved.md'), 'origin: zulip#ops#from-around-the-read\n');
     const asked: Array<{ path: string; maxBytes?: number }> = [];
     const workspace = {
@@ -47,7 +54,11 @@ describe("the origin hint comes only from what the mount's own read gives", () =
       getModule: (name: string) => (name === 'workspace' ? workspace : undefined),
     } as unknown as ModuleContext);
     module.setFramework(framework as never);
+    return { module, asked, typing, trace };
+  }
 
+  test('a file the read gives sets the topic, one it refuses sets nothing, and only the head is asked for', async () => {
+    const { module, asked, typing, trace } = await moduleOverStandIn();
     await module.onProcess({ type: 'workspace:created', paths: ['files/refused.md'] } as never, {} as never);
     trace('inference:started');
     expect(typing.at(-1)).toEqual({ channel: 'zulip:ops', metadata: undefined });
@@ -61,5 +72,14 @@ describe("the origin hint comes only from what the mount's own read gives", () =
       { path: 'files/refused.md', maxBytes: 2048 },
       { path: 'files/given.md', maxBytes: 2048 },
     ]);
+  });
+
+  // Each path of an event is read on its own: a refused one doesn't stop the rest.
+  test('an event naming a refused file and a given one still takes the topic from the given one', async () => {
+    const { module, asked, typing, trace } = await moduleOverStandIn();
+    await module.onProcess({ type: 'workspace:modified', paths: ['files/refused.md', 'files/given.md'] } as never, {} as never);
+    trace('inference:started');
+    expect(typing.at(-1)).toEqual({ channel: 'zulip:ops', metadata: { topic: 'from-the-mount' } });
+    expect(asked.map((a) => a.path)).toEqual(['files/refused.md', 'files/given.md']);
   });
 });
