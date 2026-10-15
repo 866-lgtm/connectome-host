@@ -240,6 +240,24 @@ describe('observers tools and the grants file', () => {
     expect(stored(path).observers).toEqual([BASELINE, { key: key('B'), label: 'phone', scopes: ['tools'], expires: null }]);
   });
 
+  test('a number too large for JSON is written back as text, so the grant it broke stays unused', async () => {
+    // 1e309 parses as Infinity, which JSON.stringify would write as null: no expiry at all.
+    writeFileSync(path, `{"observers": [${JSON.stringify(BASELINE)}, {"key": "${key('B')}", "label": "forever?", "scopes": ["health"], "expires": 1e309}]}`);
+    const m = new ObserversModule({ path });
+    expect((await m.handleToolCall(call('get', {}))).data).toMatchObject({ notUsed: ['grant 2 ("forever?") has an expiry that isn\'t a date: Infinity'] });
+    expect((await m.handleToolCall(call('grant', { key: key('C'), label: 'new', scopes: ['health'] }))).success).toBe(true);
+    expect(stored(path).observers[1]!.expires).toBe('Infinity');
+    expect(loadObserversFile(path)?.observers.map((g) => g.label)).toEqual(['baseline', 'new']);
+  });
+
+  test('a revoke by label takes every entry spelled with its key, when the key doesn\'t decode', async () => {
+    const short = 'ed25519:short';
+    writeFileSync(path, JSON.stringify({ observers: [BASELINE, { key: short, label: 'a', scopes: ['health'] }, { key: short, label: 'b', scopes: ['health'] }] }));
+    const res = await new ObserversModule({ path }).handleToolCall(call('revoke', { label: 'a' }));
+    expect((res.data as { message: string }).message).toStartWith('Revoked: a, b.');
+    expect(keys(path)).toEqual([key('A')]);
+  });
+
   test('a grant refuses a key that doesn\'t decode to 32 bytes', async () => {
     writeFileSync(path, GOOD);
     const dropped = key('C').slice(0, -1); // one character short

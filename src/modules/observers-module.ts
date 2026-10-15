@@ -190,8 +190,9 @@ export class ObserversModule implements Module {
           if (!key && matches.length > 1) return err(`label matches ${matches.length} grants — revoke by key`);
           const named = matches[0]!;
           if (named.protected) return err('that grant is protected (operator baseline) — edit the file to remove it');
-          const namedKey = canonicalKey(named.key);
-          if (!key && namedKey) matches = entries(keyed(namedKey));
+          // As a revoke by key does: one that doesn't decode matches entries
+          // spelled exactly as it is.
+          if (!key && typeof named.key === 'string') matches = entries(keyed(canonicalKey(named.key) ?? named.key));
           if (matches.some((g) => g.protected)) {
             return err('that key also holds a protected grant (operator baseline) — edit the file to remove it');
           }

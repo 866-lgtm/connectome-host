@@ -209,7 +209,7 @@ function entryProblems(i: number, g: unknown): string[] {
   // take effect. This check reads it the same way.
   const { expires } = grant;
   if (expires && !Number.isFinite(parseDate(expires))) {
-    problems.push(`${which} has an expiry that isn't a date: ${JSON.stringify(expires)}`);
+    problems.push(`${which} has an expiry that isn't a date: ${shown(expires)}`);
   }
   if (!Array.isArray(grant.scopes)) {
     problems.push(`${which} has no list of scopes`);
@@ -224,7 +224,7 @@ function entryProblems(i: number, g: unknown): string[] {
   if (unknown.length > 0) {
     const what = unknown.length === 1 ? "a scope that doesn't exist" : "scopes that don't exist";
     problems.push(
-      `${which} names ${what}: ${unknown.map((s) => JSON.stringify(s)).join(', ')} (the scopes are ${OBSERVER_SCOPES.join(', ')})`,
+      `${which} names ${what}: ${unknown.map(shown).join(', ')} (the scopes are ${OBSERVER_SCOPES.join(', ')})`,
     );
   }
   return problems;
@@ -238,6 +238,12 @@ function parseDate(value: unknown): number {
   } catch {
     return NaN;
   }
+}
+
+/** A value as a problem quotes it: as JSON, except a number JSON can't hold,
+ *  which JSON.stringify would show as null. */
+function shown(value: unknown): string {
+  return typeof value === 'number' && !Number.isFinite(value) ? String(value) : JSON.stringify(value);
 }
 
 /** An entry as the problems name it: by position, and by label if it has one. */
@@ -270,8 +276,18 @@ export function saveObserversFile(path: string, file: ObserversFile): void {
   const target = isLink(path) ? realpathSync(path) : path;
   mkdirSync(dirname(target), { recursive: true });
   const tmp = `${target}.tmp`;
-  writeFileSync(tmp, JSON.stringify(file, null, 2) + '\n');
+  writeFileSync(tmp, JSON.stringify(file, keepNonFinite, 2) + '\n');
   renameSync(tmp, target); // atomic — mtime pollers never read a half-write
+}
+
+/** JSON has no Infinity: a number too large for it, such as 1e309, parses as
+ *  Infinity, and JSON.stringify writes that as null. An expiry the viewer
+ *  can't read would come back as no expiry, and the grant would admit its
+ *  key with no end. Written as text instead, every such value keeps its
+ *  meaning to both readers: "Infinity" is no date, no scope and no key,
+ *  and is as truthy as Infinity. */
+function keepNonFinite(_key: string, value: unknown): unknown {
+  return typeof value === 'number' && !Number.isFinite(value) ? String(value) : value;
 }
 
 export function observersFileMtime(path: string): number | null {
