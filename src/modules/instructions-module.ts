@@ -127,13 +127,19 @@ export class InstructionsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    // True whether or not the last read worked: the module fails open, so the
+    // agent is told how to tell, not that the text is there.
+    const heading = this.header.trim();
     return unknownToolResult(
       this,
       call.name,
-      `Your instructions reach you in context each turn, read from the workspace file ${this.path}, ` +
-      'so the text you have is the current one. workspace--read shows the workspace\'s stored copy, which ' +
-      'on a read-only mount can be older than that text. workspace--edit changes the file where its mount ' +
-      'allows writing.',
+      `Your instructions are read from the workspace file ${this.path} each turn and put in your context` +
+      (heading ? ` under the heading ${JSON.stringify(heading)}` : '') +
+      ', so the text there is the current one. If ' +
+      (heading ? 'that heading is' : 'they are') +
+      " missing from your context, the file couldn't be read, and whoever runs this host can see why in " +
+      "its log. workspace--read shows the workspace's stored copy, which on a read-only mount can be older " +
+      'than the file. workspace--edit changes the file where its mount allows writing.',
     );
   }
 

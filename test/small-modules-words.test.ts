@@ -361,14 +361,25 @@ describe('settings', () => {
 });
 
 describe('modules that offer no tools of their own', () => {
-  test('instructions names its workspace file, says the text in context is current, and names the tools that read and edit it', async () => {
+  test('instructions names its workspace file and heading, says what a missing heading means, and names the tools that read and edit it', async () => {
     const r = await new InstructionsModule({ path: 'shared/AGENTS.md' }).handleToolCall(call('edit'));
     expect(r.error).toContain('"instructions--edit"');
-    expect(r.error).toContain('shared/AGENTS.md, so the text you have is the current one');
+    expect(r.error).toContain(
+      'Your instructions are read from the workspace file shared/AGENTS.md each turn and put in your context ' +
+      'under the heading "# Shared operating instructions (live document)", so the text there is the current one.',
+    );
+    // The module fails open, so the hint can't promise the text is there.
+    expect(r.error).toContain(
+      "If that heading is missing from your context, the file couldn't be read, and whoever runs this host can see why in its log.",
+    );
     // workspace--read serves the workspace's stored copy, which a read-only
     // mount doesn't update from disk (README, "Who edits, and how it propagates").
-    expect(r.error).toContain("workspace--read shows the workspace's stored copy, which on a read-only mount can be older");
+    expect(r.error).toContain("workspace--read shows the workspace's stored copy, which on a read-only mount can be older than the file.");
     expect(r.error).toContain('workspace--edit');
+
+    const bare = await new InstructionsModule({ path: 'shared/AGENTS.md', header: '  ' }).handleToolCall(call('edit'));
+    expect(bare.error).toContain('put in your context, so the text there is the current one. If they are missing from your context,');
+    expect(bare.error).not.toContain('heading');
   });
 
   test('the others say they have none and point to the tools listed', async () => {
