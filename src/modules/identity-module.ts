@@ -47,12 +47,18 @@ import {
 } from '@animalabs/agent-framework';
 
 /** A disk read's refusal that means disk has no file at the path, where
- *  the workspace's own copy stands in: nothing there (ENOENT; ENOTDIR, a
- *  parent that's a file; ENAMETOOLONG, a path disk can't hold), or a mount
- *  whose directory is gone. */
+ *  the workspace's own copy stands in: not_found with ENOENT (nothing there,
+ *  a link that leads nowhere, or a mount whose directory is gone, since the
+ *  read's lstat of the path comes first), ENOTDIR (a parent that's a file)
+ *  or ENAMETOOLONG (a name disk can't hold). mount_unavailable comes only
+ *  after that lstat found an entry, when the mount root's realpath then
+ *  fails, so it means no file only with ENOENT or ENOTDIR, the root gone
+ *  between the two; with any other errno, disk has an entry it couldn't
+ *  resolve. */
 function diskHasNoFile(error: WorkspaceReadError): boolean {
-  return error.code === 'mount_unavailable'
-    || (error.code === 'not_found' && ['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.errno ?? ''));
+  const gone = ['ENOENT', 'ENOTDIR'];
+  if (error.code === 'mount_unavailable') return gone.includes(error.errno ?? '');
+  return error.code === 'not_found' && [...gone, 'ENAMETOOLONG'].includes(error.errno ?? '');
 }
 
 export interface IdentityModuleConfig {
@@ -456,11 +462,15 @@ export class IdentityModule implements Module {
       // allows; its errors name the mount-prefixed path, never the host's.
       // readBinaryFromDisk, which this used before, checked the path's text
       // alone and followed any link, so a link in the mount sent a file from
-      // outside it. The store's copy stands in only where disk has no file:
-      // one the resident wrote through the workspace and never materialized,
-      // or one whose mount's directory is gone. Any other refusal (a link the
-      // mount refuses or one leading out of it, a directory, a file disk
-      // can't read) stops the upload, since the store's copy can differ.
+      // outside it. The store's copy stands in only where disk has no file
+      // (diskHasNoFile): one the resident wrote through the workspace and
+      // never materialized, one deleted from disk, a link that leads nowhere,
+      // or one whose mount's directory is gone. That copy is the workspace's
+      // own, since agent-framework's sync takes in only regular files inside
+      // the mount, so nothing from outside it goes this way either. Any other
+      // refusal (a link the mount refuses or one leading out of it, a
+      // directory, a file disk can't read) stops the upload, since the
+      // store's copy can differ from disk's.
       let bytes: Buffer;
       try {
         const fromDisk = await workspace.readFileFromDisk(input.fromFile, { maxBytes: UPLOAD_BODY_MAX });
