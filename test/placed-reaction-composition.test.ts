@@ -1,6 +1,8 @@
 /**
- * Requires the AF release containing agent-framework#95. During companion
- * development, run against that AF branch; the old release lacks its default.
+ * The host leaves the reaction-suppression default to agent-framework
+ * (0.22.1 and later derive it at each stdio child's spawn), and an explicit
+ * baseline in the server's env with tokens still replaces it. Runs a real
+ * framework with a stdio child that reports the env it was started with.
  */
 import { test, expect } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
