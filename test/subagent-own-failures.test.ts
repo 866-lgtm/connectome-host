@@ -132,6 +132,27 @@ async function outcome(h: Harness, name: string): Promise<{ ok: boolean; text: s
     (e) => ({ ok: false, text: e instanceof Error ? e.message : String(e) }),
   );
 }
+/** What the module delivers to the parent agent: each message it adds to
+ *  the parent's context, and each inference it requests. */
+function deliveries(h: Harness): { messages: string[]; requests: string[] } {
+  const got = { messages: [] as string[], requests: [] as string[] };
+  const ctx = (h.subagent as unknown as { ctx: {
+    addMessage(participant: string, content: Array<{ type: string; text?: string }>): unknown;
+    pushEvent(event: { type: string; reason?: string }): unknown;
+  } }).ctx;
+  const add = ctx.addMessage.bind(ctx);
+  const push = ctx.pushEvent.bind(ctx);
+  ctx.addMessage = (participant, content) => {
+    for (const block of content) if (block.type === 'text' && block.text) got.messages.push(block.text);
+    return add(participant, content);
+  };
+  ctx.pushEvent = (event) => {
+    if (event.type === 'inference-request' && event.reason) got.requests.push(event.reason);
+    return push(event);
+  };
+  return got;
+}
+
 /** Count each ephemeral agent's stops (cancelStream calls) and when they came. */
 function countStops(h: Harness): number[] {
   const at: number[] = [];
@@ -221,33 +242,51 @@ describe('a sync run moves to the background at its timeoutMs and goes on', () =
   test('with timeoutMs, the call answers "moved to background", the run is not stopped, and its result arrives', async () => {
     const h = await harness({ maxRetries: 0 }, () => sleep(700).then(() => ({ speech: 'done', toolCallsCount: 0 })));
     const stops = countStops(h);
+    const delivered = deliveries(h);
     try {
       const res = await h.subagent.handleToolCall(spawn('scout', { sync: true, timeoutMs: 200 }));
       expect(String(res.data)).toContain('moved to background');
       expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'done' });
       expect(stops).toEqual([]);
+      // The parent gets the result as a message, and one turn to read it.
+      await until(() => delivered.requests.length > 0);
+      await sleep(50);
+      expect(delivered.messages.filter((m) => m.startsWith("[Subagent 'scout'"))).toEqual(["[Subagent 'scout' returned]\n\ndone"]);
+      expect(delivered.requests).toEqual(['subagent-completed:scout']);
     } finally { await h.cleanup(); }
   }, 20_000);
 
   test('without timeoutMs, it moves at maxExecutionMs, the default, and isn\'t stopped there either', async () => {
     const h = await harness({ maxRetries: 0, maxExecutionMs: 200 }, () => sleep(700).then(() => ({ speech: 'done', toolCallsCount: 0 })));
     const stops = countStops(h);
+    const delivered = deliveries(h);
     try {
       const res = await h.subagent.handleToolCall(spawn('scout', { sync: true }));
       expect(String(res.data)).toContain('moved to background');
       expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'done' });
       expect(stops).toEqual([]);
+      // The parent gets the result as a message, and one turn to read it.
+      await until(() => delivered.requests.length > 0);
+      await sleep(50);
+      expect(delivered.messages.filter((m) => m.startsWith("[Subagent 'scout'"))).toEqual(["[Subagent 'scout' returned]\n\ndone"]);
+      expect(delivered.requests).toEqual(['subagent-completed:scout']);
     } finally { await h.cleanup(); }
   }, 20_000);
 
   test('a sync fork does the same', async () => {
     const h = await harness({ maxRetries: 0 }, () => sleep(700).then(() => ({ speech: 'done', toolCallsCount: 0 })));
     const stops = countStops(h);
+    const delivered = deliveries(h);
     try {
       const res = await h.subagent.handleToolCall(fork('probe', { sync: true, timeoutMs: 200 }));
       expect(String(res.data)).toContain('moved to background');
       expect(await outcome(h, 'probe')).toEqual({ ok: true, text: 'done' });
       expect(stops).toEqual([]);
+      // The parent gets the result as a message, and one turn to read it.
+      await until(() => delivered.requests.length > 0);
+      await sleep(50);
+      expect(delivered.messages.filter((m) => m.startsWith("[Subagent 'probe'"))).toEqual(["[Subagent 'probe' returned]\n\ndone"]);
+      expect(delivered.requests).toEqual(['subagent-completed:probe']);
     } finally { await h.cleanup(); }
   }, 20_000);
 });
