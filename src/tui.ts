@@ -2538,6 +2538,7 @@ export async function runTui(app: AppContext): Promise<void> {
   // ── Input handling ─────────────────────────────────────────────────
 
   let resolveExit: (() => void) | null = null;
+  let rejectExit: ((error: unknown) => void) | null = null;
 
   /**
    * If fleet children are alive, print the quit-confirm prompt, arm
@@ -2762,13 +2763,16 @@ export async function runTui(app: AppContext): Promise<void> {
     logStream.end();
     app.framework.stop().then(() => {
       resolveExit?.();
+    }, error => {
+      rejectExit?.(error);
     });
   }
 
   // ── Wait for exit ──────────────────────────────────────────────────
 
-  await new Promise<void>(resolve => {
+  await new Promise<void>((resolve, reject) => {
     resolveExit = resolve;
+    rejectExit = reject;
   });
 }
 

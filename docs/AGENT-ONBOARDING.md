@@ -351,8 +351,8 @@ COUNT_TOKENS_MODEL=<a live model id>     # optional override; makeup counts with
 ```
 
 Stdio MCPL servers see only what their entry declares in `env` (plus a small
-system allowlist — see the README's MCP section — and the host's
-`AGENT_TIMEZONE` and `DISCORD_SUPPRESSED_REACTIONS_BASELINE`). Map every
+system allowlist — see the README's MCP section — the host's `AGENT_TIMEZONE`,
+and agent-framework's default `DISCORD_SUPPRESSED_REACTIONS_BASELINE`). Map every
 variable a server reads, as in the skeleton above. A variable left only in
 `.env` is unset for the server, unless its entry sets `inheritEnv: true`, which
 passes every secret in the host's environment — and an unset
