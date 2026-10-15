@@ -26,6 +26,20 @@ export interface ActivityModuleConfig {
   initialChannels?: string[];
 }
 
+/** Trace events that end a turn's stream. A turn's tool rounds stay inside
+ *  its one stream, so `inference:completed` comes once, at a turn's normal
+ *  end; `inference:turn_ended` ends one a tool closed; and an aborted, failed
+ *  or exhausted stream ends with its own event. A failed attempt that the
+ *  framework retries starts again with `inference:started`, and a failure
+ *  can send `failed` and then `exhausted`. */
+const TURN_END_TRACES: ReadonlySet<string> = new Set([
+  'inference:completed',
+  'inference:turn_ended',
+  'inference:aborted',
+  'inference:failed',
+  'inference:exhausted',
+]);
+
 interface ActivityState {
   channels: string[];
 }
@@ -74,7 +88,14 @@ export class ActivityModule implements Module {
   private ctx: ModuleContext | null = null;
   private framework: AgentFramework | null = null;
   private channels = new Set<string>();
+  /** Whether a turn is under way, as far as typing shows it. One flag for
+   *  every agent: the framework itself clears every channel's typing when
+   *  any turn's stream reaches its end, so a turn's end, whoever's, is when
+   *  the channels stop showing it. */
   private typingActive = false;
+  /** The framework's trace subscription, ended in stop(), as onTrace's
+   *  contract asks, and when setFramework replaces the framework. */
+  private unsubscribeTrace: (() => void) | null = null;
 
   /** Most recent incoming-message metadata per channel. Handed back to the
    *  originating server on each typing notification so routing hints (e.g.
@@ -96,17 +117,33 @@ export class ActivityModule implements Module {
   }
 
   async stop(): Promise<void> {
+    this.unsubscribeTrace?.();
+    this.unsubscribeTrace = null;
     this.stopAllTyping();
     this.ctx = null;
     this.framework = null;
   }
 
-  /** Called from the host after framework creation, like SubagentModule. */
+  /** Called from the host after framework creation, like SubagentModule.
+   *  The host builds a module per framework; a framework handed over here
+   *  replaces any earlier one as stop() ends it: no more of its traces, and
+   *  no typing left on its channels. */
   setFramework(framework: AgentFramework): void {
+    this.unsubscribeTrace?.();
+    this.stopAllTyping();
     this.framework = framework;
-    framework.onTrace((event: TraceEvent) => {
-      if (event.type === 'inference:started') this.onInferenceStarted();
-      else if (event.type === 'inference:completed') this.onInferenceCompleted();
+    this.typingActive = false;
+    this.unsubscribeTrace = framework.onTrace((event: TraceEvent) => {
+      if (event.type === 'inference:started') {
+        // A silent wake's prose is suppressed. agent-framework's own Discord
+        // module shows no typing for one either.
+        if ((event as { silent?: unknown }).silent === true) return;
+        this.onInferenceStarted();
+      } else if (TURN_END_TRACES.has(event.type)) {
+        // Any end, failed or aborted ones included: leaving the flag on
+        // would have show_in start "typing…" when no turn is under way.
+        this.onInferenceEnded();
+      }
     });
   }
 
@@ -253,7 +290,7 @@ export class ActivityModule implements Module {
     }
   }
 
-  private onInferenceCompleted(): void {
+  private onInferenceEnded(): void {
     this.typingActive = false;
     this.stopAllTyping();
   }
