@@ -36,14 +36,24 @@ import {
   createHash,
   type KeyObject,
 } from 'node:crypto';
-import type {
-  Module,
-  ModuleContext,
-  ToolCall,
-  ToolResult,
-  ToolDefinition,
-  WorkspaceModule,
+import {
+  WorkspaceReadError,
+  type Module,
+  type ModuleContext,
+  type ToolCall,
+  type ToolResult,
+  type ToolDefinition,
+  type WorkspaceModule,
 } from '@animalabs/agent-framework';
+
+/** A disk read's refusal that means disk has no file at the path, where
+ *  the workspace's own copy stands in: nothing there (ENOENT; ENOTDIR, a
+ *  parent that's a file; ENAMETOOLONG, a path disk can't hold), or a mount
+ *  whose directory is gone. */
+function diskHasNoFile(error: WorkspaceReadError): boolean {
+  return error.code === 'mount_unavailable'
+    || (error.code === 'not_found' && ['ENOENT', 'ENOTDIR', 'ENAMETOOLONG'].includes(error.errno ?? ''));
+}
 
 export interface IdentityModuleConfig {
   /** ed25519 PKCS#8 PEM, generated on first use, 0600. dataDir-anchored:
@@ -440,25 +450,36 @@ export class IdentityModule implements Module {
       // Disk first, store second. An upload is egress: reading it through the
       // append-only store would retain every byte forever and refuse anything
       // binary or over the mount's maxFileSize — which is most media. Disk
-      // has neither problem. The store remains the fallback for a file the
-      // resident wrote through the workspace and never materialized.
-      const diskRead = (workspace as WorkspaceModule & {
-        readBinaryFromDisk?: (
-          path: string,
-          opts?: { maxBytes?: number },
-        ) => Promise<{ data: Buffer; absolutePath: string } | { error: string }>;
-      }).readBinaryFromDisk;
-      const fromDisk = diskRead
-        ? await diskRead.call(workspace, input.fromFile, { maxBytes: UPLOAD_BODY_MAX })
-        : { error: 'this host has no disk read path' };
+      // has neither problem. The disk read is readFileFromDisk, which keeps
+      // the mount's link policy and reads only inside the mount (it checks the
+      // canonical path it opened), so an upload sends only what the mount
+      // allows; its errors name the mount-prefixed path, never the host's.
+      // readBinaryFromDisk, which this used before, checked the path's text
+      // alone and followed any link, so a link in the mount sent a file from
+      // outside it. The store's copy stands in only where disk has no file:
+      // one the resident wrote through the workspace and never materialized,
+      // or one whose mount's directory is gone. Any other refusal (a link the
+      // mount refuses or one leading out of it, a directory, a file disk
+      // can't read) stops the upload, since the store's copy can differ.
       let bytes: Buffer;
-      if (!('error' in fromDisk)) {
-        bytes = fromDisk.data;
-      } else {
+      try {
+        const fromDisk = await workspace.readFileFromDisk(input.fromFile, { maxBytes: UPLOAD_BODY_MAX });
+        if (fromDisk.truncated) return fail(`file too large (${fromDisk.size} > ${UPLOAD_BODY_MAX})`);
+        bytes = fromDisk.bytes;
+      } catch (error) {
+        if (!(error instanceof WorkspaceReadError)) throw error;
+        // A path no mount holds has no copy anywhere.
+        if (error.code === 'unknown_mount' || error.code === 'traversal') return fail(`Nothing was sent: ${error.message}.`);
+        if (!diskHasNoFile(error)) {
+          return fail(
+            `Nothing was sent: "${input.fromFile}" couldn't be read from disk, and the workspace's copy wasn't sent in ` +
+            `its place, since it can differ from disk's. On disk: ${error.message}${error.errno ? ` (${error.errno})` : ''}.`,
+          );
+        }
         const fromStore = await workspace.readBinary(input.fromFile);
         if ('error' in fromStore) {
           return fail(
-            `identity request: could not read ${input.fromFile}: ${fromDisk.error}; ${fromStore.error}`,
+            `identity request: could not read ${input.fromFile}: ${error.message}; ${fromStore.error}`,
           );
         }
         bytes = fromStore.data;

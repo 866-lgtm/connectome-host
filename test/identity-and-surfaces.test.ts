@@ -7,10 +7,12 @@
 // HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
 import { describe, it, expect } from 'bun:test';
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { JsStore } from '@animalabs/chronicle';
+import { WorkspaceModule, WorkspaceReadError } from '@animalabs/agent-framework';
 
 import { IdentityModule } from '../src/modules/identity-module.ts';
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
@@ -198,7 +200,9 @@ describe('identity module', () => {
     audio[audio.length - 1] = 0x7f;
     let sentBody: Buffer | null = null;
     let sentType = '';
+    // The resident wrote the file through the workspace, and disk has no copy.
     const workspace = {
+      readFileFromDisk: async (path: string) => { throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT'); },
       readBinary: async (path: string) =>
         path === 'files/music/track.mp3' ? { data: audio } : { error: `File not found: ${path}` },
       writeBinary: async () => ({ success: true }),
@@ -256,6 +260,10 @@ describe('identity module', () => {
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
     const sent: Array<{ url: string; method: string; type: string; auth: string; body: unknown }> = [];
     const workspace = {
+      readFileFromDisk: async (path: string) => {
+        if (path === 'files/artifacts/grid.png') return { bytes: png, size: png.byteLength, truncated: false };
+        throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT');
+      },
       readBinary: async (path: string) =>
         path === 'files/artifacts/grid.png' ? { data: png } : { error: `File not found: ${path}` },
       writeBinary: async () => ({ success: true }),
@@ -476,5 +484,99 @@ describe('observers surface flag', () => {
     expect(asTools.getTools().map((t) => t.name)).toEqual(asUtils.getUtilities().map((u) => u.name));
     expect(asTools.getUtilities().length).toBe(0);
     expect(asUtils.getTools().length).toBe(0);
+  });
+});
+
+// An upload reads only what the workspace mount allows. agent-framework's
+// readFileFromDisk keeps the mount's link policy and reads only inside it;
+// the disk read this used before checked the path's text alone and followed
+// any link, so a link in the mount sent a file from outside it to the
+// service. These run agent-framework's own WorkspaceModule on a real mount;
+// only the store's copy is set by the test.
+describe('identity request: fromFile reads only what the mount allows', () => {
+  async function mounted(opts: { followSymlinks?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-mount-'));
+    const mountDir = join(dir, 'files');
+    const outside = join(dir, 'outside');
+    mkdirSync(mountDir);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'host-secret.txt'), 'the host\'s own file');
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const workspace = new WorkspaceModule({
+      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never', ...(opts.followSymlinks ? { followSymlinks: true } : {}) }],
+    });
+    workspace.initStore(store);
+    // The store's copy of a path, as the resident would have written it through the workspace.
+    const stored = new Map<string, Buffer>();
+    (workspace as unknown as { readBinary: (p: string) => Promise<unknown> }).readBinary = async (p: string) =>
+      (stored.has(p) ? { data: stored.get(p)! } : { error: `File not found: ${p}` });
+    const bodies: Buffer[] = [];
+    const mod = new IdentityModule({
+      keyPath: join(dir, 'k.pem'),
+      home: 'id.test',
+      services: { orrery: 'https://orrery.test' },
+      fetchImpl: (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.includes('/enroll')) return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+        if (u.includes('/token')) return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
+        if (u.includes('/services')) return new Response(JSON.stringify({ services: {} }), { status: 200 });
+        bodies.push(Buffer.from(init?.body as Uint8Array));
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch,
+    });
+    (mod as any).ctx = { getModule: (n: string) => (n === 'workspace' ? workspace : null) };
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+    const upload = (fromFile: string) =>
+      mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile }));
+    return { dir, mountDir, outside, stored, bodies, upload };
+  }
+
+  it('sends a file in the mount from disk', async () => {
+    const { mountDir, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'grid.png'), 'disk bytes');
+    expect((await upload('files/grid.png')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['disk bytes']);
+  });
+
+  it('refuses a link in the mount to a file outside it, sends nothing, and names no host path', async () => {
+    const { dir, mountDir, outside, stored, bodies, upload } = await mounted();
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    // Even with a copy in the store, the refusal stands: it isn't sent in the link's place.
+    stored.set('files/link.txt', Buffer.from('store bytes'));
+    const res = await upload('files/link.txt');
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Nothing was sent: "files/link.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlinks are not allowed: files/link.txt');
+    expect(res.error).not.toContain(dir);
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a link leading out of the mount where the mount follows links', async () => {
+    const { mountDir, outside, bodies, upload } = await mounted({ followSymlinks: true });
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    const res = await upload('files/link.txt');
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Symlink escape detected: files/link.txt');
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a directory, and a file over the upload cap, reading no more of it than the cap', async () => {
+    const { mountDir, bodies, upload } = await mounted();
+    mkdirSync(join(mountDir, 'album'));
+    expect((await upload('files/album')).error).toContain('Path is a directory: files/album');
+    // A sparse file one byte over the cap: nothing that large is written to the test's disk.
+    writeFileSync(join(mountDir, 'huge.bin'), '');
+    truncateSync(join(mountDir, 'huge.bin'), 64 * 1024 * 1024 + 1);
+    expect((await upload('files/huge.bin')).error).toContain(`file too large (${64 * 1024 * 1024 + 1} > ${64 * 1024 * 1024})`);
+    expect(bodies).toEqual([]);
+  });
+
+  it("sends the workspace's copy of a file disk doesn't have, and when the mount's directory is gone", async () => {
+    const { mountDir, stored, bodies, upload } = await mounted();
+    stored.set('files/notes.txt', Buffer.from('written through the workspace'));
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    rmSync(mountDir, { recursive: true, force: true });
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['written through the workspace', 'written through the workspace']);
   });
 });
