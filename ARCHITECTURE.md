@@ -168,19 +168,23 @@ conditions are required so the headers can never reach a vendor endpoint.
 
 - **`autobiographical`** (default) — context-manager's
   `AutobiographicalStrategy`. The host turns on **adaptive resolution** and
-  **kv-stable folding** unless the recipe says otherwise: the raw tail stays
+  **kv-unified folding** unless the recipe says otherwise: the raw tail stays
   verbatim, and the middle is folded — each stretch rendered raw or as an
   L1…L8 memory — just enough to fit the context budget, by a solver that
-  disturbs the already-cached prefix as little as it can. Memories are written by the agent's own model
+  weighs budget fit, cache cost and continuity. Memories are written by the agent's own model
   (`compressionModel` defaults to `agent.model`) in the agent's own voice
   (`summaryParticipant` defaults to `agent.name`). Host defaults:
-  `headWindowTokens` 4000, `recentWindowTokens` 30000, `maxMessageTokens`
-  10000. About 48 further context-manager keys pass through verbatim,
-  among them the live-image limits `maxLiveImages`, `imageStripDepthTokens`
-  and `maxLiveImageBytes` (context-manager defaults 6, 30000 and 20 MiB; zero
-  disables each). `foldingStrategy: "kv-unified"` is an opt-in cost-aware
-  solver; its `kvUnified` block must set `treeifyNonContiguousSummaries` and
-  `preserveGapBearingSummaries` explicitly, and not both `true`.
+  `contextBudgetTokens` 300000, `headWindowTokens` 4000,
+  `recentWindowTokens` 40% of the budget (120000 at the default),
+  `maxMessageTokens` 10000. Without a `kvUnified` block the host supplies its
+  standard one (`standardKvUnifiedConfig`), with cache prices matched to the
+  provider, `cacheTtl` and model; a written block must be complete, set
+  `treeifyNonContiguousSummaries` and `preserveGapBearingSummaries`
+  explicitly, and not both `true`. Residents built on `kv-stable` pin
+  `foldingStrategy: "kv-stable"`. About 48 further context-manager keys pass
+  through verbatim, among them the live-image limits `maxLiveImages`,
+  `imageStripDepthTokens` and `maxLiveImageBytes` (context-manager defaults
+  6, 30000 and 20 MiB; zero disables each).
 - **`frontdesk`** (`src/strategies/frontdesk-strategy.ts`) — the same, plus
   channel provenance headers, topic-aware chunk boundaries and preservation of
   unanswered questions and @mentions. For agents that staff a channel.

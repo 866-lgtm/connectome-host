@@ -27,8 +27,8 @@ A connectome agent is:
 
 It reaches the model through **membrane** (Anthropic-format adapter; can target a gateway via
 `ANTHROPIC_BASE_URL`). Memory is **context-manager** with the **autobiographical** strategy
-(adaptive resolution; `kv-stable` folding by default, with an opt-in cost-aware
-`kv-unified` solver — §5b). The shell, Discord, and heartbeat tools are
+(adaptive resolution, folded by the cost-aware **`kv-unified`** solver, the host default;
+established residents built on `kv-stable` pin it — §5b). The shell, Discord, and heartbeat tools are
 **MCPL** servers spawned by the host.
 
 You don't need to understand all of it to deploy one. Follow the phases.
@@ -65,6 +65,10 @@ infra work (§4–5) in parallel once you have a name.
 3. **If importing:** in that transcript, **which speaker label(s) are the agent itself?** List
    the distinct speakers and have them point at "self." Other Claude-family voices in the same
    log are *separate participants*, not self — don't merge them.
+
+*System prompt:* recommend an empty one, or a few sentences at most (§5). If they arrive with
+a long persona document, it's still their call, but steer them toward minimal before writing
+it into the recipe.
 
 **Model**
 4. **Which model should it run on?** Exact id. If it's a **deprecated / gateway-only** model,
@@ -249,7 +253,7 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
     "name": "<agent>",                      // = chronicle "self" participant (byte-exact)
     "model": "<model-id>",                  // or gateway-prefixed, e.g. anthropic/claude-opus-4
     "timezone": "America/Los_Angeles",      // agent-visible wall clock only; storage stays UTC
-    "systemPrompt": "<persona / or minimal>",
+    "systemPrompt": "",                     // empty, or a few sentences at most — see below
     "thinking": { "enabled": true, "type": "adaptive", "display": "summarized" },
     "maxTokens": 32000,                     // response cap
     "maxStreamTokens": 320000,              // recompile trigger; keep < model window
@@ -258,7 +262,7 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
     "strategy": {
       "type": "autobiographical",
       "adaptiveResolution": true,
-      "foldingStrategy": "kv-stable",       // default solver; "kv-unified" is opt-in (§5b)
+      "foldingStrategy": "kv-unified",      // the default (§5b); omit "kvUnified" for the standard block
       "targetChunkTokens": 3000,            // L1 chunk size; also the ingest shard size
       "compressionSlackRatio": 0.1,
       "mergeThreshold": 6,                  // L1→L2 / L2→L3 fan-in
@@ -298,6 +302,26 @@ model scale the three window numbers down together — e.g. `contextBudgetTokens
 and keep everything under `strategy` as is; chunk size, merge fan-in and the
 fallback rungs are window-independent.
 
+**System prompt: keep it minimal.** Leave it empty (`""` is valid; the request then carries
+no system block at all), or write a few sentences at most. Most long-running residents run
+a single sentence or nothing. Why:
+
+- **The agent's identity lives in its memory.** That means the imported history and everything
+  it lives through afterwards, which the strategy keeps in context. A long persona or rulebook
+  is a fixed description that its lived memory will outgrow. It is also re-applied as standing
+  instructions on every turn, and it pulls the agent back toward an instructed-assistant register.
+- **It's the front of the prompt cache.** The system prompt comes first in every request, so
+  any edit to it invalidates the whole cache, and the next turn re-writes the entire context
+  (hundreds of thousands of tokens on a large resident). A prompt with nothing in it to tune
+  rarely needs editing.
+- **Tools describe themselves.** Shell, Discord, heartbeat and workspace usage come from the
+  tool descriptions the servers declare. Don't restate them in the prompt.
+
+What earns a place, if anything, is a fact or standing permission the agent can't get any
+other way, e.g. `"Explicit content is allowed at your own discretion."` If the user has a
+longer persona text, offer to put it where the agent can read it as material (a file in its
+`notes/` mount, or part of the imported history) rather than as standing instructions.
+
 For Anthropic streaming turns, add `"effort": "medium"` to `agent.thinking` to
 set the recipe baseline; `enabled` is still required and can be `false`.
 Explicit `agent_settings` effort overrides the recipe until reset. Unrelated
@@ -320,14 +344,20 @@ entries in the recipe anyway — older host checkouts treated these as opt-out,
 and an accidentally-enabled RetrievalModule has caused severe prompt-cache
 churn in the field.
 
-**Memory defaults.** Current host code defaults an omitted/partial `strategy`
-to the fleet-standard shape: autobiographical + `adaptiveResolution: true` +
-`foldingStrategy: "kv-stable"` + same-model compression (`compressionModel`
-falls back to `agent.model`) + `summaryParticipant` = `agent.name`. Keep the
-skeleton's explicit values anyway: older host checkouts default folding to
-`flat-profile` and summary voice to the literal `'Claude'` (the stranger's-voice
-hazard), and explicit values survive host downgrades and copy-paste to other
-deployments.
+**Memory defaults.** Current host code fills an omitted/partial `strategy` with:
+autobiographical + `adaptiveResolution: true` + `foldingStrategy: "kv-unified"` with the
+host's standard `kvUnified` block (§5b) + same-model compression (`compressionModel` falls
+back to `agent.model`) + `summaryParticipant` = `agent.name`. Omitted sizes: a
+`contextBudgetTokens` of 300k (for 1M-window models — set your own on a smaller window,
+§11.1), a `recentWindowTokens` of 40% of the budget (120k at 300k), and a `maxStreamTokens`
+of 320k when the budget is also omitted, else 150k. A resident whose store was built under
+`kv-stable` must pin `"foldingStrategy": "kv-stable"` before it moves to such a host, or
+the upgrade switches its solver. The host's built-in default recipe (`bun src/index.ts`
+with no recipe) is just these defaults with an empty system prompt. Keep the skeleton's
+explicit values anyway: older host checkouts default folding to `kv-stable` or
+`flat-profile`, the budget to 100k, the tail to 30k and summary voice to the literal
+`'Claude'` (the stranger's-voice hazard), reject `kv-unified` without a complete block, and
+explicit values survive host downgrades and copy-paste to other deployments.
 
 **`.env`** (`chmod 600`). Common vars:
 
@@ -358,26 +388,29 @@ variable a server reads, as in the skeleton above. A variable left only in
 passes every secret in the host's environment — and an unset
 `DISCORD_GUILD_ID` means every channel the bot is invited to (§7).
 
-## 5b. Folding solver — `kv-stable` (default) vs `kv-unified` (opt-in)
+## 5b. Folding solver — `kv-unified` (new residents) vs `kv-stable` (established residents)
 
 Both solvers decide, at every compile, which summaries to present and which raw
 messages to keep verbatim so the context fits `contextBudgetTokens`.
 
-**`kv-stable`** (default, and what most residents run) keeps the presented layout as
-stable as possible between compiles so the prompt-cache prefix survives; it folds
-deeper only when forced. Robust, well understood, and the right choice unless you
-have a reason.
-
-**`kv-unified`** is a cost-aware Pareto solver: it scores candidate layouts on
-budget fit, **cache cost** (what a layout change will cost in cache writes vs reads at
-the configured prices), **continuity** (how much recent, still-referenced material
-stays verbatim) and fidelity, and picks the cheapest acceptable one. On a large-budget
+**`kv-unified`** (use it for every new resident) is a cost-aware Pareto solver: it scores
+candidate layouts on budget fit, **cache cost** (what a layout change will cost in cache
+writes vs reads at the configured prices), **continuity** (how much recent, still-referenced
+material stays verbatim) and fidelity, and picks the cheapest acceptable one. On a large-budget
 resident (600k budget / 300k tail on a 1M-window model) it has cut effective cache
 spend materially (on the order of 40 % in our accounting). It is **fail-closed**:
-selecting it without every required field is a recipe-load error — there are no live defaults.
+context-manager has no live defaults; the host always hands it a complete block. It is the
+host's default for a recipe that omits `foldingStrategy`, and a recipe that omits the
+`kvUnified` block gets the host's standard one.
 
-Reference configuration in production (600k / 300k resident; tune `labelCeiling`
-and the bucket sizes to your budget):
+**`kv-stable`** keeps the presented layout as stable as possible between compiles so the
+prompt-cache prefix survives, and folds deeper only when forced. It is what residents built
+before kv-unified still run; such a resident pins `"foldingStrategy": "kv-stable"`. Leave
+an established resident on it unless you have a reason to switch (see the preconditions
+below).
+
+The standard block, which the production kv-unified residents run at budgets from 300k to
+600k (shown with the prices the host picks for a Claude model on the 1-hour cache):
 
 ```jsonc
 "strategy": {
@@ -394,7 +427,7 @@ and the bucket sizes to your budget):
       "budgetLowRatio": 0.6, "budgetHighRatio": 0.85,
       "budgetUnderLambda": 1000, "budgetOverLambda": 4000,
       "cacheLambda": 1, "cacheScale": 100000,
-      "cacheReadPrice": 0.1, "cacheWritePrice": 1.25,     // $/Mtok for the agent's model
+      "cacheReadPrice": 0.1, "cacheWritePrice": 2,        // multiples of the model's base input price
       "continuityLambda": 1, "continuityScale": 100000,
       "continuityRecencyHalfLifeTokens": 100000, "continuityRecencyFloor": 0.2,
       "continuityStableHalfLife": 16, "continuityStableFloor": 0.25
@@ -408,6 +441,18 @@ and the bucket sizes to your budget):
   }
 }
 ```
+
+`cacheReadPrice` / `cacheWritePrice` are ratios to the model's uncached input price, not
+dollar figures. The host's standard block matches them to what the provider bills:
+
+- **writes:** `2` on the 1-hour cache (the default `cacheTtl`), `1.25` on the 5-minute
+  cache and on Bedrock (5-minute only), `1` on OpenAI (no write premium);
+- **reads:** `0.1` on most models, `0.05` on Claude Opus 5.5, `0.025` on Claude Fable 5.1 /
+  Mythos 5.1; `0.1` on OpenAI.
+
+Write the block yourself only to change the policy, and then set the prices to match.
+`recentWindowTokens` follows the budget as in §5 (300k tail on a 600k budget, 100k–120k on
+300k).
 
 **Preconditions — read before flipping a resident:**
 
@@ -429,15 +474,18 @@ and the bucket sizes to your budget):
   passes the persisted `kvUnifiedImmutablePrefixHash`, so it never exercises the
   cache-live solver path — the one that failed above. Rehearse on a copy with the
   receipt hash the live host would pass.
-- **New residents: decide before first boot.** Choosing kv-unified after weeks on
-  kv-stable is a layout change (one full cache rewrite) plus the audit above.
+- **New residents start on kv-unified, from the first boot** (the default). Switching an
+  established kv-stable resident later is a layout change (one full cache rewrite) plus the
+  audit above — and a kv-stable recipe that never named its solver switches on its first
+  boot under a host where kv-unified is the default, unless it pins `kv-stable` first.
 - `hysteresisCertificate: true` skips the full Pareto pass when the previously
   accepted layout is provably still selected — large latency win on quiet turns;
   `adoptEpsilon` is the score slack that lets an unchanged layout be retained.
 - `hysteresisCertificate` is optional (off unless set); every other field is
   required. The host checks the required keys at recipe load — including that
   `treeifyNonContiguousSummaries` / `preserveGapBearingSummaries` are explicit
-  booleans and not both `true` — and passes the object through whole;
+  booleans and not both `true`, and that `hysteresisCertificate`, when set, is a
+  boolean — and passes the object through whole;
   context-manager ignores keys it doesn't know, so a misspelled optional key
   silently does nothing. Pin the runtime and validate the recipe against it.
 
@@ -590,7 +638,8 @@ Snapshot a clean baseline once it's verified.
 ## 11. CRITICAL gotchas (read before deploying)
 
 **11.1 — `contextBudgetTokens` must fit the model window.** The autobiographical strategy
-fills context up to `contextBudgetTokens`. If that plus the response (`maxTokens`) exceeds the
+fills context up to `contextBudgetTokens`, which defaults to 300k when the recipe omits it —
+right for 1M-window models, fatal on a 200k one. If that plus the response (`maxTokens`) exceeds the
 model's context window, **every reply silently 400s** — the agent appears to "think but not
 speak" (compression calls, with small contexts, still succeed; full replies don't). Rule:
 `contextBudgetTokens + maxTokens + overhead  <  model window`. For a 200k-window model with a
