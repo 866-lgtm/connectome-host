@@ -262,6 +262,37 @@ describe('ObserverRegistry checks', () => {
     } finally { done(); }
   });
 
+  test('a file that can\'t be reached from the start is named once', () => {
+    const { tmp, lines, done } = setup();
+    // A name longer than a directory entry can be fails the stat with
+    // ENAMETOOLONG, which a test can make without chmod, as root too.
+    const path = join(tmp, 'x'.repeat(300), 'observers.json');
+    const registry = new ObserverRegistry(path, 60_000);
+    try {
+      registry.start();
+      for (let i = 0; i < 5; i++) check(registry);
+      expect(lines).toEqual([`[webui-observers] ${path} can't be read (ENAMETOOLONG) — admitting no grants from it`]);
+      expect(registry.active()).toBe(false);
+    } finally { registry.stop(); done(); }
+  });
+
+  test('a link whose file goes away is named as a link', () => {
+    const { tmp, path, lines, registry, done } = setup();
+    const kp = makeKeypair();
+    const target = join(tmp, 'grants.json');
+    try {
+      saveObserversFile(target, { observers: [{ key: kp.id, label: 'a', scopes: ['health'] }] });
+      symlinkSync(target, path);
+      registry.start();
+      expect(registry.grants().map((g) => g.label)).toEqual(['a']);
+      rmSync(target);
+      check(registry);
+      check(registry);
+      expect(registry.grants()).toEqual([]);
+      expect(lines.at(-1)).toBe(`[webui-observers] ${path} is a link to a file that can't be read (ENOENT) — admitting no grants from it`);
+    } finally { done(); }
+  });
+
   test('a file there but unreadable is named with why', () => {
     const { path, lines, registry, done } = setup();
     try {

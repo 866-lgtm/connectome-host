@@ -301,11 +301,11 @@ export function observersFileStat(path: string): { sig: string } | { problem: st
     return { sig: `${s.mtimeMs}:${s.ctimeMs}:${s.ino}:${s.size}` };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    return {
-      problem: code === 'ENOENT' || code === 'ENOTDIR'
-        ? 'is gone'
-        : `can't be read (${code ?? (err instanceof Error ? err.message : String(err))})`,
-    };
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      // A link whose target is gone stats as missing too, but the path is there.
+      return { problem: isLink(path) ? `is a link to a file that can't be read (${code})` : 'is gone' };
+    }
+    return { problem: `can't be read (${code ?? (err instanceof Error ? err.message : String(err))})` };
   }
 }
 
@@ -339,8 +339,10 @@ export class ObserverRegistry {
   start(): void {
     const at = observersFileStat(this.path);
     this.present = 'sig' in at;
-    if (!this.present && isLink(this.path)) {
-      console.error(`[webui-observers] ${this.path} is a link to a file that can't be read — observers disabled until it's fixed`);
+    // A file that's there but can't be reached is named once, as a check
+    // names it; a host that never had the file says nothing.
+    if ('problem' in at && at.problem !== 'is gone') {
+      this.say(`[webui-observers] ${this.path} ${at.problem} — admitting no grants from it`);
     }
     if ('sig' in at) this.load(at.sig, readObserversFile(this.path), 'start');
     this.poll = setInterval(() => this.check(), this.pollMs);
