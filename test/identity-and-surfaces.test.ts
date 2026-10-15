@@ -449,6 +449,7 @@ describe('mcpl-admin access grants', () => {
     const mod = new McplAdminModule({ overlayPath: join(dir, 'overlay.json') });
     // stub framework so the deploy reaches the access check
     mod.setFramework({
+      getModule: () => null,
       listMcplServers: () => [],
       connectMcplServer: async () => {},
       restartMcplServer: async () => {},

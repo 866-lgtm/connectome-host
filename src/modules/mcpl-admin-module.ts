@@ -41,6 +41,7 @@ import {
   readAgentOverlay,
   saveAgentOverlay,
   resolveOverlayEntry,
+  composeOverlay,
   serverProvisions,
   lostByReplacement,
   composeMcplChildEnv,
@@ -105,11 +106,15 @@ function reasonText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/** The repair of an overlay file that can't be read. Some agents can edit
+ *  the file, most can't. */
+const REPAIR = 'fix the file (or, if you can\'t edit it, ask your operator to)';
+const NOT_ASIDE = 'Don\'t move it aside: that would load every server you unloaded and drop your deployments.';
+
 /** What to do about an unreadable overlay, and, after a call `name` it
- *  stopped, to call it again. Some agents can edit the file, most can't. */
+ *  stopped, to call it again. */
 function overlayRepair(name?: string): string {
-  return `Fix the file (or, if you can't edit it, ask your operator to)${name ? `, then call ${name} again` : ''}. ` +
-    'Don\'t move it aside: that would load every server you unloaded and drop your deployments.';
+  return `${capital(REPAIR)}${name ? `, then call ${name} again` : ''}. ${NOT_ASIDE}`;
 }
 
 /** The failures with which a write may have stopped partway. The overlay is
@@ -118,22 +123,31 @@ function overlayRepair(name?: string): string {
  *  is written. */
 const PARTWAY_WRITE = new Set(['ENOSPC', 'EDQUOT', 'EFBIG', 'EIO']);
 
-/** What a failed write of the overlay may have left, as a sentence, or
- *  nothing for a failure that comes before anything is written. */
-function cutShort(error: unknown): string {
+/** Whether a failed save of the overlay may have stopped partway. */
+function partway(error: unknown): boolean {
   const code = (error as { code?: unknown } | null)?.code;
-  return typeof code === 'string' && PARTWAY_WRITE.has(code)
-    ? ` The write may have stopped partway and left your overlay file cut short: if ${LIST} then says it isn't ` +
-      'valid JSON, ask your operator to repair it.'
-    : '';
+  return typeof code === 'string' && PARTWAY_WRITE.has(code);
 }
+
+/** What a save that may have stopped partway left, as sentences. EIO can
+ *  come from the read before the write, and a failure at close after the
+ *  whole content went out, so no one guess about the file is true. */
+const PARTWAY_TEXT = ' What your overlay file holds now isn\'t known: its old content, the new content whole, or ' +
+  `a mix cut short. ${LIST} shows which. If it says the file isn't valid JSON, the next host start will stop on ` +
+  `it until it's fixed: ${REPAIR}. ${NOT_ASIDE}`;
+
+/** What takes a server out. An unload removes the agent's own entry, or
+ *  tombstones an operator's server, and its receipt says what the next host
+ *  start loads: an operator's definition the agent's entry replaced comes
+ *  back then, so no more is promised here. */
+const UNLOAD_REMEDY = `${UNLOAD} unloads it.`;
 
 /** What fixes a server that won't connect. A restart reconnects with the
  *  configuration of the server's last connect, so a wrong command, args or
- *  url is corrected only by deploying again, and a server rebuilt in place
- *  by a restart. */
+ *  url is corrected only by deploying again, while a server rebuilt in place
+ *  is picked up by a restart. */
 const CONNECT_REMEDY = `If its command, args or url is wrong, call ${DEPLOY} with the right one; if the server ` +
-  `itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD} removes it.`;
+  `itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
 
 /** What a call has changed so far, for the catch-all. Each step that
  *  changes the overlay file or a server's connection sets `changed` just
@@ -179,7 +193,10 @@ export class McplAdminModule implements Module {
    *  names only, never a credential. index.ts wires it; without it, no
    *  receipt can say what a replacement lacks. */
   private operatorServers = new Map<string, ServerProvisions>();
+  /** The same definitions whole, for what the next host start configures. */
+  private operatorDefinitions: Array<{ id: string } & Record<string, unknown>> = [];
   setOperatorServers(servers: ReadonlyArray<{ id: string } & Record<string, unknown>>): void {
+    this.operatorDefinitions = [...servers];
     this.operatorServers = new Map(servers.map((server) => [server.id, serverProvisions(server)]));
   }
 
@@ -536,7 +553,7 @@ export class McplAdminModule implements Module {
     }
 
     if (lines.length === 0) {
-      return ok(`No MCPL servers configured. Use ${DEPLOY} to add one.`);
+      return ok(`No MCPL servers are loaded. Use ${DEPLOY} to add one.`);
     }
     return ok(`MCPL servers (${lines.length}):\n` + lines.map(l => `  ${l}`).join('\n'));
   }
@@ -544,15 +561,31 @@ export class McplAdminModule implements Module {
   private async handleDeploy(input: Record<string, unknown>, progress: CallProgress): Promise<ToolResult> {
     const framework = this.requireFramework();
     // Every problem with the call's arguments goes into one refusal, so an
-    // agent corrects them in one call: the id, the command or url, an access
-    // grant this host can't serve, and each malformed field. Only the
-    // cleartext check comes after, since it reads a valid url.
+    // agent corrects them in one call: a key the tool doesn't declare, the
+    // id, the command or url, an access grant this host can't serve, each
+    // malformed field, and a tool prefix another holds. Only the cleartext
+    // check comes after, since it reads a url the refusal has found valid.
     const problems: string[] = [];
+    // A key the tool doesn't declare is refused rather than dropped, so a
+    // misspelled one (`disabledTool`, say) can't leave the server without
+    // what it was meant to set. The keys are the tool's own, so they can't
+    // drift from its definition.
+    const declared = Object.keys(
+      (this.definitions().find((d) => d.name === 'mcpl_deploy')!.inputSchema as { properties: object }).properties,
+    );
+    const undeclared = Object.keys(input).filter((k) => !declared.includes(k));
+    if (undeclared.length > 0) {
+      problems.push(
+        `${undeclared.map((k) => JSON.stringify(k)).join(', ')} ${undeclared.length === 1 ? 'isn\'t a field' : 'aren\'t fields'} ` +
+        `of ${DEPLOY}, which takes ${declared.join(', ')}.`,
+      );
+    }
     const id = typeof input.id === 'string' ? input.id.trim() : '';
+    let idOk = false;
     if (!id) {
       problems.push(
-        '`id` is missing: give the server\'s name as text, such as "my-server", in letters, digits, _ and -, since ' +
-        'it becomes part of its tools\' names.',
+        '`id` is missing or empty, or isn\'t text: give the server\'s name as text, such as "my-server", in letters, ' +
+        'digits, _ and -, since it becomes part of its tools\' names.',
       );
     } else if (!/^[a-zA-Z0-9_-]+$/.test(id)) {
       // The id with each run of other characters as one -, as a name to copy.
@@ -569,6 +602,8 @@ export class McplAdminModule implements Module {
         '"__proto__" can\'t be a server id, since JavaScript reads it as an object\'s prototype rather than a name: ' +
         'choose another.',
       );
+    } else {
+      idOk = true;
     }
 
     // Each field the caller gives is judged as given, by the strict reading
@@ -604,6 +639,26 @@ export class McplAdminModule implements Module {
         'dialled at a url (WebSocket).',
       );
     }
+    // agent-framework dials only a url that parses as ws:// or wss://. Its
+    // rule is buildWebSocketUrl's (transport.ts:357-373 at 0.22.1), restated
+    // here since it isn't exported: compare the two when either changes. A
+    // url it can't dial would be saved, and with reconnect, a url's default,
+    // the first dial's failure leaves a stub retrying a url that never opens.
+    // The url isn't quoted back: it can hold a credential.
+    if (typeof url === 'string') {
+      let scheme: string | null = null;
+      try {
+        scheme = new URL(url).protocol;
+      } catch {
+        // It doesn't parse.
+      }
+      if (scheme !== 'ws:' && scheme !== 'wss:') {
+        problems.push(
+          `\`url\` ${scheme === null ? 'doesn\'t parse as a url' : `begins ${JSON.stringify(scheme)}, not ws: or wss:`}: ` +
+          'give the server\'s ws:// or wss:// address.',
+        );
+      }
+    }
 
     const fields: Record<string, unknown> = {};
     if (command !== undefined) fields.command = command;
@@ -637,6 +692,21 @@ export class McplAdminModule implements Module {
     const problem = overlayEntryProblem(fields, { strict: true });
     const malformed = problem !== null && problem !== NAMES_NOTHING;
     if (malformed) problems.push(`The entry would be malformed: ${problem}.`);
+
+    // The overlay, for the prefix check and the save. One that can't be read
+    // stops the call here, through the catch-all, before anything changes.
+    const overlay = readAgentOverlay(this.overlayPath);
+    if (idOk && (fields.toolPrefix === undefined || typeof fields.toolPrefix === 'string')) {
+      const prefix = typeof fields.toolPrefix === 'string' ? fields.toolPrefix : `mcpl--${id}`;
+      const holder = this.prefixHolder(framework, id, prefix, overlay);
+      if (holder) {
+        problems.push(
+          `Its tool prefix "${prefix}"${fields.toolPrefix === undefined ? ', the default for this id,' : ''} is ` +
+          `${holder}, and agent-framework refuses a prefix two hold, so the next host start would stop on it: give ` +
+          '`toolPrefix` a name of its own.',
+        );
+      }
+    }
     if (problems.length > 0) {
       return fail(
         `Nothing was deployed or saved: ${problems.join(' ')} Correct ${problems.length === 1 ? 'it' : 'each'}` +
@@ -664,15 +734,15 @@ export class McplAdminModule implements Module {
     // Persist to the overlay first — a connect failure still leaves the entry
     // in place, so the agent can fix the server and restart it, or deploy
     // again with what was wrong corrected.
-    const overlay = readAgentOverlay(this.overlayPath);
     overlay[id] = entry;
     progress.changed = true;
     try {
       saveAgentOverlay(this.overlayPath, overlay);
     } catch (error) {
       return fail(
-        `Nothing was deployed: your overlay couldn't be saved (${reasonText(error)}), so no server was connected or ` +
-        `restarted. Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your operator.${cutShort(error)}`,
+        `Nothing was deployed: saving your overlay failed (${reasonText(error)}), so no server was connected or ` +
+        `restarted. Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your operator.` +
+        `${partway(error) ? PARTWAY_TEXT : ''}`,
       );
     }
 
@@ -724,7 +794,7 @@ export class McplAdminModule implements Module {
   private async handleRestart(input: Record<string, unknown>, progress: CallProgress): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail(`Nothing was restarted: ${RESTART} needs \`id\`, the server's id as ${LIST} shows it.`);
+    if (!id) return fail(`Nothing was restarted: ${RESTART} needs \`id\` as text, the server's id as ${LIST} shows it.`);
 
     // The overlay is read before the restart, so a restart that throws still
     // carries what it says, and an overlay file that can't be read costs only
@@ -815,14 +885,50 @@ export class McplAdminModule implements Module {
           `it, but it isn't in effect now. Once the cause is fixed, call ${DEPLOY} again to apply it.`;
     }
     if (!status) {
-      return restart
-        ? `It isn't loaded in this session any more, so ${RESTART} can't reach it: ` +
-          `${restartOf ? `${capital(this.nextStart(id, restartOf))} ` : ''}${DEPLOY} with its command or url loads it now.`
-        : `It isn't loaded in this session, so ${RESTART} can't reach it: once the cause is fixed, call ${DEPLOY} ` +
-          `again. ${UNLOAD} removes the saved entry.`;
+      // A restart's advice is the restart refusal's for an id that isn't
+      // loaded, by what defines it. A deploy reads the overlay before it
+      // saves, so with the file unreadable it can't load the server yet.
+      if (restart) {
+        return `It isn't loaded in this session any more, so ${RESTART} can't reach it.` +
+          (restartOf
+            ? this.notLoadedAdvice(id, restartOf)
+            : ` ${DEPLOY} with its command or url can load it again once your overlay file is fixed.`);
+      }
+      return `It isn't loaded in this session, so ${RESTART} can't reach it. Your entry is saved, so the next host ` +
+        `start loads it; once the cause is fixed, call ${DEPLOY} again to load it now. ${UNLOAD} removes the saved ` +
+        'entry.';
     }
-    return `It isn't connected${status.retrying ? `; it keeps retrying on its own, so it may still connect, which ${LIST} shows` : ''}. ` +
-      CONNECT_REMEDY;
+    const retrying = status.retrying ? `; it keeps retrying on its own, so it may still connect, which ${LIST} shows` : '';
+    if (restart) return `It isn't connected${retrying}. ${CONNECT_REMEDY}`;
+    // After a failed redeploy the framework may hold the server's previous
+    // configuration (a restart that stopped before its disconnect) or the
+    // new one, so a restart could reconnect either; a deploy applies the
+    // saved entry whichever it holds.
+    return `It isn't connected${retrying}. Your entry is saved, and the next host start loads it; once the cause is ` +
+      `fixed, call ${DEPLOY} again to apply it now. ${UNLOAD_REMEDY}`;
+  }
+
+  /** What else holds `prefix`, as a phrase, if `id` deployed with it would
+   *  share it: a module, or another server the next host start configures
+   *  (the operator's, as this host's start composed them, under the
+   *  overlay's other entries) or that's loaded now. agent-framework's
+   *  create() refuses a prefix two hold, so the next start would stop on it
+   *  (framework.ts:2361-2377 at 0.22.1); connectMcplServer refuses it too,
+   *  but only after the save. */
+  private prefixHolder(
+    framework: AgentFramework,
+    id: string,
+    prefix: string,
+    overlay: Record<string, AgentOverlayEntry>,
+  ): string | null {
+    if (framework.getModule(prefix)) return `the name of the host's module "${prefix}"`;
+    const prefixOf = (s: { id: string; toolPrefix?: unknown }): string =>
+      typeof s.toolPrefix === 'string' ? s.toolPrefix : `mcpl--${s.id}`;
+    // This deploy's entry replaces whatever `id` had, so only the others count.
+    const others = Object.fromEntries(Object.entries(overlay).filter(([key]) => key !== id));
+    const nextStart = composeOverlay(this.operatorDefinitions, others, this.overlayPath);
+    const other = [...nextStart, ...framework.listMcplServers()].find((s) => s.id !== id && prefixOf(s) === prefix);
+    return other ? `server "${other.id}"'s` : null;
   }
 
   /** The next step for an id a restart found unloaded, by what defines it. */
@@ -856,7 +962,7 @@ export class McplAdminModule implements Module {
   private async handleUnload(input: Record<string, unknown>, progress: CallProgress): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail(`Nothing was unloaded: ${UNLOAD} needs \`id\`, the server's id as ${LIST} shows it.`);
+    if (!id) return fail(`Nothing was unloaded: ${UNLOAD} needs \`id\` as text, the server's id as ${LIST} shows it.`);
     // As for mcpl_deploy: `overlay["__proto__"] = …` would set the prototype,
     // so a tombstone for it would never be saved.
     if (id === '__proto__') {
@@ -929,10 +1035,14 @@ export class McplAdminModule implements Module {
       saveAgentOverlay(this.overlayPath, current);
       return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
     } catch (error) {
+      // A save that may have stopped partway leaves the file's content, and
+      // so what the next start loads, unknown.
       return fail(
-        `${head} But your overlay couldn't be updated (${reasonText(error)}), so the unload isn't recorded: ` +
-        `${this.nextStart(id, overlay)} ${UNLOAD} "${id}" again records it once the file can be read and written.` +
-        `${error instanceof OverlayUnreadableError ? ` ${overlayRepair()}` : cutShort(error)}`,
+        `${head} ${partway(error)
+          ? `But saving your overlay failed (${reasonText(error)}).${PARTWAY_TEXT}`
+          : `But your overlay couldn't be updated (${reasonText(error)}), so the unload isn't recorded: ` +
+            this.nextStart(id, overlay)} ${UNLOAD} "${id}" again records it once the file can be read and written.` +
+        `${error instanceof OverlayUnreadableError ? ` ${overlayRepair()}` : ''}`,
       );
     }
   }

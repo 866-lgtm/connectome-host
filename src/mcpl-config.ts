@@ -19,7 +19,8 @@ export const DEFAULT_CONFIG_PATH = resolve(process.cwd(), 'mcpl-servers.json');
  * valid JSON throws a SyntaxError naming the file, never JSON.parse's own
  * message, which can quote a stretch of the text, and the file can hold a
  * token in an env block. A root of null, which neither reader can take
- * entries from, throws naming the file too.
+ * entries from, throws a TypeError naming the file, the class main threw for
+ * it unnamed (reading `mcplServers` of null).
  */
 function parseServersFile(path: string): unknown {
   const raw = readFileSync(path, 'utf-8');
@@ -30,7 +31,7 @@ function parseServersFile(path: string): unknown {
     if (error instanceof SyntaxError) throw new SyntaxError(`${path} isn't valid JSON`);
     throw error;
   }
-  if (parsed === null) throw new Error(`${path} holds null, not an object with mcplServers`);
+  if (parsed === null) throw new TypeError(`${path} holds null, not an object with mcplServers`);
   return parsed;
 }
 
@@ -317,9 +318,11 @@ export type OverlayEntryReading =
   | { entry: AgentOverlayEntry; notes: string[]; problem?: undefined }
   | { problem: string; entry?: undefined; notes?: undefined };
 
-/** Text, a number or true/false. */
+/** Text, a number or true/false. A number JSON can't write, Infinity or NaN
+ *  (a call's 1e400 parses as Infinity), doesn't count: it would be saved as
+ *  null, and the boot skips an entry with a null env value. */
 const isPlain = (v: unknown): v is string | number | boolean =>
-  typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+  typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) || typeof v === 'boolean';
 
 /** The problem readOverlayEntry gives an entry with neither a command nor a
  *  url, which mcpl_deploy says in its own words. */
@@ -365,7 +368,9 @@ export const NAMES_NOTHING = 'it names no command to run and no url to dial';
  * `strict` is for new writes (mcpl_deploy): what a model writes now is held
  * to the plain shapes, text where text is meant, lists of text, an env map
  * of text, numbers or true/false, a transport of stdio or websocket, and a
- * reconnect of true or false, so anything else is refused, not saved. It
+ * reconnect of true or false, so anything else is refused, not saved.
+ * (mcpl_deploy reads numbers and true/false in a list as their text before
+ * this reading, as the boot reads args, so those are saved as text.) It
  * names every field that breaks them at once, joined by "; ", so a deploy
  * isn't refused one field at a time; a field's later checks are skipped
  * only where its first one leaves nothing to check, such as the items of an
@@ -563,9 +568,11 @@ export function saveAgentOverlay(
  * Write `servers` as a servers file's `mcplServers`, in place. The root's
  * other keys are kept as JSON.parse reads them: no reader acts on them, but
  * they're whoever wrote them's, such as an entry under a misspelled key. A
- * root that isn't an object holds no entries for any reader, and is
- * replaced. A file that doesn't parse is never overwritten: its readers
- * refuse it, so the save refuses too, without quoting it.
+ * root of null is refused by both files' readers, and every save follows a
+ * read of its file, so a save never meets one; any other root that isn't an
+ * object holds no entries for any reader, and is replaced. A file that
+ * doesn't parse is never overwritten: its readers refuse it, so the save
+ * refuses too, without quoting it.
  */
 function writeServersFile(path: string, servers: Record<string, unknown>): void {
   let root: Record<string, unknown> = {};
@@ -721,7 +728,16 @@ export function applyAgentOverlay<T extends { id: string }>(
   servers: T[],
   overlayPath: string,
 ): Array<T | ({ id: string } & Record<string, unknown>)> {
-  const overlay = readAgentOverlay(overlayPath);
+  return composeOverlay(servers, readAgentOverlay(overlayPath), overlayPath);
+}
+
+/** applyAgentOverlay's work on an overlay already read, such as one a
+ *  deploy is about to save, so it can see what the next start will load. */
+export function composeOverlay<T extends { id: string }>(
+  servers: T[],
+  overlay: Record<string, AgentOverlayEntry>,
+  overlayPath: string,
+): Array<T | ({ id: string } & Record<string, unknown>)> {
   if (Object.keys(overlay).length === 0) return servers;
 
   // A malformed entry is skipped: neither a tombstone nor a replacement.

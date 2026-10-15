@@ -74,6 +74,8 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
       writeFileSync(path, 'null');
       for (const read of [readMcplServersFile, loadMcplServers]) {
         expect(() => read(path)).toThrow(`${path} holds null, not an object with mcplServers`);
+        // A TypeError, as main threw for it, unnamed.
+        expect(() => read(path)).toThrow(TypeError);
       }
     });
   });
