@@ -35,7 +35,9 @@ import type {
   ToolResult,
   TraceEvent,
   SessionUsageSnapshot,
+  WorkspaceModule,
 } from '@animalabs/agent-framework';
+import { WorkspaceReadError } from '@animalabs/agent-framework';
 import type { ServerWebSocket } from 'bun';
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -1188,9 +1190,9 @@ export class WebUiModule implements Module {
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
-    // Resolves through WorkspaceModule.resolveAbsolutePath, which enforces
-    // mount-relative containment and the mount's read-permission. We never
-    // serve a path the agent framework's mount layer wouldn't itself serve.
+    // Reads through WorkspaceModule.readFileFromDisk, which keeps the mount's
+    // link policy and reads a file only if its canonical path lies inside the
+    // mount, so it serves only what the workspace's own reads would.
     if (url.pathname.startsWith('/files/')) {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
@@ -1418,17 +1420,22 @@ export class WebUiModule implements Module {
     const inMountPath = decoded.slice(slash + 1);
     const mountPrefixed = `${mount}/${inMountPath}`;
 
-    const ws = sharedServer.app.framework.getModule('workspace');
-    if (!ws || !('resolveAbsolutePath' in ws)) {
+    const ws = sharedServer.app.framework.getModule('workspace') as Partial<WorkspaceModule> | undefined;
+    if (!ws || typeof ws.readFileFromDisk !== 'function') {
       return new Response('Workspace not mounted', { status: 503 });
     }
-    const abs = (ws as { resolveAbsolutePath: (p: string) => string | null }).resolveAbsolutePath(mountPrefixed);
-    if (!abs) return new Response('Forbidden', { status: 403 });
-
     try {
-      const data = await readFile(abs);
-      return new Response(data, { headers: { 'content-type': mimeFor(abs) } });
-    } catch {
+      const { bytes } = await ws.readFileFromDisk(mountPrefixed);
+      // A Uint8Array copy, not the Buffer itself: Buffer is not a BodyInit.
+      return new Response(new Uint8Array(bytes), { headers: { 'content-type': mimeFor(mountPrefixed) } });
+    } catch (err) {
+      // A path no mount holds or one leading out of its mount, a link the
+      // mount doesn't follow, and one leading outside it are forbidden, as
+      // a path the mount refused always was here; anything else the read
+      // can't give is not found.
+      if (err instanceof WorkspaceReadError && ['unknown_mount', 'traversal', 'symlink', 'escape'].includes(err.code)) {
+        return new Response('Forbidden', { status: 403 });
+      }
       return new Response('Not found', { status: 404 });
     }
   }

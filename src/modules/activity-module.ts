@@ -20,7 +20,6 @@ import type {
   TraceEvent,
   WorkspaceModule,
 } from '@animalabs/agent-framework';
-import { open } from 'node:fs/promises';
 
 export interface ActivityModuleConfig {
   initialChannels?: string[];
@@ -62,6 +61,9 @@ interface ActivityState {
  * All platform hints currently resolve to `zulip:<channel>` — extend here when
  * another MCPL server wants in on origin-routing.
  */
+/** How much of a file's head the origin hint is read from. */
+const ORIGIN_HEAD_BYTES = 2048;
+
 function parseOriginHint(text: string): { channelId: string; topic: string } | null {
   const compact = text.match(/origin:\s*zulip#([^\s#]+)#(\S+)/i);
   if (compact) return { channelId: `zulip:${compact[1]}`, topic: compact[2] };
@@ -255,28 +257,20 @@ export class ActivityModule implements Module {
     if (!workspace) return;
 
     for (const mountPath of mountPaths) {
-      const abs = workspace.resolveAbsolutePath(mountPath);
-      if (!abs) continue;
-
       try {
-        const fd = await open(abs, 'r');
-        try {
-          const buf = Buffer.alloc(2048);
-          const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-          const head = buf.toString('utf8', 0, bytesRead);
-
-          const origin = parseOriginHint(head);
-          if (origin && this.channels.has(origin.channelId)) {
-            // Merge with any existing metadata so other keys (e.g. senderEmail)
-            // survive if the origin refresh is subsequent to an incoming message.
-            const prior = this.lastMetadata.get(origin.channelId) ?? {};
-            this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
-          }
-        } finally {
-          await fd.close();
+        // readFileFromDisk keeps the mount's link policy, reads a file only if
+        // its canonical path lies inside the mount, and reads no more than
+        // the head the hint needs.
+        const { bytes } = await workspace.readFileFromDisk(mountPath, { maxBytes: ORIGIN_HEAD_BYTES });
+        const origin = parseOriginHint(bytes.toString('utf8'));
+        if (origin && this.channels.has(origin.channelId)) {
+          // Merge with any existing metadata so other keys (e.g. senderEmail)
+          // survive if the origin refresh is subsequent to an incoming message.
+          const prior = this.lastMetadata.get(origin.channelId) ?? {};
+          this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
         }
       } catch {
-        // File unreadable / gone / etc. — silently skip.
+        // Unreadable, gone, or refused by the mount: silently skip.
       }
     }
   }
