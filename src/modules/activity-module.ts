@@ -21,6 +21,8 @@ import type {
   WorkspaceModule,
 } from '@animalabs/agent-framework';
 import { open } from 'node:fs/promises';
+import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
 
 export interface ActivityModuleConfig {
   initialChannels?: string[];
@@ -188,12 +190,19 @@ export class ActivityModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    const channel = typeof (call.input as { channel?: unknown }).channel === 'string'
-      ? ((call.input as { channel: string }).channel)
-      : null;
-    if (!channel) {
-      return { success: false, isError: true, error: 'channel (string) is required' };
+    if (call.name !== 'show_in' && call.name !== 'hide_in') return unknownToolResult(this, call.name);
+    const given = (call.input as { channel?: unknown } | undefined)?.channel;
+    if (typeof given !== 'string' || given.length === 0) {
+      return {
+        success: false,
+        isError: true,
+        error:
+          `Nothing changed: activity--${call.name} needs channel, the channel's MCPL id exactly as its ` +
+          `incoming events show it, such as "zulip:tracker-miner-f"` +
+          (given === undefined || given === '' ? '.' : `, not ${shown(given)}.`),
+      };
     }
+    const channel = given;
 
     if (call.name === 'show_in') {
       const added = !this.channels.has(channel);
@@ -222,7 +231,7 @@ export class ActivityModule implements Module {
       };
     }
 
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {

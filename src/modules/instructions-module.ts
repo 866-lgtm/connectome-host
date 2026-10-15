@@ -46,6 +46,7 @@ import type {
   ToolResult,
 } from '@animalabs/agent-framework';
 import type { ContextInjection } from '@animalabs/context-manager';
+import { unknownToolResult } from './unknown-tool.js';
 
 /**
  * The slice of WorkspaceModule this module depends on. Structural so tests
@@ -126,11 +127,12 @@ export class InstructionsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return {
-      success: false,
-      error: `InstructionsModule has no tool "${call.name}"`,
-      isError: true,
-    };
+    return unknownToolResult(
+      this,
+      call.name,
+      `Your instructions reach you in context each turn, from the workspace file ${this.path}; ` +
+      'workspace--read reads it, and workspace--edit changes it where its mount allows writing.',
+    );
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {

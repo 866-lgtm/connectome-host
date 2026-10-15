@@ -36,6 +36,7 @@ import type {
   TraceEvent,
   SessionUsageSnapshot,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 import type { ServerWebSocket } from 'bun';
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -541,8 +542,8 @@ export class WebUiModule implements Module {
 
   getTools(): ToolDefinition[] { return []; }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    return { success: false, error: 'WebUiModule has no tools', isError: true };
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
