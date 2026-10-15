@@ -5,20 +5,23 @@
  * authoritative usage buckets. Cache creation MUST remain split by TTL:
  * Anthropic bills 5m writes at 1.25x input and 1h writes at 2x input.
  *
- * Cache READS are 0.1x input on every model but two: Claude Fable 5.1 and
+ * Cache READS are 0.1x input on every model but three: Claude Fable 5.1 and
  * Claude Mythos 5.1 read at 0.025x ($0.25/MTok), a quarter of the 5 pair's
- * rate. That exception is not cosmetic for long-lived agents — a resident
- * re-reading a 260k prefix on every call spends most of its bill on cache
- * reads, so charging them at 0.1x overstates its total roughly fourfold.
+ * rate, and Claude Opus 5.5 at 0.05x ($0.20/MTok). Those exceptions are not
+ * cosmetic for long-lived agents — a resident re-reading a 260k prefix on
+ * every call spends most of its bill on cache reads, so charging them at
+ * 0.1x overstates its total two- to fourfold.
  *
  * Source: https://platform.claude.com/docs/en/about-claude/pricing
- * Snapshot: 2026-09-21. Keep the version string/date auditable; silently
- * changing historical prices would make old JSONL replay disagree with bills.
+ * Snapshot: 2026-10-15 (Opus 5.5 added; it had matched the Opus 5 prefix and
+ * was priced at $5/$25 with 0.1x reads). Keep the version string/date
+ * auditable; silently changing historical prices would make old JSONL replay
+ * disagree with bills.
  */
 
 import type { CallCostBreakdown } from './web/protocol.js';
 
-export const ANTHROPIC_PRICING_VERSION = 'anthropic-public-2026-09-21';
+export const ANTHROPIC_PRICING_VERSION = 'anthropic-public-2026-10-15';
 
 /** Cache reads bill at this multiple of base input on every model that does
  *  not override it. */
@@ -104,6 +107,10 @@ function anthropicBaseRate(model: string): BaseRate | undefined {
   // Fable 5 and Mythos 5 share pricing.
   if (starts(model, 'claude-fable-5', 'claude-mythos-5')) return rate(10, 50);
 
+  // Opus 5.5 before the Opus 5 group, whose 'claude-opus-5' prefix also
+  // matches it: $4/$20, cache reads $0.20 (0.05x).
+  if (starts(model, 'claude-opus-5-5')) return rate(4, 20, 0.05);
+
   if (starts(model,
     'claude-opus-5',
     'claude-opus-4-8',
@@ -133,6 +140,17 @@ function anthropicBaseRate(model: string): BaseRate | undefined {
 
   if (starts(model, 'claude-opus-4-1', 'claude-opus-4-')) return rate(15, 75);
   return undefined;
+}
+
+/**
+ * Cache-read price as a multiple of the model's base input price, for a
+ * Claude model id as a recipe names it: a Bedrock region prefix
+ * (`global.anthropic.`) or a gateway prefix (`anthropic/`) is stripped first.
+ * Models this table doesn't know get the standard 0.1x.
+ */
+export function anthropicCacheReadMultiplier(model: string): number {
+  const bare = model.replace(/^(?:[a-z]+\.)?anthropic[./]/, '');
+  return anthropicBaseRate(bare)?.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER;
 }
 
 function starts(model: string, ...prefixes: string[]): boolean {
