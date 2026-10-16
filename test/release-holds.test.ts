@@ -90,8 +90,9 @@ function exec(
 const run = (cwd: string, env: Record<string, string>) => exec("node", [SCRIPT], cwd, env);
 
 /** A throwaway package whose preversion and prepublishOnly are this
- *  repository's own, with the script beside it. */
-function wiredProject(): string {
+ *  repository's own, with the script beside it, and the built Web UI that
+ *  prepublishOnly also requires, unless `webUi` is false. */
+function wiredProject(webUi = true): string {
   const scripts = (JSON.parse(readFileSync(PACKAGE_JSON, "utf8")) as { scripts: Record<string, string> }).scripts;
   const dir = project({
     ...PKG,
@@ -100,6 +101,10 @@ function wiredProject(): string {
   mkdirSync(join(dir, "scripts"));
   copyFileSync(SCRIPT, join(dir, "scripts", "release-holds.mjs"));
   writeFileSync(join(dir, ".npmrc"), "");
+  if (webUi) {
+    mkdirSync(join(dir, "dist", "web"), { recursive: true });
+    writeFileSync(join(dir, "dist", "web", "index.html"), "");
+  }
   return dir;
 }
 
@@ -187,6 +192,19 @@ test("this repository's prepublishOnly stops npm publish while a hold is open", 
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /#300 DefaultErrorPolicy/);
     assert.match(result.stderr, /then run npm publish again\./);
+  } finally {
+    await gh.close();
+  }
+}, 30_000);
+
+test("this repository's prepublishOnly refuses a tree without the built Web UI, before it asks about holds", async () => {
+  const gh = await github(200, []);
+  try {
+    const dir = wiredProject(false);
+    const result = await npm(dir, ["publish", "--dry-run"], gh.url);
+    assert.notEqual(result.code, 0);
+    assert.match(result.stderr, /dist\/web\/index\.html is missing: the package carries the Web UI built, so build it \(npm run build:web:ci\) before publishing\./);
+    assert.ok(!gh.seen.some((s) => s.url.startsWith("/repos/")));
   } finally {
     await gh.close();
   }
