@@ -52,10 +52,10 @@ test('a subagent inference-exhausted row clears when the subagent leaves the sna
 
 test('a row a live trace created is left to its own lifecycle', () => {
   // The main agent's klaxon raised it; the reconciliation never did.
-  const alerts: Alerts = new Map([['gone:compression-quarantine', { message: 'from the klaxon' }]]);
+  const alerts: Alerts = new Map([['main:compression-quarantine', { message: 'from the klaxon' }]]);
   const reconciled = new Set<string>();
   apply({ agents: [{ name: 'main' }], compressionQuarantine: {} }, alerts, reconciled);
-  expect(alerts.has('gone:compression-quarantine')).toBe(true);
+  expect(alerts.has('main:compression-quarantine')).toBe(true);
 });
 
 test('a row stays while its agent\'s quarantine read fails', () => {

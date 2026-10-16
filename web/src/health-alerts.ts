@@ -3,11 +3,8 @@
  * (compression quarantine, inference hard-down), worked out as a plan the
  * page applies. Kept free of Solid and the DOM so it can be tested alone.
  *
- * `reconciled` holds the keys of rows this reconciliation created itself.
- * A row for an agent that has left the snapshot (an ephemeral subagent torn
- * down) is removed only when its key is in that set: such a row has nothing
- * else that would ever clear it. Rows that live traces created keep their
- * own lifecycle (a `-clear` trace, or a snapshot that reports the agent).
+ * A current row of either kind whose agent is missing from the snapshot's
+ * `agents` list is removed: the agent was torn down (an ephemeral subagent).
  */
 
 import type { HealthSnapshot } from './Health';
@@ -35,7 +32,6 @@ function agentOf(key: string, kind: string): string | undefined {
 export function planHealthAlerts(
   h: HealthSnapshot,
   current: ReadonlyMap<string, { message: string }>,
-  reconciled: ReadonlySet<string>,
 ): HealthAlertPlan {
   const plan: HealthAlertPlan = { upsert: [], remove: [] };
   const quarantine = h.compressionQuarantine;
@@ -50,17 +46,6 @@ export function planHealthAlerts(
         });
       }
     } else {
-      plan.remove.push(key);
-    }
-  }
-  // An agent missing from the map is gone, or has nothing to report, unless
-  // its quarantine read failed: then the row stays until a read succeeds.
-  // A snapshot without the map at all (an older host) says nothing.
-  if (quarantine) {
-    for (const key of reconciled) {
-      const agent = agentOf(key, QUARANTINE);
-      if (agent === undefined || Object.hasOwn(quarantine, agent)) continue;
-      if (h.readFailures?.[agent]?.compressionQuarantine !== undefined) continue;
       plan.remove.push(key);
     }
   }
@@ -82,10 +67,11 @@ export function planHealthAlerts(
       plan.remove.push(key);
     }
   }
+  // Departed agents; a snapshot without `agents` (an older host) says nothing.
   if (Array.isArray(agents)) {
     const present = new Set(agents.map((a) => a.name));
-    for (const key of reconciled) {
-      const agent = agentOf(key, EXHAUSTED);
+    for (const key of current.keys()) {
+      const agent = agentOf(key, EXHAUSTED) ?? agentOf(key, QUARANTINE);
       if (agent !== undefined && !present.has(agent)) plan.remove.push(key);
     }
   }

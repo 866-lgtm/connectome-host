@@ -207,10 +207,7 @@ export function App() {
       return next;
     });
   };
-  /** Keys of the rows /healthz reconciliation created (see health-alerts.ts). */
-  const reconciledAlertKeys = new Set<string>();
   const removeOpsAlert = (key: string): void => {
-    reconciledAlertKeys.delete(key);
     setOpsAlerts((prev) => {
       if (!prev.has(key)) return prev;
       const next = new Map(prev);
@@ -230,7 +227,6 @@ export function App() {
       removeOpsAlert(`${agent}:${kind.slice(0, -'-clear'.length)}`);
       return;
     }
-    reconciledAlertKeys.delete(`${agent}:${kind}`);
     upsertOpsAlert(kind, agent, message, true, readActions((e.data as { actions?: unknown } | undefined)?.actions));
   };
 
@@ -311,12 +307,10 @@ export function App() {
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
     applyCredentialState(h.credential, 'local');
-    const plan = planHealthAlerts(h, opsAlerts(), reconciledAlertKeys);
+    const plan = planHealthAlerts(h, opsAlerts());
     for (const key of plan.remove) removeOpsAlert(key);
     for (const u of plan.upsert) {
-      upsertOpsAlert(u.kind, u.agent, u.message, false);
-      reconciledAlertKeys.add(`${u.agent}:${u.kind}`);
-    }
+      upsertOpsAlert(u.kind, u.agent, u.message, false);    }
   };
 
   /** `force` retries past a remembered 401/403 — the operator's grant may
