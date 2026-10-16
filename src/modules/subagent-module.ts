@@ -427,6 +427,22 @@ export function materialiseStructuralFork(
 // Module
 // ---------------------------------------------------------------------------
 
+/** A cancel that wins the race with creating a run's agent leaves the
+ *  creation running. The agent it gives is still the module's, so it's
+ *  given back when it comes; a creation that fails leaves nothing. */
+function giveBackWhenCreated(creating: Promise<{ cleanup: () => void }>, name: string): void {
+  creating.then(
+    (created) => {
+      try {
+        created.cleanup();
+      } catch (err) {
+        console.error(`[subagent] ${name}: giving back an agent created after its run was stopped failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+    () => { /* a creation that failed leaves nothing to give back */ },
+  );
+}
+
 export class SubagentModule implements Module {
   readonly name = 'subagent';
 
@@ -2060,30 +2076,31 @@ export class SubagentModule implements Module {
         // setup never finishes. A reclaim does once the run is registered
         // (registerLive, below), since the reaper reads registered runs only.
         let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent({
+          name: agentName,
+          model,
+          systemPrompt: input.systemPrompt,
+          maxTokens: admission.maxTokens,
+          ...(admission.proseRouting !== undefined
+            ? { proseRouting: admission.proseRouting }
+            : {}),
+          maxStreamTokens: 500_000,
+          strategy: new KnowledgeStrategy({
+            headWindowTokens: 2_000,
+            recentWindowTokens: 80_000,
+            compressionModel: model,
+            autoTickOnNewMessage: true,
+            maxMessageTokens: 10_000,
+          }),
+          allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
+        });
         try {
-          created = await Promise.race([
-            framework.createEphemeralAgent({
-              name: agentName,
-              model,
-              systemPrompt: input.systemPrompt,
-              maxTokens: admission.maxTokens,
-              ...(admission.proseRouting !== undefined
-                ? { proseRouting: admission.proseRouting }
-                : {}),
-              maxStreamTokens: 500_000,
-              strategy: new KnowledgeStrategy({
-                headWindowTokens: 2_000,
-                recentWindowTokens: 80_000,
-                compressionModel: model,
-                autoTickOnNewMessage: true,
-                maxMessageTokens: 10_000,
-              }),
-              allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
-            }),
-            cancel.promise,
-          ]);
+          created = await Promise.race([creating, cancel.promise]);
         } catch (err) {
-          if (err instanceof SubagentTerminated) return this.endTerminated(input.name, entry, err, waitedMs);
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs);
+          }
           throw err;
         }
         const { agent, contextManager, cleanup } = created;
@@ -2256,30 +2273,31 @@ export class SubagentModule implements Module {
         // setup never finishes. A reclaim does once the run is registered
         // (registerLive, below), since the reaper reads registered runs only.
         let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent({
+          name: agentName,
+          model,
+          systemPrompt,
+          maxTokens: admission.maxTokens,
+          ...(admission.proseRouting !== undefined
+            ? { proseRouting: admission.proseRouting }
+            : {}),
+          maxStreamTokens: 500_000,
+          strategy: new KnowledgeStrategy({
+            headWindowTokens: 2_000,
+            recentWindowTokens: 80_000,
+            compressionModel: model,
+            autoTickOnNewMessage: true,
+            maxMessageTokens: 10_000,
+          }),
+          allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
+        });
         try {
-          created = await Promise.race([
-            framework.createEphemeralAgent({
-              name: agentName,
-              model,
-              systemPrompt,
-              maxTokens: admission.maxTokens,
-              ...(admission.proseRouting !== undefined
-                ? { proseRouting: admission.proseRouting }
-                : {}),
-              maxStreamTokens: 500_000,
-              strategy: new KnowledgeStrategy({
-                headWindowTokens: 2_000,
-                recentWindowTokens: 80_000,
-                compressionModel: model,
-                autoTickOnNewMessage: true,
-                maxMessageTokens: 10_000,
-              }),
-              allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
-            }),
-            cancel.promise,
-          ]);
+          created = await Promise.race([creating, cancel.promise]);
         } catch (err) {
-          if (err instanceof SubagentTerminated) return this.endTerminated(input.name, entry, err, waitedMs);
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs);
+          }
           throw err;
         }
         const { agent, contextManager, cleanup } = created;

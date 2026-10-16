@@ -1233,6 +1233,32 @@ describe('a name means one subagent until its result has come back', () => {
     }, 20_000);
   }
 
+  for (const kind of ['spawn', 'fork'] as const) {
+    test(`an agent a ${kind}'s creation gives after its run was cancelled is given back`, async () => {
+      const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+      const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ cleanup: () => void }> };
+      const create = fw.createEphemeralAgent.bind(fw);
+      let finish!: () => void;
+      let cleanups = 0;
+      fw.createEphemeralAgent = (c) => new Promise((resolve, reject) => {
+        // Creation finishes only when the test says, after the cancel.
+        finish = () => create(c).then((created) => resolve({ ...created, cleanup: () => { cleanups++; created.cleanup(); } }), reject);
+      });
+      const delivered = deliveries(h);
+      try {
+        await h.subagent.handleToolCall(kind === 'spawn' ? spawn('scout') : fork('scout'));
+        await until(() => finish !== undefined);
+        expect(h.subagent.cancelSubagent('scout')).toBe(true);
+        await until(() => delivered.requests.length === 1);
+        expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' returned]\n\n[Stopped by user]");
+        expect(cleanups).toBe(0);
+        finish();
+        await until(() => cleanups === 1);
+        expect(cleanups).toBe(1);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
+
   test('a reclaim ends a run whose setup never finishes compiling its prompt, and frees its name', async () => {
     const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
     const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ contextManager: { compile(): Promise<unknown> } }> };
