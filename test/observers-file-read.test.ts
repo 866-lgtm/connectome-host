@@ -227,7 +227,7 @@ describe('the registry', () => {
   test('started on a link whose file is gone, it says so', () => {
     symlinkSync(join(dir, 'gone', 'observers.json'), path);
     registry.start();
-    expect(lines).toEqual([`[webui-observers] ${path} is a link to a file that can't be read — observers disabled until it's fixed`]);
+    expect(lines).toEqual([`[webui-observers] ${path} is a link to a file that can't be read (ENOENT) — admitting no grants from it`]);
   });
 
   test('a hello is found whichever spelling of its key the file or the client uses', () => {

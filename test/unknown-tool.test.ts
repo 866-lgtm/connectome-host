@@ -43,6 +43,11 @@ describe('unknownToolResult', () => {
     expect(r.error!.endsWith('Reasoning is set through agent_settings.')).toBe(true);
   });
 
+  test('one utility reads as one', () => {
+    const r = unknownToolResult({ name: 'identity', getTools: () => [], getUtilities: () => [def('status')] }, 'stat');
+    expect(r.error).toContain("The identity module's one utility is identity--status, run through the utils tool");
+  });
+
   test('one tool reads as one', () => {
     const r = unknownToolResult({ name: 'time', getTools: () => [def('now')] }, 'today');
     expect(r.error).toContain("The time module's one tool is time--now.");
