@@ -411,7 +411,9 @@ describe('mcpl_deploy', () => {
     expect(calls).toEqual(['connect:chat']);
     expect(Object.keys(readAgentOverlay(overlayPath)).sort()).toEqual(['gone', 'other', 'squat']);
     // A tombstoned server's prefix is free at the next start, and an id's own entry is replaced, not a rival.
-    expect((await call(mod, 'mcpl_deploy', { id: 'f', command: 'node', toolPrefix: 'freed' })).success).toBe(true);
+    // The receipt names the tools the framework connected, under the prefix they hold.
+    expect(String((await call(mod, 'mcpl_deploy', { id: 'f', command: 'node', toolPrefix: 'freed' })).data))
+      .toStartWith('Deployed server "f" — connected, 1 tools under prefix freed.');
     expect((await call(mod, 'mcpl_deploy', { id: 'other', command: 'bun', toolPrefix: 'mine' })).success).toBe(true);
   });
 
@@ -977,6 +979,18 @@ describe('mcpl_list', () => {
     expect(listed).not.toContain('heartbeat: UNLOADED');
   });
 
+  // The next start loads the entry with no deploy, and a deploy now needs
+  // its command or url, which the line doesn't show.
+  test("an overlay entry that isn't loaded says the next start loads it, and what a deploy needs to load it now", async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    writeFileSync(overlayPath, JSON.stringify({ mcplServers: { idle: { command: 'node' } } }));
+    expect(String((await call(mod, 'mcpl_list')).data)).toContain(
+      'idle: NOT LOADED (in your overlay but not connected: the next host start loads it, and mcpl-admin--mcpl_deploy ' +
+      'with its command or url loads it now)',
+    );
+  });
+
   test('a recipe server named like an inherited key is labelled recipe, not file/recipe', async () => {
     const { stub } = makeStubFramework();
     await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
@@ -1067,7 +1081,8 @@ describe('an overlay entry that replaces the operator definition', () => {
     expect(text).toContain('Restarted server "shell" — connected');
     expect(text).toContain(
       'replaces the operator\'s definition of "shell" and lacks its env SESSION_SERVER_TOKEN, ' +
-      'so the server runs without the operator\'s values for them. An overlay entry can\'t name host variables.',
+      'so the server, run from your entry, gets none of the operator\'s values for them. Naming a host variable in ' +
+      'your entry wouldn\'t fill them in, since only a recipe substitutes those.',
     );
     expect(text).not.toContain('SESSION_SERVER_PORT');
     expect(text).not.toContain('s3cret-token');
@@ -1128,7 +1143,7 @@ describe('an overlay entry that replaces the operator definition', () => {
     });
 
     const text = String(result.data);
-    expect(text).toContain('lacks its env SESSION_SERVER_TOKEN, so the server runs without the operator\'s values for them.');
+    expect(text).toContain('lacks its env SESSION_SERVER_TOKEN, so the server, run from your entry, gets none of the operator\'s values for them.');
     expect(text).toContain(
       'Your entry names a host variable in env SESSION_SERVER_TOKEN, and only a recipe substitutes those, ' +
       'so the server gets that text as written.',
@@ -1650,7 +1665,7 @@ describe('a failed call says what changed and what to do', () => {
         save.mockRestore();
       }
       const unknown = [
-        'What your overlay file holds now isn\'t known: its old content, the new content whole, or a mix cut short.',
+        'What your overlay file holds now isn\'t known: its old content, the new content whole, or the new content cut short.',
         'mcpl-admin--mcpl_list shows which. If it says the file isn\'t valid JSON, the next host start will stop on it ' +
         'until it\'s fixed: fix the file (or, if you can\'t edit it, ask your operator to).',
       ];
@@ -1661,7 +1676,7 @@ describe('a failed call says what changed and what to do', () => {
       expect(afterDeploy).toEqual(['connect:kept']);
       expectSays(
         unloaded, `But saving your overlay failed (${code}: the write failed).`, ...unknown,
-        'If the file doesn\'t hold the unload, mcpl-admin--mcpl_unload "kept" again records it once the file can be written.',
+        'If the file doesn\'t hold the unload, mcpl-admin--mcpl_unload "kept" again records it once the file can be read and written.',
       );
       // What the next start loads depends on what the file holds, so it isn't said.
       expect(unloaded).not.toContain('next host start loads');
@@ -1705,6 +1720,101 @@ describe('a failed call says what changed and what to do', () => {
     );
     expect(calls).toEqual(['connect:kept']);
     expect(readAgentOverlay(overlayPath)).toEqual({ kept: { command: 'node' } });
+  });
+
+  // A persist that isn't true or false would be read as true, saving an
+  // unload asked for this session only.
+  test("an unload refuses a persist that isn't true or false, and takes null as the default", async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    await call(mod, 'mcpl_deploy', { id: 'kept', command: 'node' });
+    for (const [value, said] of [['false', '"false"'], [0, '0'], ['', '""']] as const) {
+      expect((await call(mod, 'mcpl_unload', { id: 'kept', persist: value })).error).toBe(
+        `Nothing was unloaded: \`persist\` is true or false, not ${said}.`,
+      );
+    }
+    expect(calls).toEqual(['connect:kept']);
+    expect(readAgentOverlay(overlayPath)).toEqual({ kept: { command: 'node' } });
+    // Null is unspecified, as in a deploy, so the unload persists.
+    expectSays((await call(mod, 'mcpl_unload', { id: 'kept', persist: null })).data, 'Removed from your agent overlay.');
+    expect(readAgentOverlay(overlayPath)).toEqual({});
+  });
+
+  // A key that would be dropped is refused, and one of deploy's own fields,
+  // the likeliest reason to pass it, is pointed to deploy.
+  test("a restart refuses a key it doesn't take, and points one of deploy's fields to deploy", async () => {
+    const { stub, calls } = makeStubFramework();
+    const mod = makeModule(stub);
+    await call(mod, 'mcpl_deploy', { id: 'shell', command: 'node' });
+    expect((await call(mod, 'mcpl_restart', { id: 'shell', command: 'bun', args: ['serve'] })).error).toBe(
+      'Nothing was restarted: "command", "args" aren\'t fields of mcpl-admin--mcpl_restart, which takes id. ' +
+      'mcpl-admin--mcpl_deploy takes command, args: deploy the server again to change them.',
+    );
+    expect((await call(mod, 'mcpl_restart', { id: 'shell', reason: 'rebuilt' })).error).toBe(
+      'Nothing was restarted: "reason" isn\'t a field of mcpl-admin--mcpl_restart, which takes id.',
+    );
+    expect(calls).toEqual(['connect:shell']);
+    // A key given no value is absent, as the utils validator reads it.
+    expect((await call(mod, 'mcpl_restart', { id: 'shell', reason: undefined })).success).toBe(true);
+    expect(calls).toEqual(['connect:shell', 'restart:shell']);
+  });
+
+  test('a save failing with a code that comes before anything is written says nothing was deployed', async () => {
+    const codes = ['EACCES', 'EPERM', 'ENOENT', 'ENOTDIR', 'EISDIR', 'EROFS', 'ELOOP', 'ENAMETOOLONG', 'EMFILE', 'ENFILE', 'ETXTBSY', 'EBUSY'];
+    for (const code of codes) {
+      const { stub, calls } = makeStubFramework();
+      const mod = makeModule(stub);
+      const save = spyOn(mcplConfig, 'saveAgentOverlay').mockImplementation(() => {
+        throw Object.assign(new Error(`${code}: the open failed`), { code });
+      });
+      let deployed: string;
+      try {
+        deployed = String((await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).error);
+      } finally {
+        save.mockRestore();
+      }
+      expectSays(deployed, `Nothing was deployed: saving your overlay failed (${code}: the open failed)`);
+      expect(deployed).not.toContain('cut short');
+      expect(calls).toEqual([]);
+    }
+  });
+
+  // A save that fails at the open writes nothing, so the receipt reads what
+  // the next start loads from the file as it still is: for a server loaded
+  // now, one the overlay alone names, and one the operator defines.
+  test('an unload whose save fails at the open says what the file still loads at the next start', async () => {
+    const { stub } = makeStubFramework();
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'op', command: 'operator-server' }]);
+    await call(mod, 'mcpl_deploy', { id: 'kept', command: 'node' });
+    saveAgentOverlay(overlayPath, { kept: { command: 'node' }, idle: { command: 'node' } });
+    const save = spyOn(mcplConfig, 'saveAgentOverlay').mockImplementation(() => {
+      throw Object.assign(new Error('EACCES: the open failed'), { code: 'EACCES' });
+    });
+    let loaded: string;
+    let idle: string;
+    let operator: string;
+    try {
+      loaded = String((await call(mod, 'mcpl_unload', { id: 'kept' })).error);
+      idle = String((await call(mod, 'mcpl_unload', { id: 'idle' })).error);
+      operator = String((await call(mod, 'mcpl_unload', { id: 'op' })).error);
+    } finally {
+      save.mockRestore();
+    }
+    const unrecorded = 'But your overlay couldn\'t be updated (EACCES: the open failed), so the unload isn\'t recorded:';
+    const retry = (id: string) => `mcpl-admin--mcpl_unload "${id}" again records it once the file can be read and written.`;
+    expectSays(
+      loaded, 'Unloaded server "kept"', `${unrecorded} your overlay entry loads it again at the next host start.`, retry('kept'),
+    );
+    expectSays(
+      idle, 'Server "idle" wasn\'t loaded in this session.', `${unrecorded} your overlay entry loads it again at the next host start.`,
+      retry('idle'),
+    );
+    expectSays(
+      operator, 'Server "op" wasn\'t loaded in this session.',
+      `${unrecorded} the operator's definition loads it again at the next host start.`, retry('op'),
+    );
+    expect(readAgentOverlay(overlayPath)).toEqual({ kept: { command: 'node' }, idle: { command: 'node' } });
   });
 
   test("a restart of an id the framework holds no server for is refused before it's asked, naming what is loaded", async () => {

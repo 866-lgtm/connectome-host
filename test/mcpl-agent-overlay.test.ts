@@ -776,9 +776,9 @@ describe('what an overlay replacement lacks of the operator definition', () => {
     });
   });
 
-  // The receipt says an overlay entry can't name host variables, but the
-  // likeliest next move is to write one anyway: `${VAR}` there reaches the
-  // child as literal text, so it supplies nothing.
+  // The receipt says naming a host variable in an overlay entry wouldn't fill
+  // it in, and the likeliest next move is to write one anyway: `${VAR}` there
+  // reaches the child as literal text, so it supplies nothing.
   test('a value that names a host variable supplies nothing, and is named, never shown', () => {
     expect(lostByReplacement(serverProvisions(shell), {
       command: 'node',

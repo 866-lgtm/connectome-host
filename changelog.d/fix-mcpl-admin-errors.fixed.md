@@ -8,17 +8,24 @@
     its own terms, with how to repair the file (or have the operator repair
     it) and why not to move it aside, on every tool's path. The boot, which
     stops on such a file, keeps its operator message.
-  - `mcpl_deploy` names every problem with a call in one refusal, where it
-    named only the first, so an agent fixes them in one call: an argument
-    the tool doesn't take, the id, the command or url, an `access` grant the
-    host can't serve, each malformed field, a url that isn't `ws://` or
-    `wss://`, and a tool prefix a module or another server holds.
-  - `mcpl_deploy` and `mcpl_unload` now refuse an argument they don't take,
-    naming it beside the arguments they take. Before, the argument was
-    dropped and the call went on without it, so a misspelled
-    `disabledTools` left the server with no deny-list, and a misspelled
-    `persist: false` made an unload meant for this session persist, with
-    nothing said.
+  - `mcpl_deploy` names every problem with its arguments in one refusal,
+    where it named only the first, so an agent fixes them in one call: an
+    argument the tool doesn't take, the id, the command or url, an `access`
+    grant the host can't serve, each malformed field, a url that isn't
+    `ws://` or `wss://`, and a tool prefix a module or another server holds.
+    A credential it would send over `ws://` to another machine is refused
+    after that, once the url is known to be valid.
+  - `mcpl_deploy`, `mcpl_restart` and `mcpl_unload` now refuse an argument
+    they don't take, naming it beside the arguments they take, and
+    `mcpl_unload` refuses a `persist` given as anything but true or false
+    (`null` leaves the default, as an unspecified field does in a deploy).
+    Before, such an argument was dropped and the call went on without it,
+    and any `persist` but `false` counted as true. So a misspelled `disabledTools`
+    left the server with no deny-list, a `command` given to a restart left
+    the server running its old one while the reply said it had restarted,
+    and a misspelled `persist: false`, or `persist: "false"`, made an unload
+    meant for this session persist, with nothing said. A restart given one
+    of `mcpl_deploy`'s arguments is pointed to a deploy.
   - A url that isn't `ws://` or `wss://`, and a tool prefix that a module,
     a server loaded now, or a server the next host start configures holds,
     are refused before anything is saved. Before, such a url was saved,
@@ -32,8 +39,8 @@
     nothing was deployed. For a save that may have stopped partway (a full
     disk, say, or any failure not known to come before the write), it says
     what the file holds isn't known (its old content, the new content
-    whole, or a mix cut short), that `mcpl_list` shows which, and that the
-    next host start stops on a file that isn't valid JSON. Before, the raw
+    whole, or the new content cut short), that `mcpl_list` shows which, and
+    that the next host start stops on a file that isn't valid JSON. Before, the raw
     file-system error came through. An unload whose record fails that way
     says the same.
   - A failed connect or restart says the state agent-framework left the

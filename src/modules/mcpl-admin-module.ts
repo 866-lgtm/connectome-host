@@ -57,6 +57,7 @@ import {
   type ServerProvisions,
 } from '../mcpl-config.js';
 import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
 
 export interface McplAdminModuleConfig {
   /** IANA zone propagated to newly deployed stdio servers. */
@@ -140,7 +141,7 @@ function partway(error: unknown): boolean {
  *  come from the read before the write, and a failure at close after the
  *  whole content went out, so no single guess about the file is true. */
 const PARTWAY_TEXT = ' What your overlay file holds now isn\'t known: its old content, the new content whole, or ' +
-  `a mix cut short. ${LIST} shows which. If it says the file isn't valid JSON, the next host start will stop on ` +
+  `the new content cut short. ${LIST} shows which. If it says the file isn't valid JSON, the next host start will stop on ` +
   `it until it's fixed: ${REPAIR}. ${NOT_ASIDE}`;
 
 /** What takes a server out. An unload removes the agent's own entry, or
@@ -278,8 +279,8 @@ export class McplAdminModule implements Module {
     if (replacement?.lost) {
       sentences.push(
         `Your overlay entry replaces the operator's definition of "${id}" and lacks its ${replacement.lost}, ` +
-        'so the server runs without the operator\'s values for them.',
-        literal || 'An overlay entry can\'t name host variables.',
+        'so the server, run from your entry, gets none of the operator\'s values for them.',
+        literal || 'Naming a host variable in your entry wouldn\'t fill them in, since only a recipe substitutes those.',
         `To go back to the operator's definition, ${UNLOAD} "${id}": that removes your entry, and the ` +
         'operator\'s loads again at the next host start.',
       );
@@ -551,7 +552,10 @@ export class McplAdminModule implements Module {
           ? `${id}: TOMBSTONED in your overlay, still connected this session; the next host start leaves it unloaded — ${this.tombstoneAdvice(id)}`
           : `${id}: UNLOADED (tombstoned in your overlay — ${this.tombstoneAdvice(id)})`);
       } else if (!liveIds.has(id)) {
-        lines.push(`${id}: NOT LOADED (in your overlay but not connected — try ${DEPLOY} again)`);
+        lines.push(
+          `${id}: NOT LOADED (in your overlay but not connected: the next host start loads it, and ${DEPLOY} with its ` +
+          'command or url loads it now)',
+        );
       }
     }
 
@@ -561,19 +565,26 @@ export class McplAdminModule implements Module {
     return ok(`MCPL servers (${lines.length}):\n` + lines.map(l => `  ${l}`).join('\n'));
   }
 
-  /** A sentence naming the keys `input` gives that the tool `name` doesn't
-   *  declare, or null when there are none. Such a key is refused rather than
-   *  dropped, so a misspelled one (`disabledTool`, `persistent`) can't leave
-   *  a call doing other than what it asked. The keys are read from the
-   *  tool's own definition, so they can't drift from it. */
-  private undeclared(name: string, input: Record<string, unknown>): string | null {
-    const declared = Object.keys(
-      (this.definitions().find((d) => d.name === name)!.inputSchema as { properties: object }).properties,
-    );
-    const extra = Object.keys(input).filter((k) => !declared.includes(k));
-    if (extra.length === 0) return null;
-    return `${extra.map((k) => JSON.stringify(k)).join(', ')} ${extra.length === 1 ? 'isn\'t a field' : 'aren\'t fields'} ` +
-      `of ${tool(name)}, which takes ${declared.join(', ')}.`;
+  /** The fields the tool `name` declares, read from its own definition, so
+   *  they can't drift from it. */
+  private declared(name: string): string[] {
+    return Object.keys((this.definitions().find((d) => d.name === name)!.inputSchema as { properties: object }).properties);
+  }
+
+  /** The keys `input` gives that the tool `name` doesn't declare, with a
+   *  sentence naming them, or null when there are none. Such a key is
+   *  refused rather than dropped, so a misspelled one (`disabledTool`,
+   *  `persistent`) can't leave a call doing other than what it asked. */
+  private undeclared(name: string, input: Record<string, unknown>): { keys: string[]; text: string } | null {
+    const declared = this.declared(name);
+    // A key given no value is absent, as the utils validator reads it.
+    const keys = Object.keys(input).filter((k) => input[k] !== undefined && !declared.includes(k));
+    if (keys.length === 0) return null;
+    return {
+      keys,
+      text: `${keys.map((k) => JSON.stringify(k)).join(', ')} ${keys.length === 1 ? 'isn\'t a field' : 'aren\'t fields'} ` +
+        `of ${tool(name)}, which takes ${declared.join(', ')}.`,
+    };
   }
 
   private async handleDeploy(input: Record<string, unknown>, progress: CallProgress): Promise<ToolResult> {
@@ -587,7 +598,7 @@ export class McplAdminModule implements Module {
     // the catch-all, since no deploy can succeed until it's fixed.
     const problems: string[] = [];
     const undeclared = this.undeclared('mcpl_deploy', input);
-    if (undeclared) problems.push(undeclared);
+    if (undeclared) problems.push(undeclared.text);
     const id = typeof input.id === 'string' ? input.id.trim() : '';
     let idOk = false;
     if (!id) {
@@ -809,7 +820,18 @@ export class McplAdminModule implements Module {
   private async handleRestart(input: Record<string, unknown>, progress: CallProgress): Promise<ToolResult> {
     const framework = this.requireFramework();
     const id = typeof input.id === 'string' ? input.id.trim() : '';
-    if (!id) return fail(`Nothing was restarted: ${RESTART} needs \`id\` as text, the server's id as ${LIST} shows it.`);
+    const problems: string[] = [];
+    if (!id) problems.push(`${RESTART} needs \`id\` as text, the server's id as ${LIST} shows it.`);
+    // A restart takes only the id: a key it doesn't take would be dropped,
+    // and the restart would report its old configuration connected. One of
+    // deploy's own fields, such as command or url, says where it goes.
+    const undeclared = this.undeclared('mcpl_restart', input);
+    if (undeclared) {
+      const forDeploy = undeclared.keys.filter((k) => this.declared('mcpl_deploy').includes(k));
+      problems.push(undeclared.text + (forDeploy.length === 0 ? '' :
+        ` ${DEPLOY} takes ${forDeploy.join(', ')}: deploy the server again to change ${forDeploy.length === 1 ? 'it' : 'them'}.`));
+    }
+    if (problems.length > 0) return fail(`Nothing was restarted: ${problems.join(' ')}`);
 
     // The overlay is read before the restart, so a restart that throws still
     // carries what it says, and an overlay file that can't be read costs only
@@ -999,7 +1021,13 @@ export class McplAdminModule implements Module {
     // A misspelled `persist` would otherwise be dropped, and the unload
     // would persist when the caller asked for this session only.
     const undeclared = this.undeclared('mcpl_unload', input);
-    if (undeclared) problems.push(undeclared);
+    if (undeclared) problems.push(undeclared.text);
+    // A `persist` that isn't true or false would be read as true, saving an
+    // unload asked for this session only. Null is unspecified, as in a
+    // deploy, so the default holds.
+    if (input.persist !== undefined && input.persist !== null && typeof input.persist !== 'boolean') {
+      problems.push(`\`persist\` is true or false, not ${shown(input.persist)}.`);
+    }
     if (problems.length > 0) return fail(`Nothing was unloaded: ${problems.join(' ')}`);
     const persist = input.persist !== false;
 
@@ -1046,7 +1074,9 @@ export class McplAdminModule implements Module {
     // next start loads; an unload of it again records it.
     progress.changed = true;
     try {
-      const current = known ? readAgentOverlay(this.overlayPath) : overlay;
+      // A copy when it isn't read again, so a save that fails leaves
+      // `overlay` as the file still holds it, for the receipt.
+      const current = known ? readAgentOverlay(this.overlayPath) : { ...overlay };
       const entry = entryOf(current, id);
       // An agent-deployed entry is removed, and so is a malformed one for an
       // id the operator doesn't define, which loads nothing. Otherwise a
@@ -1073,7 +1103,7 @@ export class McplAdminModule implements Module {
       return fail(
         `${head} ${partway(error)
           ? `But saving your overlay failed (${reasonText(error)}).${PARTWAY_TEXT} If the file doesn't hold the ` +
-            `unload, ${UNLOAD} "${id}" again records it once the file can be written.`
+            `unload, ${UNLOAD} "${id}" again records it once the file can be read and written.`
           : `But your overlay couldn't be updated (${reasonText(error)}), so the unload isn't recorded: ` +
             `${unreadable ? 'the next host start will stop on the file until it\'s fixed.' : this.nextStart(id, overlay)} ` +
             `${UNLOAD} "${id}" again records it once the file can be read and written.`}` +
