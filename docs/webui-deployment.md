@@ -88,12 +88,20 @@ The module accepts three credentials:
   written in either base64 alphabet, padded or not, and is the same key either
   way. Once the file holds at least one usable grant, the static app shell is
   served without auth and `/ws` accepts upgrades that must then present a
-  signed observer hello. Each observer sees only its grant's scopes —
-  `health`, `ops`, `messages`, `tools`, `thinking`, `debug` — and gets a
-  session cookie for the matching HTTP routes (`debug` for `/debug/*` and
-  `/curve`, `health` for `/healthz` and `/quota`, `messages` for `/media/…`).
-  Observers are read-only; `/files/…` and `/debug/retrieval*` stay
-  password-only.
+  signed observer hello. Removing the file takes every grant in it away
+  within about 6 s, once two checks in a row, 3 s apart, find it gone, and
+  the log says so then: no hello is admitted from it, and a visitor without
+  a session needs the password for the shell again. A session an observer
+  already holds keeps its routes until it expires, up to 12 hours, and a
+  connection already open keeps its scopes until it closes. A file back by
+  the second check, as after an editor's save that removes it before
+  writing it again, changes nothing. To stop admitting anyone new, remove
+  the file: one that doesn't parse keeps the grants. Each
+  observer sees only its grant's scopes — `health`, `ops`, `messages`,
+  `tools`, `thinking`, `debug` — and gets a session cookie for the matching
+  HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
+  and `/quota`, `messages` for `/media/…`). Observers are read-only;
+  `/files/…` and `/debug/retrieval*` stay password-only.
 
 ## Caddy
 

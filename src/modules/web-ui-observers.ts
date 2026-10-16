@@ -6,7 +6,8 @@
  * human device or agent or service. Authorization is a per-agent grant file
  * (data/observers.json) that is hot-reloaded on mtime (the proven
  * discord-filters pattern: atomic tmp+rename writes, parse errors keep the
- * previous state) and editable by the agent itself through the observers
+ * previous state; removing the file revokes every grant in it) and editable
+ * by the agent itself through the observers
  * module's tools — interiority access is a consent question, so the agent
  * holds the pen.
  *
@@ -290,11 +291,21 @@ function keepNonFinite(_key: string, value: unknown): unknown {
   return typeof value === 'number' && !Number.isFinite(value) ? String(value) : value;
 }
 
-export function observersFileMtime(path: string): number | null {
+/** What the registry compares between checks: the file's mtime, ctime,
+ *  inode and size, so a file replaced by one with the same mtime (cp -p,
+ *  rsync -t) or made unreadable in place (chmod) reads as changed. When the
+ *  stat fails, why, as the log names it. */
+export function observersFileStat(path: string): { sig: string } | { problem: string } {
   try {
-    return statSync(path).mtimeMs;
-  } catch {
-    return null;
+    const s = statSync(path);
+    return { sig: `${s.mtimeMs}:${s.ctimeMs}:${s.ino}:${s.size}` };
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === 'ENOENT' || code === 'ENOTDIR') {
+      // A link whose target is gone stats as missing too, but the path is there.
+      return { problem: isLink(path) ? `is a link to a file that can't be read (${code})` : 'is gone' };
+    }
+    return { problem: `can't be read (${code ?? (err instanceof Error ? err.message : String(err))})` };
   }
 }
 
@@ -309,37 +320,80 @@ export interface VerifyResult {
 
 export class ObserverRegistry {
   private file: ObserversFile | null = null;
-  private lastMtime: number | null = null;
+  /** The file as the last read found it (observersFileStat), or null to
+   *  read it again at the next check. */
+  private lastSig: string | null = null;
+  /** Whether the file was there when last found, so its removal is said
+   *  once, whatever the file held. */
+  private present = false;
+  /** Checks in a row that haven't found the file. */
+  private misses = 0;
   private poll: ReturnType<typeof setInterval> | null = null;
   /** The last problem logged, so a file read again at every check is named
    *  once rather than every 3 s. */
   private lastSaid: string | null = null;
 
-  /** `pollMs` is how often the file's mtime is checked; tests shorten it. */
+  /** `pollMs` is how often the file is checked; tests shorten it. */
   constructor(private readonly path: string, private readonly pollMs = 3000) {}
 
   start(): void {
-    this.lastMtime = observersFileMtime(this.path);
-    if (this.lastMtime === null && isLink(this.path)) {
-      console.error(`[webui-observers] ${this.path} is a link to a file that can't be read — observers disabled until it's fixed`);
+    const at = observersFileStat(this.path);
+    this.present = 'sig' in at;
+    // A file that's there but can't be reached is named once, as a check
+    // names it; a host that never had the file says nothing.
+    if ('problem' in at && at.problem !== 'is gone') {
+      this.say(`[webui-observers] ${this.path} ${at.problem} — admitting no grants from it`);
     }
-    if (this.lastMtime !== null) this.load(this.lastMtime, 'start');
-    this.poll = setInterval(() => {
-      const m = observersFileMtime(this.path);
-      if (m === null || m === this.lastMtime) return; // missing/mid-rename or unchanged
-      this.load(m, 'reload');
-    }, this.pollMs);
+    if ('sig' in at) this.load(at.sig, readObserversFile(this.path), 'start');
+    this.poll = setInterval(() => this.check(), this.pollMs);
     this.poll.unref();
   }
 
-  /** Read the file at mtime `m` and take what the read gives. A read that
-   *  failed, or JSON a save in progress left half-written, is read again at
-   *  the next check, since the write that finishes it can keep the same
-   *  mtime; anything else waits for the file to change. */
-  private load(m: number, when: 'start' | 'reload'): void {
-    const read = readObserversFile(this.path);
-    const again = read.kind === 'unparsed' || (read.kind === 'unreadable' && read.readFailed === true);
-    this.lastMtime = again ? null : m;
+  /** One check of the file: read it again if it changed, and take no grants
+   *  from it once it's gone. */
+  private check(): void {
+    const at = observersFileStat(this.path);
+    if ('problem' in at) {
+      this.missed(at.problem);
+      return;
+    }
+    if (at.sig !== this.lastSig) {
+      const read = readObserversFile(this.path);
+      // Gone between the stat and the read: a miss, as a failed stat is.
+      if (read.kind === 'missing') {
+        this.missed('is gone');
+        return;
+      }
+      this.load(at.sig, read, 'reload');
+    }
+    this.misses = 0;
+    this.present = true;
+  }
+
+  /** A check that didn't find the file. It gives no grants, as the tools
+   *  read a missing file, once two checks in a row haven't found it. The
+   *  host's and the tools' writes are atomic renames, so they never leave it
+   *  missing; an editor's save that removes the file before writing it does,
+   *  for milliseconds, and is back by the next check, so it changes nothing. */
+  private missed(problem: string): void {
+    if (++this.misses < 2) return;
+    this.lastSig = null;
+    this.file = null;
+    if (this.present) {
+      this.present = false;
+      this.say(`[webui-observers] ${this.path} ${problem} — admitting no grants from it`);
+    }
+  }
+
+  /** Take what a read of the file gives. A read that failed, a file gone
+   *  between the stat and the read at start, or JSON a save in progress
+   *  left half-written, is read again at the next check, since the write
+   *  that finishes it can leave the stat as it was; anything else waits for
+   *  the file to change. */
+  private load(sig: string, read: ObserversFileRead, when: 'start' | 'reload'): void {
+    const again = read.kind === 'unparsed' || read.kind === 'missing'
+      || (read.kind === 'unreadable' && read.readFailed === true);
+    this.lastSig = again ? null : sig;
     this.take(read, when);
   }
 
@@ -351,10 +405,7 @@ export class ObserverRegistry {
    *  stat and the read included. */
   private take(read: ObserversFileRead, when: 'start' | 'reload'): void {
     const where = `[webui-observers] ${this.path}`;
-    const say = (line: string) => {
-      if (line !== this.lastSaid) console.error(line);
-      this.lastSaid = line;
-    };
+    const say = (line: string) => this.say(line);
     if (read.kind === 'ok') {
       this.file = read.file;
       this.lastSaid = null;
@@ -371,6 +422,12 @@ export class ObserverRegistry {
     if (read.kind === 'missing') say(`${where} is gone — admitting no grants from it`);
     else if (read.kind === 'unparsed') say(`${where} ${read.problem} — admitting no grants until it parses`);
     else say(`${where} ${read.problem} — admitting no grants from it`);
+  }
+
+  /** Log a problem once while it lasts. */
+  private say(line: string): void {
+    if (line !== this.lastSaid) console.error(line);
+    this.lastSaid = line;
   }
 
   stop(): void {
