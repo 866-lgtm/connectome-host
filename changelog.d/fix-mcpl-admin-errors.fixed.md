@@ -13,24 +13,29 @@
     the tool doesn't take, the id, the command or url, an `access` grant the
     host can't serve, each malformed field, a url that isn't `ws://` or
     `wss://`, and a tool prefix a module or another server holds.
-  - `mcpl_deploy` now refuses an argument it doesn't take, naming it beside
-    the arguments it takes. Before, the argument was dropped and the deploy
-    went on without it, so a misspelled `disabledTools` left the server
-    with no deny-list and nothing said.
-  - A url that isn't `ws://` or `wss://`, and a tool prefix that a module
-    or another server holds, now or at the next host start, are refused
-    before anything is saved. Before, such a url was saved, and with
-    reconnect, a url's default, retried in the background while the reply
-    said it might still connect; such a prefix was saved, and the next host
-    start stopped on it. An env value JSON can't write (`Infinity`, `NaN`),
-    which would have been saved as `null`, is refused too.
-  - A deploy whose overlay can't be saved says nothing was deployed and no
-    server was connected or restarted. For a write that may have stopped
-    partway (a full disk, say), it says what the file holds isn't known
-    (its old content, the new content whole, or a mix cut short), that
-    `mcpl_list` shows which, and that the next host start stops on a file
-    that isn't valid JSON. Before, the raw file-system error came through.
-    An unload whose record fails that way says the same.
+  - `mcpl_deploy` and `mcpl_unload` now refuse an argument they don't take,
+    naming it beside the arguments they take. Before, the argument was
+    dropped and the call went on without it, so a misspelled
+    `disabledTools` left the server with no deny-list, and a misspelled
+    `persist: false` made an unload meant for this session persist, with
+    nothing said.
+  - A url that isn't `ws://` or `wss://`, and a tool prefix that a module,
+    a server loaded now, or a server the next host start configures holds,
+    are refused before anything is saved. Before, such a url was saved,
+    and with reconnect, a url's default, retried in the background while
+    the reply said it kept retrying; such a prefix was saved, the connect
+    failed, and the next host start stopped on it. An env value JSON can't
+    write (`Infinity`, `NaN`), which would have been saved as `null`, is
+    refused too.
+  - A deploy whose overlay can't be saved says no server was connected or
+    restarted, and, when the save failed before writing anything, that
+    nothing was deployed. For a save that may have stopped partway (a full
+    disk, say, or any failure not known to come before the write), it says
+    what the file holds isn't known (its old content, the new content
+    whole, or a mix cut short), that `mcpl_list` shows which, and that the
+    next host start stops on a file that isn't valid JSON. Before, the raw
+    file-system error came through. An unload whose record fails that way
+    says the same.
   - A failed connect or restart says the state agent-framework left the
     server in, read rather than guessed: still running its previous
     configuration, no longer loaded (so `mcpl_restart` can't reach it), or
@@ -39,8 +44,9 @@
     that does says its entry is saved and loads at the next host start. A
     server a restart leaves down is pointed to a deploy for a wrong command,
     args or url, and to a restart only once the server itself is fixed,
-    since a restart reconnects with the configuration it last connected
-    with; one a deploy leaves down is pointed to a deploy again, which
+    since a restart reconnects with the configuration of its last connect,
+    whether that connect succeeded or not. One that a deploy's failed
+    connect or restart leaves down is pointed to a deploy again, which
     applies the saved entry whichever configuration the framework holds.
   - `mcpl_restart` of an id that isn't loaded is refused before
     agent-framework is asked, naming the loaded servers and the next step by
@@ -50,10 +56,10 @@
   - The advice for a tombstoned server the operator defines routes the
     tombstone's removal to the operator for an agent that can't edit the
     file, and says it takes effect at the next host start.
-  - After the module stops, at shutdown or a session switch, each tool says
-    the tools have stopped, without advice to retry.
+  - After the module stops, each tool says the tools have stopped, without
+    advice to retry.
   - A tool name the module doesn't have is answered with the tools it does
-    have, or its utilities when the recipe sets `surface: "utilities"`.
+    have, or with its utilities on the `utilities` surface.
   - `mcpl_list` with nothing loaded and nothing in the overlay says no
     server is loaded, where it said none was configured.
 - A `mcpl-servers.json` that isn't valid JSON is named by its path in a

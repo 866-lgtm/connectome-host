@@ -317,11 +317,15 @@ export type OverlayEntryReading =
   | { entry: AgentOverlayEntry; notes: string[]; problem?: undefined }
   | { problem: string; entry?: undefined; notes?: undefined };
 
-/** Text, a number or true/false. A number JSON can't write, Infinity or NaN
- *  (a call's 1e400 parses as Infinity), doesn't count: it would be saved as
- *  null, and the boot skips an entry with a null env value. */
+/** Text, a number or true/false. */
 const isPlain = (v: unknown): v is string | number | boolean =>
-  typeof v === 'string' || (typeof v === 'number' && Number.isFinite(v)) || typeof v === 'boolean';
+  typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+
+/** Plain, as a new write takes it: a number JSON can't write, Infinity or
+ *  NaN (a call's 1e400 parses as Infinity), doesn't count, since the file
+ *  would hold null in its place, not the number given. */
+const isPlainToWrite = (v: unknown): v is string | number | boolean =>
+  isPlain(v) && !(typeof v === 'number' && !Number.isFinite(v));
 
 /** The problem readOverlayEntry gives an entry with neither a command nor a
  *  url, which mcpl_deploy says in its own words. */
@@ -398,8 +402,8 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
       if (e.env === null || typeof e.env !== 'object' || Array.isArray(e.env)) {
         problems.push('its env isn\'t a map of names to values');
       } else {
-        const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlain(v)).map(([k]) => k);
-        if (odd.length > 0) problems.push(`its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false`);
+        const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlainToWrite(v)).map(([k]) => k);
+        if (odd.length > 0) problems.push(`its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a finite number or true/false`);
       }
     }
     for (const k of OVERLAY_NAME_LIST_FIELDS) {
@@ -739,7 +743,9 @@ export function composeOverlay<T extends { id: string }>(
 ): Array<T | ({ id: string } & Record<string, unknown>)> {
   if (Object.keys(overlay).length === 0) return servers;
 
-  // A malformed entry is skipped: neither a tombstone nor a replacement.
+  // A malformed entry is skipped: it neither tombstones nor replaces. An
+  // entry with `disabled: true` is a tombstone whatever else it holds
+  // (readOverlayEntry).
   const result: Array<T | ({ id: string } & Record<string, unknown>)> =
     servers.filter(s => !overlayEntryTombstones(Object.hasOwn(overlay, s.id) ? overlay[s.id] : undefined));
 

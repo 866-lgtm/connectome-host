@@ -88,7 +88,7 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
       { strict: true },
     )).toBe(
       "its command isn't text; its transport is neither stdio nor websocket; its args aren't a list of text; its env A " +
-      "isn't text, a number or true/false; its enabledTools isn't a list of names; its enabledTools holds an empty name, " +
+      "isn't text, a finite number or true/false; its enabledTools isn't a list of names; its enabledTools holds an empty name, " +
       'which matches nothing; its reconnect is neither true nor false',
     );
   });
@@ -531,14 +531,25 @@ describe('what an overlay replacement lacks of the operator definition', () => {
 
   test('a new write is held to the plain shapes the boot reads leniently (strict)', () => {
     for (const [entry, problem] of [
-      [{ command: 'node', env: { A: null } }, "its env A isn't text, a number or true/false"],
-      [{ command: 'node', env: { A: ['x'], B: {} } }, "its env A, B aren't text, a number or true/false"],
+      [{ command: 'node', env: { A: null } }, "its env A isn't text, a finite number or true/false"],
+      [{ command: 'node', env: { A: ['x'], B: {} } }, "its env A, B aren't text, a finite number or true/false"],
       [{ transport: 'ws', url: 'wss://w/mcpl' }, 'its transport is neither stdio nor websocket'],
       [{ command: 'node', toolPrefix: 5 }, "its toolPrefix isn't text"],
     ] as const) {
       expect(overlayEntryProblem(entry, { strict: true })).toBe(problem);
       expect(overlayEntryProblem(entry)).toBeNull();
     }
+  });
+
+  // A number JSON can't write (a file's 1e400 parses as Infinity) is refused
+  // for a new write, which would save null in its place, while the boot reads
+  // args as main did: every number as its text.
+  test('a number JSON can\'t write is refused for a new write, and read as its text in the boot\'s args', () => {
+    expect(overlayEntryProblem({ command: 'node', env: { BIG: Infinity } }, { strict: true }))
+      .toBe("its env BIG isn't text, a finite number or true/false");
+    expect(overlayEntryProblem({ command: 'node', args: ['--size', 1e400] })).toBeNull();
+    expect(resolveOverlayEntry('big', { command: 'node', args: ['--size', 1e400] } as AgentOverlayEntry, '/o.json')?.args)
+      .toEqual(['--size', 'Infinity']);
   });
 
   // A wrong kind is refused for a new write, and the boot passes it on as
