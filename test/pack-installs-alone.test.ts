@@ -9,7 +9,7 @@
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -27,6 +27,7 @@ import { helper } from "./helper.ts";
 const recipe = JSON.parse(readFileSync(process.argv[2], "utf8"));
 if (recipe.modules?.webui !== false) { console.error("zz: the Web UI is on"); process.exit(3); }
 if (recipe.agent?.mock?.echoMode !== false) { console.error("zz: the mock echoes"); process.exit(4); }
+if (recipe.agent?.name !== "zz-agent") { console.error("zz: the recipe's agent settings were dropped"); process.exit(5); }
 const queue = [...(recipe.agent?.mock?.responseQueue ?? [])];
 for (const line of readFileSync(0, "utf8").split("\\n").filter(Boolean)) console.log(\`> \${line}\\n\\n\${helper(queue.shift() ?? "")}\`);
 `;
@@ -42,7 +43,7 @@ function standIn(pkg: Record<string, unknown>, index = HOST, extra: Record<strin
     "package.json": JSON.stringify({ name: "@zz/host", version: "1.0.0", type: "module", scripts: { postinstall: BUILDS_WEB_UI }, ...pkg }),
     "src/index.ts": index,
     "src/helper.ts": "export const helper = (line: string): string => line;\n",
-    "recipes/mock-test.json": JSON.stringify({ name: "Mock", modules: { wake: false, webui: { host: "127.0.0.1" } } }),
+    "recipes/mock-test.json": JSON.stringify({ name: "Mock", agent: { name: "zz-agent" }, modules: { wake: false, webui: { host: "127.0.0.1" } } }),
     ...extra,
   };
   for (const [path, text] of Object.entries(files)) {
@@ -57,7 +58,7 @@ function check(dir: string, env: Record<string, string> = {}): Promise<{ code: n
   const home = mkdtempSync(join(tmpdir(), "pack-installs-alone-home-"));
   made.push(home);
   return new Promise((resolve) => {
-    execFile("node", [SCRIPT], {
+    execFile(process.execPath, [SCRIPT], {
       cwd: dir,
       env: {
         PATH: process.env.PATH ?? "",
@@ -74,6 +75,22 @@ function check(dir: string, env: Record<string, string> = {}): Promise<{ code: n
     });
   });
 }
+
+/** A directory holding an `npm` that runs `body` with `args` (its
+ *  arguments), `fs`, `bin` (this directory) and `pass()`, which runs the
+ *  real npm with the same arguments. */
+function npmShim(body: string): string {
+  const bin = mkdtempSync(join(tmpdir(), "pack-installs-alone-npm-"));
+  made.push(bin);
+  const real = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
+  writeFileSync(
+    join(bin, "npm"),
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst fs = require("node:fs");\nconst args = process.argv.slice(2);\nconst bin = ${JSON.stringify(bin)};\nconst pass = () => { try { process.stdout.write(execFileSync(${JSON.stringify(real)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] })); } catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); } };\n${body}\n`,
+    { mode: 0o755 },
+  );
+  return bin;
+}
+const withPath = (bin: string) => ({ PATH: `${bin}:${process.env.PATH ?? ""}` });
 
 const smokeRun = "the offline smoke run \\(recipes\\/mock-test\\.json in batch mode, Web UI off\\) of the installed zz-host-1\\.0\\.0\\.tgz";
 
@@ -182,14 +199,20 @@ test("a working tree that differs from HEAD gets a warning, and is checked as it
   git("init", "-q");
   git("-c", "user.name=zz", "-c", "user.email=zz@zz.invalid", "add", "-A");
   git("-c", "user.name=zz", "-c", "user.email=zz@zz.invalid", "commit", "-q", "-m", "zz");
+  const files = (out: string) => Number(/\((\d+) files\)/.exec(out)?.[1]);
+  const clean = await check(dir);
+  assert.equal(clean.code, 0, clean.stderr);
+  assert.doesNotMatch(clean.stderr, /warning/);
   writeFileSync(join(dir, "src", "untracked.ts"), "export const zz = 1;\n");
   const result = await check(dir);
   assert.equal(result.code, 0, result.stderr);
   assert.match(
     result.stderr,
-    /^pack-installs-alone: warning: the working tree differs from HEAD in 1 path \(src\/untracked\.ts\)\. npm pack packs the working tree, so this run checks those changes too, while the publish workflow packs a clean checkout of the tag\.$/m,
+    /^pack-installs-alone: warning: the working tree differs from HEAD in 1 path \(src\/untracked\.ts\)\. npm pack packs the working tree, so this run checks whichever of them the package includes, where the publish workflow packs a clean checkout\.$/m,
   );
-}, TIMEOUT_MS);
+  // The untracked file went into the package that was checked.
+  assert.equal(files(result.stdout), files(clean.stdout) + 1);
+}, TIMEOUT_MS * 2);
 
 test("@opentui/core must load in the installed tree, its native package with it", async () => {
   // Bundled, so the offline install takes it from the tarball.
@@ -203,11 +226,16 @@ test("@opentui/core must load in the installed tree, its native package with it"
   assert.match(loads.stdout, /src\/index\.ts's imports resolve, @opentui\/core loads, and the offline smoke run answered\.$/m);
   const missing = await check(standIn(pkg, HOST, opentui(`await import(["@opentui", "core-zz-" + process.arch].join("/"));\n`)));
   assert.equal(missing.code, 1);
+  // Listed as an optional dependency, it's probed all the same.
+  const optional = { optionalDependencies: { "@opentui/core": "1.0.0" }, bundleDependencies: ["@opentui/core"] };
+  const optionalMissing = await check(standIn(optional, HOST, opentui(`await import(["@opentui", "core-zz-" + process.arch].join("/"));\n`)));
+  assert.equal(optionalMissing.code, 1);
+  assert.match(optionalMissing.stderr, /pack-installs-alone: @opentui\/core doesn't load in the installed zz-host-1\.0\.0\.tgz/);
   assert.match(
     missing.stderr,
     new RegExp(`pack-installs-alone: @opentui/core doesn't load in the installed zz-host-1\\.0\\.0\\.tgz \\(bun's output is above\\): its native package for this platform \\(${process.platform}-${process.arch}\\) is missing or doesn't load\\.\\n$`),
   );
-}, TIMEOUT_MS * 2);
+}, TIMEOUT_MS * 3);
 
 test("a smoke run that doesn't finish is stopped at its limit, and the limit must be a number", async () => {
   const slow = await check(
@@ -221,4 +249,43 @@ test("a smoke run that doesn't finish is stopped at its limit, and the limit mus
     assert.equal(bad.code, 1);
     assert.equal(bad.stderr, `pack-installs-alone: PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS is '${value}', not a whole number of milliseconds.\n`);
   }
+}, TIMEOUT_MS);
+
+test("an install that fails once and then succeeds passes on its second attempt", async () => {
+  const blip = npmShim(`if (args[0] === "install" && !fs.existsSync(bin + "/failed")) { fs.writeFileSync(bin + "/failed", ""); console.error("zz: registry blip"); process.exit(1); }\npass();`);
+  const result = await check(standIn({}), withPath(blip));
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stderr, /zz: registry blip\n(?:.*\n)*pack-installs-alone: the install failed \(attempt 1 of 3\); trying again\./);
+  assert.doesNotMatch(result.stderr, /attempt 2 of 3/);
+  assert.match(result.stdout, /installs on its own with npm /);
+}, TIMEOUT_MS * 2);
+
+test("an install that runs out of time fails at once, saying so, without another attempt", async () => {
+  const slow = npmShim(`if (args[0] === "install") setTimeout(() => {}, 30_000);\nelse pass();`);
+  const result = await check(standIn({}), { ...withPath(slow), PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000" });
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /pack-installs-alone: the install of zz-host-1\.0\.0\.tgz didn't finish within 2 s\.\n$/);
+  assert.doesNotMatch(result.stderr, /attempt 1 of 3/);
+}, TIMEOUT_MS);
+
+test("npm pack that fails, or prints anything but one record with a filename, fails by name", async () => {
+  const failing = npmShim(`if (args[0] === "pack") { console.error("zz: pack failed"); process.exit(1); }\npass();`);
+  const failed = await check(standIn({}), withPath(failing));
+  assert.equal(failed.code, 1);
+  assert.match(failed.stderr, /zz: pack failed\n(?:.*\n)*pack-installs-alone: npm pack failed \(its output is above\)\.\n$/);
+  for (const out of ["[]", "{}", "not json", '[{"name":"zz"}]']) {
+    const odd = npmShim(`if (args[0] === "pack") { process.stdout.write(${JSON.stringify(out)}); process.exit(0); }\npass();`);
+    const result = await check(standIn({}), withPath(odd));
+    assert.equal(result.code, 1, out);
+    assert.match(result.stderr, /pack-installs-alone: npm pack --json didn't print one record with a filename \(its output is above\)\.\n$/, out);
+  }
+}, TIMEOUT_MS * 3);
+
+test("no npm on PATH fails by name", async () => {
+  const onlyNode = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
+  made.push(onlyNode);
+  symlinkSync(process.execPath, join(onlyNode, "node"));
+  const result = await check(standIn({}), { PATH: onlyNode });
+  assert.equal(result.code, 1);
+  assert.equal(result.stderr, "pack-installs-alone: couldn't run npm: it isn't on PATH.\n");
 }, TIMEOUT_MS);

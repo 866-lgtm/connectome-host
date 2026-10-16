@@ -9,14 +9,16 @@
 // @animalabs/membrane' is the membrane that agent-framework gets. Where a
 // copy sits doesn't matter, only what each importer gets. Other packages
 // aren't compared, and a stack package that only a third-party package
-// depends on wouldn't be reached (none does today). A registry version
-// compares as its version, and a GitHub pin as its repository and commit,
-// which bun.lock writes as `github:owner/repo#<sha7>` and package-lock.json
-// as a `git+…github.com/owner/repo.git#<sha40>` source. A source of any
-// other kind can't be compared, and fails saying so. CI runs it beside
-// `bun install --frozen-lockfile`, which checks bun.lock against
-// package.json, and `npm ci`, which checks package-lock.json against it.
-// Exits 1 naming each disagreement.
+// depends on isn't reached. A registry version compares as its version, and
+// a GitHub pin as its repository and commit, which bun.lock writes as
+// `github:owner/repo#<sha7>` and package-lock.json as a
+// `git+…github.com/owner/repo.git#<sha40>` source. A package neither
+// lockfile installs agrees. Pins of another kind on both sides, such as a
+// link, can't be compared, and fail saying so; such a pin against one of a
+// known kind differs. CI runs it beside `bun install --frozen-lockfile`,
+// which checks bun.lock against package.json, as Build & Test's `npm ci`
+// checks package-lock.json on each platform. Exits 1 naming each
+// disagreement.
 import { readFileSync } from "node:fs";
 
 const SCOPE = "@animalabs/";
@@ -40,13 +42,13 @@ const declared = (meta = {}) =>
     name.startsWith(SCOPE),
   );
 
-/** What a lockfile pins a package to: a registry version, a GitHub
- *  repository and commit, or a source this check can't compare. `text` is
- *  how the lockfile writes it. */
-function pinOf(text, source) {
-  const git = /^(?:github:|git\+(?:https|ssh):\/\/(?:git@)?github\.com[/:])([\w.-]+\/[\w.-]+?)(?:\.git)?#([0-9a-f]{7,40})$/i.exec(source ?? text);
+/** What a lockfile pins a package to, from how it writes it: a registry
+ *  version, a GitHub repository and commit, or a source this check can't
+ *  compare. */
+function pinOf(text) {
+  const git = /^(?:github:|git\+(?:https|ssh):\/\/(?:git@)?github\.com[/:])([\w.-]+\/[\w.-]+?)(?:\.git)?#([0-9a-f]{7,40})$/i.exec(text);
   if (git) return { kind: "git", repo: git[1].toLowerCase(), commit: git[2].toLowerCase(), text };
-  if (source === undefined && /^\d+\.\d+\.\d+(?:[-+][\w.+-]*)?$/.test(text)) return { kind: "version", text };
+  if (/^\d+\.\d+\.\d+(?:[-+][\w.+-]*)?$/.test(text)) return { kind: "version", text };
   return { kind: "other", text };
 }
 
@@ -77,7 +79,7 @@ function npmTree(lock) {
     const resolved = typeof entry.resolved === "string" ? entry.resolved : undefined;
     const fromRegistry = resolved === undefined || /^https?:\/\//.test(resolved);
     tree.set(path.replace(/(^|\/)node_modules\//g, "$1"), {
-      pin: fromRegistry && entry.version !== undefined ? pinOf(entry.version) : pinOf(resolved ?? "(no version)", resolved ?? ""),
+      pin: pinOf(fromRegistry && entry.version !== undefined ? entry.version : (resolved ?? "(no version)")),
       deps: declared(entry),
     });
   }
@@ -120,9 +122,11 @@ function resolutions({ tree, root }) {
   return out;
 }
 
-/** Whether two pins agree: the same registry version, or the same GitHub
- *  repository at the same commit, one hash a prefix of the other. */
+/** Whether two pins agree: neither lockfile installs the package, or both
+ *  pin the same registry version, or the same GitHub repository at the same
+ *  commit, one hash a prefix of the other. */
 function samePin(a, b) {
+  if (!a && !b) return true;
   if (!a || !b || a.kind !== b.kind) return false;
   if (a.kind === "version") return a.text === b.text;
   return a.repo === b.repo && (a.commit.startsWith(b.commit) || b.commit.startsWith(a.commit));
@@ -139,8 +143,17 @@ function main() {
     return 1;
   }
   const chains = [...new Set([...bun.keys(), ...npm.keys()])].sort();
+  if (chains.length === 0) {
+    console.error(
+      "lockfiles-agree: neither lockfile's root depends on a stack package (@animalabs/*), so there is nothing to " +
+        "compare: run it from the host's repository root.",
+    );
+    return 1;
+  }
   const shown = (pin) => pin?.text ?? "none";
-  const unknown = chains.filter((chain) => bun.get(chain)?.kind === "other" || npm.get(chain)?.kind === "other");
+  // Both of a kind it can't read: a pin of a known kind on either side
+  // differs from it, so that pair is reported as differing.
+  const unknown = chains.filter((chain) => bun.get(chain)?.kind === "other" && npm.get(chain)?.kind === "other");
   const differ = chains.filter((chain) => !unknown.includes(chain) && !samePin(bun.get(chain), npm.get(chain)));
   if (differ.length === 0 && unknown.length === 0) {
     console.log(
@@ -161,7 +174,7 @@ function main() {
     console.error(
       `These pins are of a kind this check can't compare (it reads registry versions and GitHub commits):\n` +
         unknown.map((chain) => `  ${chain}: bun.lock ${shown(bun.get(chain))}, package-lock.json ${shown(npm.get(chain))}\n`).join("") +
-        "Compare them by hand, and teach scripts/lockfiles-agree.mjs the kind if it's to stay.",
+        "Compare them by hand. To keep such a pin, extend pinOf in scripts/lockfiles-agree.mjs so the check reads it.",
     );
   }
   return 1;

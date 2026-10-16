@@ -21,7 +21,7 @@ afterAll(() => {
  *  `git` pins it to a GitHub commit instead, 'owner/repo#<sha40>', as each
  *  lockfile writes one; `source` gives each lockfile's text for a pin of
  *  another kind, such as a link. */
-type Tree = Record<string, { version: string; deps?: string[]; git?: string; source?: { bun: string; npm: string } }>;
+type Tree = Record<string, { version: string; deps?: string[]; git?: string; ssh?: boolean; source?: { bun: string; npm: string } }>;
 
 const ROOT_DEPS = ["@animalabs/agent-framework", "@animalabs/context-manager", "@animalabs/membrane", "discord.js"];
 /** An install path's packages: 'a/@s/b' is ['a', '@s/b']. */
@@ -53,8 +53,9 @@ function bunLock(tree: Tree, rootDeps = ROOT_DEPS, rootDevDeps: string[] = []): 
 /** package-lock.json for the same tree: 'a/b' is node_modules/a/node_modules/b. */
 function npmLock(tree: Tree, rootDeps = ROOT_DEPS, rootDevDeps: string[] = []): string {
   const packages: Record<string, unknown> = { "": { name: "zz", dependencies: depsOf(rootDeps), devDependencies: depsOf(rootDevDeps) } };
-  for (const [path, { version, deps, git, source }] of Object.entries(tree)) {
-    const resolved = git ? `git+https://github.com/${git.replace("#", ".git#")}` : source?.npm ?? "https://zz";
+  for (const [path, { version, deps, git, ssh, source }] of Object.entries(tree)) {
+    // npm writes a GitHub pin over https, or over ssh as git@github.com.
+    const resolved = git ? `${ssh ? "git+ssh://git@" : "git+https://"}github.com/${git.replace("#", ".git#")}` : source?.npm ?? "https://zz";
     packages[`node_modules/${packagesOf(path).join("/node_modules/")}`] = { version, resolved, integrity: "sha512-zz==", dependencies: depsOf(deps) };
   }
   return JSON.stringify({ name: "zz", lockfileVersion: 3, packages }, null, 2);
@@ -224,4 +225,43 @@ test("a pin of a kind the check can't compare fails, saying so, without the relo
   assert.match(result.stderr, /can't compare/);
   assert.match(result.stderr, /host > @animalabs\/membrane: bun\.lock file:\.\.\/membrane, package-lock\.json \.\.\/membrane/);
   assert.doesNotMatch(result.stderr, /delete bun\.lock/);
+});
+
+test("npm's ssh form of a GitHub pin, and a repository named in another case, compare as the same pin", async () => {
+  const ssh: Tree = { ...PINNED, "@animalabs/membrane": { version: "0.5.84", git: MEMBRANE_PIN, ssh: true } };
+  const viaSsh = await check(project(bunLock(PINNED), npmLock(ssh)));
+  assert.equal(viaSsh.code, 0, viaSsh.stderr);
+  const cased: Tree = { ...PINNED, "@animalabs/membrane": { version: "0.5.84", git: "Antra-Tess/Membrane#18a86e9eda277378acd982b07c7fe7c187721119" } };
+  const inCase = await check(project(bunLock(cased), npmLock(PINNED)));
+  assert.equal(inCase.code, 0, inCase.stderr);
+});
+
+test("a stack package that neither lockfile installs agrees, shown as none", async () => {
+  // context-manager declares an optional stack package that installs on
+  // neither side, as one for another platform wouldn't.
+  const optional: Tree = { ...STACK, "@animalabs/context-manager": { version: "0.14.0", deps: ["@animalabs/membrane", "@animalabs/zz-optional"] } };
+  const result = await check(project(bunLock(optional), npmLock(optional)));
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /host > @animalabs\/context-manager > @animalabs\/zz-optional none[;.]/);
+});
+
+test("a pin of another kind against a version differs, with the relock remedy, and isn't called incomparable", async () => {
+  const linked: Tree = { ...STACK, "@animalabs/membrane": { version: "0.5.87", source: { bun: "0.5.87", npm: "../membrane" } } };
+  const result = await check(project(bunLock(linked), npmLock(linked)));
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /resolve the stack's packages differently:\n/);
+  // agent-framework's chain to membrane differs the same way, and sorts first.
+  assert.match(result.stderr, /^ {2}host > @animalabs\/membrane: bun\.lock 0\.5\.87, package-lock\.json \.\.\/membrane$/m);
+  assert.match(result.stderr, /^ {2}host > @animalabs\/agent-framework > @animalabs\/membrane: bun\.lock 0\.5\.87, package-lock\.json \.\.\/membrane$/m);
+  assert.match(result.stderr, /delete bun\.lock/);
+  assert.doesNotMatch(result.stderr, /can't compare/);
+});
+
+test("lockfiles whose roots depend on no stack package fail: there's nothing to compare", async () => {
+  const result = await check(project(bunLock(STACK, ["discord.js"]), npmLock(STACK, ["discord.js"])));
+  assert.equal(result.code, 1);
+  assert.equal(
+    result.stderr,
+    "lockfiles-agree: neither lockfile's root depends on a stack package (@animalabs/*), so there is nothing to compare: run it from the host's repository root.\n",
+  );
 });

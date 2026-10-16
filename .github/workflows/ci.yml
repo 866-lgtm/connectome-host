@@ -39,15 +39,18 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      # --ignore-scripts skips the root postinstall, a non-strict
-      # `npm --prefix web install` followed by the web build. Run first, that
-      # install would re-resolve platform packages missing from
-      # web/package-lock.json (npm >= 11) and heal a broken lock on disk
+      # npm ci, the root's lockfile guard on each platform, as the web step
+      # below is the web app's: it never rewrites package-lock.json, and
+      # fails when the lock doesn't match package.json or lacks a package
+      # this platform needs, where `npm install` (npm >= 11) would re-resolve
+      # it silently. --ignore-scripts skips the root postinstall, a
+      # non-strict `npm --prefix web install` followed by the web build. Run
+      # first, that install would heal a broken web/package-lock.json on disk
       # before the strict step below could check it. The strict step does the
       # web build instead. No dependency in package-lock.json has an install
       # script of its own.
-      - name: Install dependencies
-        run: npm install --ignore-scripts
+      - name: Install dependencies (strict lockfile)
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       # npm ci is the actual lockfile guard: `npm install` (npm >= 11)
       # silently re-resolves platform packages missing from the lock, so a
@@ -123,11 +126,6 @@ jobs:
       # tested on this tree.
       - name: bun.lock matches package.json
         run: bun install --frozen-lockfile --ignore-scripts
-
-      # npm ci refuses when package-lock.json doesn't match package.json,
-      # where Build & Test's npm install would rewrite the lock silently.
-      - name: package-lock.json matches package.json
-        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Both lockfiles resolve the @animalabs packages the same way
         run: node scripts/lockfiles-agree.mjs

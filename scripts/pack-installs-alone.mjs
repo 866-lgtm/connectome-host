@@ -2,9 +2,9 @@
 // alone into an empty directory with its dependencies from the registry, as
 // `npm install @animalabs/connectome-host` does with the npm on PATH, and
 // runs it there under bun. That npm must run a dependency's install scripts,
-// as npm 11 does, so the postinstall builds the Web UI: npm 12, and bun,
-// skip them by default, so their installs have no Web UI, which this check
-// can't show. It checks:
+// as npm 11 does, so the postinstall builds the Web UI: npm 12 and bun skip
+// them by default, so their installs have no Web UI, and under npm 12 this
+// check fails at its Web UI step. It checks:
 //   1. the Web UI built: dist/web/index.html is in the installed package;
 //   2. `bun build` resolves src/index.ts's static imports, and its dynamic
 //      ones with a literal specifier, in the installed tree, on paths a run
@@ -23,11 +23,13 @@
 // without the publish credential, since install scripts run here; to check
 // by hand, run it from the repository root, for example before
 // `git push --follow-tags`. npm pack packs the working tree, so it warns when
-// that differs from HEAD: the publish workflow packs a clean checkout of the
-// tag. The install is tried three times, PACK_INSTALLS_ALONE_RETRY_DELAY_MS
-// apart (default 15000), to get past a registry blip.
-// PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS sets the smoke run's limit in
-// milliseconds (default 120000).
+// that differs from HEAD, where the publish workflow packs a clean checkout.
+// A failed install is tried again, three attempts in all,
+// PACK_INSTALLS_ALONE_RETRY_DELAY_MS apart (default 15000), to get past a
+// registry blip; one that runs out of time isn't.
+// PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS and
+// PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS set the install's and the smoke run's
+// limits in milliseconds (defaults 900000 and 120000).
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -41,7 +43,6 @@ const WEB_UI = "dist/web/index.html";
 // Loads its native package for this platform by a computed import.
 const NATIVE = "@opentui/core";
 const INSTALL_ATTEMPTS = 3;
-const INSTALL_TIMEOUT_MS = 15 * 60_000;
 const BUILD_TIMEOUT_MS = 5 * 60_000;
 const MAX_BUFFER = 64 * 1024 * 1024;
 
@@ -65,30 +66,40 @@ function changesFromHead() {
   return status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
 }
 
-/** Runs a command, its output going to ours; a failure throws `message`. */
-function run(file, args, options, message) {
+class TimeoutError extends CheckError {}
+
+/** Runs a command, its output going to ours. A failure throws `message`,
+ *  and running out of time says that `what` didn't finish. */
+function run(file, args, options, what, message) {
   try {
     execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], ...options });
   } catch (error) {
     if (error?.code === "ENOENT") throw new CheckError(`couldn't run ${file}: it isn't on PATH.`);
-    if (error?.code === "ETIMEDOUT") throw new CheckError(`${message.split(" (")[0]}: it didn't finish within ${options.timeout / 1000} s.`);
+    if (error?.code === "ETIMEDOUT") throw new TimeoutError(`${what} didn't finish within ${options.timeout / 1000} s.`);
     throw new CheckError(message);
   }
 }
 
 function main() {
   const smokeTimeoutMs = millis("PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS", 120_000);
+  const installTimeoutMs = millis("PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS", 15 * 60_000);
   const retryDelayMs = millis("PACK_INSTALLS_ALONE_RETRY_DELAY_MS", 15_000, true);
   const changed = changesFromHead();
   if (changed.length > 0) {
     console.error(
       `pack-installs-alone: warning: the working tree differs from HEAD in ${changed.length} ` +
         `${changed.length === 1 ? "path" : "paths"} (${changed.slice(0, 5).join(", ")}${changed.length > 5 ? ", …" : ""}). ` +
-        "npm pack packs the working tree, so this run checks those changes too, while the publish workflow packs a " +
-        "clean checkout of the tag.",
+        "npm pack packs the working tree, so this run checks whichever of them the package includes, where the " +
+        "publish workflow packs a clean checkout.",
     );
   }
-  const npmVersion = execFileSync("npm", ["--version"], { encoding: "utf8" }).trim();
+  let npmVersion;
+  try {
+    npmVersion = execFileSync("npm", ["--version"], { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).trim();
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new CheckError("couldn't run npm: it isn't on PATH.");
+    throw new CheckError("npm --version failed (its output is above).");
+  }
   const work = mkdtempSync(join(tmpdir(), "pack-installs-alone-"));
   try {
     let out = "";
@@ -127,14 +138,18 @@ function main() {
         run(
           "npm",
           ["install", "--no-audit", "--no-fund", "--no-package-lock", tarball],
-          { cwd: dir, timeout: INSTALL_TIMEOUT_MS },
+          { cwd: dir, timeout: installTimeoutMs },
+          `the install of ${packed.filename}`,
           `${packed.filename} didn't install on its own into an empty directory, in ${INSTALL_ATTEMPTS} attempts ` +
             "(npm's output is above). A dependency that isn't on the registry does that, or a registry or network " +
             "error that outlasts the attempts.",
         );
         break;
       } catch (error) {
-        if (!(error instanceof CheckError) || attempt === INSTALL_ATTEMPTS || /isn't on PATH/.test(error.message)) throw error;
+        // Running out of time isn't a blip: retried, it would leave npm's
+        // children writing into the tree the next attempt starts from.
+        const final = !(error instanceof CheckError) || error instanceof TimeoutError || /isn't on PATH/.test(error.message);
+        if (final || attempt === INSTALL_ATTEMPTS) throw error;
         console.error(`pack-installs-alone: the install failed (attempt ${attempt} of ${INSTALL_ATTEMPTS}); trying again.`);
         rmSync(join(dir, "node_modules"), { recursive: true, force: true });
         Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, retryDelayMs);
@@ -154,16 +169,19 @@ function main() {
       "bun",
       ["build", "--target=bun", join(installed, ENTRY), "--outdir", join(work, "bundle")],
       { cwd: dir, stdio: ["ignore", "ignore", "inherit"], timeout: BUILD_TIMEOUT_MS },
+      `bun build of the installed ${ENTRY}`,
       `an import of ${ENTRY} doesn't resolve in the installed ${packed.filename} (bun's output is above). ` +
         "A file missing from the package, or a dependency only devDependencies supplied, does that.",
     );
 
     const pkg = JSON.parse(readFileSync(join(installed, "package.json"), "utf8"));
-    if (pkg.dependencies?.[NATIVE] !== undefined) {
+    const native = [pkg.dependencies, pkg.optionalDependencies, pkg.peerDependencies].some((deps) => deps?.[NATIVE] !== undefined);
+    if (native) {
       run(
         "bun",
         ["-e", `await import(${JSON.stringify(NATIVE)})`],
         { cwd: installed, stdio: ["ignore", "ignore", "inherit"], timeout: BUILD_TIMEOUT_MS },
+        `loading ${NATIVE}`,
         `${NATIVE} doesn't load in the installed ${packed.filename} (bun's output is above): its native package ` +
           `for this platform (${process.platform}-${process.arch}) is missing or doesn't load.`,
       );
@@ -214,7 +232,7 @@ function main() {
     }
     console.log(
       `${packed.filename} (${packed.entryCount} files) installs on its own with npm ${npmVersion}; the Web UI built, ` +
-        `${ENTRY}'s imports resolve${pkg.dependencies?.[NATIVE] !== undefined ? `, ${NATIVE} loads` : ""}, and the ` +
+        `${ENTRY}'s imports resolve${native ? `, ${NATIVE} loads` : ""}, and the ` +
         "offline smoke run answered.",
     );
   } finally {
