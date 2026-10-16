@@ -136,12 +136,19 @@ never do.
   checks in a job of its own that the packed release installs and runs on
   its own (`node scripts/pack-installs-alone.mjs`: npm installs the tarball
   alone into an empty directory, install scripts included, so the Web UI
-  builds; bun resolves `src/index.ts`'s imports there; and the offline
-  mock-recipe smoke run answers; CI runs it on pull requests too, and by
-  hand it runs from the repository root, for example before
-  `git push --follow-tags`), publishes `@animalabs/connectome-host` to npm
-  once that check has passed, and creates the GitHub release with that
-  section as its notes. The two release jobs are independent: some
+  builds; bun resolves `src/index.ts`'s imports there and loads
+  `@opentui/core`; and the offline mock-recipe smoke run answers; CI runs it
+  on pull requests too, and by hand it runs from the repository root, for
+  example before `git push --follow-tags`, warning when the working tree
+  differs from `HEAD`, since npm packs the working tree), publishes
+  `@animalabs/connectome-host` to npm once that check has passed, and
+  creates the GitHub release with that section as its notes. The check
+  stands for the npm it runs, node 24's npm 11, which runs a dependency's
+  install scripts: npm 12 and bun skip them by default, so the Web UI
+  isn't built in their installs. When the check fails on a tag, the notes
+  are out and npm isn't: if the install failed against the registry,
+  re-run the failed jobs; otherwise fix the break and release the next
+  patch. The two release jobs are independent: some
   consumers run github-clone checkouts, so release notes must exist even
   when npm publish fails. Both need the build job, so a failed build stops
   both; past it, so do a tag with no changelog section, which neither can
@@ -189,7 +196,10 @@ agree` job fails when `bun.lock` doesn't match `package.json`
 (`bun install --frozen-lockfile`) or when the two resolve the stack's
 packages (`@animalabs/*`) differently (`node scripts/lockfiles-agree.mjs`,
 which follows the stack's dependencies from the root, through each stack
-package's own; other packages may differ). So when you change a
+package's own, comparing registry versions and GitHub commits; other
+packages may differ). It also fails when `package-lock.json` doesn't match
+`package.json` (`npm ci`), which CI's `npm install` would otherwise
+rewrite unseen. So when you change a
 dependency, update `package-lock.json` with npm, then make `bun.lock`
 follow it as for `web/`: delete `bun.lock` and run
 `bun install --lockfile-only`.

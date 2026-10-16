@@ -124,5 +124,10 @@ jobs:
       - name: bun.lock matches package.json
         run: bun install --frozen-lockfile --ignore-scripts
 
+      # npm ci refuses when package-lock.json doesn't match package.json,
+      # where Build & Test's npm install would rewrite the lock silently.
+      - name: package-lock.json matches package.json
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
       - name: Both lockfiles resolve the @animalabs packages the same way
         run: node scripts/lockfiles-agree.mjs

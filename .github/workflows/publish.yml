@@ -60,8 +60,11 @@ jobs:
   # The tarball npm publish makes from this tree, installed alone into an
   # empty directory with its dependencies from npm, install scripts
   # included, then run there (see scripts/pack-installs-alone.mjs): the Web
-  # UI builds, every import resolves, and the README's offline smoke run
-  # answers. A job of its own, so the install scripts it runs never see the
+  # UI builds, src/index.ts's static and literal dynamic imports resolve
+  # (computed ones, such as recipe extensions, aside), @opentui/core loads,
+  # and the README's offline smoke run answers. It certifies the install of
+  # node 24's npm, which runs a dependency's install scripts; npm 12 and bun
+  # skip them by default. A job of its own, so the install scripts it runs never see the
   # publish job's id-token; publish needs it, the GitHub release notes
   # don't. It runs on a dispatch too, which publishes nothing.
   pack-check:

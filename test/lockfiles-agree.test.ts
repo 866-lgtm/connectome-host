@@ -17,8 +17,11 @@ afterAll(() => {
 });
 
 /** A tree as both lockfiles describe it: an install path ('a/b' for b
- *  nested under a) to the version there and the packages it depends on. */
-type Tree = Record<string, { version: string; deps?: string[] }>;
+ *  nested under a) to the version there and the packages it depends on.
+ *  `git` pins it to a GitHub commit instead, 'owner/repo#<sha40>', as each
+ *  lockfile writes one; `source` gives each lockfile's text for a pin of
+ *  another kind, such as a link. */
+type Tree = Record<string, { version: string; deps?: string[]; git?: string; source?: { bun: string; npm: string } }>;
 
 const ROOT_DEPS = ["@animalabs/agent-framework", "@animalabs/context-manager", "@animalabs/membrane", "discord.js"];
 /** An install path's packages: 'a/@s/b' is ['a', '@s/b']. */
@@ -34,8 +37,15 @@ const depsOf = (deps: string[] = []) => Object.fromEntries(deps.map((dep) => [de
 /** bun.lock's text, as bun writes it, trailing commas included. */
 function bunLock(tree: Tree, rootDeps = ROOT_DEPS, rootDevDeps: string[] = []): string {
   const entries = Object.entries(tree)
-    .map(([path, { version, deps }]) =>
-      `    "${path}": ["${nameOf(path)}@${version}", "", ${JSON.stringify({ dependencies: depsOf(deps) })}, "sha512-zz=="],\n`)
+    .map(([path, { version, deps, git, source }]) => {
+      const meta = JSON.stringify({ dependencies: depsOf(deps) });
+      if (git) {
+        // As bun writes a GitHub pin: its metadata second, then its id.
+        const [repo, sha] = git.split("#") as [string, string];
+        return `    "${path}": ["${nameOf(path)}@github:${repo}#${sha.slice(0, 7)}", ${meta}, "${repo.replace("/", "-")}-${sha.slice(0, 7)}", "sha512-zz=="],\n`;
+      }
+      return `    "${path}": ["${nameOf(path)}@${source?.bun ?? version}", "", ${meta}, "sha512-zz=="],\n`;
+    })
     .join("");
   return `{\n  "lockfileVersion": 1,\n  "workspaces": {\n    "": {\n      "name": "zz",\n      "dependencies": ${JSON.stringify(depsOf(rootDeps))},\n      "devDependencies": ${JSON.stringify(depsOf(rootDevDeps))},\n    },\n  },\n  "packages": {\n${entries}  },\n}\n`;
 }
@@ -43,8 +53,9 @@ function bunLock(tree: Tree, rootDeps = ROOT_DEPS, rootDevDeps: string[] = []): 
 /** package-lock.json for the same tree: 'a/b' is node_modules/a/node_modules/b. */
 function npmLock(tree: Tree, rootDeps = ROOT_DEPS, rootDevDeps: string[] = []): string {
   const packages: Record<string, unknown> = { "": { name: "zz", dependencies: depsOf(rootDeps), devDependencies: depsOf(rootDevDeps) } };
-  for (const [path, { version, deps }] of Object.entries(tree)) {
-    packages[`node_modules/${packagesOf(path).join("/node_modules/")}`] = { version, resolved: "https://zz", integrity: "sha512-zz==", dependencies: depsOf(deps) };
+  for (const [path, { version, deps, git, source }] of Object.entries(tree)) {
+    const resolved = git ? `git+https://github.com/${git.replace("#", ".git#")}` : source?.npm ?? "https://zz";
+    packages[`node_modules/${packagesOf(path).join("/node_modules/")}`] = { version, resolved, integrity: "sha512-zz==", dependencies: depsOf(deps) };
   }
   return JSON.stringify({ name: "zz", lockfileVersion: 3, packages }, null, 2);
 }
@@ -167,4 +178,50 @@ test("a missing, damaged or shapeless lockfile fails, naming it", async () => {
   const shapeless = await check(project(`{ "lockfileVersion": 1, }`, npmLock(STACK)));
   assert.equal(shapeless.code, 1);
   assert.equal(shapeless.stderr, "lockfiles-agree: couldn't read the lockfiles: bun.lock has no packages map\n");
+});
+
+// From main's lockfiles at 065b034 (Sep 10 to 14), which pinned membrane to a
+// commit: bun.lock writes `github:antra-tess/membrane#18a86e9`, with its
+// metadata second, and package-lock.json the git source and membrane's own
+// version, 0.5.84.
+const MEMBRANE_PIN = "antra-tess/membrane#18a86e9eda277378acd982b07c7fe7c187721119";
+const PINNED: Tree = {
+  ...STACK,
+  "@animalabs/membrane": { version: "0.5.84", git: MEMBRANE_PIN },
+  "@animalabs/context-manager/@animalabs/membrane": { version: "0.5.84", git: MEMBRANE_PIN },
+};
+
+test("a stack package pinned to a GitHub commit compares as its repository and commit", async () => {
+  const result = await check(project(bunLock(PINNED), npmLock(PINNED)));
+  assert.equal(result.code, 0, result.stderr);
+  assert.match(result.stdout, /host > @animalabs\/membrane github:antra-tess\/membrane#18a86e9[;.]/);
+  assert.match(result.stdout, /host > @animalabs\/context-manager > @animalabs\/membrane github:antra-tess\/membrane#18a86e9[;.]/);
+});
+
+test("a git-pinned stack package's own stack dependencies are followed, from where bun keeps its metadata", async () => {
+  // agent-framework pinned to a commit, its metadata in bun's second slot,
+  // depending on a membrane only bun.lock moves.
+  const pinned: Tree = { ...STACK, "@animalabs/agent-framework": { version: "0.22.1", deps: ["@animalabs/membrane"], git: "anima-research/agent-framework#1234567890abcdef1234567890abcdef12345678" } };
+  const bumped: Tree = { ...pinned, "@animalabs/agent-framework/@animalabs/membrane": { version: "0.5.88" } };
+  const result = await check(project(bunLock(bumped), npmLock(pinned)));
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /host > @animalabs\/agent-framework > @animalabs\/membrane: bun\.lock 0\.5\.88, package-lock\.json 0\.5\.87/);
+});
+
+test("another commit, or another repository, disagrees, naming each side's pin", async () => {
+  const other: Tree = { ...PINNED, "@animalabs/membrane": { version: "0.5.84", git: "antra-tess/membrane#0123456789abcdef0123456789abcdef01234567" } };
+  const result = await check(project(bunLock(other), npmLock(PINNED)));
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /host > @animalabs\/membrane: bun\.lock github:antra-tess\/membrane#0123456, package-lock\.json git\+https:\/\/github\.com\/antra-tess\/membrane\.git#18a86e9eda277378acd982b07c7fe7c187721119/);
+  const fork: Tree = { ...PINNED, "@animalabs/membrane": { version: "0.5.84", git: "someone/membrane#18a86e9eda277378acd982b07c7fe7c187721119" } };
+  assert.equal((await check(project(bunLock(fork), npmLock(PINNED)))).code, 1);
+});
+
+test("a pin of a kind the check can't compare fails, saying so, without the relock remedy", async () => {
+  const linked: Tree = { ...STACK, "@animalabs/membrane": { version: "0.5.87", source: { bun: "file:../membrane", npm: "../membrane" } } };
+  const result = await check(project(bunLock(linked), npmLock(linked)));
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /can't compare/);
+  assert.match(result.stderr, /host > @animalabs\/membrane: bun\.lock file:\.\.\/membrane, package-lock\.json \.\.\/membrane/);
+  assert.doesNotMatch(result.stderr, /delete bun\.lock/);
 });
