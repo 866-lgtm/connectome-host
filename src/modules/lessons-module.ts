@@ -503,16 +503,17 @@ export class LessonsModule implements Module {
 
     const byId = new Map(this.state.lessons.map(l => [l.id, l]));
     let merged = false;
-    // An entry that isn't an object isn't a lesson: it's left out, so the
-    // next save writes the file without it.
+    // An entry that isn't an object isn't a lesson: it's left out of what's
+    // merged. The next save writes the file with the lessons the module
+    // holds, so without it unless the module's own state holds it too.
     const entries = (global.lessons as unknown[]).filter(isRecord) as StoredLesson[];
     const skipped = global.lessons.length - entries.length;
     if (skipped > 0) {
       console.warn(skipped === 1
         ? `[lessons] the shared lessons file ${this.globalPath} has 1 entry that isn't a lesson (not an object). ` +
-          "It's left out, and the next save writes the file without it."
+          "It's left out, and the next save writes the file with the lessons this host holds."
         : `[lessons] the shared lessons file ${this.globalPath} has ${skipped} entries that aren't lessons (not objects). ` +
-          "They're left out, and the next save writes the file without them.");
+          "They're left out, and the next save writes the file with the lessons this host holds.");
     }
     for (const gl of entries) {
       const existing = byId.get(gl.id);
@@ -620,10 +621,20 @@ function fixPhrase(f: Faults): { give: string; orDeprecate: boolean } {
   return { give: [...fields, ...confidence].join(', and '), orDeprecate: fields.length > 0 };
 }
 
+/** Whether a lesson tool can reach a stored lesson: update, deprecate,
+ *  boost and demote all find it by its id, which is text. */
+function reachable(l: StoredLesson): boolean {
+  return typeof l.id === 'string';
+}
+
 /** What the agent's list and query say a stored lesson needs, if anything. */
 function needsFix(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
   if (!f) return undefined;
+  if (!reachable(l)) {
+    return `Stored ${storedPhrase(f)}, and without an id. ${readsPhrase(f)}. No lesson tool can reach a lesson ` +
+      "without an id, so there's nothing to do about it.";
+  }
   const { give, orDeprecate } = fixPhrase(f);
   return `Stored ${storedPhrase(f)}: give ${give} with lessons--update${orDeprecate ? ', or deprecate this lesson' : ''}.`;
 }
@@ -633,18 +644,27 @@ function needsFix(l: StoredLesson): string | undefined {
 function loadLine(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
   if (!f) return undefined;
+  if (!reachable(l)) {
+    return `[lessons] a lesson with no id is stored ${storedPhrase(f)}. ${readsPhrase(f)}. No lesson tool can ` +
+      "reach a lesson without an id, so there's nothing to do about it.";
+  }
+  const { give, orDeprecate } = fixPhrase(f);
+  return `[lessons] lesson ${JSON.stringify(l.id)} is stored ${storedPhrase(f)}. ` +
+    `${readsPhrase(f)}${f.content ? ',' : ''} until the lesson is updated with ` +
+    `${orDeprecate ? `${give} or deprecated` : give.replace(/,$/, '')}.`;
+}
+
+/** What queries and retrieval make of a stored lesson's faults. */
+function readsPhrase(f: Faults): string {
   const reads = [
     ...(f.tags === 'missing' && !f.content ? ['read its tags as empty'] : []),
     ...(f.tags === 'mixed' ? ['read only its text tags'] : []),
     ...(f.confidence ? [`rank it as ${f.confidence.ranked}`] : []),
   ];
-  const readers = f.content
+  return f.content
     ? `Queries find no words in its content${f.tags === 'missing' ? ' and read its tags as empty' : ''}` +
-      `${reads.length > 0 ? ` and ${reads.join(' and ')}` : ''}, and retrieval leaves it out,`
+      `${reads.length > 0 ? ` and ${reads.join(' and ')}` : ''}, and retrieval leaves it out`
     : `Queries and retrieval ${reads.join(' and ')}`;
-  const { give, orDeprecate } = fixPhrase(f);
-  return `[lessons] lesson ${JSON.stringify(l.id)} is stored ${storedPhrase(f)}. ` +
-    `${readers} until the lesson is updated with ${orDeprecate ? `${give} or deprecated` : give.replace(/,$/, '')}.`;
 }
 
 /** Why boost or demote leaves a lesson as it is: one whose stored confidence

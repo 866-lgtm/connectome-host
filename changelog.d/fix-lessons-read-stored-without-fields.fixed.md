@@ -8,22 +8,24 @@
   evidence keeps every value already stored. `lessons--list` and
   `lessons--query` mark each lesson stored without usable content or tags
   with what's wrong and how to fix it, the host's log names each one in
-  one line when lessons load, and retrieval no longer injects a lesson with
-  no content. An entry in the shared lessons file that isn't an object is
-  left out, the log says how many, and the next save writes the file
-  without it. A shared file that holds just `null` reads as holding no
+  one line when lessons load, and retrieval no longer injects a lesson
+  with no content. An entry in the shared lessons file that isn't an
+  object is left out, the log says how many, and the next save writes the
+  file with the lessons this host holds. A lesson stored without an id is
+  marked and logged as one no lesson tool can reach, with nothing to do
+  about it. A shared file that holds just `null` reads as holding no
   lessons, where it stopped lessons from loading.
 - A lesson stored with a confidence outside 0 to 1, such as 85 meant as
   85%, or with one that isn't a number, is ranked and filtered as the
   nearer end of that range: 85 ranks as 1, the top of the range, beside
-  any lesson stored at 1, and one that isn't a number as 0. Text that holds
-  a number, such as "0.9", reads as that number. A number in the shared
-  file too large for JSON to hold, such as `1e999`, reads as one that isn't
-  a number, where it stopped lessons from loading. `lessons--list` and
-  `lessons--query` show the confidence as stored and say how to fix it,
-  the host's log names it when lessons load, and `lessons--boost` and
-  `lessons--demote` leave such a lesson as it is, saying to give it a
-  confidence from 0 to 1 first. The TUI's `/lessons`, the web viewer's
-  lessons list, headless mode, retrieval and `/export`'s markdown show the
-  confidence a lesson is ranked by, the markdown with each lesson's mark,
-  and `/export`'s JSON holds the lessons as stored.
+  any lesson stored at 1, and one that isn't a number as 0. Text that
+  holds a number, such as "0.9", reads as that number. A number in the
+  shared file too large for JSON to hold, such as `1e999`, reads as one
+  that isn't a number, where it stopped lessons from loading.
+  `lessons--list` and `lessons--query` show the confidence as stored and
+  say how to fix it, the host's log names it when lessons load, and
+  `lessons--boost` and `lessons--demote` leave such a lesson as it is,
+  saying to give it a confidence from 0 to 1 first. The TUI's `/lessons`,
+  the web viewer's lessons list, headless mode, retrieval and `/export`'s
+  markdown show the confidence a lesson is ranked by, the markdown with
+  each lesson's mark, and `/export`'s JSON holds the lessons as stored.
