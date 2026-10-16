@@ -6,11 +6,13 @@
 // accept_invite, no tokens in any result); credentials exist only on the
 // HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
-import { describe, it, expect } from 'bun:test';
-import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
+import { afterEach, describe, it, expect } from 'bun:test';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPublicKey, verify as cryptoVerify } from 'node:crypto';
+import { JsStore } from '@animalabs/chronicle';
+import { WorkspaceModule, WorkspaceReadError } from '@animalabs/agent-framework';
 
 import { IdentityModule } from '../src/modules/identity-module.ts';
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
@@ -198,7 +200,9 @@ describe('identity module', () => {
     audio[audio.length - 1] = 0x7f;
     let sentBody: Buffer | null = null;
     let sentType = '';
+    // The resident wrote the file through the workspace, and disk has no copy.
     const workspace = {
+      readFileFromDisk: async (path: string) => { throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT'); },
       readBinary: async (path: string) =>
         path === 'files/music/track.mp3' ? { data: audio } : { error: `File not found: ${path}` },
       writeBinary: async () => ({ success: true }),
@@ -244,11 +248,127 @@ describe('identity module', () => {
     );
     expect(both.error).toContain('not both');
     const onGet = await mod.handleToolCall(call('request', { service: 'music', path: '/x', fromFile: 'files/music/track.mp3' }));
-    expect(onGet.error).toContain('POST or PUT');
+    expect(onGet.error).toContain('needs a method that sends a body');
     const missing = await mod.handleToolCall(
       call('request', { service: 'music', path: '/x', method: 'PUT', fromFile: 'files/nope.mp3' }),
     );
     expect(missing.error).toContain('could not read');
+  });
+
+  it('request: every writing method carries a JSON body or a workspace file; GET carries neither', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
+    const sent: Array<{ url: string; method: string; type: string; auth: string; body: unknown }> = [];
+    const workspace = {
+      readFileFromDisk: async (path: string) => {
+        if (path === 'files/artifacts/grid.png') return { bytes: png, size: png.byteLength, truncated: false };
+        throw new WorkspaceReadError('not_found', `File not found: ${path}`, 'lstat', 'ENOENT');
+      },
+      readBinary: async (path: string) =>
+        path === 'files/artifacts/grid.png' ? { data: png } : { error: `File not found: ${path}` },
+      writeBinary: async () => ({ success: true }),
+    };
+    const mod = new IdentityModule({
+      keyPath: join(dir, 'k.pem'),
+      home: 'id.test',
+      services: { orrery: 'https://orrery.test' },
+      fetchImpl: (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.includes('/enroll')) return new Response(JSON.stringify({ sub: 'agent:a@id.test', token: 't0' }), { status: 200 });
+        if (u.includes('/token')) return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
+        if (u.includes('/services')) return new Response(JSON.stringify({ services: {} }), { status: 200 });
+        if (u.startsWith('https://orrery.test/api/nodes/')) {
+          sent.push({
+            url: u,
+            method: String(init?.method),
+            type: String(init?.headers?.['content-type'] ?? ''),
+            auth: String(init?.headers?.authorization ?? ''),
+            body: init?.body instanceof Uint8Array ? Buffer.from(init.body) : init?.body,
+          });
+          // An empty 204, as PATCH and DELETE routes often answer.
+          if (u.endsWith('/empty')) return new Response(null, { status: 204 });
+          return new Response(JSON.stringify({ id: 'n1', starred: true, note: 'the open ring' }), {
+            status: 200,
+            headers: { 'content-type': 'application/json' },
+          });
+        }
+        return new Response('{}', { status: 404 });
+      }) as typeof fetch,
+    });
+    (mod as any).ctx = { getModule: (n: string) => (n === 'workspace' ? workspace : null) };
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+
+    // The framework's `utils run` checks args against the advertised enum
+    // before the handler runs, so the schema has to offer every verb.
+    const request = mod.getUtilities().find((u) => u.name === 'request')!;
+    const methods = (request.inputSchema.properties as any).method.enum as string[];
+    expect(methods).toEqual(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+    for (const method of ['POST', 'PUT', 'PATCH', 'DELETE']) {
+      // A JSON body, as orrery's PATCH-only node update takes one.
+      const withBody = await mod.handleToolCall(call('request', {
+        service: 'orrery', path: '/api/nodes/n1', method, body: { starred: true, note: 'the open ring' },
+      }));
+      expect(withBody.success).toBe(true);
+      expect(withBody.data).toEqual({ status: 200, body: { id: 'n1', starred: true, note: 'the open ring' } });
+      expect(sent.at(-1)).toEqual({
+        url: 'https://orrery.test/api/nodes/n1',
+        method,
+        type: 'application/json',
+        auth: 'Bearer aid1.fresh.secret',
+        body: JSON.stringify({ starred: true, note: 'the open ring' }),
+      });
+      expect(JSON.stringify(withBody.data)).not.toContain('aid1.');
+
+      // A workspace file's bytes, byte-exactly, with the upload receipt.
+      const withFile = await mod.handleToolCall(call('request', {
+        service: 'orrery', path: '/api/nodes/n1', method, fromFile: 'files/artifacts/grid.png',
+      }));
+      expect(withFile.success).toBe(true);
+      expect((withFile.data as any).sent).toEqual({ path: 'files/artifacts/grid.png', size: png.byteLength, contentType: 'image/png' });
+      expect(sent.at(-1)).toMatchObject({ method, type: 'image/png', auth: 'Bearer aid1.fresh.secret' });
+      expect(Buffer.isBuffer(sent.at(-1)!.body) && (sent.at(-1)!.body as Buffer).equals(png)).toBe(true);
+      expect(JSON.stringify(withFile.data)).not.toContain('aid1.');
+    }
+    expect(sent.length).toBe(8);
+
+    // A writing method with neither body nor file sends neither, and no type.
+    const bare = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/nodes/n1', method: 'PATCH' }));
+    expect(bare.success).toBe(true);
+    expect(sent.at(-1)).toEqual({ url: 'https://orrery.test/api/nodes/n1', method: 'PATCH', type: '', auth: 'Bearer aid1.fresh.secret', body: undefined });
+
+    // An empty 204 is an empty success, with no advice to repeat the write.
+    const empty = await mod.handleToolCall(call('request', {
+      service: 'orrery', path: '/api/nodes/empty', method: 'DELETE',
+    }));
+    expect(empty.success).toBe(true);
+    expect(empty.data).toEqual({ status: 204, body: '' });
+    expect(sent.length).toBe(10);
+
+    // Refused before the wire: a body or a file with GET, whether GET was
+    // given or defaulted; body with fromFile; an unlisted verb.
+    for (const input of [
+      { method: 'GET', body: { starred: true } },
+      { body: { starred: true } },
+      { method: 'GET', fromFile: 'files/artifacts/grid.png' },
+      { fromFile: 'files/artifacts/grid.png' },
+    ]) {
+      const refused = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/nodes/n1', ...input }));
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain('needs a method that sends');
+      expect(refused.error).toContain('POST, PUT, PATCH, DELETE');
+      expect(refused.error).toContain(input.method ? 'method is GET' : 'method is GET by default');
+    }
+    const both = await mod.handleToolCall(call('request', {
+      service: 'orrery', path: '/api/nodes/n1', method: 'PATCH', body: { starred: true }, fromFile: 'files/artifacts/grid.png',
+    }));
+    expect(both.success).toBe(false);
+    expect(both.error).toContain('not both');
+    expect(methods).not.toContain('TRACE');
+    const trace = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/nodes/n1', method: 'TRACE' }));
+    expect(trace.success).toBe(false);
+    expect(trace.error).toContain('unsupported method TRACE');
+    expect(sent.length).toBe(10);
   });
 
   it('request: binary responses are described safely or saved byte-exactly to workspace', async () => {
@@ -364,5 +484,234 @@ describe('observers surface flag', () => {
     expect(asTools.getTools().map((t) => t.name)).toEqual(asUtils.getUtilities().map((u) => u.name));
     expect(asTools.getUtilities().length).toBe(0);
     expect(asUtils.getTools().length).toBe(0);
+  });
+});
+
+// An upload reads only what the workspace mount allows. agent-framework's
+// readFileFromDisk keeps the mount's link policy and reads only inside it;
+// the disk read this used before checked the path's text alone and followed
+// any link, so a link in the mount sent a file from outside it to the
+// service. These run agent-framework's own WorkspaceModule and store on a
+// real mount. The mount doesn't materialize, so a copy written through the
+// workspace is in the store alone, as a file the resident wrote and never
+// materialized.
+describe('identity request: fromFile reads only what the mount allows', () => {
+  const CAP = 64 * 1024 * 1024;
+
+  // Each fixture's teardown, registered as it makes its tree and store, and
+  // run after every test, passed or failed: the store closed, the tree removed.
+  const teardowns: Array<() => void> = [];
+  afterEach(() => {
+    for (const teardown of teardowns.splice(0).reverse()) teardown();
+  });
+
+  async function mounted(opts: { followSymlinks?: boolean } = {}) {
+    const dir = mkdtempSync(join(tmpdir(), 'ident-mount-'));
+    teardowns.push(() => rmSync(dir, { recursive: true, force: true }));
+    const mountDir = join(dir, 'files');
+    const outside = join(dir, 'outside');
+    mkdirSync(mountDir);
+    mkdirSync(outside);
+    writeFileSync(join(outside, 'host-secret.txt'), 'the host\'s own file');
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    teardowns.push(() => store.close?.());
+    const workspace = new WorkspaceModule({
+      mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never', ...(opts.followSymlinks ? { followSymlinks: true } : {}) }],
+    });
+    workspace.initStore(store);
+    // What each disk read asked for and what it read.
+    const diskReads: Array<{ maxBytes?: number; read: number; truncated: boolean }> = [];
+    const readFileFromDisk = workspace.readFileFromDisk.bind(workspace);
+    workspace.readFileFromDisk = async (path, options) => {
+      const result = await readFileFromDisk(path, options);
+      diskReads.push({ maxBytes: options?.maxBytes, read: result.bytes.byteLength, truncated: result.truncated });
+      return result;
+    };
+    /** A copy of a path in the store, written through the workspace as the resident would. */
+    const putInStore = async (path: string, text: string) => {
+      expect((await workspace.writeBinary(path, Buffer.from(text), 'application/octet-stream')).success).toBe(true);
+    };
+    const bodies: Buffer[] = [];
+    const mod = new IdentityModule({
+      keyPath: join(dir, 'k.pem'),
+      home: 'id.test',
+      services: { orrery: 'https://orrery.test' },
+      fetchImpl: (async (url: any, init?: any) => {
+        const u = String(url);
+        if (u.includes('/enroll')) return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+        if (u.includes('/token')) return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
+        if (u.includes('/services')) return new Response(JSON.stringify({ services: {} }), { status: 200 });
+        bodies.push(Buffer.from(init?.body as Uint8Array));
+        return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+      }) as typeof fetch,
+    });
+    (mod as any).ctx = { getModule: (n: string) => (n === 'workspace' ? workspace : null) };
+    await mod.handleToolCall(call('accept_invite', { invite: 'i', name: 'A' }));
+    const upload = (fromFile: string) =>
+      mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile }));
+    return { dir, mountDir, outside, workspace, putInStore, diskReads, bodies, upload };
+  }
+
+  it("sends a file in the mount from disk, not the workspace's copy of it", async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'grid.png'), 'disk bytes');
+    await putInStore('files/grid.png', 'store bytes');
+    expect((await upload('files/grid.png')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['disk bytes']);
+  });
+
+  // A link that stays inside the mount is the mount's to allow: followed where
+  // the mount sets followSymlinks, refused where it doesn't, whatever the
+  // workspace holds at the link's path.
+  it('sends the file a link names when that file is in the same mount and the mount follows links', async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted({ followSymlinks: true });
+    writeFileSync(join(mountDir, 'v2.png'), 'the file the link names');
+    symlinkSync('v2.png', join(mountDir, 'latest.png'));
+    await putInStore('files/latest.png', 'store bytes');
+    expect((await upload('files/latest.png')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['the file the link names']);
+  });
+
+  it("refuses a link to a file in the same mount when the mount doesn't follow links", async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'v2.png'), 'the file the link names');
+    symlinkSync('v2.png', join(mountDir, 'latest.png'));
+    await putInStore('files/latest.png', 'store bytes');
+    const res = await upload('files/latest.png');
+    expect(res.error).toContain('Nothing was sent: "files/latest.png" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlinks are not allowed: files/latest.png');
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a link in the mount to a file outside it, sends nothing, and names no host path', async () => {
+    const { dir, mountDir, outside, putInStore, bodies, upload } = await mounted();
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    // Even with a copy in the store, the refusal stands: it isn't sent in the link's place.
+    await putInStore('files/link.txt', 'store bytes');
+    const res = await upload('files/link.txt');
+    expect(res.success).toBe(false);
+    expect(res.error).toContain('Nothing was sent: "files/link.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlinks are not allowed: files/link.txt');
+    expect(res.error).not.toContain(dir);
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a link leading out of the mount where the mount follows links', async () => {
+    const { mountDir, outside, putInStore, bodies, upload } = await mounted({ followSymlinks: true });
+    symlinkSync(join(outside, 'host-secret.txt'), join(mountDir, 'link.txt'));
+    await putInStore('files/link.txt', 'store bytes');
+    const res = await upload('files/link.txt');
+    expect(res.error).toContain('Nothing was sent: "files/link.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlink escape detected: files/link.txt');
+    expect(bodies).toEqual([]);
+  });
+
+  // The link policy is the file's own; a directory on the path may be a link,
+  // and the read still sends only a file whose canonical path is in the mount.
+  it('refuses a file reached through a parent directory that links out of the mount', async () => {
+    const { dir, mountDir, outside, bodies, upload } = await mounted();
+    symlinkSync(outside, join(mountDir, 'out'));
+    const res = await upload('files/out/host-secret.txt');
+    expect(res.error).toContain('Nothing was sent: "files/out/host-secret.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Symlink escape detected: files/out/host-secret.txt');
+    expect(res.error).not.toContain(dir);
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a directory, even with a copy of that path in the workspace', async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted();
+    mkdirSync(join(mountDir, 'album'));
+    await putInStore('files/album', 'store bytes');
+    const res = await upload('files/album');
+    expect(res.error).toContain('Nothing was sent: "files/album" couldn\'t be read from disk');
+    expect(res.error).toContain('Path is a directory: files/album');
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses a file disk can't read, even with a copy in the workspace", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/locked.png', 'store bytes');
+    // As agent-framework reports a file whose open is refused (EACCES).
+    workspace.readFileFromDisk = async (path) => {
+      throw new WorkspaceReadError('not_found', `Unable to read file: ${path}`, 'open', 'EACCES');
+    };
+    const res = await upload('files/locked.png');
+    expect(res.error).toContain('Nothing was sent: "files/locked.png" couldn\'t be read from disk');
+    expect(res.error).toContain('Unable to read file: files/locked.png (EACCES)');
+    expect(bodies).toEqual([]);
+  });
+
+  // mount_unavailable comes after the read's lstat found an entry, when the
+  // mount root's realpath fails: no file only when the root has gone.
+  it("takes a mount root gone during the read as no file, and a root that can't be resolved as a refusal", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/notes.txt', 'the workspace\'s copy');
+    let errno = 'ENOENT';
+    workspace.readFileFromDisk = async () => {
+      throw new WorkspaceReadError('mount_unavailable', 'Mount unavailable: files', 'realpath_root', errno);
+    };
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    errno = 'EACCES';
+    const res = await upload('files/notes.txt');
+    expect(res.error).toContain('Nothing was sent: "files/notes.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('Mount unavailable: files (EACCES)');
+    expect(bodies.map(String)).toEqual(['the workspace\'s copy']);
+  });
+
+  it('refuses a file over the upload cap, having read no more of it than the cap', async () => {
+    const { mountDir, diskReads, bodies, upload } = await mounted();
+    // A sparse file one byte over the cap: nothing that large is written to the test's disk.
+    writeFileSync(join(mountDir, 'huge.bin'), '');
+    truncateSync(join(mountDir, 'huge.bin'), CAP + 1);
+    expect((await upload('files/huge.bin')).error).toContain(`file too large (${CAP + 1} > ${CAP})`);
+    expect(diskReads).toEqual([{ maxBytes: CAP, read: CAP, truncated: true }]);
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses the workspace's copy when it's over the upload cap", async () => {
+    const { workspace, bodies, upload } = await mounted();
+    (workspace as unknown as { readBinary: () => Promise<unknown> }).readBinary = async () => ({ data: { byteLength: CAP + 1 } });
+    expect((await upload('files/big.wav')).error).toContain(`file too large (${CAP + 1} > ${CAP})`);
+    expect(bodies).toEqual([]);
+  });
+
+  it('refuses a path no mount holds, and one leading out of its mount, each with its own reason', async () => {
+    const { bodies, upload } = await mounted();
+    expect((await upload('nope/grid.png')).error).toBe('Nothing was sent: Unknown mount: "nope". Available: files.');
+    expect((await upload('files/../outside/host-secret.txt')).error).toBe(
+      'Nothing was sent: Path traversal detected: "files/../outside/host-secret.txt" resolves outside mount "files".',
+    );
+    expect(bodies).toEqual([]);
+  });
+
+  // The store holds only what the resident wrote or what the sync took from
+  // regular files inside the mount, so the copy that stands in is the
+  // workspace's own, whatever is (or isn't) on disk at the path now.
+  it("sends the workspace's own copy of a file deleted from disk, and where a link leads nowhere", async () => {
+    const { mountDir, workspace, bodies, upload } = await mounted();
+    writeFileSync(join(mountDir, 'old.txt'), 'synced before it was deleted');
+    expect('data' in (await workspace.readBinary('files/old.txt'))).toBe(true); // the workspace takes it in
+    rmSync(join(mountDir, 'old.txt'));
+    expect((await upload('files/old.txt')).success).toBe(true);
+    const following = await mounted({ followSymlinks: true });
+    symlinkSync(join(following.outside, 'missing.txt'), join(following.mountDir, 'gone.txt'));
+    await following.putInStore('files/gone.txt', 'written through the workspace');
+    expect((await following.upload('files/gone.txt')).success).toBe(true);
+    expect([...bodies, ...following.bodies].map(String)).toEqual(['synced before it was deleted', 'written through the workspace']);
+  });
+
+  it("sends the workspace's copy where disk has no file: never materialized, under a file, a name disk can't hold, a gone mount", async () => {
+    const { mountDir, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/notes.txt', 'never materialized');
+    writeFileSync(join(mountDir, 'plain.txt'), 'a file, not a directory');
+    await putInStore('files/plain.txt/inner.txt', 'under a file'); // ENOTDIR
+    const long = `files/${'n'.repeat(300)}.txt`;
+    await putInStore(long, 'a name disk can\'t hold'); // ENAMETOOLONG
+    for (const path of ['files/notes.txt', 'files/plain.txt/inner.txt', long]) {
+      expect((await upload(path)).success).toBe(true);
+    }
+    rmSync(mountDir, { recursive: true, force: true });
+    expect((await upload('files/notes.txt')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['never materialized', 'under a file', 'a name disk can\'t hold', 'never materialized']);
   });
 });

@@ -36,14 +36,32 @@ import {
   createHash,
   type KeyObject,
 } from 'node:crypto';
-import type {
-  Module,
-  ModuleContext,
-  ToolCall,
-  ToolResult,
-  ToolDefinition,
-  WorkspaceModule,
+import {
+  WorkspaceReadError,
+  type Module,
+  type ModuleContext,
+  type ToolCall,
+  type ToolResult,
+  type ToolDefinition,
+  type WorkspaceModule,
 } from '@animalabs/agent-framework';
+
+/** A disk read's refusal that means disk has no file at the path, where
+ *  the workspace's own copy stands in: not_found with ENOENT (nothing there,
+ *  or a link that leads nowhere), ENOTDIR (a parent that's a file) or
+ *  ENAMETOOLONG (a name disk can't hold), and mount_unavailable with ENOENT
+ *  or ENOTDIR (the mount's directory gone, or a file in its place). A gone
+ *  mount directory reaches agent-framework 0.22.1's read as not_found with
+ *  ENOENT, since it lstats the path before it resolves the root, and a read
+ *  that resolves the root first reports it as mount_unavailable with ENOENT.
+ *  mount_unavailable with any other errno, or none, is a root the read
+ *  couldn't resolve or trust, where disk may hold a file it couldn't reach,
+ *  so the upload is refused. */
+function diskHasNoFile(error: WorkspaceReadError): boolean {
+  const gone = ['ENOENT', 'ENOTDIR'];
+  if (error.code === 'mount_unavailable') return gone.includes(error.errno ?? '');
+  return error.code === 'not_found' && [...gone, 'ENAMETOOLONG'].includes(error.errno ?? '');
+}
 
 export interface IdentityModuleConfig {
   /** ed25519 PKCS#8 PEM, generated on first use, 0600. dataDir-anchored:
@@ -77,6 +95,12 @@ const DEFAULT_SERVICES: Record<string, string> = {
  *  about a minute, and an unknown name forces a refresh immediately anyway. */
 const SERVICES_TTL_MS = 60_000;
 const SERVICES_TIMEOUT_MS = 5_000;
+
+/** HTTP methods the `request` utility sends. The security boundary is the
+ *  service allowlist with host-attached access, and each service authorizes
+ *  every request itself; this list just names the verbs services route.
+ *  The advertised schema and the runtime check both read it. */
+const REQUEST_METHODS = ['GET', 'POST', 'PUT', 'PATCH', 'DELETE'] as const;
 
 const REQUEST_BODY_MAX = 256 * 1024;
 /** Uploads are bytes the host streams from a workspace file, not text the
@@ -166,9 +190,9 @@ export class IdentityModule implements Module {
           properties: {
             service: { type: 'string', description: 'Service name, e.g. "orrery". Unknown names list what is available.' },
             path: { type: 'string', description: 'API path starting with "/", e.g. "/api/ops".' },
-            method: { type: 'string', enum: ['GET', 'POST', 'PUT', 'DELETE'], description: 'Default GET.' },
-            body: { type: 'object', description: 'JSON body for POST/PUT.' },
-            fromFile: { type: 'string', description: 'Workspace path whose raw bytes become the request body, e.g. files/music/track.mp3. Use instead of body for uploads; not combinable with it.' },
+            method: { type: 'string', enum: [...REQUEST_METHODS], description: 'Default GET.' },
+            body: { type: 'object', description: 'JSON body; sent with any method other than GET.' },
+            fromFile: { type: 'string', description: 'Workspace path whose raw bytes become the request body, e.g. files/music/track.mp3. Use instead of body for uploads, with any method other than GET; not combinable with body.' },
             contentType: { type: 'string', description: 'Content-Type for fromFile uploads. Inferred from the file extension when omitted.' },
             saveAs: { type: 'string', description: 'Optional workspace path for the raw response bytes, e.g. files/artifacts/image.png. Required to retrieve binary bodies without loss.' },
           },
@@ -405,9 +429,16 @@ export class IdentityModule implements Module {
       return fail('`path` must be a string starting with "/"');
     }
     const method = typeof input.method === 'string' ? input.method.toUpperCase() : 'GET';
-    if (!['GET', 'POST', 'PUT', 'DELETE'].includes(method)) return fail(`unsupported method ${method}`);
+    if (!(REQUEST_METHODS as readonly string[]).includes(method)) return fail(`unsupported method ${method}`);
+    // A body or an upload with GET would be dropped while the call reports
+    // success, and `method` defaults to GET, so a write that forgot its verb
+    // would silently read instead. Refuse it, naming the verbs that carry one.
+    const carrying = REQUEST_METHODS.filter((m) => m !== 'GET').join(', ');
+    if (method === 'GET' && input.body !== undefined) {
+      return fail(`\`body\` needs a method that sends one (${carrying}); method is GET${typeof input.method === 'string' ? '' : ' by default'}`);
+    }
     let bodyStr: string | undefined;
-    if (input.body !== undefined && method !== 'GET') {
+    if (input.body !== undefined) {
       bodyStr = typeof input.body === 'string' ? input.body : JSON.stringify(input.body);
       if (bodyStr.length > REQUEST_BODY_MAX) return fail(`body too large (${bodyStr.length} > ${REQUEST_BODY_MAX})`);
     }
@@ -419,31 +450,48 @@ export class IdentityModule implements Module {
     let upload: { bytes: Buffer; contentType: string; path: string } | undefined;
     if (typeof input.fromFile === 'string' && input.fromFile.length > 0) {
       if (bodyStr !== undefined) return fail('pass either `body` or `fromFile`, not both');
-      if (method === 'GET') return fail('`fromFile` needs a method with a body (POST or PUT)');
+      if (method === 'GET') {
+        return fail(`\`fromFile\` needs a method that sends a body (${carrying}); method is GET${typeof input.method === 'string' ? '' : ' by default'}`);
+      }
       const workspace = this.ctx?.getModule<WorkspaceModule>('workspace');
       if (!workspace) return fail('identity request: workspace module is not available for fromFile');
       // Disk first, store second. An upload is egress: reading it through the
       // append-only store would retain every byte forever and refuse anything
       // binary or over the mount's maxFileSize — which is most media. Disk
-      // has neither problem. The store remains the fallback for a file the
-      // resident wrote through the workspace and never materialized.
-      const diskRead = (workspace as WorkspaceModule & {
-        readBinaryFromDisk?: (
-          path: string,
-          opts?: { maxBytes?: number },
-        ) => Promise<{ data: Buffer; absolutePath: string } | { error: string }>;
-      }).readBinaryFromDisk;
-      const fromDisk = diskRead
-        ? await diskRead.call(workspace, input.fromFile, { maxBytes: UPLOAD_BODY_MAX })
-        : { error: 'this host has no disk read path' };
+      // has neither problem. The disk read is readFileFromDisk, which keeps
+      // the mount's link policy and reads only inside the mount (it checks the
+      // canonical path it opened), so an upload sends only what the mount
+      // allows; its errors name the mount-prefixed path, never the host's.
+      // readBinaryFromDisk, which this used before, checked the path's text
+      // alone and followed any link, so a link in the mount sent a file from
+      // outside it. The store's copy stands in only where disk has no file
+      // (diskHasNoFile): one the resident wrote through the workspace and
+      // never materialized, one deleted from disk, a link that leads nowhere,
+      // or one whose mount's directory is gone. That copy is the workspace's
+      // own, since agent-framework's sync takes in only regular files inside
+      // the mount, so nothing from outside it goes this way either. Any other
+      // refusal (a link the mount refuses or one leading out of it, a
+      // directory, a file disk can't read) stops the upload, since the
+      // store's copy can differ from disk's.
       let bytes: Buffer;
-      if (!('error' in fromDisk)) {
-        bytes = fromDisk.data;
-      } else {
+      try {
+        const fromDisk = await workspace.readFileFromDisk(input.fromFile, { maxBytes: UPLOAD_BODY_MAX });
+        if (fromDisk.truncated) return fail(`file too large (${fromDisk.size} > ${UPLOAD_BODY_MAX})`);
+        bytes = fromDisk.bytes;
+      } catch (error) {
+        if (!(error instanceof WorkspaceReadError)) throw error;
+        // A path no mount holds has no copy anywhere.
+        if (error.code === 'unknown_mount' || error.code === 'traversal') return fail(`Nothing was sent: ${error.message}.`);
+        if (!diskHasNoFile(error)) {
+          return fail(
+            `Nothing was sent: "${input.fromFile}" couldn't be read from disk, and the workspace's copy wasn't sent in ` +
+            `its place, since it can differ from disk's. On disk: ${error.message}${error.errno ? ` (${error.errno})` : ''}.`,
+          );
+        }
         const fromStore = await workspace.readBinary(input.fromFile);
         if ('error' in fromStore) {
           return fail(
-            `identity request: could not read ${input.fromFile}: ${fromDisk.error}; ${fromStore.error}`,
+            `identity request: could not read ${input.fromFile}: ${error.message}; ${fromStore.error}`,
           );
         }
         bytes = fromStore.data;
@@ -517,6 +565,17 @@ export class IdentityModule implements Module {
         // successful parse is a safer fallback than treating valid JSON as
         // opaque bytes; arbitrary binary almost never parses as one JSON value.
         || (!declaredType && parsedJson);
+      // An empty body (a 204, or an empty 200) is an empty success, not an
+      // omitted binary: advising a repeat with saveAs would re-send a write.
+      if (bytes.byteLength === 0) {
+        return ok({
+          status: res.status,
+          body: '',
+          ...(upload
+            ? { sent: { path: upload.path, size: upload.bytes.byteLength, contentType: upload.contentType } }
+            : {}),
+        });
+      }
       if (!textual) {
         return ok({
           status: res.status,

@@ -16,6 +16,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
+import { REASONING_EFFORTS, type ReasoningEffort } from './modules/settings-module.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -248,6 +249,9 @@ export interface RecipeAgent {
    * chapterx CLI-sim's "<cmd>cat untitled.txt</cmd>"). Prefill formatter only. */
   prefillUserMessage?: string;
   systemPrompt: string;
+  /** Agent Framework exact-name tool allowlist. Omitted preserves its 'all' default.
+   * This configures tool visibility; dispatch enforcement belongs to the framework. */
+  allowedTools?: 'all' | string[];
   maxTokens?: number;
   /**
    * Per-agent stream token budget — the accumulated-input ceiling at which the
@@ -332,6 +336,10 @@ export interface RecipeAgent {
      * 'omitted' returns empty text + signature only. Models 4.7+ default
      * to 'omitted' server-side. */
     display?: 'summarized' | 'omitted';
+    /** Anthropic streaming effort baseline, independent of enabled. Explicit agent
+     * settings override it until reset; compression calls are unaffected. Other
+     * providers ignore this field; OpenAI uses responses.reasoningEffort. */
+    effort?: ReasoningEffort;
   };
   /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
    * compaction and serviceTier are API-key transport settings. */
@@ -348,15 +356,9 @@ export interface RecipeAgent {
   codex?: {
     fastMode?: boolean;
   };
-  /** Mock-provider settings. Only used with `provider: "mock"`. The default
-   * (no block) echoes the last user message back — the most informative shape
-   * for interactive smoke runs, since you can see your own words complete the
-   * loop. `echoMode: false` returns `defaultResponse` instead, which gives
-   * deterministic output for scripted tests. */
-  mock?: {
-    echoMode?: boolean;
-    defaultResponse?: string;
-  };
+  /** Mock-provider settings. Only used with `provider: "mock"`. See
+   * RecipeMockConfig. */
+  mock?: RecipeMockConfig;
   /**
    * Content-refusal handling. When `autoRewind` is on, a `stop_reason: refusal`
    * turn triggers an automatic rewind of the triggering turn + retry (keeping
@@ -367,6 +369,38 @@ export interface RecipeAgent {
     maxRewinds?: number;
     announceHumanTurns?: boolean;
   };
+}
+
+/**
+ * Settings for membrane's MockAdapter (`agent.provider: "mock"`). The default
+ * (no block) echoes the last user message back — the most informative shape
+ * for interactive smoke runs, since you can see your own words complete the
+ * loop. `echoMode: false` returns `defaultResponse` instead, which gives
+ * deterministic output for scripted tests. The timing knobs and the queue let
+ * a run reproduce delay-sensitive behavior (event coalescing during a slow
+ * turn, say) offline.
+ *
+ * Each reply is chosen in this order: the next `responseQueue` entry, then
+ * the echo, then `defaultResponse`. Unset numbers keep membrane's defaults.
+ */
+export interface RecipeMockConfig {
+  /** Echo the last user message (`[Echo] …`). Default true in this host. */
+  echoMode?: boolean;
+  /** Reply when not echoing and the queue is empty. */
+  defaultResponse?: string;
+  /** Delay before a non-streamed `complete()` reply, in ms (membrane
+   *  default 10). Agent turns stream; compression and session naming don't. */
+  completeDelayMs?: number;
+  /** Delay between streamed chunks, in ms (membrane default 5). There is no
+   *  delay before the first chunk: a streamed reply of `L` characters takes
+   *  about `(ceil(L / streamChunkSize) - 1) * streamChunkDelayMs`. */
+  streamChunkDelayMs?: number;
+  /** Characters per streamed chunk; a positive integer (membrane default 10). */
+  streamChunkSize?: number;
+  /** Replies returned in order, one per provider call, before falling back
+   *  to the echo / `defaultResponse`. Every call through the adapter takes
+   *  one, auxiliary calls (compression, session naming) included. */
+  responseQueue?: string[];
 }
 
 export interface RecipeMcpServer {
@@ -397,8 +431,18 @@ export interface RecipeMcpServer {
    * credentials per dial; neither the recipe nor the agent holds one.
    */
   access?: string;
+  /** Namespace for this server's model-facing tool names. Default
+   *  `mcpl--<id>`, so tools surface as `mcpl--<id>--<tool>`. */
   toolPrefix?: string;
+  /**
+   * Feature-set allow-list (`*` matches one dot-separated segment). Omitted:
+   * every declared set is a candidate. `[]`: none (deny-all), in a recipe or
+   * mcpl-servers.json alike; only the agent's own overlay file reads `[]` as
+   * unset. A set whose declaration has no valid `uses` stays disabled either
+   * way (MCPL §6.4, fail-closed).
+   */
   enabledFeatureSets?: string[];
+  /** Feature-set deny-list; wins over enabledFeatureSets on overlap. */
   disabledFeatureSets?: string[];
   /**
    * Tool allow-list (bare tool names as the server exports them, no toolPrefix).
@@ -455,7 +499,9 @@ export interface RecipeMcpServer {
 /** A narrowing for one tool-lifecycle path (RFC-007 §4.3). Every stated key
  *  must hold; patterns use the RFC-007 §6.2 grammar (`*` = any run). */
 export interface RecipeToolLifecycleNarrowing {
-  /** Patterns over the model-facing tool name (`computer--*`). */
+  /** Patterns over the model-facing tool name: `mcpl--<serverId>--<tool>`
+   *  for an MCPL server's tools unless its entry sets `toolPrefix`
+   *  (`mcpl--cua--*`), `<module>--<tool>` for host modules. */
   tools?: string[];
   /** RFC-008 classes the tool must have one of; `"default"` = computer,
    *  shell, files, web, media, body. */
@@ -712,6 +758,33 @@ export interface RecipeModules {
    * tools.
    */
   activity?: boolean | { channels?: string[] };
+  /**
+   * Outage notices: tell the people in the agent's channels, through those
+   * channels, when the host cannot answer them. A sink of the framework's
+   * `ops:alert` stream (hard-down, spent quota, expired/rejected credential,
+   * pending login, provider hold, MCPL server down, …). Off by default:
+   * writing into a channel is a bigger act than showing a typing indicator.
+   *
+   * - `statusChannels` — always get the operator-grade message (kind + error
+   *   text) for `status` and `reply` kinds, after `quietMs` without a clear.
+   * - `reply.in` / `reply.not` — channel-id patterns (`zulip:*`, exact ids)
+   *   where a person who writes to the agent during an outage gets one canned
+   *   "cannot respond right now" line, and where the channel whose message
+   *   triggered the failing turn is told the same. Default `in: ['*']`.
+   * - `kinds` — tier per alert kind (`silent` | `status` | `reply`), `*`
+   *   wildcard allowed (`'auth-*': 'reply'`), merged over the built-in table;
+   *   unknown kinds are silent.
+   * - `quietMs` (default 60000), `renotifyMs` (default 1800000).
+   *
+   * `true` = reply anywhere the agent is subscribed, no status channels.
+   */
+  notices?: boolean | {
+    statusChannels?: string[];
+    reply?: { in?: string[]; not?: string[] };
+    kinds?: Record<string, 'silent' | 'status' | 'reply'>;
+    quietMs?: number;
+    renotifyMs?: number;
+  };
   /**
    * MCPL self-administration. Off by default. When enabled, the agent gets
    * `mcpl_list` / `mcpl_deploy` / `mcpl_restart` / `mcpl_unload` tools to
@@ -1128,7 +1201,10 @@ export interface Recipe {
    * highest-precedence source of a tool's class, and the way to class
    * third-party MCP servers (blender, computer use, …) that will never
    * declare `_meta["mcpl/class"]`. Replaces, never merges with, what the
-   * server declared. First matching pattern wins.
+   * server declared. First matching pattern wins. Patterns match the
+   * model-facing name, so an MCPL server's tools are
+   * `mcpl--<serverId>--<tool>` (`"mcpl--blender--*": ["media"]`) unless its
+   * entry sets `toolPrefix`.
    */
   toolClassOverrides?: Record<string, string[]>;
 }
@@ -1172,6 +1248,15 @@ export const DEFAULT_RECIPE: Recipe = {
 // Environment variable substitution
 // ---------------------------------------------------------------------------
 
+/** A `${VAR}` or `${VAR:-default}` reference, as substituteEnvVars reads one. */
+const ENV_REFERENCE = String.raw`\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}`;
+
+/** Whether text holds a `${VAR}` reference: the form a recipe substitutes
+ *  from the environment. An agent overlay entry passes it on as written. */
+export function namesEnvReference(text: string): boolean {
+  return new RegExp(ENV_REFERENCE).test(text);
+}
+
 /**
  * Walk a parsed-JSON value tree and substitute `${VAR_NAME}` patterns in
  * string values with `process.env.VAR_NAME`.  Applied at recipe-load time,
@@ -1196,7 +1281,7 @@ export const DEFAULT_RECIPE: Recipe = {
 export function substituteEnvVars(value: unknown, source: string): unknown {
   if (typeof value === 'string') {
     return value.replace(
-      /\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}/g,
+      new RegExp(ENV_REFERENCE, 'g'),
       (_match, name: string, defaultValue: string | undefined) => {
         const v = process.env[name];
         if (defaultValue !== undefined) {
@@ -1497,22 +1582,28 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
 
 /**
  * The keys each recipe level reads. The type check below keeps these lists in
- * step with Recipe, RecipeAgent and RecipeModules: a key added to an interface
- * and not here (or listed here and gone from the interface) fails to compile.
+ * step with Recipe, RecipeAgent, RecipeModules and RecipeMockConfig: a key
+ * added to an interface and not here (or listed here and gone from the
+ * interface) fails to compile.
  */
 const RECIPE_KEYS = [
   'name', 'description', 'version', 'agent', 'mcpServers', 'modules', 'extensions',
   'sessionNaming', 'codeExecution', 'conversations', 'subconscious', 'toolClassOverrides',
 ] as const;
 const RECIPE_AGENT_KEYS = [
+  'allowedTools',
   'name', 'model', 'timezone', 'provider', 'baseUrl', 'formatter', 'retry', 'prefillUserMessage',
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',
   'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
   'refusalHandling',
 ] as const;
+const RECIPE_AGENT_MOCK_KEYS = [
+  'echoMode', 'defaultResponse', 'completeDelayMs', 'streamChunkDelayMs', 'streamChunkSize',
+  'responseQueue',
+] as const;
 const RECIPE_MODULE_KEYS = [
-  'subagents', 'lessons', 'retrieval', 'wake', 'workspace', 'instructions', 'activity',
+  'subagents', 'lessons', 'retrieval', 'wake', 'workspace', 'instructions', 'activity', 'notices',
   'mcplAdmin', 'history', 'identity', 'fleet', 'webui', 'ttsRelay', 'subscriptionGc',
   'channelMode',
 ] as const;
@@ -1524,7 +1615,8 @@ const recipeKeyListsInStep: [
   ListsExactly<keyof Recipe & string, typeof RECIPE_KEYS>,
   ListsExactly<keyof RecipeAgent & string, typeof RECIPE_AGENT_KEYS>,
   ListsExactly<keyof RecipeModules & string, typeof RECIPE_MODULE_KEYS>,
-] = [true, true, true];
+  ListsExactly<keyof RecipeMockConfig & string, typeof RECIPE_AGENT_MOCK_KEYS>,
+] = [true, true, true, true];
 void recipeKeyListsInStep;
 
 /** Keys that were renamed or removed, with what replaced them. */
@@ -1559,10 +1651,10 @@ function nearestRecipeKey(key: string, known: readonly string[]): string | null 
 
 /**
  * The keys a recipe carries that the host never reads — at the top level,
- * under `agent` and under `modules` — each with what it was probably meant to
- * be. A misspelled key doesn't fail, it just doesn't happen (#167); for now
- * they are warned about, not rejected, so recipes carrying leftovers keep
- * loading (the strict schema is #91's direction).
+ * under `agent`, `agent.mock` and `modules` — each with what it was probably
+ * meant to be. A misspelled key doesn't fail, it just doesn't happen (#167);
+ * for now they are warned about, not rejected, so recipes carrying leftovers
+ * keep loading (the strict schema is #91's direction).
  */
 export function unknownRecipeKeys(raw: unknown): string[] {
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return [];
@@ -1581,6 +1673,9 @@ export function unknownRecipeKeys(raw: unknown): string[] {
   };
   check('', obj, RECIPE_KEYS);
   check('agent.', obj.agent, RECIPE_AGENT_KEYS);
+  if (obj.agent && typeof obj.agent === 'object' && !Array.isArray(obj.agent)) {
+    check('agent.mock.', (obj.agent as Record<string, unknown>).mock, RECIPE_AGENT_MOCK_KEYS);
+  }
   check('modules.', obj.modules, RECIPE_MODULE_KEYS);
   return found;
 }
@@ -1630,6 +1725,12 @@ export function validateRecipe(raw: unknown): Recipe {
     agent.systemPrompt = '';
   } else if (typeof agent.systemPrompt !== 'string') {
     throw new Error('Recipe agent "systemPrompt" must be a string when present');
+  }
+
+  if (agent.allowedTools !== undefined && agent.allowedTools !== 'all' &&
+      (!Array.isArray(agent.allowedTools) ||
+       !Array.from(agent.allowedTools).every((tool) => typeof tool === 'string'))) {
+    throw new Error("Recipe agent.allowedTools must be 'all' or an array of tool-name strings.");
   }
 
   if (agent.provider !== undefined &&
@@ -1717,6 +1818,24 @@ export function validateRecipe(raw: unknown): Recipe {
     if (mock.defaultResponse !== undefined &&
         (typeof mock.defaultResponse !== 'string' || !mock.defaultResponse.trim())) {
       throw new Error('Recipe agent.mock.defaultResponse must be a non-empty string.');
+    }
+    for (const key of ['completeDelayMs', 'streamChunkDelayMs'] as const) {
+      const v = mock[key];
+      if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+        throw new Error(`Recipe agent.mock.${key} must be a non-negative finite number (milliseconds).`);
+      }
+    }
+    // MockAdapter advances by streamChunkSize per chunk: 0 never advances (an
+    // endless loop) and a fraction makes uneven or empty chunks.
+    if (mock.streamChunkSize !== undefined &&
+        (typeof mock.streamChunkSize !== 'number' || !Number.isSafeInteger(mock.streamChunkSize) ||
+          mock.streamChunkSize < 1)) {
+      throw new Error('Recipe agent.mock.streamChunkSize must be a positive integer (characters per chunk).');
+    }
+    if (mock.responseQueue !== undefined &&
+        (!Array.isArray(mock.responseQueue) ||
+          !mock.responseQueue.every((r) => typeof r === 'string' && r.trim() !== ''))) {
+      throw new Error('Recipe agent.mock.responseQueue must be an array of non-empty strings.');
     }
   }
 
@@ -1861,6 +1980,11 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
       throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
+    }
+    if (thinking.effort !== undefined && (
+      typeof thinking.effort !== 'string' || !REASONING_EFFORTS.includes(thinking.effort as ReasoningEffort)
+    )) {
+      throw new Error(`Recipe agent.thinking.effort must be one of: ${REASONING_EFFORTS.join(', ')}.`);
     }
     if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
       if (thinking.budgetTokens >= agent.maxTokens) {
@@ -2455,6 +2579,54 @@ export function validateRecipe(raw: unknown): Recipe {
           'modules.retrieval.model must be a non-empty string when ' +
           'modules.retrieval.reasoningEffort is configured.',
         );
+      }
+    }
+
+    // Validate notices if present: channel ids and tiers are the whole
+    // contract, and a typo here means an outage nobody is told about.
+    if (mods.notices !== undefined && mods.notices !== false && mods.notices !== true) {
+      if (mods.notices === null || typeof mods.notices !== 'object' || Array.isArray(mods.notices)) {
+        throw new Error('modules.notices must be a boolean or object');
+      }
+      const n = mods.notices as Record<string, unknown>;
+      const strList = (v: unknown, name: string): void => {
+        if (v === undefined) return;
+        if (!Array.isArray(v) || v.some((x) => typeof x !== 'string' || !x)) {
+          throw new Error(`modules.notices.${name} must be an array of non-empty strings`);
+        }
+      };
+      for (const key of Object.keys(n)) {
+        if (!['statusChannels', 'reply', 'kinds', 'quietMs', 'renotifyMs'].includes(key)) {
+          throw new Error(`modules.notices has unknown field ${JSON.stringify(key)}`);
+        }
+      }
+      strList(n.statusChannels, 'statusChannels');
+      if (n.reply !== undefined) {
+        if (typeof n.reply !== 'object' || n.reply === null || Array.isArray(n.reply)) {
+          throw new Error('modules.notices.reply must be an object ({ in?, not? })');
+        }
+        const r = n.reply as Record<string, unknown>;
+        for (const key of Object.keys(r)) {
+          if (key !== 'in' && key !== 'not') throw new Error(`modules.notices.reply has unknown field ${JSON.stringify(key)}`);
+        }
+        strList(r.in, 'reply.in');
+        strList(r.not, 'reply.not');
+      }
+      if (n.kinds !== undefined) {
+        if (typeof n.kinds !== 'object' || n.kinds === null || Array.isArray(n.kinds)) {
+          throw new Error('modules.notices.kinds must be an object of kind → tier');
+        }
+        for (const [kind, tier] of Object.entries(n.kinds as Record<string, unknown>)) {
+          if (tier !== 'silent' && tier !== 'status' && tier !== 'reply') {
+            throw new Error(`modules.notices.kinds[${JSON.stringify(kind)}] must be 'silent', 'status', or 'reply'`);
+          }
+        }
+      }
+      for (const key of ['quietMs', 'renotifyMs'] as const) {
+        const v = n[key];
+        if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
+          throw new Error(`modules.notices.${key} must be a non-negative number`);
+        }
       }
     }
 

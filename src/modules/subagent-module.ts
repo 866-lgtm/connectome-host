@@ -10,9 +10,13 @@
  * results as user messages + inference-request events. Pass `sync: true`
  * to block until completion.
  *
- * Sync tasks are detachable: user can push them to background mid-flight
- * via Ctrl+B in TUI, or they auto-detach after `timeoutMs` if specified.
- * Both spawn and fork accept `timeoutMs` for per-task execution deadlines.
+ * Sync tasks are detachable: the user can push one to the background
+ * mid-flight with Ctrl+B in the TUI, and one still running at its `timeoutMs`
+ * (default maxExecutionMs, 600 s) moves there itself. A run in the background
+ * goes on until it ends and delivers its result as a message. An async
+ * task's `timeoutMs` is a hard limit on its whole run, retries included,
+ * counted from when it holds a concurrency slot; async tasks have none by
+ * default.
  */
 
 import type {
@@ -27,10 +31,11 @@ import type {
   TraceEvent,
   ContextManager,
 } from '@animalabs/agent-framework';
-import type { AgentFramework } from '@animalabs/agent-framework';
+import type { Agent, AgentFramework } from '@animalabs/agent-framework';
 import { KnowledgeStrategy } from '@animalabs/agent-framework';
 import { isToolResultContent, isToolUseContent } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
+import { emptyUsage, foldUsageSample, type UsageCounts, type UsageSample } from '../state/stream-usage.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -112,18 +117,13 @@ interface DetachableHandle {
   detach: () => void;
 }
 
-/**
- * A launch refused before its stream sends anything: its stream wouldn't
- * read what the launch promises, or its prompt is over the size limit. It's
- * the launch's outcome, not a provider failure, so neither the retry gate
- * nor the rate-limit backoff reads it, whatever words its text holds.
- */
-export class SubagentLaunchRefused extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'SubagentLaunchRefused';
-  }
-}
+/** The two endings agent-framework's `statedWaitNotSlept` appends to an
+ *  ephemeral run's failure when it ends the run over a provider's stated
+ *  wait, each at the end of the message (see isUnsleptProviderWait). */
+const UNSLEPT_PROVIDER_WAIT_ENDINGS: readonly RegExp[] = [
+  /\(the provider asked to wait [^()]*; an ephemeral run doesn't sleep a stated wait longer than \d+ s, so it ends now\)\s*$/,
+  /\(the provider's stated wait is not a number, and an ephemeral run sleeps only a stated wait of \d+ s or less, so it ends now\)\s*$/,
+];
 
 /**
  * Non-retryable termination of a subagent. All abnormal-but-expected exits
@@ -140,6 +140,38 @@ export class SubagentTerminated extends Error {
     this.name = 'SubagentTerminated';
   }
 }
+
+/**
+ * A subagent's failure that the module accounts for itself, such as its
+ * prompt over the module's limit or its run past its own time limit.
+ * Running the subagent again as it stands can't change it, so the retry
+ * loop ends on one without reading its words. (Before, the classifiers read
+ * these messages too, so a name or a number in them could make one count as
+ * transient or as a rate limit: a subagent named "migrate" holds "rate", a
+ * 1500 ms limit holds "500".)
+ */
+class SubagentFailure extends Error {
+  override readonly name: string = 'SubagentFailure';
+}
+
+/**
+ * A launch refused before its stream sends anything: its stream wouldn't
+ * read what the launch promises, or its prompt is over the size limit. It's
+ * the launch's outcome, not a provider failure: as a SubagentFailure, the
+ * retry loop ends on it, and neither the retry gate nor the rate-limit
+ * backoff reads it, whatever words its text holds.
+ */
+export class SubagentLaunchRefused extends SubagentFailure {
+  override readonly name: string = 'SubagentLaunchRefused';
+}
+
+/** setTimeout's longest delay; a longer one fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+const timerDelay = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0, ms));
+/** How early a timer may fire, by Date.now(): Node's timers can fire up to
+ *  1 ms before the time they were set for (Bun 1.4.3's didn't, in a probe
+ *  of 2,000). */
+const TIMER_SLACK_MS = 2;
 
 /** Persisted subagent state (stored in Chronicle module state).
  *  'cancelled' = terminal-but-benign (user cancel, zombie reclaim, supersession).
@@ -204,6 +236,8 @@ interface LiveSubagentState {
    *  contexts routinely exceed 30s TTFT) get reaped mid-request. Cleared
    *  on first token, completion, failure, or new tool yield. */
   requestInFlightSince?: number;
+  /** The current stream's usage as of its latest sample (see stream-usage.ts). */
+  streamUsage?: UsageCounts;
 }
 
 /** Streaming event pushed to peek subscribers. */
@@ -394,11 +428,10 @@ const SLOT_TIMEOUT_MS = 120_000;
 
 /**
  * What a forked or spawned stream is launched with, resolved once at the
- * call. The stream is created from these inputs, except its tool rules,
- * which filterToolNames applies when the stream is created, as it always
- * has, so a requested tool registered during a slot wait is usable. Both the
- * caller's receipt and the stream's own first context render them, so the
- * two can't describe different launches. The parent's values are as they
+ * call, its tool rules included, and kept through the slot wait and every
+ * retry. The stream is created from these inputs, and both the caller's
+ * receipt and the stream's own first context render them, so the two can't
+ * describe different launches. The parent's values are as they
  * were at the call; a value the parent doesn't report stays undefined and
  * is said to be uncompared, never assumed equal.
  */
@@ -428,16 +461,21 @@ export interface SubagentLaunch {
    *  undefined when there is no calling stream, so the framework's default
    *  applies (stated when the stream starts). */
   proseRouting?: ProseRouting;
-  /** The tool rules the stream is created with. filterToolNames applies
-   *  them when the stream is created, as it always has; the stream's first
-   *  context then states the surface they actually produced. */
+  /** The tool rules the stream is created with, resolved at the call by
+   *  filterToolNames; the stream's first context then states the surface
+   *  they actually produced. */
   tools: {
+    /** What the stream is created with: the caller's own rules, narrowed by
+     *  a spawn's list, less the subagent tools at the depth limit, with
+     *  subagent--return; 'all' only for an unrestricted caller's fork or
+     *  spawn without a list, short of the depth limit. */
+    allowed: 'all' | string[];
     /** The spawn caller's own list (subagent--return is always added). */
     requested?: string[];
-    /** What of that list the stream is offered at the call: what
-     *  filterToolNames grants (subagent--return once; at the depth limit no
-     *  other subagent tool), less any name the process doesn't offer then.
-     *  Present with `requested`. */
+    /** The names of `allowed` the process offers at the call, which is
+     *  what the description can say the stream gets; present when `allowed`
+     *  is a list. `allowed` keeps every name, so a tool registered later
+     *  still reaches the stream. */
     granted?: string[];
     /** At the sub-fork depth limit: no subagent tools but subagent--return. */
     depthLimited: boolean;
@@ -457,6 +495,10 @@ export interface SubagentLaunch {
     maxMessageTokens?: number;
     allowedTools: 'all' | string[];
   };
+  /** The calling stream's agent as resolved at the call (not rendered): a
+   *  fork compiles this agent's context, never another later registered
+   *  under its name. Null when there is none. */
+  parentAgent: Agent | null;
 }
 
 /** What happened when the stream was created: known only then, so stated
@@ -971,10 +1013,19 @@ export class SubagentModule implements Module {
   // Concurrency control — adaptive rate-limit-aware semaphore
   private configuredMaxConcurrent: number;   // User's ceiling
   private effectiveConcurrent: number;       // Current effective limit (may be reduced)
-  private activeConcurrent = 0;
-  private waitQueue: Array<() => void> = [];
+  /** The slots runs hold, one each. A slot is released once, however its
+   *  run ends, so the count never falls below the runs holding one. */
+  private heldSlots = new Set<object>();
+  private waitQueue: Array<(slot: object) => void> = [];
+  /** The slot each running subagent holds, for a zombie reclaim to release. */
+  private slotOf = new WeakMap<ActiveSubagent, object>();
   private consecutiveSuccesses = 0;
-  private lastRateLimitAt = 0;
+  /** A rate limit has held the effective limit down, at or below the
+   *  configured ceiling, and successes haven't yet brought it back up to it.
+   *  A rate limit at an effective limit of 1 sets it too: the provider has
+   *  just pushed back. While it holds, raising the ceiling leaves the
+   *  effective limit to recover toward it, one step per three successes. */
+  private throttled = false;
   private rateLimitCooldownMs = 30_000;      // Delay after rate limit before releasing next slot
 
   // Periodic zombie reaper. The pre-existing reaper only ran on-demand
@@ -1016,7 +1067,7 @@ export class SubagentModule implements Module {
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
-  private lastInputTokens = new Map<string, number>();  // displayName → last known input token count
+  private lastInputTokens = new Map<string, number>();  // displayName → context size: its latest call's prompt
   private cancellationHandles = new Map<string, { reject: (err: Error) => void }>();  // displayName → cancel
   private agentDepths = new Map<string, number>();  // framework agent name → fork depth
 
@@ -1052,17 +1103,12 @@ export class SubagentModule implements Module {
         // subagent from one that has been silently stuck. Look up the
         // ActiveSubagent record by entry-key (a separate index, since
         // displayName isn't the activeSubagents key directly).
-        for (const sa of this.activeSubagents.values()) {
-          if (sa.name === displayName) {
-            sa.lastActivityAt = Date.now();
-            break;
-          }
-        }
+        const sa = this.runningEntry(displayName);
+        if (sa) sa.lastActivityAt = Date.now();
 
         // inference:usage is emitted at runtime but not in the TraceEvent union — handle it first
         if ((event as { type: string }).type === 'inference:usage') {
-          const roundUsage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
-          if (roundUsage?.input) this.lastInputTokens.set(displayName, roundUsage.input);
+          this.noteUsageSample(live, (event as { tokenUsage?: UsageSample }).tokenUsage);
           return;
         }
 
@@ -1078,6 +1124,8 @@ export class SubagentModule implements Module {
             live.pendingToolCalls = [];
             live.activeCallIds.clear();
             live.requestInFlightSince = Date.now();
+            // A new stream: its usage samples count from zero.
+            live.streamUsage = emptyUsage();
             this.emit(displayName, { type: 'inference:started' });
             break;
           case 'inference:tokens': {
@@ -1107,8 +1155,7 @@ export class SubagentModule implements Module {
             this.emit(displayName, { type: 'stream_resumed' });
             break;
           case 'inference:completed': {
-            const usage = (event as { tokenUsage?: { input?: number } }).tokenUsage;
-            if (usage?.input) this.lastInputTokens.set(displayName, usage.input);
+            this.noteUsageSample(live, (event as { tokenUsage?: UsageSample }).tokenUsage);
             live.requestInFlightSince = undefined;
             this.emit(displayName, { type: 'inference:completed' });
             break;
@@ -1270,10 +1317,10 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'systemPrompt', 'task'],
         },
@@ -1294,7 +1341,7 @@ export class SubagentModule implements Module {
             model: { type: 'string', description: 'Model override (optional)' },
             maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
             sync: { type: 'boolean', description: 'If true, block until fork completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'task'],
         },
@@ -1441,34 +1488,24 @@ export class SubagentModule implements Module {
      *  queue: run*() starts with this call, so handle*() can say in its
      *  receipt whether the launch is starting or waiting for a slot. */
     ticket?: { queued: boolean },
-  ): Promise<{ waitedMs: number }> {
-    if (this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+  ): Promise<{ waitedMs: number; slot: object }> {
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
-    // Before queueing, try to reclaim slots from zombie subagents
-    const reclaimedZombies = this.reclaimZombieSlots();
-    if (reclaimedZombies > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+    // Before queueing, try to reclaim slots from zombie subagents. What a
+    // reclaim frees goes to the spawns already waiting first.
+    this.reclaimZombieSlots();
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
     if (ticket) ticket.queued = true;
     const startWait = Date.now();
-    return new Promise<{ waitedMs: number }>((resolve, reject) => {
+    return new Promise<{ waitedMs: number; slot: object }>((resolve, reject) => {
       const timer = setTimeout(() => {
-        // Remove ourselves from the wait queue
+        // Last-chance zombie reclamation before failing. What it frees goes
+        // to the queue in order, this spawn included.
+        this.reclaimZombieSlots();
         const idx = this.waitQueue.indexOf(onSlot);
-        if (idx >= 0) this.waitQueue.splice(idx, 1);
-
-        // Last-chance zombie reclamation before failing
-        const reclaimed = this.reclaimZombieSlots();
-        if (reclaimed > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-          this.activeConcurrent++;
-          resolve({ waitedMs: Date.now() - startWait });
-          return;
-        }
+        if (idx < 0) return; // a freed slot has reached it
+        this.waitQueue.splice(idx, 1);
 
         // Surface which subagents currently hold the slots, with silence
         // and total runtime. Without this the caller only sees "5/5 in
@@ -1490,9 +1527,9 @@ export class SubagentModule implements Module {
         ));
       }, slotTimeoutMs);
 
-      const onSlot = () => {
+      const onSlot = (slot: object) => {
         clearTimeout(timer);
-        resolve({ waitedMs: Date.now() - startWait });
+        resolve({ waitedMs: Date.now() - startWait, slot });
       };
 
       this.waitQueue.push(onSlot);
@@ -1544,11 +1581,8 @@ export class SubagentModule implements Module {
     let reclaimed = 0;
 
     for (const [displayName, live] of this.liveSubagents) {
-      let entry: ActiveSubagent | undefined;
-      for (const e of this.activeSubagents.values()) {
-        if (e.name === displayName) { entry = e; break; }
-      }
-      if (!entry || entry.status !== 'running') continue;
+      const entry = this.runningEntry(displayName);
+      if (!entry) continue;
 
       const silentMs = Date.now() - entry.lastActivityAt;
       // Postmortem 2026-05-28 F3: `!live.requestInFlightSince` protects the
@@ -1573,7 +1607,7 @@ export class SubagentModule implements Module {
         // Cancel the zombie's framework agent
         try {
           const agent = this.getFramework().getAgent(live.frameworkAgentName);
-          if (agent) agent.cancelStream();
+          if (agent) this.stopRun(agent);
         } catch { /* best-effort */ }
 
         // Cancel via cancellation handle (unblocks the Promise.race in runSpawn/runFork)
@@ -1597,10 +1631,10 @@ export class SubagentModule implements Module {
         entry.completedAt = Date.now();
         entry.statusMessage = 'zombie — slot reclaimed';
 
-        // Release the slot (the finally block in runSpawn/runFork will also
-        // call releaseSlot, but that's safe — activeConcurrent just goes to
-        // max(0, activeConcurrent-1) effectively)
-        this.activeConcurrent = Math.max(0, this.activeConcurrent - 1);
+        // Release the zombie's own slot. Its run's finally releases the same
+        // slot, which by then is free, so nothing is released twice.
+        const slot = this.slotOf.get(entry);
+        if (slot) this.releaseSlot(slot);
         reclaimed++;
       }
     }
@@ -1608,12 +1642,60 @@ export class SubagentModule implements Module {
     return reclaimed;
   }
 
-  private releaseSlot(): void {
-    if (this.activeConcurrent <= 0) return; // Guard against double-release (e.g., zombie reclamation + finally)
-    this.activeConcurrent--;
-    if (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
+  /** The running entry for a display name. Spawn and fork entries are
+   *  keyed differently and stay after they end, so a finished entry of the
+   *  other type can share the name; the first match by name alone could be
+   *  that one. */
+  private runningEntry(displayName: string): ActiveSubagent | undefined {
+    for (const e of this.activeSubagents.values()) {
+      if (e.name === displayName && e.status === 'running') return e;
+    }
+    return undefined;
+  }
+
+  private get activeConcurrent(): number {
+    return this.heldSlots.size;
+  }
+
+  private takeSlot(): object {
+    const slot = {};
+    this.heldSlots.add(slot);
+    return slot;
+  }
+
+  /** Release `slot`, if it's still held, and let waiting spawns start. */
+  private releaseSlot(slot: object): void {
+    if (!this.heldSlots.delete(slot)) return; // a zombie reclaim released it already
+    this.admitWaiters();
+  }
+
+  /** Start waiting spawns, in order, while the limit allows. Called wherever
+   *  a slot frees or the limit rises. */
+  private admitWaiters(): void {
+    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
+      this.waitQueue.shift()!(this.takeSlot());
+    }
+  }
+
+  /** Stop a run: cancel its live stream and set its agent idle. At a tool
+   *  boundary the agent reads 'ready', and agent-framework 0.22.1's
+   *  Agent.cancelStream signals a stream only from 'streaming' or
+   *  'waiting_for_tools', so the provider stream would stay parked until
+   *  the run's 15-minute idle watchdog. That stream is cancelled directly,
+   *  the way the framework's own context-budget restart cancels it
+   *  (src/framework.ts, the overBudget branch of the stream driver, about
+   *  line 8265 at v0.22.1); the agent is set idle even if that cancel
+   *  throws. The framework marks its own cancels as its own, in a private
+   *  map, and nothing lets a host do the same, so it records a stopped
+   *  stream as aborted, a failed inference in its log, as it does for a
+   *  user's cancel. A tool call already running isn't stopped: it
+   *  finishes, and the framework drops its result. */
+  private stopRun(agent: Agent): void {
+    const state = agent.state;
+    try {
+      if (state.status === 'ready' && state.stream) state.stream.cancel();
+    } finally {
+      agent.cancelStream();
     }
   }
 
@@ -1634,31 +1716,74 @@ export class SubagentModule implements Module {
       this.effectiveConcurrent++;
       this.consecutiveSuccesses = 0;
     }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
-  /** Call on rate limit error — halves concurrency and applies cooldown. */
-  private async onRateLimitHit(): Promise<void> {
+  /** Call on rate limit error — halves concurrency and applies cooldown,
+   *  during which the run keeps its slot. A run with a deadline cools down
+   *  no later than its deadline; the halving holds either way. */
+  private async onRateLimitHit(deadline?: number): Promise<void> {
     const prev = this.effectiveConcurrent;
     this.effectiveConcurrent = Math.max(1, Math.floor(this.effectiveConcurrent / 2));
     this.consecutiveSuccesses = 0;
-    this.lastRateLimitAt = Date.now();
+    this.throttled = true;
+    const coolMs = deadline === undefined
+      ? this.rateLimitCooldownMs
+      : Math.max(0, Math.min(this.rateLimitCooldownMs, deadline - Date.now()));
     console.error(
       `[subagent] Rate limit hit — concurrency ${prev} → ${this.effectiveConcurrent}, ` +
-      `cooling down ${this.rateLimitCooldownMs}ms`
+      `cooling down ${coolMs}ms`
     );
-    await new Promise(resolve => setTimeout(resolve, this.rateLimitCooldownMs));
+    await new Promise(resolve => setTimeout(resolve, coolMs));
   }
 
-  private isRateLimitError(err: unknown): boolean {
-    if (!(err instanceof Error) || err instanceof SubagentLaunchRefused) return false;
-    const msg = err.message.toLowerCase();
-    return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
+  /** The words the classifiers read: the failure's message without the
+   *  ephemeral agent's name, which the framework quotes in its own messages
+   *  ("Ephemeral agent \"spawn-migrate-…\" failed to start inference …") and
+   *  which holds the name the agent chose. agent-framework 0.22.1 gives an
+   *  ephemeral run's failure no other structure to read: it rejects with an
+   *  Error carrying the text, apart from the class agent-framework #343
+   *  adds, which isUnsleptProviderWait reads by name. */
+  private classifiedText(err: Error, agentName?: string): string {
+    const text = agentName ? err.message.split(agentName).join('') : err.message;
+    return text.toLowerCase();
+  }
+
+  private isRateLimitError(err: unknown, agentName?: string): boolean {
+    if (!(err instanceof Error)) return false;
+    const msg = this.classifiedText(err, agentName);
+    // Rate-limit phrases, not words: "rate" with no letter before it and
+    // "limit" or "exceeded" after it, so "generate", "moderate" or "rated"
+    // isn't a rate limit and "upstream_rate_limit_exceeded" is; "too many
+    // requests", not "too many", which also opens "too many tokens"; and
+    // the status code as a whole number, so a duration such as 14290ms
+    // isn't one.
+    return /(?<![a-z])rate[\s_-]?(limit|exceeded)/.test(msg)
+      || /\b429\b/.test(msg)
+      || /too many (\w+ )?requests/.test(msg);
+  }
+
+  /** The framework ended the run rather than sleep the stated wait of a
+   *  retryable failure (agent-framework 0.22.1 on): one longer than an
+   *  ephemeral run sleeps, or one it can't read as a number. Either way the
+   *  provider asked for a wait the run won't sit out, so a restart would
+   *  only call it again too soon. agent-framework 0.22.1 says so only in the
+   *  message, as one of the two endings its `statedWaitNotSlept` appends.
+   *  Each is matched at the end of the message, where the framework puts
+   *  it, so the same words echoed earlier in a provider's text don't count.
+   *  agent-framework #343 rejects with its own error class instead,
+   *  `ProviderWaitNotSleptError`, keeping those words; the class is read
+   *  here by name, since 0.22.1 doesn't export it. */
+  private isUnsleptProviderWait(err: Error): boolean {
+    return err.name === 'ProviderWaitNotSleptError' ||
+      UNSLEPT_PROVIDER_WAIT_ENDINGS.some((ending) => ending.test(err.message));
   }
 
   /** Transient = worth retrying the whole subagent from scratch. */
-  private isTransientError(err: Error): boolean {
-    if (err instanceof SubagentLaunchRefused) return false;
-    const msg = err.message.toLowerCase();
+  private isTransientError(err: Error, agentName?: string): boolean {
+    if (this.isUnsleptProviderWait(err)) return false;
+    const msg = this.classifiedText(err, agentName);
     return (
       msg.includes('timeout') ||
       msg.includes('idle') ||
@@ -1667,34 +1792,37 @@ export class SubagentModule implements Module {
       msg.includes('network') ||
       msg.includes('stream aborted') ||
       msg.includes('overloaded') ||
-      msg.includes('529') ||
-      msg.includes('500') ||
-      msg.includes('502') ||
-      msg.includes('503') ||
-      this.isRateLimitError(err)
+      // Whole numbers, so a duration such as 15000ms isn't an HTTP 500.
+      /\b(500|502|503|529)\b/.test(msg) ||
+      this.isRateLimitError(err, agentName)
     );
   }
 
-  /** Set concurrency ceiling at runtime. Also raises effective if below new ceiling. */
+  /** Set the concurrency ceiling at runtime. The effective limit follows it,
+   *  up or down, except that while a rate limit's halving holds, a higher
+   *  ceiling leaves the effective limit to recover toward it after
+   *  successes. Spawns waiting for a slot start as the limit allows. */
   setConcurrency(n: number): void {
     this.configuredMaxConcurrent = Math.max(1, n);
-    if (this.effectiveConcurrent > this.configuredMaxConcurrent) {
+    if (!this.throttled || this.effectiveConcurrent > this.configuredMaxConcurrent) {
       this.effectiveConcurrent = this.configuredMaxConcurrent;
     }
-    // If we were throttled below the new ceiling, let waiters through
-    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
-    }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
   /** Get current concurrency status for observability. */
-  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number } {
+  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number; note?: string } {
+    const held = this.throttled && this.effectiveConcurrent < this.configuredMaxConcurrent;
     return {
       configured: this.configuredMaxConcurrent,
       effective: this.effectiveConcurrent,
       active: this.activeConcurrent,
       queued: this.waitQueue.length,
+      ...(held ? {
+        note: `A rate limit holds the limit at ${this.effectiveConcurrent}. It rises by one after every three ` +
+          `subagents that finish without error, up to ${this.configuredMaxConcurrent}.`,
+      } : {}),
     };
   }
 
@@ -1720,7 +1848,7 @@ export class SubagentModule implements Module {
     if (live) {
       try {
         const agent = this.getFramework().getAgent(live.frameworkAgentName);
-        if (agent) agent.cancelStream();
+        if (agent) this.stopRun(agent);
       } catch { /* best-effort */ }
     }
 
@@ -1826,6 +1954,16 @@ export class SubagentModule implements Module {
     this.frameworkNameIndex.delete(frameworkAgentName);
   }
 
+  /** Fold a usage sample into the subagent's context size (`lastInputTokens`).
+   *  A sample is the stream's usage so far, so the context size is the prompt
+   *  of the call it adds (see stream-usage.ts). */
+  private noteUsageSample(live: LiveSubagentState, sample: UsageSample | undefined): void {
+    if (!sample) return;
+    const step = foldUsageSample(live.streamUsage, sample);
+    live.streamUsage = step.total;
+    if (step.prompt !== undefined) this.lastInputTokens.set(live.displayName, step.prompt);
+  }
+
   /** Fan out a stream event to all subscribers for this subagent + wildcard. */
   private emit(displayName: string, event: SubagentStreamEvent): void {
     for (const key of [displayName, '*']) {
@@ -1892,11 +2030,8 @@ export class SubagentModule implements Module {
     const live = this.liveSubagents.get(displayName);
     if (!live) return null;
 
-    // Find the matching ActiveSubagent entry for status/metadata
-    let entry: ActiveSubagent | undefined;
-    for (const e of this.activeSubagents.values()) {
-      if (e.name === displayName) { entry = e; break; }
-    }
+    // The matching ActiveSubagent entry for status/metadata
+    const entry = this.runningEntry(displayName);
 
     let messageCount = 0;
     let lastMessageSnippet = '';
@@ -1959,18 +2094,6 @@ export class SubagentModule implements Module {
    *   3. parent agent's `maxTokens` (by default, subagents inherit their caller's budget)
    *   4. last-resort framework fallback (4096) — only reached if there's no parent at all
    */
-  /** Ephemeral agents inherit the caller's prose-routing mode. AF's Agent
-   *  defaults to 'locus' (ambient locus capture publishes plain prose to the
-   *  open channel), so a resident running proseRouting 'disabled' would still
-   *  spawn divers whose between-tool-calls prose leaks into its live channel
-   *  as parent speech — field-confirmed 2026-08-26. Falls back to the
-   *  configured parent agent, then to AF's own default. */
-  private resolveProseRouting(callerAgentName?: string): 'locus' | 'explicit' | 'hybrid' | 'disabled' | undefined {
-    const parentName = callerAgentName ?? this.config.parentAgentName;
-    if (!parentName) return undefined;
-    return this.framework?.getAgent(parentName)?.proseRouting;
-  }
-
   private resolveMaxTokens(callMaxTokens: number | undefined, parentAgentName?: string): number {
     if (callMaxTokens !== undefined) return callMaxTokens;
     if (this.config.defaultMaxTokens !== undefined) return this.config.defaultMaxTokens;
@@ -1982,17 +2105,46 @@ export class SubagentModule implements Module {
     return 4096;
   }
 
-  private withTimeout<T>(promise: Promise<T>, name: string, timeoutMs?: number): Promise<T> {
-    if (timeoutMs === undefined) return promise;
-    return Promise.race([
-      promise,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`Subagent ${name} timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        )
-      ),
-    ]);
+  /** Race an attempt against its run's time limit: `limitMs` long, ending
+   *  at `deadline`, so every attempt shares one limit. At the deadline,
+   *  `stop` ends the run itself, and the error is the module's own, which
+   *  the retry loop doesn't retry. A stop that throws is logged, and the
+   *  limit still ends the attempt. The framework's startup watchdog for the
+   *  attempt ends at the deadline too (watchdogsFor), and its timer can
+   *  fire first, so a failure that ends the attempt at the deadline is
+   *  reported as the time limit, whichever settled it. The timer ends with
+   *  the attempt, so a finished run is never stopped late. */
+  private withTimeout<T>(promise: Promise<T>, name: string, limitMs: number | undefined, deadline: number | undefined, stop: () => void): Promise<T> {
+    if (limitMs === undefined || deadline === undefined) return promise;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          stop();
+        } catch (err) {
+          console.error(`[subagent] ${name}: stopping the run at its time limit failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        reject(this.timedOut(name, limitMs));
+      }, timerDelay(deadline - Date.now()));
+    });
+    const attempt = promise.catch((err: unknown) => {
+      throw deadline - Date.now() <= TIMER_SLACK_MS ? this.timedOut(name, limitMs) : err;
+    });
+    return Promise.race([attempt, limit]).finally(() => clearTimeout(timer));
+  }
+
+  private timedOut(name: string, limitMs: number): SubagentFailure {
+    return new SubagentFailure(`Subagent ${name} timed out after ${limitMs}ms`);
+  }
+
+  /** The framework's watchdogs for an attempt of a run with a deadline: its
+   *  startup watchdog no later than the deadline, so a run whose inference
+   *  hasn't started by then (held behind a provider wait, say) is dropped by
+   *  the framework rather than started after the run was reported timed
+   *  out. Without a deadline, the framework's own. */
+  private watchdogsFor(deadline: number | undefined): { startupTimeoutMs: number } | undefined {
+    if (deadline === undefined) return undefined;
+    return { startupTimeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())) };
   }
 
   // =========================================================================
@@ -2038,11 +2190,13 @@ export class SubagentModule implements Module {
     callToolUseId?: string,
   ): SubagentLaunch {
     const framework = this.getFramework();
-    // Same parent resolution runFork has always used: the caller (recursive
-    // forks), else the configured parent agent.
-    const parentAgent = callerAgentName
-      ? framework.getAgent(callerAgentName)
-      : (this.config.parentAgentName ? framework.getAgent(this.config.parentAgentName) : null);
+    // The caller (recursive forks and spawns), else the configured parent
+    // agent. A caller named but not found is refused, before any slot.
+    const parentName = callerAgentName ?? this.config.parentAgentName;
+    const parentAgent = parentName === undefined ? null : (framework.getAgent(parentName) ?? null);
+    if (callerAgentName !== undefined && !parentAgent) {
+      throw new Error(`Cannot resolve subagent caller: ${callerAgentName}`);
+    }
     const model = input.model ?? this.config.defaultModel ?? FALLBACK_SUBAGENT_MODEL;
 
     let systemPrompt: string;
@@ -2064,6 +2218,10 @@ export class SubagentModule implements Module {
     }
 
     const requestedTools = kind === 'spawn' ? (input as SpawnInput).tools : undefined;
+    // The caller's own tool rules, narrowed by the spawn's list, less the
+    // subagent tools at the depth limit: resolved now and kept through the
+    // slot wait and every retry.
+    const allowed = this.filterToolNames(requestedTools, callerDepth, parentAgent);
 
     // The parent's context settings at the call, from supported surfaces
     // only: its runtime settings (budget, and the strategy's recent tail when
@@ -2080,7 +2238,9 @@ export class SubagentModule implements Module {
     } catch { /* a strategy that can't be read reports nothing */ }
     const parentRuntime = parentAgent?.getRuntimeSettings();
 
-    const proseRouting = this.resolveProseRouting(callerAgentName);
+    // Agent defaults to 'locus'. A resolved caller's mode is inherited, so
+    // children of a 'disabled' caller can't leak prose into its live channel.
+    const proseRouting = parentAgent?.proseRouting;
     return {
       kind,
       name: input.name,
@@ -2096,9 +2256,9 @@ export class SubagentModule implements Module {
       strategy: { ...SUBAGENT_STRATEGY, compressionModel: model },
       ...(proseRouting !== undefined ? { proseRouting } : {}),
       tools: {
-        ...(requestedTools !== undefined
-          ? { requested: [...requestedTools], granted: this.offeredOf(this.filterToolNames(requestedTools, callerDepth) as string[]) }
-          : {}),
+        allowed: allowed === 'all' ? 'all' : [...allowed],
+        ...(requestedTools !== undefined ? { requested: [...requestedTools] } : {}),
+        ...(allowed !== 'all' ? { granted: this.offeredOf(allowed) } : {}),
         // filterToolNames' own threshold.
         depthLimited: callerDepth + 1 >= this.maxDepth,
       },
@@ -2115,13 +2275,14 @@ export class SubagentModule implements Module {
             allowedTools: Array.isArray(parentAgent.allowedTools) ? [...parentAgent.allowedTools] : 'all',
           }
         : null,
+      parentAgent,
     };
   }
 
   /** The ephemeral agent a launch describes. Nothing here is re-resolved:
-   *  each value comes from the launch, except the tool rules, which
-   *  filterToolNames applies now, as it always has. */
-  private ephemeralAgentConfig(launch: SubagentLaunch, agentName: string, callerDepth: number) {
+   *  each value comes from the launch as resolved at the call, its tool
+   *  rules included. */
+  private ephemeralAgentConfig(launch: SubagentLaunch, agentName: string) {
     return {
       name: agentName,
       model: launch.model,
@@ -2136,7 +2297,7 @@ export class SubagentModule implements Module {
         autoTickOnNewMessage: true,
         maxMessageTokens: launch.strategy.maxMessageTokens,
       }),
-      allowedTools: this.filterToolNames(launch.tools.requested, callerDepth),
+      allowedTools: launch.tools.allowed === 'all' ? 'all' as const : [...launch.tools.allowed],
     };
   }
 
@@ -2200,10 +2361,12 @@ export class SubagentModule implements Module {
     const framework = this.getFramework();
     let parentTools: string[] | undefined;
     let parentAgentSettings: AgentSettings | undefined;
-    const parentAgent = launch.parent ? framework.getAgent(launch.parent.stream) : undefined;
+    // The parent the launch was resolved against at the call, as the fork's
+    // context is: never another agent later registered under its name.
+    const parentAgent = launch.parentAgent;
     if (launch.parent && parentAgent) {
       try {
-        parentTools = framework.listToolClasses(launch.parent.stream).map((t) => t.tool);
+        parentTools = framework.listToolClasses(parentAgent.name).map((t) => t.tool);
       } catch { /* stated as unreadable */ }
       parentAgentSettings = agentSettingsOf(parentAgent as unknown as Parameters<typeof agentSettingsOf>[0]);
     }
@@ -2227,7 +2390,6 @@ export class SubagentModule implements Module {
       : 'Running in background.';
     return `${head} ${slot}\n\n${describeSubagentLaunch(launch)}`;
   }
-
   private async handleSpawn(input: SpawnInput, callerAgentName?: string): Promise<ToolResult> {
     const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
     if (callerDepth >= this.maxDepth) {
@@ -2239,8 +2401,10 @@ export class SubagentModule implements Module {
     }
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
-    // Resolved before any slot, as the base resolved inside its run's try: a
-    // module with no framework yet answers with an error, never a throw.
+    // Resolved once, before any slot, and kept through the slot wait and
+    // every retry: the caller's settings, context and tool rules as they are
+    // now. A caller that can't be resolved, or a module with no framework
+    // yet, answers with an error, never a throw.
     let launch: SubagentLaunch;
     try {
       launch = this.resolveLaunch('spawn', input, callerAgentName, callerDepth);
@@ -2249,12 +2413,12 @@ export class SubagentModule implements Module {
     }
     const ticket = { queued: false };
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runSpawn(launch, input, callerAgentName, callerDepth, timeoutMs, ticket);
-      return await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs, launch);
+      const promise = this.runSpawn(launch, input, callerAgentName, callerDepth, undefined, ticket);
+      return await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs, launch);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
@@ -2283,8 +2447,10 @@ export class SubagentModule implements Module {
     }
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
-    // Resolved before any slot, as the base resolved inside its run's try: a
-    // module with no framework yet answers with an error, never a throw.
+    // Resolved once, before any slot, and kept through the slot wait and
+    // every retry: the caller's settings, context and tool rules as they are
+    // now. A caller that can't be resolved, or a module with no framework
+    // yet, answers with an error, never a throw.
     let launch: SubagentLaunch;
     try {
       launch = this.resolveLaunch('fork', input, callerAgentName, callerDepth, callToolUseId);
@@ -2293,12 +2459,12 @@ export class SubagentModule implements Module {
     }
     const ticket = { queued: false };
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runFork(launch, input, callerAgentName, callerDepth, timeoutMs, callToolUseId, ticket);
-      return await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs, launch);
+      const promise = this.runFork(launch, input, callerAgentName, callerDepth, undefined, callToolUseId, ticket);
+      return await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs, launch);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
@@ -2388,7 +2554,7 @@ export class SubagentModule implements Module {
         if (this.detachableHandles.has(name)) {
           handle.detach();
         }
-      }, autoDetachMs);
+      }, timerDelay(autoDetachMs));
     }
 
     type RaceResult =
@@ -2510,8 +2676,10 @@ export class SubagentModule implements Module {
     executionTimeoutMs?: number,
     ticket?: { queued: boolean },
   ): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot(undefined, ticket);
+    const { waitedMs, slot } = await this.acquireSlot(undefined, ticket);
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -2520,18 +2688,20 @@ export class SubagentModule implements Module {
       toolCallsCount: 0, findingsCount: 0,
     };
     const entryKey = `spawn-${input.name}`;
-    this.activeSubagents.set(entryKey, entry);
-    if (_callerAgentName) this.parentMap.set(input.name, _callerAgentName);
-    this.persistState();
 
     try {
+      this.activeSubagents.set(entryKey, entry);
+      this.slotOf.set(entry, slot);
+      if (_callerAgentName) this.parentMap.set(input.name, _callerAgentName);
+      this.persistState();
+
       const framework = this.getFramework();
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
         const agentName = `spawn-${input.name}-${Date.now()}`;
         const { agent, contextManager, cleanup } = await framework.createEphemeralAgent(
-          this.ephemeralAgentConfig(launch, agentName, callerDepth),
+          this.ephemeralAgentConfig(launch, agentName),
         );
 
         // Track depth for recursive fork/spawn calls from this agent
@@ -2569,6 +2739,10 @@ export class SubagentModule implements Module {
             );
           }
 
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut(input.name, executionTimeoutMs!);
+
           // Race execution against both timeout and user cancellation
           const cancelPromise = new Promise<never>((_, reject) => {
             this.cancellationHandles.set(input.name, { reject });
@@ -2576,9 +2750,11 @@ export class SubagentModule implements Module {
 
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
             cancelPromise,
           ]);
@@ -2621,10 +2797,14 @@ export class SubagentModule implements Module {
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          if (this.isRateLimitError(lastError, agentName)) await this.onRateLimitHit(deadline);
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
@@ -2642,9 +2822,19 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
       this.persistState();
-      this.releaseSlot();
     }
   }
 
@@ -2657,8 +2847,10 @@ export class SubagentModule implements Module {
     callToolUseId?: string,
     ticket?: { queued: boolean },
   ): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot(undefined, ticket);
+    const { waitedMs, slot } = await this.acquireSlot(undefined, ticket);
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -2666,24 +2858,21 @@ export class SubagentModule implements Module {
       status: 'running', startedAt: now, lastActivityAt: now,
       toolCallsCount: 0, findingsCount: 0,
     };
-    this.activeSubagents.set(input.name, entry);
-    if (callerAgentName) this.parentMap.set(input.name, callerAgentName);
-    this.persistState();
-
     try {
+      this.activeSubagents.set(input.name, entry);
+      this.slotOf.set(entry, slot);
+      if (callerAgentName) this.parentMap.set(input.name, callerAgentName);
+      this.persistState();
+
       const framework = this.getFramework();
 
-      // The parent the launch was resolved against (the caller, which enables
-      // recursive forks, else the configured parent agent), looked up again
-      // now because its context is materialised at creation. A launch that
-      // found no parent at the call stays without one: a parent registered
-      // while it waited for a slot isn't used, since the receipt and the
-      // stream's orientation were resolved at the call and would be false.
-      // A parent found at the call is looked up by name: an ephemeral
-      // parent's name can't be taken again (createEphemeralAgent refuses a
-      // used name), and a resident registered again under its name is the
-      // same resident.
-      const parentAgent = launch.parent ? framework.getAgent(launch.parent.stream) : null;
+      // The parent the launch was resolved against at the call (the caller,
+      // which enables recursive forks, else the configured parent agent),
+      // whose context is compiled now. A launch that found no parent at the
+      // call stays without one, and one that found a parent uses that agent,
+      // never another later registered under its name: the receipt and the
+      // stream's orientation describe the parent at the call.
+      const parentAgent = launch.parentAgent;
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -2695,7 +2884,7 @@ export class SubagentModule implements Module {
         const agentName = `${input.name}-${suffix}`;
 
         const { agent, contextManager, cleanup } = await framework.createEphemeralAgent(
-          this.ephemeralAgentConfig(launch, agentName, callerDepth),
+          this.ephemeralAgentConfig(launch, agentName),
         );
 
         // Track depth for recursive fork/spawn calls from this agent
@@ -2818,6 +3007,10 @@ export class SubagentModule implements Module {
             );
           }
 
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut(input.name, executionTimeoutMs!);
+
           // Race execution against both timeout and user cancellation
           const cancelPromise = new Promise<never>((_, reject) => {
             this.cancellationHandles.set(input.name, { reject });
@@ -2825,9 +3018,11 @@ export class SubagentModule implements Module {
 
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
             cancelPromise,
           ]);
@@ -2868,10 +3063,14 @@ export class SubagentModule implements Module {
             return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
           }
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          if (this.isRateLimitError(lastError, agentName)) await this.onRateLimitHit(deadline);
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
@@ -2889,9 +3088,19 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
       this.persistState();
-      this.releaseSlot();
     }
   }
 
@@ -2928,10 +3137,16 @@ export class SubagentModule implements Module {
 
   /**
    * Build the allowedTools list for a subagent.
-   * Removes subagent tools if at depth limit.
+   * Inherits or narrows the caller's tools, then removes subagent tools at depth limit.
    *
    */
-  private filterToolNames(allowedTools?: string[], callerDepth = 0): 'all' | string[] {
+  private filterToolNames(requestedTools: string[] | undefined, callerDepth: number, parent: Agent | null): 'all' | string[] {
+    const inheritedTools = parent?.allowedTools ?? 'all';
+    const allowedTools = inheritedTools === 'all'
+      ? requestedTools?.slice()
+      : (requestedTools === undefined
+        ? [...inheritedTools]
+        : requestedTools.filter(name => inheritedTools.includes(name)));
     // Always include subagent--return — subagents need it to deliver results
     // A copy: the list may be the caller's own (a spawn's `tools`, or the
     // launch description's), which must keep saying what was asked for.
@@ -2940,7 +3155,13 @@ export class SubagentModule implements Module {
 
     // Use per-agent depth (from caller) rather than the module's static depth
     if (callerDepth + 1 >= this.maxDepth) {
-      const allTools = this.getFramework().getAllTools();
+      const framework = this.getFramework();
+      // Published older Framework releases have only the collapsed utils surface.
+      // The paired permission release exposes each utility's own allowlist name.
+      const utilities = (framework as AgentFramework & {
+        getAllUtilities?: () => ToolDefinition[];
+      }).getAllUtilities?.() ?? [];
+      const allTools = [...framework.getAllTools(), ...utilities];
       const filtered = allTools
         .filter(t => !t.name.startsWith('subagent--'))
         .map(t => t.name);

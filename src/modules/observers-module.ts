@@ -8,6 +8,11 @@
  * the file on mtime (~3s), so grants and revocations apply to new
  * connections without a restart. Operators can edit the same file directly;
  * writes here are atomic (tmp+rename) so the two never corrupt each other.
+ * A file these tools can't read, or that isn't a grants file, is never
+ * written over. In one they can read, a change touches only the entries it
+ * matches: every other entry, an unusable one included, and every other
+ * field stays as found. The host uses a file's usable grants and names the
+ * rest, so a bad entry never stops the agent's own changes.
  *
  * Grants marked `protected: true` (recipe-designated operator baseline) are
  * visible but not revocable through these tools; only a file edit removes
@@ -27,8 +32,11 @@ import type {
 } from '@animalabs/agent-framework';
 import {
   OBSERVER_SCOPES,
-  loadObserversFile,
+  canonicalKey,
+  checkObserversFile,
+  readObserversFile,
   saveObserversFile,
+  type GrantsDocument,
   type ObserverGrant,
   type ObserverScope,
   type ObserversFile,
@@ -102,8 +110,8 @@ export class ObserversModule implements Module {
         inputSchema: {
           type: 'object',
           properties: {
-            key: { type: 'string', description: 'ed25519:<base64url public key> to revoke.' },
-            label: { type: 'string', description: 'Alternative: revoke by exact label (must match exactly one grant).' },
+            key: { type: 'string', description: 'ed25519:<base64url public key> to revoke; every grant for that key goes.' },
+            label: { type: 'string', description: 'Alternative: revoke by exact label (must match exactly one grant); every grant for that grant\'s key goes with it.' },
           },
         },
       },
@@ -114,15 +122,27 @@ export class ObserversModule implements Module {
     const input = (call.input ?? {}) as Record<string, unknown>;
     try {
       switch (call.name) {
-        case 'get':
-          return ok({ observers: this.load().observers.map(redactNothing) });
+        case 'get': {
+          const read = this.read();
+          if ('problem' in read) {
+            return err(
+              `The grants can't be listed: ${read.problem}. ` +
+              (read.unparsed
+                ? 'Until it parses, the web viewer goes on with the grants it last admitted, if any. '
+                : '') +
+              'These tools leave the file alone. Ask whoever runs this host to repair it.',
+            );
+          }
+          return ok({ observers: read.usable.map(redactNothing), ...notUsed(read.problems) });
+        }
 
         case 'grant': {
-          const key = typeof input.key === 'string' ? input.key.trim() : '';
+          // Written in canonical form, whichever base64 spelling was given.
+          const key = canonicalKey(typeof input.key === 'string' ? input.key.trim() : '');
           const label = typeof input.label === 'string' ? input.label.trim() : '';
           const scopes = Array.isArray(input.scopes) ? input.scopes : [];
-          if (!key.startsWith('ed25519:') || key.length < 20) {
-            return err('key must be "ed25519:<base64url public key>"');
+          if (!key) {
+            return err('key must be "ed25519:<base64url public key>", a key that decodes to 32 bytes');
           }
           if (!label) return err('label is required');
           if (scopes.length === 0 || !scopes.every((s) => (OBSERVER_SCOPES as readonly string[]).includes(s as string))) {
@@ -131,35 +151,54 @@ export class ObserversModule implements Module {
           const expires = typeof input.expires === 'string' ? input.expires : null;
           if (expires && !Number.isFinite(Date.parse(expires))) return err('expires must be an ISO timestamp');
 
-          const file = this.load();
-          const existing = file.observers.find((g) => g.key === key);
-          if (existing?.protected) return err('that key holds a protected grant — edit the file to change it');
+          const read = this.read();
+          if ('problem' in read) return err(`Nothing was granted: ${read.problem}. ${leftAlone('grant')}`);
+          // Every entry for the key becomes this one, as a revoke by key takes
+          // them all: a repeat left behind would stay in the file, unused.
+          const sameKey = read.doc.observers.filter((g): g is ObserverGrant => isEntry(g) && canonicalKey(g.key) === key);
+          if (sameKey.some((g) => g.protected)) return err('that key holds a protected grant — edit the file to change it');
           const grant: ObserverGrant = { key, label, scopes: scopes as ObserverScope[], expires };
+          const existing = sameKey[0];
           if (existing) {
             Object.assign(existing, grant); // update label/scopes/expiry in place
+            read.doc.observers = read.doc.observers.filter((g) => g === existing || !sameKey.includes(g as ObserverGrant));
           } else {
-            file.observers.push(grant);
+            read.doc.observers.push(grant);
           }
-          saveObserversFile(this.config.path, file);
-          return ok({
-            message: `${existing ? 'Updated' : 'Granted'}: ${label} → [${grant.scopes.join(', ')}]${expires ? ` until ${expires}` : ''}. Live within ~3s.`,
-            observers: file.observers,
-          });
+          return this.saved(
+            read.doc,
+            `${existing ? 'Updated' : 'Granted'}: ${label} → [${grant.scopes.join(', ')}]${expires ? ` until ${expires}` : ''}. Live within ~3s.`,
+          );
         }
 
         case 'revoke': {
           const key = typeof input.key === 'string' ? input.key.trim() : '';
           const label = typeof input.label === 'string' ? input.label.trim() : '';
           if (!key && !label) return err('provide key or label');
-          const file = this.load();
-          const matches = file.observers.filter((g) => (key ? g.key === key : g.label === label));
+          const read = this.read();
+          if ('problem' in read) return err(`Nothing was revoked: ${read.problem}. ${leftAlone('revoke')}`);
+          const entries = (match: (g: ObserverGrant) => boolean) =>
+            read.doc.observers.filter((g): g is ObserverGrant => isEntry(g) && match(g));
+          // A key matches every spelling of itself. One that doesn't decode can
+          // still name an entry spelled exactly so.
+          const keyed = (k: string) => (g: ObserverGrant) => (canonicalKey(g.key) ?? g.key) === k;
+          let matches = entries(key ? keyed(canonicalKey(key) ?? key) : (g) => g.label === label);
           if (matches.length === 0) return err('no matching grant');
-          if (matches.length > 1) return err(`label matches ${matches.length} grants — revoke by key`);
-          const target = matches[0]!;
-          if (target.protected) return err('that grant is protected (operator baseline) — edit the file to remove it');
-          file.observers = file.observers.filter((g) => g !== target);
-          saveObserversFile(this.config.path, file);
-          return ok({ message: `Revoked: ${target.label}. New connections stop within ~3s.`, observers: file.observers });
+          // A label has to name one entry. The key is the observer, though, so
+          // a revoke takes every entry for it: a repeat left behind would be
+          // used in place of the one revoked.
+          if (!key && matches.length > 1) return err(`label matches ${matches.length} grants — revoke by key`);
+          const named = matches[0]!;
+          if (named.protected) return err('that grant is protected (operator baseline) — edit the file to remove it');
+          // As a revoke by key does: one that doesn't decode matches entries
+          // spelled exactly as it is.
+          if (!key && typeof named.key === 'string') matches = entries(keyed(canonicalKey(named.key) ?? named.key));
+          if (matches.some((g) => g.protected)) {
+            return err('that key also holds a protected grant (operator baseline) — edit the file to remove it');
+          }
+          read.doc.observers = read.doc.observers.filter((g) => !matches.includes(g as ObserverGrant));
+          const revoked = matches.map((g) => (typeof g.label === 'string' ? g.label : g.key));
+          return this.saved(read.doc, `Revoked: ${revoked.join(', ')}. New connections stop within ~3s.`);
         }
 
         default:
@@ -174,9 +213,48 @@ export class ObserversModule implements Module {
     return {};
   }
 
-  private load(): ObserversFile {
-    return loadObserversFile(this.config.path) ?? { observers: [] };
+  /** The file as found, its usable grants and what's wrong with the rest; or
+   *  why it can't be changed. A missing file is no grants yet. A file that
+   *  can't be read, isn't valid JSON or isn't a grants file is never written
+   *  over. `unparsed` marks one that isn't valid JSON, which the viewer reads
+   *  differently. */
+  private read():
+    | { doc: GrantsDocument; usable: ObserverGrant[]; problems: string[] }
+    | { problem: string; unparsed: boolean } {
+    const read = readObserversFile(this.config.path);
+    if (read.kind === 'ok') return { doc: read.doc, usable: read.file.observers, problems: read.problems };
+    if (read.kind === 'missing') return { doc: { observers: [] }, usable: [], problems: [] };
+    return { problem: `the grants file, ${this.config.path}, ${read.problem}`, unparsed: read.kind === 'unparsed' };
   }
+
+  /** Save the changed document, and answer with `message` and the grants the
+   *  file now gives, naming any entry it holds that isn't used. */
+  private saved(doc: GrantsDocument, message: string): ToolResult {
+    saveObserversFile(this.config.path, doc as unknown as ObserversFile);
+    const after = checkObserversFile(doc);
+    return after.kind === 'ok'
+      ? ok({ message, observers: after.file.observers, ...notUsed(after.problems) })
+      : ok({ message });
+  }
+}
+
+/** The entries a read found but the host doesn't use, each with its reason,
+ *  for an answer that lists the grants. */
+function notUsed(problems: string[]): { notUsed?: string[] } {
+  return problems.length > 0 ? { notUsed: problems } : {};
+}
+
+/** An entry of the grants list that can be read as a grant's fields. */
+function isEntry(g: unknown): g is ObserverGrant {
+  return typeof g === 'object' && g !== null;
+}
+
+/** Why grant and revoke refuse a file they can't read, and what fixes it. */
+function leftAlone(verb: 'grant' | 'revoke'): string {
+  return (
+    "These tools don't write over a file they can't read as grants, so they leave it alone until it's repaired. " +
+    `Ask whoever runs this host to repair the file, then ${verb} again.`
+  );
 }
 
 function redactNothing(g: ObserverGrant): ObserverGrant {
