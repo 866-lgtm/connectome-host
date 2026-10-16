@@ -33,7 +33,12 @@ type Internal = {
   asyncHandles: Map<string, { promise: Promise<unknown> }>;
   activeSubagents: Map<string, { lastActivityAt: number; status: string }>;
   cancellationHandles: Map<string, unknown>;
-  acquireSlot(slotTimeoutMs?: number): Promise<{ waitedMs: number; slot: object }>;
+  liveSubagents: Map<string, { frameworkAgentName: string }>;
+  callIdIndex: Map<string, string>;
+  lastInputTokens: Map<string, number>;
+  parentMap: Map<string, string>;
+  waitOrStop(ms: number, cancelled: Promise<never>): Promise<unknown>;
+  acquireSlot(slotTimeoutMs?: number, cancelled?: Promise<never>): Promise<{ waitedMs: number; slot: object }>;
   releaseSlot(slot: object): void;
   persistState(): void;
   effectiveConcurrent: number;
@@ -52,6 +57,9 @@ interface Harness {
   framework: AgentFramework;
   subagent: SubagentModule;
   runs(): number;
+  /** Whether a run of this subagent is in the framework now, past its
+   *  setup: the point at which a stop or a reclaim can end it. */
+  running(name: string): boolean;
   cleanup(): Promise<void>;
 }
 
@@ -102,6 +110,7 @@ async function harness(
     framework,
     subagent,
     runs: () => runs,
+    running: (name: string) => [...fw.agents.keys()].some((k) => k.startsWith(`spawn-${name}-`) || k.startsWith(`${name}-d`)),
     cleanup: async () => {
       try { await framework.stop(); } catch { /* noop */ }
       rmSync(tmpDir, { recursive: true, force: true });
@@ -118,10 +127,37 @@ function fork(name: string, extra: Record<string, unknown> = {}): ToolCall {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-/** Wait for what a step brings about rather than for a set time. */
+/** Wait for what a step brings about rather than for a set time, and fail
+ *  if it doesn't come. */
 async function until(done: () => boolean, ms = 10_000): Promise<void> {
   const end = Date.now() + ms;
-  while (!done() && Date.now() < end) await sleep(10);
+  while (!done()) {
+    if (Date.now() >= end) throw new Error(`not brought about within ${ms} ms`);
+    await sleep(10);
+  }
+}
+/** A promise the test opens when it's ready: it holds a run open for as
+ *  long as the test's probes need, rather than for a set time. */
+function gate(): { open(): void; wait: Promise<void> } {
+  let open!: () => void;
+  const wait = new Promise<void>((r) => { open = r; });
+  return { open, wait };
+}
+/** The waits a run makes between attempts (a rate limit's cooldown, the
+ *  back-off before a retry): each one's length, and whether the run's
+ *  cancel or its own timer ended it. */
+function watchWaits(sub: SubagentModule): Array<{ ms: number; endedBy?: 'cancel' | 'timer' }> {
+  const waits: Array<{ ms: number; endedBy?: 'cancel' | 'timer' }> = [];
+  const m = internal(sub);
+  const wait = m.waitOrStop.bind(sub);
+  m.waitOrStop = async (ms, cancelled) => {
+    const w: { ms: number; endedBy?: 'cancel' | 'timer' } = { ms };
+    waits.push(w);
+    const stopped = await wait(ms, cancelled);
+    w.endedBy = stopped ? 'cancel' : 'timer';
+    return stopped;
+  };
+  return waits;
 }
 /** The settled outcome of an async subagent, from its handle. */
 async function outcome(h: Harness, name: string): Promise<{ ok: boolean; text: string }> {
@@ -523,7 +559,7 @@ describe('the stop', () => {
       const stop = sub.stopRun.bind(sub);
       sub.stopRun = (agent) => { stopped.push(agent); stop(agent); };
       await h.subagent.handleToolCall(spawn('scout'));
-      await until(() => sub.cancellationHandles.has('scout'));
+      await until(() => h.running('scout'));
       expect(h.subagent.cancelSubagent('scout')).toBe(true);
       expect((await outcome(h, 'scout')).text).toContain('[Stopped by user]');
       expect(stopped).toHaveLength(1);
@@ -632,7 +668,7 @@ describe('concurrency slots', () => {
       await h.subagent.handleToolCall(spawn('waiting'));
       // Both runs have reached the point where a reclaim can end them.
       await until(() => h.subagent.getConcurrencyStatus().queued === 1
-        && sub.cancellationHandles.has('zombie') && sub.cancellationHandles.has('long'));
+        && h.running('zombie') && h.running('long'));
       const stopped: unknown[] = [];
       const stop = sub.stopRun.bind(sub);
       sub.stopRun = (agent) => { stopped.push(agent); stop(agent); };
@@ -656,7 +692,7 @@ describe('concurrency slots', () => {
       const sub = internal(h.subagent);
       expect((await h.subagent.handleToolCall(fork('scout', { sync: true }))).success).toBe(true);
       await h.subagent.handleToolCall(spawn('scout'));
-      await until(() => sub.cancellationHandles.has('scout'));
+      await until(() => h.running('scout'));
       sub.activeSubagents.get('spawn-scout')!.lastActivityAt = Date.now() - 200_000;
       expect(sub.reclaimZombieSlots()).toBe(1);
       expect((await outcome(h, 'scout')).text).toContain('[Terminated: zombie]');
@@ -670,7 +706,7 @@ describe('concurrency slots', () => {
     try {
       const sub = internal(h.subagent);
       await h.subagent.handleToolCall(spawn('zombie'));
-      await until(() => sub.cancellationHandles.has('zombie'));
+      await until(() => h.running('zombie'));
       const first = sub.acquireSlot(100); // gives up after 100 ms, unless a reclaim then frees a slot
       const second = sub.acquireSlot(10_000);
       expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 1, queued: 2 });
@@ -711,4 +747,577 @@ describe('concurrency slots', () => {
       expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0 });
     } finally { await h.cleanup(); }
   });
+});
+
+describe('a cancel reaches the whole run', () => {
+  test('a spawn waiting for a slot leaves the queue when it\'s cancelled, and never starts', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, (agent) => (agent.name.startsWith('spawn-long-')
+      ? sleep(300).then(() => ({ speech: 'ok', toolCallsCount: 0 }))
+      : sleep(5).then(() => ({ speech: 'ran', toolCallsCount: 0 }))));
+    try {
+      await h.subagent.handleToolCall(spawn('long'));
+      await until(() => h.running('long'));
+      await h.subagent.handleToolCall(spawn('waiting'));
+      await until(() => h.subagent.getConcurrencyStatus().queued === 1);
+      expect(h.subagent.cancelSubagent('waiting')).toBe(true);
+      expect(await outcome(h, 'waiting')).toEqual({
+        ok: true,
+        text: '[Stopped by user] (no output: it was still waiting for a concurrency slot, and never started)',
+      });
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 1, queued: 0 });
+      await outcome(h, 'long');
+      await sleep(50);
+      expect(h.runs()).toBe(1); // only "long" ever ran
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('cancelling them all reaches a spawn still waiting for a slot', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('long'));
+      await until(() => h.running('long'));
+      await h.subagent.handleToolCall(spawn('waiting'));
+      await until(() => h.subagent.getConcurrencyStatus().queued === 1);
+      expect(h.subagent.cancelAll()).toBe(2);
+      const waiting = outcome(h, 'waiting');
+      const long = outcome(h, 'long');
+      expect((await waiting).text).toStartWith('[Stopped by user] (no output: it was still waiting');
+      expect((await long).text).toStartWith('[Stopped by user]');
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  for (const [what, failure] of [['the back-off before a retry', '503 overloaded'], ["a rate limit's cooldown", '429 Too Many Requests']] as const) {
+    for (const call of [spawn, fork]) {
+      test(`a cancel during ${what} ends the ${call.name}'s run there`, async () => {
+        let attempts = 0;
+        const h = await harness({ maxRetries: 1 }, async () => { attempts++; await sleep(20); throw new Error(failure); });
+        internal(h.subagent).rateLimitCooldownMs = 5000;
+        const waits = watchWaits(h.subagent);
+        try {
+          await h.subagent.handleToolCall(call('scout'));
+          await until(() => waits.length === 1); // past the attempt, into the wait of 5 s
+          expect(h.subagent.cancelSubagent('scout')).toBe(true);
+          expect((await outcome(h, 'scout')).text).toStartWith('[Stopped by user]');
+          expect(waits).toEqual([{ ms: 5000, endedBy: 'cancel' }]);
+          expect(attempts).toBe(1);
+          expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0 });
+        } finally { await h.cleanup(); }
+      }, 20_000);
+    }
+  }
+
+  for (const [call, config] of [[spawn, {}], [fork, {}], [spawn, { maxPromptTokens: 10 }]] as const) {
+    const over = 'maxPromptTokens' in config ? ' whose prompt is over the limit' : '';
+    test(`a cancel during a ${call.name}'s setup${over} ends the run before the attempt starts`, async () => {
+      let started = 0;
+      const h = await harness({ maxRetries: 0, ...config }, async () => { started++; await sleep(5); return { speech: 'ran', toolCallsCount: 0 }; });
+      const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<unknown> };
+      const create = fw.createEphemeralAgent.bind(fw);
+      let creating = false;
+      fw.createEphemeralAgent = async (c) => { creating = true; await sleep(200); return create(c); };
+      try {
+        await h.subagent.handleToolCall(call('scout'));
+        await until(() => creating);
+        const done = outcome(h, 'scout');
+        expect(h.subagent.cancelSubagent('scout')).toBe(true);
+        expect((await done).text).toStartWith('[Stopped by user]');
+        await sleep(100);
+        expect(started).toBe(0);
+        expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
+
+  for (const call of [spawn, fork]) {
+    test(`a cancel that lands just as a ${call.name}'s prompt compiles ends the run before the attempt starts`, async () => {
+      let started = 0;
+      const h = await harness({ maxRetries: 0 }, async () => { started++; await sleep(5); return { speech: 'ran', toolCallsCount: 0 }; });
+      const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ contextManager: { compile(): Promise<unknown> } }> };
+      const create = fw.createEphemeralAgent.bind(fw);
+      fw.createEphemeralAgent = async (c) => {
+        const created = await create(c);
+        const compile = created.contextManager.compile.bind(created.contextManager);
+        created.contextManager.compile = () => {
+          const compiled = compile();
+          // Runs when compiling settles, just before the setup's race takes
+          // up its result. The race still takes compile's result, which
+          // reached it before the cancel did, so only the check after the
+          // race can see this cancel.
+          void compiled.then(() => h.subagent.cancelSubagent('scout'));
+          return compiled;
+        };
+        return created;
+      };
+      try {
+        await h.subagent.handleToolCall(call('scout'));
+        expect((await outcome(h, 'scout')).text).toStartWith('[Stopped by user]');
+        await sleep(100);
+        expect(started).toBe(0);
+        expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
+
+  test('a reclaim during the back-off ends the run, which starts no attempt without its slot', async () => {
+    let attempts = 0;
+    const h = await harness({ maxRetries: 1 }, async () => { attempts++; await sleep(20); throw new Error('503 overloaded'); });
+    const waits = watchWaits(h.subagent);
+    try {
+      const sub = internal(h.subagent);
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => waits.length === 1); // in the back-off, still registered
+      sub.activeSubagents.get('spawn-scout')!.lastActivityAt = Date.now() - 200_000;
+      expect(sub.reclaimZombieSlots()).toBe(1);
+      expect((await outcome(h, 'scout')).text).toContain('[Terminated: zombie]');
+      expect(waits).toEqual([{ ms: 5000, endedBy: 'cancel' }]);
+      expect(attempts).toBe(1);
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0 });
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('cancelling a subagent reaches its child still waiting for a slot', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => h.running('lead'));
+      const lead = internal(h.subagent).liveSubagents.get('lead')!.frameworkAgentName;
+      await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: lead });
+      await until(() => h.subagent.getConcurrencyStatus().queued === 1);
+      const child = outcome(h, 'child');
+      const leadDone = outcome(h, 'lead');
+      expect(h.subagent.cancelSubagent('lead')).toBe(true);
+      expect((await child).text).toStartWith('[Stopped by user] (no output: it was still waiting');
+      expect((await leadDone).text).toStartWith('[Stopped by user]');
+      await sleep(50);
+      expect(h.runs()).toBe(1); // the child never started
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('cancelling them all counts a parent and its child, each once', async () => {
+    const h = await harness({ maxConcurrent: 2, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => h.running('lead'));
+      const lead = internal(h.subagent).liveSubagents.get('lead')!.frameworkAgentName;
+      await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: lead });
+      await until(() => h.running('child'));
+      const child = outcome(h, 'child');
+      const leadDone = outcome(h, 'lead');
+      expect(h.subagent.cancelAll()).toBe(2);
+      expect((await child).text).toStartWith('[Stopped by user]');
+      expect((await leadDone).text).toStartWith('[Stopped by user]');
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('cancelling a subagent that has retried reaches the children its earlier attempt spawned', async () => {
+    let leadAttempts = 0;
+    let h!: Harness;
+    h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
+      if (agent.name.startsWith('spawn-lead-')) {
+        if (++leadAttempts === 1) {
+          await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
+          throw new Error('503 overloaded');
+        }
+        return new Promise(() => { /* the retry runs until cancelled */ });
+      }
+      return new Promise(() => { /* the child runs until cancelled */ });
+    });
+    internal(h.subagent).waitOrStop = async () => null; // retry at once
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => leadAttempts === 2 && h.running('child'));
+      let childText: string | undefined;
+      void outcome(h, 'child').then((o) => { childText = o.text; });
+      const lead = outcome(h, 'lead');
+      expect(h.subagent.cancelSubagent('lead')).toBe(true);
+      await until(() => childText !== undefined);
+      expect(childText).toStartWith('[Stopped by user]');
+      expect((await lead).text).toStartWith('[Stopped by user]');
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('cancelling a subagent in its back-off reaches the children its earlier attempt spawned', async () => {
+    let leadAttempts = 0;
+    let h!: Harness;
+    h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
+      if (agent.name.startsWith('spawn-lead-')) {
+        leadAttempts++;
+        await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
+        throw new Error('503 overloaded');
+      }
+      return new Promise(() => { /* the child runs until cancelled */ });
+    });
+    const waits = watchWaits(h.subagent);
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => waits.length === 1 && h.running('child')); // the lead is in its back-off
+      let childText: string | undefined;
+      void outcome(h, 'child').then((o) => { childText = o.text; });
+      const lead = outcome(h, 'lead');
+      expect(h.subagent.cancelSubagent('lead')).toBe(true);
+      await until(() => childText !== undefined);
+      expect(childText).toStartWith('[Stopped by user]');
+      expect((await lead).text).toStartWith('[Stopped by user]');
+      expect(leadAttempts).toBe(1);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test("cancelling a subagent while its retry sets up reaches the children its earlier attempt spawned", async () => {
+    let leadAttempts = 0;
+    let retrySettingUp = false;
+    let h!: Harness;
+    h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
+      if (agent.name.startsWith('spawn-lead-')) {
+        leadAttempts++;
+        await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
+        throw new Error('503 overloaded');
+      }
+      return new Promise(() => { /* the child runs until cancelled */ });
+    });
+    internal(h.subagent).waitOrStop = async () => null; // retry at once
+    // The lead's second attempt never finishes creating its agent: between
+    // its attempts, with neither attempt live.
+    const fw = h.framework as unknown as { createEphemeralAgent: (c: { name: string }) => Promise<unknown> };
+    const create = fw.createEphemeralAgent.bind(fw);
+    let leadCreates = 0;
+    fw.createEphemeralAgent = async (c) => {
+      if (c.name.startsWith('spawn-lead-') && ++leadCreates === 2) {
+        retrySettingUp = true;
+        return new Promise(() => { /* never settles */ });
+      }
+      return create(c);
+    };
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => retrySettingUp && h.running('child'));
+      let childText: string | undefined;
+      void outcome(h, 'child').then((o) => { childText = o.text; });
+      const lead = outcome(h, 'lead');
+      expect(h.subagent.cancelSubagent('lead')).toBe(true);
+      await until(() => childText !== undefined);
+      expect(childText).toStartWith('[Stopped by user]');
+      expect((await lead).text).toStartWith('[Stopped by user]');
+      expect(leadAttempts).toBe(1);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a child whose wait for a slot times out leaves no parent link', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    const sub = internal(h.subagent);
+    const acquire = sub.acquireSlot.bind(h.subagent);
+    sub.acquireSlot = (_slotTimeoutMs?: number, cancelled?: Promise<never>) => acquire(50, cancelled);
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await until(() => h.running('lead'));
+      const lead = sub.liveSubagents.get('lead')!.frameworkAgentName;
+      await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: lead });
+      const child = await outcome(h, 'child');
+      expect(child.text).toContain('Timed out waiting for a concurrency slot');
+      expect(sub.parentMap.has('child')).toBe(false);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a run leaves no cancel behind, so a second cancel finds nothing', async () => {
+    const h = await harness({ maxRetries: 0 }, (agent) => (agent.name.startsWith('spawn-quick-')
+      ? sleep(5).then(() => ({ speech: 'ok', toolCallsCount: 0 }))
+      : new Promise(() => { /* never settles */ })));
+    try {
+      const sub = internal(h.subagent);
+      await h.subagent.handleToolCall(spawn('quick'));
+      await outcome(h, 'quick');
+      expect(sub.cancellationHandles.has('quick')).toBe(false);
+      expect(h.subagent.cancelSubagent('quick')).toBe(false);
+
+      await h.subagent.handleToolCall(spawn('long'));
+      await until(() => h.running('long'));
+      const long = outcome(h, 'long');
+      expect(h.subagent.cancelAll()).toBe(1);
+      expect(h.subagent.cancelAll()).toBe(0);
+      expect(h.subagent.cancelSubagent('long')).toBe(false);
+      expect((await long).text).toStartWith('[Stopped by user]');
+      expect(sub.cancellationHandles.size).toBe(0);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a spawn under a running subagent\'s name is refused, and a cancel still stops the running one', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('scan'));
+      await until(() => h.running('scan'));
+      const scan = outcome(h, 'scan');
+      expect((await h.subagent.handleToolCall(spawn('scan'))).error ?? '').toStartWith("Nothing was started: a subagent named 'scan' is already running");
+      expect(h.subagent.getConcurrencyStatus().queued).toBe(0);
+      expect(h.subagent.cancelSubagent('scan')).toBe(true);
+      expect((await scan).text).toStartWith('[Stopped by user]');
+    } finally { await h.cleanup(); }
+  }, 20_000);
+});
+
+describe('a name means one subagent until its result has come back', () => {
+  const refused = (name: string) => new RegExp(`^Nothing was started: a subagent named '${name}' `);
+  const ran = (speech: string) => ({ speech, toolCallsCount: 0 });
+
+  test('a spawn or fork under a running subagent\'s name is refused, and the name is free once its result has come back', async () => {
+    const held = gate();
+    const h = await harness({ maxRetries: 0 }, async () => { await held.wait; return ran('first'); });
+    const delivered = deliveries(h);
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => h.running('scout'));
+      const again = await h.subagent.handleToolCall(spawn('scout'));
+      expect(again.success).toBe(false);
+      expect(again.error).toMatch(/^Nothing was started: a subagent named 'scout' is already running \(for \d+ s\), and a name means one subagent until its result has come back\. Choose another name, or wait for that one's result\.$/);
+      expect((await h.subagent.handleToolCall(fork('scout'))).error).toMatch(refused('scout'));
+      expect((await h.subagent.handleToolCall(spawn('scout', { sync: true }))).error).toMatch(refused('scout'));
+      expect((await h.subagent.handleToolCall(fork('scout', { sync: true }))).error).toMatch(refused('scout'));
+      held.open();
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages).toEqual(["[Subagent 'scout' returned]\n\nfirst"]);
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+    } finally { held.open(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a fork from inside a subagent can\'t take another running subagent\'s name', async () => {
+    const held = gate();
+    const h = await harness({ maxRetries: 0 }, async () => { await held.wait; return ran('done'); });
+    try {
+      await h.subagent.handleToolCall(spawn('lead'));
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => h.running('lead') && h.running('scout'));
+      const lead = internal(h.subagent).liveSubagents.get('lead')!.frameworkAgentName;
+      const nested = await h.subagent.handleToolCall({ ...fork('scout'), callerAgentName: lead });
+      expect(nested.error).toMatch(refused('scout'));
+    } finally { held.open(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a name waiting for a concurrency slot is refused', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('long'));
+      await until(() => h.running('long'));
+      await h.subagent.handleToolCall(spawn('waiting'));
+      await until(() => h.subagent.getConcurrencyStatus().queued === 1);
+      const again = await h.subagent.handleToolCall(spawn('waiting'));
+      expect(again.error).toStartWith("Nothing was started: a subagent named 'waiting' is already waiting for a concurrency slot, and");
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 1, queued: 1 });
+      h.subagent.cancelAll();
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a sync spawn still blocking its caller holds its name until it returns', async () => {
+    const held = gate();
+    const h = await harness({ maxRetries: 0 }, async () => { await held.wait; return ran('done'); });
+    try {
+      const first = h.subagent.handleToolCall(spawn('scout', { sync: true }));
+      await until(() => h.running('scout'));
+      expect((await h.subagent.handleToolCall(spawn('scout'))).error).toMatch(refused('scout'));
+      held.open();
+      expect((await first).success).toBe(true);
+      expect((await h.subagent.handleToolCall(spawn('scout', { sync: true }))).success).toBe(true);
+    } finally { held.open(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a sync spawn moved to the background holds its name until its result has come back', async () => {
+    const held = gate();
+    const h = await harness({ maxRetries: 0 }, async () => { await held.wait; return ran('done'); });
+    const delivered = deliveries(h);
+    try {
+      const res = await h.subagent.handleToolCall(spawn('scout', { sync: true, timeoutMs: 100 }));
+      expect(String(res.data)).toContain('moved to background');
+      expect((await h.subagent.handleToolCall(spawn('scout'))).error).toMatch(refused('scout'));
+      held.open();
+      await until(() => delivered.requests.length === 1);
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+    } finally { held.open(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a cancelled subagent is finishing, and keeps its name until its result has come back, so a new run\'s result isn\'t taken for it', async () => {
+    let calls = 0;
+    const h = await harness({ maxRetries: 0 }, () => (++calls === 1
+      ? new Promise(() => { /* never settles: the cancel ends it */ })
+      : sleep(20).then(() => ran('second'))));
+    const delivered = deliveries(h);
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => h.running('scout'));
+      expect(h.subagent.cancelSubagent('scout')).toBe(true);
+      expect((await h.subagent.handleToolCall(spawn('scout'))).error).toBe(
+        "Nothing was started: a subagent named 'scout' is still finishing, and a name means one subagent until its result has come back. Choose another name, or wait for that one's result.",
+      );
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' returned]\n\n[Stopped by user]");
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+      expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'second' });
+      await until(() => delivered.requests.length === 2);
+      expect(delivered.messages.at(-1)).toBe("[Subagent 'scout' returned]\n\nsecond");
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a result stashed with return by a run that was then cancelled isn\'t taken by the next run under its name', async () => {
+    let calls = 0;
+    const h = await harness({ maxRetries: 0 }, () => (++calls === 1
+      ? new Promise(() => { /* never settles: the cancel ends it */ })
+      : sleep(20).then(() => ran('second'))));
+    const delivered = deliveries(h);
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => h.running('scout'));
+      // The run returns a result, then is cancelled before its attempt settles.
+      internal(h.subagent).callIdIndex.set('ret-1', 'scout');
+      await h.subagent.handleToolCall({ id: 'ret-1', name: 'return', input: { result: 'stale' } });
+      expect(h.subagent.cancelSubagent('scout')).toBe(true);
+      await until(() => delivered.requests.length === 1);
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+      expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'second' });
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test("a retry doesn't report a result an earlier attempt returned before it failed", async () => {
+    let attempts = 0;
+    let h!: Harness;
+    h = await harness({ maxRetries: 1 }, async () => {
+      if (++attempts === 1) {
+        internal(h.subagent).callIdIndex.set('ret-1', 'scout');
+        await h.subagent.handleToolCall({ id: 'ret-1', name: 'return', input: { result: 'stale' } });
+        throw new Error('503 overloaded');
+      }
+      return ran('fresh');
+    });
+    internal(h.subagent).waitOrStop = async () => null; // retry at once
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'fresh' });
+      expect(attempts).toBe(2);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a new run under a name starts with none of the last run\'s leftovers', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('done'));
+    try {
+      const sub = internal(h.subagent);
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+      await until(() => !sub.asyncHandles.has('scout')); // its result has come back
+      sub.lastInputTokens.set('scout', 1234);
+      expect(sub.parentMap.get('scout')).toBe('parent');
+      const { callerAgentName: _caller, ...noCaller } = spawn('scout');
+      expect((await h.subagent.handleToolCall(noCaller as ToolCall)).success).toBe(true);
+      expect(sub.parentMap.has('scout')).toBe(false);
+      expect(sub.lastInputTokens.has('scout')).toBe(false);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  for (const stuck of ['creating its agent', 'compiling its prompt'] as const) {
+    test(`a cancel ends a run whose setup never finishes ${stuck}, and frees its name`, async () => {
+      const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+      const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ contextManager: { compile(): Promise<unknown> } }> };
+      const create = fw.createEphemeralAgent.bind(fw);
+      let reached = false;
+      fw.createEphemeralAgent = async (c) => {
+        if (stuck === 'creating its agent') { reached = true; return new Promise(() => { /* never settles */ }); }
+        const created = await create(c);
+        created.contextManager.compile = () => { reached = true; return new Promise(() => { /* never settles */ }); };
+        return created;
+      };
+      const delivered = deliveries(h);
+      try {
+        await h.subagent.handleToolCall(spawn('scout'));
+        await until(() => reached);
+        expect(h.subagent.cancelSubagent('scout')).toBe(true);
+        await until(() => delivered.requests.length === 1);
+        expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' returned]\n\n[Stopped by user]");
+        expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+        expect(internal(h.subagent).asyncHandles.has('scout')).toBe(false);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
+
+  test('a reclaim ends a run whose setup never finishes compiling its prompt, and frees its name', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+    const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ contextManager: { compile(): Promise<unknown> } }> };
+    const create = fw.createEphemeralAgent.bind(fw);
+    let reached = false;
+    // The reaper reads the runs registered for peek, which a run is once
+    // it has its agent, so this one sticks compiling.
+    fw.createEphemeralAgent = async (c) => {
+      const created = await create(c);
+      created.contextManager.compile = () => { reached = true; return new Promise(() => { /* never settles */ }); };
+      return created;
+    };
+    const delivered = deliveries(h);
+    try {
+      const sub = internal(h.subagent);
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => reached);
+      sub.activeSubagents.get('spawn-scout')!.lastActivityAt = Date.now() - 200_000;
+      expect(sub.reclaimZombieSlots()).toBe(1);
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages.at(-1)).toContain('[Terminated: zombie]');
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+      expect(sub.asyncHandles.has('scout')).toBe(false);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a cancel ends a fork whose setup never finishes reading its parent\'s context, and frees its name', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+    const parent = h.framework.getAgent('parent') as unknown as { getContextManager(): { compile(): Promise<unknown> } };
+    const cm = parent.getContextManager();
+    const compile = cm.compile.bind(cm);
+    let reached = false;
+    // Only the fork's read of the parent's context never settles; the
+    // parent's own turn after the result compiles as usual.
+    cm.compile = () => {
+      if (reached) return compile();
+      reached = true;
+      return new Promise(() => { /* never settles */ });
+    };
+    const delivered = deliveries(h);
+    try {
+      await h.subagent.handleToolCall(fork('scout'));
+      await until(() => reached);
+      expect(h.subagent.cancelSubagent('scout')).toBe(true);
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' returned]\n\n[Stopped by user]");
+      expect(h.subagent.getConcurrencyStatus()).toMatchObject({ active: 0, queued: 0 });
+      expect(internal(h.subagent).asyncHandles.has('scout')).toBe(false);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test('a throw while delivering a result is logged, not delivered as the run\'s failure', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('done'));
+    const ctx = (h.subagent as unknown as { ctx: { addMessage(...args: unknown[]): unknown } }).ctx;
+    const add = ctx.addMessage.bind(ctx);
+    const added: string[] = [];
+    let first = true;
+    ctx.addMessage = (participant, content) => {
+      const text = (content as Array<{ text?: string }>)[0]?.text ?? '';
+      if (first) { first = false; throw new Error('store unavailable'); }
+      added.push(text);
+      return add(participant, content);
+    };
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => lines.some((l) => l.includes("delivering scout's result")));
+      await sleep(20);
+      expect(lines.filter((l) => l.startsWith('[subagent] delivering'))).toEqual(["[subagent] delivering scout's result: store unavailable"]);
+      expect(added.filter((t) => t.startsWith("[Subagent 'scout' failed]"))).toEqual([]);
+    } finally { spy.mockRestore(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a failed run frees its name once its failure has come back, async or sync', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => { await sleep(5); throw new Error('the model refused'); });
+    const delivered = deliveries(h);
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' failed]");
+      const sync = await h.subagent.handleToolCall(spawn('scout', { sync: true }));
+      expect(sync.success).toBe(false);
+      expect(sync.error ?? '').not.toMatch(refused('scout'));
+      expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
+    } finally { await h.cleanup(); }
+  }, 20_000);
 });
