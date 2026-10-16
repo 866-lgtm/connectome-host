@@ -438,13 +438,18 @@ export class IdentityModule implements Module {
     if (!existsSync(this.config.keyPath)) {
       const rec = this.record();
       if (rec) {
+        // A registration held in memory has no record file to remove: the
+        // host forgets it when it restarts.
+        const rotate = this.held
+          ? 'restart the host, which forgets the registration it holds in memory, and register it again'
+          : 'remove the record as well and register this host again';
         throw new IdentityError(
           `this host's registration as "${rec.name}" with ${rec.home} is ` +
             `${this.held ? 'held in memory' : `recorded at ${this.recordPath}`}, but its identity key at ` +
             `${this.config.keyPath} is missing, so no new key was made: the service holds the registration under the ` +
-            'old key and would refuse every access signed with a new one. Restore the key file. To rotate the key on ' +
-            'purpose, remove the record as well and register this host again; the service keeps the old ' +
-            'registration, so the new one needs a name the old one doesn\'t hold',
+            `old key and would refuse every access signed with a new one. Restore the key file. To rotate the key on ` +
+            `purpose, ${rotate} with an invitation code; the service keeps the old registration, so the new one needs ` +
+            'a name the old one doesn\'t hold',
           IDENTITY_UNLOADED,
         );
       }
@@ -464,21 +469,25 @@ export class IdentityModule implements Module {
     );
   }
 
-  /** This host's key id and its proof of `statement`. Any failure of the key,
-   *  loading it or signing with it, is an IdentityError like identityKey's. */
+  /** This host's key id and its proof of `statement`. A key that can't be
+   *  had is identityKey's IdentityError. One that loads is ed25519's, which
+   *  signs, so signing has no failure of its own to word. */
   private prove(statement: string): { id: string; proof: string } {
     const key = this.identityKey();
-    try {
-      return { id: key.id, proof: cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url') };
-    } catch (err) {
-      throw this.keyFailure(err);
-    }
+    return { id: key.id, proof: cryptoSign(null, Buffer.from(statement, 'utf8'), key.privateKey).toString('base64url') };
   }
 
   private loadOrCreateKey(): { privateKey: KeyObject; id: string } {
     let privateKey: KeyObject;
     if (existsSync(this.config.keyPath)) {
       privateKey = createPrivateKey(readFileSync(this.config.keyPath, 'utf8'));
+      // The identity service's ids and proofs are ed25519's, so a key of
+      // another type is refused where it loads, which status meets too,
+      // rather than where it signs. The file is the operator's to replace:
+      // nothing is made over it or beside it.
+      if (privateKey.asymmetricKeyType !== 'ed25519') {
+        throw new Error(`it holds a key of type ${privateKey.asymmetricKeyType}, not ed25519`);
+      }
     } else {
       privateKey = generateKeyPairSync('ed25519').privateKey;
       mkdirSync(dirname(this.config.keyPath), { recursive: true });
@@ -530,10 +539,14 @@ export class IdentityModule implements Module {
   }
 
   /** How the operator records a registration by hand, for the log: the
-   *  record's path and what to write there, with the id where this host has it. */
+   *  record's path and what to write there. Without the id, the JSON leaves
+   *  `sub` out and says to add it, so a copy made as written reads as holding
+   *  no registration, rather than loading with a stand-in for the id. */
   private recordByHand(name: string, sub: string | null, enrolledAt: string): string {
-    const record = { sub: sub ?? '<the id the identity service holds for it>', name, home: this.config.home, enrolledAt };
-    return `To record it, write ${JSON.stringify(record)} to ${this.recordPath}.`;
+    const home = this.config.home;
+    if (sub !== null) return `To record it, write ${JSON.stringify({ sub, name, home, enrolledAt })} to ${this.recordPath}.`;
+    return `To record it, write ${JSON.stringify({ name, home, enrolledAt })} to ${this.recordPath}, adding "sub" with ` +
+      'the id the identity service holds for this registration.';
   }
 
   private saveRecord(rec: IdentityRecord): void {
@@ -549,14 +562,21 @@ export class IdentityModule implements Module {
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(IDENTITY_TIMEOUT_MS),
     });
-    return { status: res.status, json: (await res.json().catch(() => ({}))) as Record<string, unknown> };
+    // A reply whose body isn't a JSON object (none, unreadable, null, an
+    // array) reads as one with no fields: its readers then find no id or
+    // reason, rather than throwing after the service may have acted. A body
+    // that can't be read keeps the status that arrived, the service's answer.
+    const parsed: unknown = await res.json().catch(() => null);
+    const json = typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : {};
+    return { status: res.status, json };
   }
 
   // ── agent-facing utilities ──
 
   private status(): ToolResult {
-    // Key material is deliberately created lazily here too, so `status` is
-    // always safe to call — but none of it surfaces in the result.
+    // Key material is created lazily here too, so status can be the first
+    // call a host gets, and none of it surfaces in the result. A key or a
+    // record that can't be had fails status, as it fails every utility.
     this.identityKey();
     const rec = this.record();
     return ok(
@@ -889,8 +909,9 @@ export class IdentityModule implements Module {
    * out of its mount, or its mount is read-only. Null when none holds. Each
    * refusal is one agent-framework 0.22.1's writeBinary makes too, after the
    * request has gone out: its path parser reads what follows an empty part
-   * after the mount as absolute, leading out of the mount, and its store
-   * refuses a tree path with a "." or ".." part ("Invalid tree path"). The
+   * after the mount as absolute, which leads out of the mount unless it names
+   * the mount's own directory, and its store refuses that tree path, as it
+   * refuses an empty one or one with a "." or ".." part ("Invalid tree path"). The
    * check covers the path and the mount's mode. Whether the workspace is
    * running isn't public in 0.22.1, and a response over the mount's size
    * limit can only be known once it arrives.
@@ -991,7 +1012,7 @@ export class IdentityModule implements Module {
   private async acceptInvite(input: { invite?: unknown; name?: unknown }): Promise<ToolResult> {
     if (typeof input.invite !== 'string' || typeof input.name !== 'string') {
       return fail(
-        'Nothing was registered: identity--accept_invite needs both `invite`, the invitation code from your operator, ' +
+        'Nothing was sent: identity--accept_invite needs both `invite`, the invitation code from your operator, ' +
         'and `name`, the name to register as, each as text.',
       );
     }
@@ -1054,8 +1075,12 @@ export class IdentityModule implements Module {
     const error = String(json.error ?? 'no reason given');
     if (status >= 500) return unknownOutcome(`answered with a fault of its own (${status}: ${error})`);
     if (status === 429) {
-      // The service's rate limit answers before it looks at the registration.
-      return fail(`Nothing was registered: the identity service at ${home} couldn't take it just now (429: ${error}). Try again shortly.`);
+      // The service's rate limit answers before it looks at the registration,
+      // so this call registered nothing, whatever an earlier one did.
+      return fail(
+        `The identity service at ${home} couldn't take the registration just now (429: ${error}), so this call ` +
+        'registered nothing. Try again shortly.',
+      );
     }
     if (status === 400) {
       // A 400 comes before the service registers anything (a malformed
@@ -1073,7 +1098,11 @@ export class IdentityModule implements Module {
     }
     // Any other answer: archipelago-home's are 403s, each before it registers
     // anything (the invite, the proof, the name, the key). Worded as the
-    // service's answer all the same, with its reason for the agent to read.
+    // service's answer all the same, with its reason for the agent to read,
+    // and logged with it, since a reason such as "key already enrolled" is
+    // the operator's to act on. The host knows nothing of a registration the
+    // service holds, so the log gives no record to write.
+    console.error(`[identity] registering this host as "${name}" with ${home}: the service answered ${status}: ${error}.`);
     return fail(
       `The identity service at ${home} answered the registration with ${status}: ${error}. If an earlier call got no ` +
       'reply, a fault of the service\'s own, or a 400 not about the name, that call may have registered this host, so ' +
@@ -1098,8 +1127,9 @@ export class IdentityModule implements Module {
       'call identity--accept_invite again: the service already holds this registration.';
     if (sub === null) {
       console.error(
-        `[identity] ${home} answered 200 to registering this host as "${name}", but its reply named no id, so it ` +
-          `wasn't recorded. ${this.recordByHand(name, null, enrolledAt)}`,
+        `[identity] ${home} answered 200 to registering this host as "${name}", but no id could be read from its ` +
+          `reply, so it wasn't recorded. This host holds it in memory only until it restarts. ` +
+          this.recordByHand(name, null, enrolledAt),
       );
       this.held = { sub, name, home, enrolledAt };
       return fail(
@@ -1116,7 +1146,8 @@ export class IdentityModule implements Module {
       // words nor its code, since it can't act on them.
       console.error(
         `[identity] ${home} registered ${sub}, but its record couldn't be saved to ${this.recordPath}: ` +
-          `${sentence(errorText(err))} ${this.recordByHand(name, sub, enrolledAt)}`,
+          `${sentence(errorText(err))} This host holds it in memory only until it restarts. ` +
+          this.recordByHand(name, sub, enrolledAt),
       );
       this.held = { sub, name, home, enrolledAt };
       return fail(

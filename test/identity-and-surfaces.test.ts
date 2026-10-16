@@ -6,8 +6,8 @@
 // accept_invite, no tokens in any result); credentials exist only on the
 // HOST-facing API (accessFor/httpAuthFor) that the MCPL dial provider
 // and HTTP helpers consume outside model context.
-import { afterEach, describe, it, expect } from 'bun:test';
-import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import { afterEach, describe, it, expect, spyOn } from 'bun:test';
+import { mkdtempSync, mkdirSync, existsSync, readdirSync, readFileSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createPublicKey, generateKeyPairSync, verify as cryptoVerify } from 'node:crypto';
@@ -594,7 +594,10 @@ describe('identity: what the agent reads when a call fails', () => {
       };
       const { mod, ready, seen } = registeredModule({ workspace: ws });
       await ready;
-      expectSays((await upload(mod)).error, 'Nothing was sent to "orrery"', 'over the 67108864-byte upload limit', 'send a smaller file');
+      expectSays(
+        (await upload(mod)).error, 'Nothing was sent to "orrery"', 'over the 67108864-byte upload limit',
+        'calling again won\'t change that', 'send a smaller file',
+      );
       expect(seen.orrery).toBe(0);
     });
 
@@ -700,8 +703,9 @@ describe('identity: what the agent reads when a call fails', () => {
   });
 
   it('refuses saveAs before anything is sent where no writable mount would keep the response', async () => {
-    // A path the workspace's own resolver puts outside its mount is refused
-    // too, whatever the form that leads it there.
+    // A path the workspace's resolver puts outside its mount is refused too.
+    // No form found on Linux reaches that check past the ones before it, so
+    // the resolver here is a stand-in that puts "files/away.json" outside.
     const resolveAbsolutePath = (path: string) => (path === 'files/away.json' || path.split('/').includes('..') ? null : `/mounts/${path}`);
     const { mod, ready, seen } = registeredModule({ workspace: keepingWorkspace(undefined, { resolveAbsolutePath }) });
     await ready;
@@ -718,7 +722,9 @@ describe('identity: what the agent reads when a call fails', () => {
 
   // Every saveAs form agent-framework's own write accepts goes out and is
   // saved, and every form it would refuse is refused before anything is
-  // sent: none goes out only to have its answer lost.
+  // sent: none goes out only to have its answer lost. Each form is also
+  // written straight through the workspace's write, so the two verdicts are
+  // compared form by form.
   it("sends every saveAs the workspace's write accepts, and nothing it would refuse", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'ident-saveas-'));
     mkdirSync(join(dir, 'files'));
@@ -737,15 +743,24 @@ describe('identity: what the agent reads when a call fails', () => {
       'files/out.json', 'files/sub/out.json', 'files/end.json/', 'files/twice//slash.json', 'files/dir/', 'files/a//b/c.json',
       'files/ends.json//', 'files/./out.json', 'files/sub/../out.json', 'files/sub/./out.json', 'files//out.json',
       'files/../out.json', 'files/', 'files', '/files/out.json', './files/out.json', 'nope/out.json', 'docs/out.json',
-      'FILES/out.json',
+      'FILES/out.json', 'files//', `files/${join(dir, 'files')}/inside.json`,
     ];
     const outcomes: Record<string, string> = {};
+    const writes: Record<string, string> = {};
     for (const saveAs of forms) {
       const before = seen.orrery;
       const res = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }));
       outcomes[saveAs] = res.success ? 'sent and saved' : seen.orrery === before ? 'not sent' : 'sent, answer lost';
+      // The workspace's own verdict on the same form, as its write gives it.
+      try {
+        const written = await workspace.writeBinary(saveAs, Buffer.from('{}'), 'application/json');
+        writes[saveAs] = written.success || (written.data as { inChronicle?: boolean } | undefined)?.inChronicle ? 'accepted' : 'refused';
+      } catch {
+        writes[saveAs] = 'refused';
+      }
     }
     expect(Object.values(outcomes)).not.toContain('sent, answer lost');
+    for (const form of forms) expect([form, outcomes[form] === 'sent and saved']).toEqual([form, writes[form] === 'accepted']);
     expect(Object.keys(outcomes).filter((form) => outcomes[form] === 'sent and saved')).toEqual([
       'files/out.json', 'files/sub/out.json', 'files/end.json/', 'files/twice//slash.json', 'files/dir/', 'files/a//b/c.json',
       'files/ends.json//',
@@ -903,7 +918,10 @@ describe('identity: what the agent reads when a call fails', () => {
     let enroll = () => new Response(JSON.stringify({ error: 'name taken' }), { status: 403 });
     const { mod, dir } = registeredModule({ register: false, enroll: () => enroll() });
     const join_ = (name = 'A') => mod.handleToolCall(call('accept_invite', { invite: 'inv', name }));
-    const refused = (await join_()).error;
+    let refused = '';
+    const refusedLog = await logged(async () => { refused = String((await join_()).error); });
+    // The operator's log has the answer and its reason, such as a key the service already holds.
+    expect(refusedLog).toContain('[identity] registering this host as "A" with id.test: the service answered 403: name taken.');
     expectSays(
       refused, 'answered the registration with 403: name taken.',
       'If an earlier call got no reply, a fault of the service\'s own, or a 400 not about the name',
@@ -911,7 +929,10 @@ describe('identity: what the agent reads when a call fails', () => {
     );
     expect(refused).not.toContain('Nothing was registered');
     enroll = () => new Response(JSON.stringify({ error: 'rate limited' }), { status: 429 });
-    expectSays((await join_()).error, 'Nothing was registered', 'couldn\'t take it just now (429: rate limited)', 'Try again shortly');
+    expectSays(
+      (await join_()).error, 'couldn\'t take the registration just now (429: rate limited), so this call registered nothing',
+      'Try again shortly',
+    );
     // A fault of its own can come after the service registered the host, as a lost reply can.
     enroll = () => new Response(JSON.stringify({ error: 'internal error' }), { status: 500 });
     expectSays(
@@ -925,9 +946,14 @@ describe('identity: what the agent reads when a call fails', () => {
       noReply, 'gave no reply (connection reset)', 'whether it registered this host is unknown',
       'again shortly with the same code and name', 'don\'t try another name', 'ask your operator',
     );
-    // The operator's log says where the record goes, should the service hold it.
-    expect(noReplyLog.some((line) => line.includes('gave no reply (connection reset)') && line.includes(`to ${join(dir, 'k.json')}`) &&
-      line.includes('"sub":"<the id the identity service holds for it>","name":"A"'))).toBe(true);
+    // The operator's log says where the record goes, should the service hold
+    // it, and leaves out the id this host doesn't have, saying to add it.
+    const byHand = noReplyLog.find((line) => line.includes('gave no reply (connection reset)'));
+    expectSays(
+      byHand, `{"name":"A","home":"id.test","enrolledAt":`, `to ${join(dir, 'k.json')}, adding "sub" with the id the identity ` +
+        'service holds for this registration.',
+    );
+    expect(byHand).not.toContain('"sub":');
     // The record can't be written: a directory where its temporary file goes.
     mkdirSync(join(dir, 'k.json.tmp'));
     enroll = () => new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
@@ -941,8 +967,8 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(unrecorded!.error).not.toContain('key');
     expect(unrecorded!.error).not.toContain('EISDIR');
     // The log says where the record goes and what to write in it.
-    expect(lines.some((line) => line.includes('EISDIR') && line.includes(`to ${join(dir, 'k.json')}`) &&
-      line.includes('"sub":"agent:a@guest","name":"A","home":"id.test"'))).toBe(true);
+    expect(lines.some((line) => line.includes('EISDIR') && line.includes('only until it restarts') &&
+      line.includes(`to ${join(dir, 'k.json')}`) && line.includes('"sub":"agent:a@guest","name":"A","home":"id.test"'))).toBe(true);
     // Held for this session: status shows it, access works, and registering again is refused here.
     const status = await mod.handleToolCall(call('status', {}));
     expect(status.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
@@ -1005,55 +1031,156 @@ describe('identity: what the agent reads when a call fails', () => {
     }
     expect(existsSync(join(dir, 'k.pem'))).toBe(false);
     expect(lines.some((line) => line.includes(`${join(dir, 'k.pem')} is missing, so no new key was made`) &&
-      line.includes('To rotate the key on purpose'))).toBe(true);
+      line.includes('To rotate the key on purpose, remove the record as well and register this host again with an invitation code'))).toBe(true);
     expect(seen.orrery).toBe(0);
   });
 
-  // A key that loads but can't sign, such as an X25519 key, fails as a key
-  // that can't be read does: the agent gets the one sentence, the log why.
-  it("says a key that can't sign is the host's, as it says of one that can't be read", async () => {
+  // A key of another type, such as an X25519 key, which loads but can't sign,
+  // fails where it loads, as a key that can't be read does: status, request
+  // and accept_invite alike. The agent gets the one sentence, the log the
+  // key's type, and the file stays the operator's to replace.
+  it("refuses a key that isn't ed25519 where it loads, and leaves its file as it is", async () => {
     const { mod, dir, ready, seen } = registeredModule();
     await ready;
-    writeFileSync(join(dir, 'k.pem'), generateKeyPairSync('x25519').privateKey.export({ format: 'pem', type: 'pkcs8' }));
+    const x25519 = generateKeyPairSync('x25519').privateKey.export({ format: 'pem', type: 'pkcs8' });
+    writeFileSync(join(dir, 'k.pem'), x25519);
+    const files = readdirSync(dir).sort();
     let request = '';
+    let status = '';
     const lines = await logged(async () => {
       request = String((await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x' }))).error);
+      status = String((await mod.handleToolCall(call('status', {}))).error);
     });
     expect(request).toBe('Nothing was sent to "orrery": this host\'s identity couldn\'t be loaded. It\'s the host\'s to fix: ask your operator, who can find the reason in the host\'s log.');
-    expect(lines.some((line) => line.includes(`${join(dir, 'k.pem')} couldn't be read, made or used`))).toBe(true);
+    expect(status).toBe('identity--status failed: this host\'s identity couldn\'t be loaded. It\'s the host\'s to fix: ask your operator, who can find the reason in the host\'s log.');
+    expect(lines.some((line) => line.includes(`${join(dir, 'k.pem')} couldn't be read, made or used: it holds a key of type x25519, not ed25519`))).toBe(true);
+    // Nothing made over the refused key or beside it.
+    expect(readFileSync(join(dir, 'k.pem'), 'utf8')).toBe(String(x25519));
+    expect(readdirSync(dir).sort()).toEqual(files);
     expect(seen.orrery).toBe(0);
+    // A host not yet registered, registering with such a key: refused before anything is sent.
+    const fresh = registeredModule({ register: false });
+    writeFileSync(join(fresh.dir, 'k.pem'), x25519);
+    let joined = '';
+    await logged(async () => { joined = String((await fresh.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error); });
+    expect(joined).toBe('identity--accept_invite failed before anything was sent: this host\'s identity couldn\'t be loaded. It\'s the host\'s to fix: ask your operator, who can find the reason in the host\'s log.');
+    expect(readFileSync(join(fresh.dir, 'k.pem'), 'utf8')).toBe(String(x25519));
+    expect(readdirSync(fresh.dir)).toEqual(['k.pem']);
   });
 
-  // A call to the identity service that hangs counts as no reply.
-  it('gives every call to the identity service a time limit', async () => {
-    const signals: Record<string, unknown> = {};
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
-    const mod = new IdentityModule({
-      keyPath: join(dir, 'k.pem'),
-      home: 'id.test',
-      fetchImpl: (async (url: any, init?: any) => {
-        const path = new URL(String(url)).pathname;
-        signals[path] = init?.signal;
-        if (path === '/enroll') return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
-        return new Response(JSON.stringify({ token: 'aid1.fresh.secret' }), { status: 200 });
-      }) as typeof fetch,
+  // A call to /enroll or /token that hangs ends after 15 seconds as no reply.
+  // The limit is asked of AbortSignal.timeout, which here answers with a
+  // 20 ms signal, and the service never answers: each call ends only when its
+  // signal fires, as fetch's does.
+  it('gives /enroll and /token 15 seconds each, after which a call that hangs counts as no reply', async () => {
+    const real = AbortSignal.timeout.bind(AbortSignal);
+    const limits: number[] = [];
+    const timeout = spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
+      limits.push(ms);
+      return real(20);
     });
-    await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
-    await mod.accessFor('orrery');
-    expect(signals['/enroll']).toBeInstanceOf(AbortSignal);
-    expect(signals['/token']).toBeInstanceOf(AbortSignal);
+    try {
+      const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+      const mod = new IdentityModule({
+        keyPath: join(dir, 'k.pem'),
+        home: 'id.test',
+        fetchImpl: ((_url: any, init?: RequestInit) => new Promise<Response>((_answer, fail) => {
+          init!.signal!.addEventListener('abort', () => fail(init!.signal!.reason));
+        })) as typeof fetch,
+      });
+      const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+      expectSays((await join_()).error, 'gave no reply (', 'whether it registered this host is unknown');
+      // The in-flight guard is released: a second call goes out, and isn't refused as under way.
+      const again = String((await join_()).error);
+      expectSays(again, 'gave no reply (');
+      expect(again).not.toContain('under way');
+      writeFileSync(join(dir, 'k.json'), JSON.stringify({ sub: 'agent:a@guest', name: 'A', home: 'id.test', enrolledAt: 'then' }));
+      let thrown: unknown;
+      try {
+        await mod.accessFor('orrery');
+      } catch (err) {
+        thrown = err;
+      }
+      expect(thrown).toBeInstanceOf(IdentityError);
+      expectSays((thrown as IdentityError).message, 'couldn\'t be reached for access to "orrery"');
+      expect(limits).toEqual([15_000, 15_000, 15_000]);
+    } finally {
+      timeout.mockRestore();
+    }
   });
 
   it("holds a registration whose reply couldn't be read, and asks the operator to record it", async () => {
     const { mod, dir } = registeredModule({ register: false, enroll: () => new Response('<html>registered</html>', { status: 200 }) });
+    let answer = '';
+    const lines = await logged(async () => {
+      answer = String((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error);
+    });
     expectSays(
-      (await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error,
-      'answered that it registered this host as "A" (200), but its reply couldn\'t be read', 'holds the registration until it restarts',
+      answer, 'answered that it registered this host as "A" (200), but its reply couldn\'t be read', 'holds the registration until it restarts',
       'Don\'t call identity--accept_invite again', 'record this registration on this host by hand',
     );
     expect(existsSync(join(dir, 'k.json'))).toBe(false);
+    // The operator's log: no id could be read, the hold ends at restart, and
+    // the record to write, without the id the host doesn't have.
+    const byHand = lines.find((line) => line.includes('no id could be read from its reply'));
+    expectSays(
+      byHand, 'only until it restarts', `{"name":"A","home":"id.test","enrolledAt":`,
+      `to ${join(dir, 'k.json')}, adding "sub" with the id the identity service holds for this registration.`,
+    );
+    expect(byHand).not.toContain('"sub":');
     expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: null });
     expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
+    // A copy of that record made as written, without the id, reads as holding
+    // no registration once the host restarts: it fails closed.
+    writeFileSync(join(dir, 'k.json'), byHand!.match(/write (\{.*?\}) to /)![1]);
+    const restarted = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
+    expectSays(
+      (await restarted.handleToolCall(call('status', {}))).error,
+      'identity--status failed: this host\'s registration record couldn\'t be read, so whether this host is registered is unknown',
+    );
+    rmSync(join(dir, 'k.json'));
+    // The key gone while the registration is held: refused, no new key made,
+    // and the log's way to rotate fits a registration held in memory.
+    rmSync(join(dir, 'k.pem'));
+    let status = '';
+    const keyLines = await logged(async () => { status = String((await mod.handleToolCall(call('status', {}))).error); });
+    expectSays(status, 'identity--status failed: this host\'s identity couldn\'t be loaded');
+    expect(keyLines.some((line) => line.includes(`is held in memory, but its identity key at ${join(dir, 'k.pem')} is missing`) &&
+      line.includes('restart the host, which forgets the registration it holds in memory, and register it again with an invitation code'))).toBe(true);
+    expect(existsSync(join(dir, 'k.pem'))).toBe(false);
+  });
+
+  // A reply whose body can't be read, or isn't a JSON object, reads as one
+  // that names no id and no reason, never as a throw after the service may
+  // have acted. The status that arrived is the service's answer.
+  it('reads a reply body that can\'t be read, or is not a JSON object, as one that names nothing', async () => {
+    const held = registeredModule({ register: false, enroll: () => new Response('null', { status: 200 }) });
+    const answer = String((await held.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error);
+    expectSays(answer, 'answered that it registered this host as "A" (200), but its reply couldn\'t be read');
+    expect(answer).not.toContain('before anything was sent');
+    const cut = registeredModule({
+      register: false,
+      enroll: () => new Response(new ReadableStream({ start(c) { c.error(new Error('stream cut')); } }), { status: 200 }),
+    });
+    expectSays(
+      (await cut.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error,
+      'answered that it registered this host as "A" (200), but its reply couldn\'t be read',
+    );
+    const refused = registeredModule({ register: false, enroll: () => new Response('[]', { status: 403 }) });
+    expectSays(
+      (await refused.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error,
+      'answered the registration with 403: no reason given.',
+    );
+    const access = registeredModule({ token: () => new Response('null', { status: 200 }) });
+    await access.ready;
+    let thrown: unknown;
+    try {
+      await access.mod.accessFor('orrery');
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeInstanceOf(IdentityError);
+    expectSays((thrown as IdentityError).message, 'answered 200 for access to "orrery", but its reply couldn\'t be read');
   });
 
   it('refuses a second registration while one is under way', async () => {
@@ -1075,7 +1202,7 @@ describe('identity: what the agent reads when a call fails', () => {
     expectSays((await mod.handleToolCall(call('request', { path: '/x' }))).error, 'needs `service`', 'orrery');
     expectSays((await mod.handleToolCall(call('request', { service: 'orrery', path: 'api/ops' }))).error, 'starting with "/"', 'it was "api/ops"');
     for (const lacking of [{ invite: 'x' }, { name: 'A' }]) {
-      expectSays((await mod.handleToolCall(call('accept_invite', lacking))).error, 'Nothing was registered', 'both `invite`', '`name`');
+      expectSays((await mod.handleToolCall(call('accept_invite', lacking))).error, 'Nothing was sent', 'both `invite`', '`name`');
     }
   });
 
