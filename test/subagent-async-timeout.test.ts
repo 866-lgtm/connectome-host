@@ -213,7 +213,7 @@ describe('SubagentModule timeout behaviour (async vs sync default)', () => {
     }
   }, 15_000);
 
-  test('SYNC spawn, no explicit timeoutMs: hard timeout fires at maxExecutionMs', async () => {
+  test('SYNC spawn, no explicit timeoutMs: moves to the background at maxExecutionMs, and the run goes on', async () => {
     const MAX_EXEC = 1_000;
     const SUBAGENT_WORK = 3_000;
     const { subagent, cleanup } = await makeHarness({
@@ -235,23 +235,25 @@ describe('SubagentModule timeout behaviour (async vs sync default)', () => {
         `error=${res.error ?? '—'}`,
       );
 
-      // Current (post-2169410) code: sync path arms withTimeout at maxExecutionMs
-      // and the auto-detach timer is gated on input.timeoutMs being explicit.
-      // Expected observation: error "timed out after 1000ms", NOT a "moved to
-      // background" ack — contradicting the schema's "auto-detaches" promise.
-      expect(res.success).toBe(false);
-      expect(res.error ?? '').toMatch(/timed out/i);
+      // The schema's promise: a sync task still running at its timeoutMs,
+      // which defaults to maxExecutionMs, moves to the background, and its
+      // run goes on to deliver its result. (Before, maxExecutionMs was a
+      // hard limit here, and the call answered "timed out".)
+      expect(res.success).toBe(true);
+      expect(String(res.data)).toContain('moved to background');
       expect(elapsed).toBeLessThan(SUBAGENT_WORK);
+      const handle = (subagent as unknown as { asyncHandles: Map<string, { promise: Promise<{ summary: string }> }> })
+        .asyncHandles.get('sync-slowpoke')!;
+      expect((await handle.promise).summary).toBe('ok');
     } finally {
       await cleanup();
     }
   }, 10_000);
 
-  test('SYNC spawn WITH explicit timeoutMs shorter than work: auto-detach vs hard-timeout race', async () => {
-    // Both `timeoutMs` parameters in handleSpawn resolve to the same value
-    // when input.timeoutMs is explicit — so withTimeout (reject) and
-    // autoDetachMs (detach→ack) race at the same deadline. This test
-    // documents which side wins in practice.
+  test('SYNC spawn WITH explicit timeoutMs shorter than work: moves to the background, and the run goes on', async () => {
+    // A sync task's timeoutMs is only when it moves to the background; a
+    // sync run has no hard limit. (Before, the same value armed a hard limit
+    // too, which raced the move at the same moment.)
     const { subagent, cleanup } = await makeHarness({
       maxExecutionMs: 60_000, // large, so input.timeoutMs is what matters
       subagentRunMs: 3_000,
@@ -271,16 +273,13 @@ describe('SubagentModule timeout behaviour (async vs sync default)', () => {
         `data=${typeof res.data === 'string' ? res.data : JSON.stringify(res.data)} ` +
         `error=${res.error ?? '—'}`,
       );
-      // Observation recorded below by the assertion the implementation actually
-      // passes — we intentionally don't enforce which side wins, because that's
-      // exactly the undefined-behaviour question we're investigating.
+      expect(res.success).toBe(true);
+      expect(String(res.data)).toContain('moved to background');
       expect(elapsed).toBeLessThan(2_500);
-      // The orphaned subagent promise will itself hard-timeout shortly after;
-      // wait for its deliverAsyncError to flush so shutdown doesn't race a
-      // "Queue is closed" push. (A small but interesting latent bug: when
-      // autoDetachMs == hard timeout, the post-detach promise rejection
-      // arrives after the parent has already moved on.)
-      await new Promise(r => setTimeout(r, 300));
+      // Wait for the run's own result, so shutdown doesn't race its delivery.
+      const handle = (subagent as unknown as { asyncHandles: Map<string, { promise: Promise<{ summary: string }> }> })
+        .asyncHandles.get('sync-explicit')!;
+      expect((await handle.promise).summary).toBe('ok');
     } finally {
       await cleanup();
     }

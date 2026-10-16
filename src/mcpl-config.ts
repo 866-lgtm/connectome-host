@@ -6,7 +6,6 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import { namesEnvReference, type RecipeToolLifecycle } from './recipe.js';
 import { validateToolLifecycle } from './tool-lifecycle-config.js';
 
@@ -978,28 +977,24 @@ export function saveMcplServers(configPath: string, servers: Record<string, Serv
 /**
  * Compose the environment for a stdio MCPL child.
  *
- * Two host-owned values ride along with whatever the server entry declares:
+ * The host supplies AGENT_TIMEZONE after the server env: the agent-facing
+ * wall clock is resolved per-recipe, not a per-server operator knob.
  *
- * - `DISCORD_SUPPRESSED_REACTIONS_BASELINE` — the framework's exported
- *   refusal-annotation set (REFUSAL_REACTION_BASELINE, comma-joined), so a
- *   never-configured Discord adapter defaults to suppressing exactly the
- *   markers this host's framework stamps. Placed BEFORE the spread: an
- *   operator who sets the var on the server entry supersedes the house
- *   baseline — the host injects a default, never overrides a decision. The
- *   adapter's own precedence (file key incl. [] → legacy operator env →
- *   baseline) then decides what is actually enforced; house markers are
- *   Host semantics, and a standalone adapter without this composition stays
- *   honestly unprotected.
- * - `AGENT_TIMEZONE` — after the spread, deliberately: the agent-facing
- *   wall clock is resolved per-recipe by the host and is not a per-server
- *   operator knob.
+ * AgentFramework supplies DISCORD_SUPPRESSED_REACTIONS_BASELINE later,
+ * where it knows its awareness marker and retained recovery outbox emojis.
+ * A host-side refusal-only default would override that complete default.
+ * Explicit operator env passes through unchanged, whatever its type. The
+ * framework then lets a baseline with tokens, as the Discord adapter parses
+ * them, replace its default, and reads any other value (blank, commas
+ * alone, null) as unset. A non-string value counts as its string form, so
+ * `false` or `0` replaces the default. For an inheritEnv entry, a baseline
+ * with tokens in the host's own environment replaces it too.
  */
 export function composeMcplChildEnv(
   serverEnv: Record<string, string> | undefined,
   timeZone: string,
 ): Record<string, string> {
   return {
-    DISCORD_SUPPRESSED_REACTIONS_BASELINE: REFUSAL_REACTION_BASELINE.join(','),
     ...(serverEnv ?? {}),
     AGENT_TIMEZONE: timeZone,
   };

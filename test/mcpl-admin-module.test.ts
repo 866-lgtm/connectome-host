@@ -7,7 +7,6 @@ import { test, expect, describe, beforeEach, afterEach, spyOn } from 'bun:test';
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import type { AgentFramework } from '@animalabs/agent-framework';
 
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.js';
@@ -221,8 +220,9 @@ describe('mcpl_deploy', () => {
     expect(calls).toEqual([]);
   });
 
-  // A deployed child used to get AGENT_TIMEZONE alone, without the
-  // refusal-reaction baseline every boot-loaded server gets.
+  // A deployed child gets the env the boot composes for every server: the
+  // entry's own env with the host's zone. The host sets no reaction
+  // baseline; agent-framework derives that default when the child spawns.
   test('gives a deployed child the env the boot composes for every server', async () => {
     const { stub } = makeStubFramework();
     const configs: Array<{ id: string; env?: Record<string, string> }> = [];
@@ -235,15 +235,23 @@ describe('mcpl_deploy', () => {
     await call(mod, 'mcpl_deploy', { id: 'quiet', command: 'node', env: { DISCORD_SUPPRESSED_REACTIONS_BASELINE: 'own', AGENT_TIMEZONE: 'Mars/Olympus' } });
 
     expect(configs[0]!.env).toEqual({
-      DISCORD_SUPPRESSED_REACTIONS_BASELINE: REFUSAL_REACTION_BASELINE.join(','),
       TOKEN: 'mine',
       AGENT_TIMEZONE: 'Pacific/Auckland',
     });
-    // The entry's own baseline overrides the default; the host's zone wins over the entry's.
+    // The entry's own baseline passes through; the host's zone wins over the entry's.
     expect(configs[1]!.env!.DISCORD_SUPPRESSED_REACTIONS_BASELINE).toBe('own');
     expect(configs[1]!.env!.AGENT_TIMEZONE).toBe('Pacific/Auckland');
     // The overlay keeps only what the agent gave.
     expect(readAgentOverlay(overlayPath).chat).toEqual({ command: 'node', env: { TOKEN: 'mine' } });
+
+    // A redeploy restarts the child with the same composition.
+    const restarted: Array<{ id: string; env?: Record<string, string> }> = [];
+    const restart = (stub as unknown as { restartMcplServer: (id: string, c?: { id: string; env?: Record<string, string> }) => Promise<void> }).restartMcplServer;
+    (stub as unknown as { restartMcplServer: (id: string, c?: { id: string; env?: Record<string, string> }) => Promise<void> }).restartMcplServer =
+      async (id, c) => { if (c) restarted.push(c); return restart(id, c); };
+    await call(mod, 'mcpl_deploy', { id: 'chat', command: 'node', env: { TOKEN: 'newer' } });
+    expect(restarted).toHaveLength(1);
+    expect(restarted[0]!.env).toEqual({ TOKEN: 'newer', AGENT_TIMEZONE: 'Pacific/Auckland' });
   });
 
   // A field of the wrong kind used to be dropped (or coerced: a null arg

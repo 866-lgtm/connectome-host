@@ -80,14 +80,20 @@ The module accepts three credentials:
   not send cached Basic credentials on WebSocket upgrades.
 - **Observer device keys** — Ed25519 grants in `$OBSERVERS_FILE` (default
   `DATA_DIR/observers.json`, hot-reloaded; the agent edits it with its
-  `observers--get/grant/revoke` tools). Once the file holds at least one grant,
-  the static app shell is served without auth and `/ws` accepts upgrades that
-  must then present a signed observer hello. Each observer sees only its
-  grant's scopes — `health`, `ops`, `messages`, `tools`, `thinking`, `debug` —
-  and gets a session cookie for the matching HTTP routes (`debug` for
-  `/debug/*` and `/curve`, `health` for `/healthz` and `/quota`, `messages`
-  for `/media/…`). Observers are read-only; `/files/…` and
-  `/debug/retrieval*` stay password-only.
+  `observers--get/grant/revoke` tools). A grant the viewer can't use, such as
+  one with an unknown scope or an expiry that isn't a date, is left out and
+  named in its log, and the file's other grants still apply; a file that isn't
+  valid JSON leaves a running viewer's previous grants in force until it
+  parses, and a viewer that starts on one admits none until then. A key may be
+  written in either base64 alphabet, padded or not, and is the same key either
+  way. Once the file holds at least one usable grant, the static app shell is
+  served without auth and `/ws` accepts upgrades that must then present a
+  signed observer hello. Each observer sees only its grant's scopes —
+  `health`, `ops`, `messages`, `tools`, `thinking`, `debug` — and gets a
+  session cookie for the matching HTTP routes (`debug` for `/debug/*` and
+  `/curve`, `health` for `/healthz` and `/quota`, `messages` for `/media/…`).
+  Observers are read-only; `/files/…` and `/debug/retrieval*` stay
+  password-only.
 
 ## Caddy
 
