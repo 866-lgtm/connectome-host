@@ -54,6 +54,7 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'summarySystemPrompt',
   'compressionSystemPrompt',
   'compressionRefusalSystemPrompt',
+  'compressionDeclareTools',
   'summaryUserPrompt',
   'summaryContextLabel',
   'witnessedBeforeSequence',

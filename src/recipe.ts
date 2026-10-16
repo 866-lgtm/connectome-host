@@ -181,6 +181,11 @@ export interface RecipeStrategy {
    *  to retry a REFUSED memory-write (content_filter). Baseline stays light;
    *  the escalation prompt fires only on the rare refusal. */
   compressionRefusalSystemPrompt?: string;
+  /** Declare the agent's tools on memory-write requests (default true).
+   *  false drops the tool surface from compression calls — only for
+   *  summarizers that accept tool history without a `tools` param
+   *  (OpenAI-family); Anthropic/Fable summarizers need it. */
+  compressionDeclareTools?: boolean;
   summaryUserPrompt?: string;
   summaryContextLabel?: string;
   /** As-of perspective pin: chunks wholly below this message sequence are
@@ -2167,6 +2172,7 @@ export function validateRecipe(raw: unknown): Recipe {
       'compressionMergeSourceOnlyFallback',
       'compressionSplitFallback',
       'compressionSplitPlaceholder',
+      'compressionDeclareTools',
     ] as const) {
       if (strategy[key] !== undefined && typeof strategy[key] !== 'boolean') {
         throw new Error(`Recipe agent.strategy.${key} must be a boolean.`);
