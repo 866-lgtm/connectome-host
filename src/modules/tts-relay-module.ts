@@ -45,6 +45,7 @@ import type {
   ToolResult,
   TraceEvent,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -291,7 +292,7 @@ export class TtsRelayModule implements Module {
   getTools(): ToolDefinition[] { return []; }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
