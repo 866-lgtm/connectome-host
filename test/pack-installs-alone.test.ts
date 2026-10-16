@@ -9,12 +9,16 @@
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
 import { execFile, execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const SCRIPT = fileURLToPath(new URL("../scripts/pack-installs-alone.mjs", import.meta.url));
+// The node on PATH, which runs the script as the workflows do (under
+// `bun test`, process.execPath is bun). Found once, since a case may hand
+// the script a PATH without it.
+const NODE = execFileSync("sh", ["-c", "command -v node"], { encoding: "utf8" }).trim();
 const TIMEOUT_MS = 60_000;
 
 const made: string[] = [];
@@ -58,7 +62,7 @@ function check(dir: string, env: Record<string, string> = {}): Promise<{ code: n
   const home = mkdtempSync(join(tmpdir(), "pack-installs-alone-home-"));
   made.push(home);
   return new Promise((resolve) => {
-    execFile(process.execPath, [SCRIPT], {
+    execFile(NODE, [SCRIPT], {
       cwd: dir,
       env: {
         PATH: process.env.PATH ?? "",
@@ -139,6 +143,7 @@ test("a dependency that can't be installed fails the install after three attempt
   assert.equal(result.code, 1);
   assert.match(result.stderr, /pack-installs-alone: the install failed \(attempt 1 of 3\); trying again\./);
   assert.match(result.stderr, /pack-installs-alone: the install failed \(attempt 2 of 3\); trying again\./);
+  assert.doesNotMatch(result.stderr, /attempt 3 of 3/);
   assert.match(
     result.stderr,
     /pack-installs-alone: zz-host-1\.0\.0\.tgz didn't install on its own into an empty directory, in 3 attempts \(npm's output is above\)\. A dependency that isn't on the registry does that, or a registry or network error that outlasts the attempts\.\n$/,
@@ -282,10 +287,9 @@ test("npm pack that fails, or prints anything but one record with a filename, fa
 }, TIMEOUT_MS * 3);
 
 test("no npm on PATH fails by name", async () => {
-  const onlyNode = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
-  made.push(onlyNode);
-  symlinkSync(process.execPath, join(onlyNode, "node"));
-  const result = await check(standIn({}), { PATH: onlyNode });
+  const empty = mkdtempSync(join(tmpdir(), "pack-installs-alone-path-"));
+  made.push(empty);
+  const result = await check(standIn({}), { PATH: empty });
   assert.equal(result.code, 1);
   assert.equal(result.stderr, "pack-installs-alone: couldn't run npm: it isn't on PATH.\n");
 }, TIMEOUT_MS);

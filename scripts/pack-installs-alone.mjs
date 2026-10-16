@@ -148,7 +148,7 @@ function main() {
       } catch (error) {
         // Running out of time isn't a blip: retried, it would leave npm's
         // children writing into the tree the next attempt starts from.
-        const final = !(error instanceof CheckError) || error instanceof TimeoutError || /isn't on PATH/.test(error.message);
+        const final = !(error instanceof CheckError) || error instanceof TimeoutError;
         if (final || attempt === INSTALL_ATTEMPTS) throw error;
         console.error(`pack-installs-alone: the install failed (attempt ${attempt} of ${INSTALL_ATTEMPTS}); trying again.`);
         rmSync(join(dir, "node_modules"), { recursive: true, force: true });
