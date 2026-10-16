@@ -90,7 +90,18 @@ export function buildFrameworkAgentConfig(
         reasoning: {
           effort: recipe.agent.responses?.reasoningEffort ?? 'high',
           context: recipe.agent.responses?.reasoningContext ?? 'all_turns',
+          ...(recipe.agent.responses?.reasoningSummary
+            ? { summary: recipe.agent.responses.reasoningSummary }
+            : {}),
         },
+        // Same meaning as on openai-compatible below. The Responses adapter
+        // uses an explicit prompt_cache_key over its subscription-mode
+        // default, and reads force_think_first as a control flag (stripped,
+        // never forwarded) that names `think` in tool_choice on round 0.
+        ...(recipe.agent.responses?.promptCacheKey
+          ? { prompt_cache_key: recipe.agent.responses.promptCacheKey }
+          : {}),
+        ...(recipe.agent.responses?.forceThinkFirst ? { force_think_first: true } : {}),
         ...(recipe.agent.provider === 'openai-responses' ? {
           ...(recipe.agent.responses?.serviceTier ? {
             service_tier: recipe.agent.responses.serviceTier,

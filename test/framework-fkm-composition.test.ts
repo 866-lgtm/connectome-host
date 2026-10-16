@@ -50,6 +50,45 @@ describe('framework FKM composition', () => {
     });
   });
 
+  test('forwards reasoning summary, cache key, and round-0 think forcing on the Responses providers', () => {
+    for (const provider of ['openai-responses', 'openai-codex'] as const) {
+      const parsed = validateRecipe(recipe({
+        provider,
+        model: 'gpt-5.1',
+        cacheTtl: '24h',
+        responses: {
+          reasoningEffort: 'high',
+          reasoningContext: 'current_turn',
+          reasoningSummary: 'detailed',
+          promptCacheKey: 'agent:main',
+          forceThinkFirst: true,
+        },
+      }));
+
+      const config = buildFrameworkAgentConfig(parsed, 'agent', 'gpt-5.1', undefined);
+      expect(config.cacheTtl).toBe('24h');
+      expect(config.providerParams).toEqual({
+        reasoning: { effort: 'high', context: 'current_turn', summary: 'detailed' },
+        prompt_cache_key: 'agent:main',
+        force_think_first: true,
+      });
+    }
+  });
+
+  test('sends no reasoning summary unless the recipe asks for one', () => {
+    const parsed = validateRecipe(recipe({ provider: 'openai-responses' }));
+    expect(buildFrameworkAgentConfig(parsed, 'agent', 'gpt-5.1', undefined).providerParams).toEqual({
+      reasoning: { effort: 'high', context: 'all_turns' },
+    });
+  });
+
+  test('rejects an unknown reasoning summary mode', () => {
+    expect(() => validateRecipe(recipe({
+      provider: 'openai-responses',
+      responses: { reasoningSummary: 'verbose' },
+    }))).toThrow(/reasoningSummary/);
+  });
+
   test('preserves the pre-merge AgentConfig shape field-for-field when FKM additions are omitted', () => {
     const parsed = validateRecipe(recipe({
       provider: 'openai-responses',

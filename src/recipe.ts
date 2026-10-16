@@ -374,9 +374,18 @@ export interface RecipeAgent {
    * compaction and serviceTier are API-key transport settings. */
   responses?: {
     reasoningEffort?: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+    /** Default 'all_turns'. Older models reject it (gpt-5.1 returns 400:
+     * supported values are 'auto' and 'current_turn'), so set 'current_turn'
+     * for them. */
     reasoningContext?: 'current_turn' | 'all_turns';
+    /** Readable reasoning summaries (`reasoning.summary`) on the Responses
+     * providers. Unset sends none. 'auto' may skip short reasoning; 'detailed'
+     * skips it less often. Summaries arrive as thinking blocks beside the
+     * encrypted reasoning. */
+    reasoningSummary?: 'auto' | 'concise' | 'detailed';
     /** Stable OpenAI prompt-cache routing key. Keep this constant for calls
-     * that extend the same reusable conversation prefix. */
+     * that extend the same reusable conversation prefix. Sent on
+     * openai-compatible and the Responses providers. */
     promptCacheKey?: string;
     compactThreshold?: number;
     /** OpenAI Responses API processing tier. `priority` is the API-key
@@ -384,10 +393,10 @@ export interface RecipeAgent {
     serviceTier?: 'auto' | 'default' | 'flex' | 'priority';
     /**
      * Force a `think` tool call on the FIRST inference round of each turn
-     * (then auto). openai-compatible only. The provider detects round 0 from
-     * the message tail and emits the NAMED tool_choice
-     * (`{type:'function', function:{name:'think'}}`) — the generic `"required"`
-     * is silently ignored by LiteRouter/gpt-5.1. No-op if no `think` tool is
+     * (then auto). openai-compatible and the Responses providers. The provider
+     * detects round 0 from the message/input tail and emits the NAMED
+     * tool_choice — the generic `"required"` is silently ignored by
+     * LiteRouter/gpt-5.1. No-op if no `think` tool is
      * present. Pairs with the think loop guard (THINK_*_CAP) for "think once,
      * then act". */
     forceThinkFirst?: boolean;
@@ -1831,6 +1840,9 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (responses.reasoningContext !== undefined && responses.reasoningContext !== 'current_turn' && responses.reasoningContext !== 'all_turns') {
       throw new Error(`Invalid agent.responses.reasoningContext ${JSON.stringify(responses.reasoningContext)}.`);
+    }
+    if (responses.reasoningSummary !== undefined && !['auto', 'concise', 'detailed'].includes(String(responses.reasoningSummary))) {
+      throw new Error(`Invalid agent.responses.reasoningSummary ${JSON.stringify(responses.reasoningSummary)}.`);
     }
     if (responses.serviceTier !== undefined && (typeof responses.serviceTier !== 'string' || !responses.serviceTier.trim())) {
       throw new Error('Recipe agent.responses.serviceTier must be a non-empty string.');

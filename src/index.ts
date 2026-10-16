@@ -1202,6 +1202,10 @@ async function main() {
           baseURL: process.env.OPENAI_BASE_URL || undefined,
         }),
         llmLogPath,
+        // Same runtime reasoning kill switch as openai-compatible: disabling
+        // reasoning strips the recipe's `reasoning` param (effort, context,
+        // summary) on the next call.
+        () => settingsModule.getReasoning(),
       )
     // Codex/openrouter/openai adapters get the provider-agnostic logging
     // decorator (llm-calls.jsonl); anthropic and bedrock keep their
