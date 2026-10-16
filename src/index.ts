@@ -26,6 +26,8 @@
  *   COMPRESSION_OPENAI_BASE_URL - Optional: run memory compression on its own
  *                         OpenAI-compatible endpoint (a separate membrane)
  *   COMPRESSION_OPENAI_API_KEY  - Key for that endpoint (falls back to OPENAI_API_KEY)
+ *   COMPRESSION_PROMPT_CACHE_KEY - prompt_cache_key for compression calls
+ *                                 (default: <recipe responses.promptCacheKey>:compression)
  *   MODEL               - Override model (default: from recipe or claude-opus-4-6)
  *   DATA_DIR            - Data directory for sessions (default: ./data)
  *
@@ -1368,6 +1370,8 @@ async function main() {
   // PRIMARY membrane): compression on another endpoint neither waits for nor
   // holds up primary turns, and its failures never arm a provider hold on
   // the primary — the right shape for a separate provider.
+  const compressionCacheKey = process.env.COMPRESSION_PROMPT_CACHE_KEY
+    || (recipe.agent.responses?.promptCacheKey ? `${recipe.agent.responses.promptCacheKey}:compression` : undefined);
   const compressionMembrane = process.env.COMPRESSION_OPENAI_BASE_URL
     ? new Membrane(
         new LoggingProviderAdapter(
@@ -1377,7 +1381,14 @@ async function main() {
           }),
           llmLogPath,
           () => settingsModule.getReasoning(),
-          { tag: 'compression' },
+          {
+            tag: 'compression',
+            // Stable cache-routing key so memory-writes (which share the
+            // compression system prompt and recall prefix) land on warm
+            // cache. COMPRESSION_PROMPT_CACHE_KEY overrides; default derives
+            // from the recipe's main key.
+            ...(compressionCacheKey ? { defaultExtra: { prompt_cache_key: compressionCacheKey } } : {}),
+          },
         ),
         {
           formatter: new NativeFormatter(),

@@ -176,9 +176,20 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     /** (local patch) Purpose tag stamped on every record as `tag` (e.g.
      *  'compression' for the dedicated summarizer endpoint), so calls that
      *  share a provider name and log file stay tell-apart-able. */
-    private readonly options: { tag?: string } = {},
+    private readonly options: {
+      tag?: string;
+      /** (local patch) Default `extra` params for every request (e.g. the
+       *  compression endpoint's prompt_cache_key); request values win. */
+      defaultExtra?: Record<string, unknown>;
+    } = {},
   ) {
     this.name = inner.name;
+  }
+
+  private withDefaultExtra(request: ProviderRequest): ProviderRequest {
+    const defaults = this.options.defaultExtra;
+    if (!defaults) return request;
+    return { ...request, extra: { ...defaults, ...(request.extra as Record<string, unknown> | undefined) } };
   }
 
   private withReasoning(request: ProviderRequest): ProviderRequest {
@@ -350,7 +361,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     request: ProviderRequest,
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
-    request = this.withReasoning(request);
+    request = this.withReasoning(this.withDefaultExtra(request));
     const started = Date.now();
     const wire: WireCapture = { captured: false, body: undefined };
     let response: ProviderResponse;
@@ -370,7 +381,7 @@ export class LoggingProviderAdapter implements ProviderAdapter {
     callbacks: StreamCallbacks,
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
-    request = this.withReasoning(request);
+    request = this.withReasoning(this.withDefaultExtra(request));
     const started = Date.now();
     const wire: WireCapture = { captured: false, body: undefined };
     let response: ProviderResponse;

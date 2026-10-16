@@ -56,3 +56,33 @@ describe('LoggingProviderAdapter purpose tag', () => {
     expect('tag' in call!).toBe(false);
   });
 });
+
+describe('LoggingProviderAdapter defaultExtra', () => {
+  function capturing(): { adapter: ProviderAdapter; seen: ProviderRequest[] } {
+    const seen: ProviderRequest[] = [];
+    const a = adapter();
+    return {
+      seen,
+      adapter: {
+        ...a,
+        complete: async (r: ProviderRequest) => { seen.push(r); return response; },
+        stream: async (r: ProviderRequest) => { seen.push(r); return response; },
+      } as ProviderAdapter,
+    };
+  }
+
+  test('adds default extra params to every call; request values win', async () => {
+    const { adapter: inner, seen } = capturing();
+    const w = new LoggingProviderAdapter(inner, logFile(), undefined, { tag: 'compression', defaultExtra: { prompt_cache_key: 'zz:compression' } });
+    await w.complete(request);
+    await w.stream({ ...request, extra: { prompt_cache_key: 'zz:own', other: 1 } } as ProviderRequest, {} as never);
+    expect(seen[0]!.extra).toEqual({ prompt_cache_key: 'zz:compression' });
+    expect(seen[1]!.extra).toEqual({ prompt_cache_key: 'zz:own', other: 1 });
+  });
+
+  test('without defaultExtra the request passes through untouched', async () => {
+    const { adapter: inner, seen } = capturing();
+    await new LoggingProviderAdapter(inner, logFile()).complete(request);
+    expect(seen[0]!.extra).toBeUndefined();
+  });
+});
