@@ -243,7 +243,7 @@ describe('fork orientation', () => {
       const block = launchBlock(receipt);
       expect(block).toContain("Launch of fork 'scout', as resolved at its subagent--fork call (toolu_fork_1):");
       // The receipt describes the intended lineage, not which path will run.
-      expect(block).toContain('- Lineage: forked from stream "parent"; depth 1 of 3. If that stream is still registered when the fork starts, the fork inherits its compiled context: through this call\'s exchange if the call is in that context then, and otherwise all of it as it is then. If it is gone by then, the fork inherits nothing.');
+      expect(block).toContain('- Lineage: forked from stream "parent"; depth 1 of 3. When the fork starts, it inherits that stream\'s compiled context, even if the stream has ended by then: through this call\'s exchange if the call is in that context then, and otherwise all of it as it is then.');
       // The harness parent runs passthrough: no windows or cap to compare.
       expect(line(block, '- Against the parent at the call')).toBe(
         '- Against the parent at the call: Differs in model, strategy type and stream budget. ' +
@@ -351,24 +351,21 @@ describe('fork orientation', () => {
     }
   });
 
-  test("a fork's extra tools are named up to ten and the rest counted; a short parent restriction is named whole", async () => {
+  test("a fork of a restricted parent keeps the parent's rules, says so, and has no tool the parent lacks but subagent--return", async () => {
     const h = await makeHarness({ parent: { allowedTools: ['agent_settings'] }, modules: [toolModule('wide', 15)] });
     try {
-      const input = { name: 'wide', task: 'use everything' };
+      const input = { name: 'wide', task: 'use what the parent may' };
       seedForkCall(h.framework, 'toolu_fork_11', input);
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_fork_11', input));
       await h.asyncPromise('wide');
       const block = launchBlock(res.data as string);
-      expect(block).toContain('- Tool rules: no restriction; the parent is restricted to 1: agent_settings.');
+      expect(block).toContain('- Tool rules: the parent is restricted to 1, and it keeps that: only these 2, as the process offered them at the call: agent_settings and subagent--return, subagent--return among them.');
+      expect(line(block, '- Against the parent at the call:')).toMatch(/Same: [^.]*tool rules/);
       const run = h.runs[0]!;
+      expect(run.allowedTools).toEqual(['agent_settings', 'subagent--return']);
       const parentTools = h.framework.listToolClasses('parent').map((t) => t.tool);
-      const extra = run.surface.filter((n) => !parentTools.includes(n));
-      expect(extra.length).toBeGreaterThan(15);
-      const tools = line(startSection(run.firstContext), '- Tools:');
-      // Only the stream's own tools are named in full: tools it has beyond
-      // its parent's are named up to ten, and the rest counted.
-      for (const name of extra.slice(0, 10)) expect(tools).toContain(name);
-      expect(tools).toContain(` and ${extra.length - 10} more`);
+      expect(run.surface.filter((n) => !parentTools.includes(n))).toEqual(['subagent--return']);
+      expect(run.surface.some((n) => n.startsWith('wide--'))).toBe(false);
     } finally {
       await h.cleanup();
     }
@@ -587,6 +584,49 @@ describe("a spawn's tool rule says what the list grants", () => {
   });
 });
 
+describe("a launch from a restricted caller keeps the caller's rules, and its tool rule says so", () => {
+  async function launch(kind: 'fork' | 'spawn', parentTools: string[], input: Record<string, unknown>, module: Partial<SubagentModuleConfig> = {}) {
+    const h = await makeHarness({ parent: { allowedTools: parentTools }, module, modules: [toolModule('probe', 1)] });
+    try {
+      const full = { name: 'kept', task: 't', ...(kind === 'spawn' ? { systemPrompt: 'p' } : {}), ...input };
+      if (kind === 'fork') seedForkCall(h.framework, 'toolu_kept', full);
+      const res = await h.subagent.handleToolCall(call(kind, 'toolu_kept', full));
+      expect(res.success).toBe(true);
+      await h.asyncPromise('kept');
+      return { rule: line(launchBlock(res.data as string), '- Tool rules'), run: h.runs[0]! };
+    } finally {
+      await h.cleanup();
+    }
+  }
+
+  test("a spawn's listed tool that the caller's own rules don't allow is named as theirs to drop", async () => {
+    const { rule, run } = await launch('spawn', ['probe--t1', 'subagent--spawn'], { tools: ['probe--t1', 'agent_settings'] });
+    expect(rule).toBe(
+      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them; " +
+        "the caller also listed agent_settings, which its own rules don't allow; the caller is restricted to 2: probe--t1 and subagent--spawn.",
+    );
+    expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
+  });
+
+  test('a fork at the depth limit keeps its restricted parent\'s rules less the subagent tools', async () => {
+    const { rule, run } = await launch('fork', ['probe--t1', 'subagent--fork'], {}, { maxDepth: 1 });
+    expect(rule).toBe(
+      '- Tool rules: the parent is restricted to 2, and it keeps that, less the subagent tools at this depth: ' +
+        'only these 2, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them.',
+    );
+    expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
+  });
+
+  test("a parent's rule for a tool the process doesn't offer is kept, and said not to be offered", async () => {
+    const { rule, run } = await launch('fork', ['probe--t1', 'no-such-tool'], {});
+    expect(rule).toBe(
+      '- Tool rules: the parent is restricted to 2, and it keeps that: only these 2, as the process offered them at the call: ' +
+        "probe--t1 and subagent--return, subagent--return among them; the parent's rules also allow no-such-tool, which isn't offered at the call.",
+    );
+    expect(run.allowedTools).toEqual(['probe--t1', 'no-such-tool', 'subagent--return']);
+  });
+});
+
 describe('what a launch block says beyond the settings it compares', () => {
   // An empty list is no tools, not "0: ".
   test('a parent restricted to no tools is said to be', async () => {
@@ -597,7 +637,8 @@ describe('what a launch block says beyond the settings it compares', () => {
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_bare_fork', input));
       await h.asyncPromise('bare');
       const rule = line(launchBlock(res.data as string), '- Tool rules');
-      expect(rule).toEndWith('; the parent is restricted to no tools.');
+      // The fork keeps the restriction, with subagent--return.
+      expect(rule).toBe('- Tool rules: the parent is restricted to no tools, and it keeps that: only subagent--return.');
       expect(rule).not.toContain('0: ');
     } finally {
       await h.cleanup();
@@ -840,7 +881,7 @@ describe('a queued launch', () => {
     }
   });
 
-  test('a parent that is gone by the start: nothing inherited, and no comparison claimed', async () => {
+  test('a parent that has left the framework by the start: the fork still inherits its context, cut at the call, and its tools are not compared', async () => {
     const h = await makeHarness({
       extraAgents: [{ name: 'helper', model: 'mock', systemPrompt: 'helper prompt', maxTokens: 256 }],
       module: { maxConcurrent: 1 },
@@ -858,16 +899,16 @@ describe('a queued launch', () => {
       await h.asyncPromise('child');
 
       const run = h.runs.find((r) => r.name.startsWith('child-'))!;
-      expect(run.firstContext).toStartWith("Launch of fork 'child'");
-      expect(run.firstContext).toEndWith('Your intention for this stream follows.\noutlive the caller');
+      // The parent resolved at the call is the one the fork compiles, though
+      // it's no longer registered: its context, through the call's exchange.
+      expect(run.allText).toContain('please look into it');
       expect(run.firstContext).toContain(block);
-      expect(run.allText).not.toContain('please look into it');
+      expect(run.firstContext).toEndWith('Your intention for this stream: outlive the caller');
       const start = startSection(run.firstContext);
-      expect(start).toContain('- Inherited: nothing; the parent stream "helper" was no longer registered when this stream started.');
-      expect(line(start, '- Agent settings')).toEndWith('; not compared, since the parent stream was no longer registered when this stream started.');
+      expect(start).toContain("- Inherited: the parent's compiled context through the fork call's exchange.");
+      expect(line(start, '- Agent settings')).toStartWith("- Agent settings: the framework's defaults, the same as the parent stream's now");
       expect(start).toContain(`- Tools: ${run.surface.length} available to this stream: `);
-      expect(start).not.toContain('Compared with');
-      expect(start).not.toContain("couldn't be read");
+      expect(start).toContain("The parent stream's tools couldn't be read for comparison.");
       // Created with the values resolved at the call, not the default
       // prompt and output limit a missing parent would give now.
       expect(run.systemPrompt).toBe('helper prompt');
@@ -1349,7 +1390,7 @@ describe('what a stream first reads is what its launch promises', () => {
   test('a refusal leaves the rate-limit backoff alone, even when its text holds "rate"', async () => {
     for (const kind of ['spawn', 'parentless'] as const) {
       const h = await realHarness({ parentless: kind === 'parentless' });
-      const state = h.subagent as unknown as { rateLimitCooldownMs: number; effectiveConcurrent: number; lastRateLimitAt: number };
+      const state = h.subagent as unknown as { rateLimitCooldownMs: number; effectiveConcurrent: number; throttled: boolean };
       state.rateLimitCooldownMs = 0;
       try {
         const before = state.effectiveConcurrent;
@@ -1362,7 +1403,7 @@ describe('what a stream first reads is what its launch promises', () => {
         expect(result.success).toBe(false);
         expect(h.requestFor(`mock-rate-${kind}`)).toBeUndefined();
         expect(state.effectiveConcurrent).toBe(before);
-        expect(state.lastRateLimitAt).toBe(0);
+        expect(state.throttled).toBe(false);
       } finally {
         await h.cleanup();
       }
@@ -1433,7 +1474,7 @@ describe('lists about another stream are named in part, so only the stream\'s ow
     }
   });
 
-  test("a fork of a restricted parent has the whole board: its orientation names how it differs in part, and it launches", async () => {
+  test("a fork of a parent restricted to a few tools keeps them, so a wide board doesn't lengthen its orientation, and it launches", async () => {
     const h = await harness(['subagent--fork', 'subagent--return']);
     try {
       const result = await h.subagent.handleToolCall({
@@ -1442,7 +1483,8 @@ describe('lists about another stream are named in part, so only the stream\'s ow
       } as never);
       expect(result.success).toBe(true);
       const wire = JSON.stringify(h.requestFor('mock-from-narrow')!.messages);
-      expect(wire).toMatch(/it also has [^"]* and \d+ more/);
+      expect(wire).toContain('- Tool rules: the parent is restricted to 2, and it keeps that: only these 2, as the process offered them at the call: subagent--fork and subagent--return, subagent--return among them.');
+      expect(wire).not.toContain('bulk--');
     } finally {
       await h.cleanup();
     }
