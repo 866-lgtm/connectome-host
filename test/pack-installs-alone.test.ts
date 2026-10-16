@@ -91,13 +91,13 @@ test("a package that installs alone, builds its Web UI, resolves and gives its q
 
 test("npm pack's JSON is read in npm 12's shape too, and a prepack's output doesn't break it", async () => {
   // npm 12 prints an object keyed by package name: a shim in front of the
-  // real npm rewrites npm 11's array that way.
+  // real npm rewrites npm 11's array that way, and passes npm 12's through.
   const bin = mkdtempSync(join(tmpdir(), "pack-installs-alone-npm12-"));
   made.push(bin);
   const realNpm = execFileSync("sh", ["-c", "command -v npm"], { encoding: "utf8" }).trim();
   writeFileSync(
     join(bin, "npm"),
-    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(realNpm)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const [record] = JSON.parse(out);\n    process.stdout.write(JSON.stringify({ [record.name]: record }));\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
+    `#!/usr/bin/env node\nconst { execFileSync } = require("node:child_process");\nconst args = process.argv.slice(2);\ntry {\n  const out = execFileSync(${JSON.stringify(realNpm)}, args, { encoding: "utf8", stdio: ["inherit", "pipe", "inherit"] });\n  if (args[0] === "pack" && args.includes("--json")) {\n    const parsed = JSON.parse(out);\n    // npm 12 prints the object already; npm 11's array is rewritten.\n    process.stdout.write(Array.isArray(parsed) ? JSON.stringify({ [parsed[0].name]: parsed[0] }) : out);\n  } else process.stdout.write(out);\n} catch (error) { process.stdout.write(error.stdout ?? ""); process.exit(error.status ?? 1); }\n`,
     { mode: 0o755 },
   );
   const twelve = await check(standIn({}), { PATH: `${bin}:${process.env.PATH ?? ""}` });
