@@ -22,7 +22,9 @@ import { join } from 'node:path';
 import { AgentFramework, KnowledgeStrategy } from '@animalabs/agent-framework';
 import type { Module, ToolCall, AgentConfig } from '@animalabs/agent-framework';
 import { AnthropicXmlFormatter, Membrane, MockAdapter, NativeFormatter, OpenAIResponsesFormatter } from '@animalabs/membrane';
-import { SubagentModule, type SubagentModuleConfig, toolDifferences, undeliveredLaunchParts } from '../src/modules/subagent-module.js';
+import {
+  SubagentModule, type SubagentModuleConfig, type SubagentLaunch, agentSettingsOf, describeSubagentStart, toolDifferences, undeliveredLaunchParts,
+} from '../src/modules/subagent-module.js';
 
 interface Run {
   name: string;
@@ -201,12 +203,13 @@ const CUT_AT_EXCHANGE =
 /** What the orientation says each prose-routing mode does with plain text. */
 const ROUTING_EFFECT = {
   locus: 'plain text is published to the channel the framework infers for each turn, if there is one',
-  explicit: 'plain text is delivered only after a destination prefix line such as ">>#channel" in the same turn; ' +
-    'the prose_help tool shows the syntax',
+  explicit: 'plain text is delivered only with a destination prefix line, such as ">>#channel"',
   hybrid: 'unprefixed plain text is published to the channel the framework infers for each turn, if there is one; ' +
     'a leading ">>>destination" envelope routes that text to the destination it names instead',
   disabled: 'plain text is never published, even with a prefix; only explicit send tools reach a channel',
 } as const;
+/** What explicit routing's line adds for a stream that is shown prose_help. */
+const PROSE_HELP = '; the prose_help tool shows the syntax';
 
 function launchBlock(receipt: string): string {
   const at = receipt.indexOf('\n\nLaunch of ');
@@ -335,7 +338,7 @@ describe('fork orientation', () => {
       const block = launchBlock(res.data as string);
       expect(block).toContain('depth 1 of 1');
       expect(block).toContain(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}.`);
-      expect(block).toContain('- Tool rules: every tool the process offers except the subagent tools, keeping subagent--return: no further forks or spawns at this depth; the parent has no restriction.');
+      expect(block).toContain('- Tool rules: every tool the process offers at the call except the subagent tools, keeping subagent--return: no further forks or spawns at this depth; the parent has no restriction.');
       const run = h.runs[0]!;
       expect(run.proseRouting).toBe('explicit');
       // The depth limit's rules hold the board's tools only, and the
@@ -494,7 +497,10 @@ describe('fork orientation', () => {
         const res = await h.subagent.handleToolCall(call('fork', `toolu_${mode}`, input));
         await h.asyncPromise(input.name);
         const block = launchBlock(res.data as string);
-        expect(line(block, '- Prose routing:')).toBe(`- Prose routing: ${mode}, inherited from the parent: ${ROUTING_EFFECT[mode]}.`);
+        // An unrestricted fork short of the depth limit is shown prose_help
+        // under explicit routing, so its line points to the tool.
+        const effect = mode === 'explicit' ? `${ROUTING_EFFECT.explicit}${PROSE_HELP}` : ROUTING_EFFECT[mode];
+        expect(line(block, '- Prose routing:')).toBe(`- Prose routing: ${mode}, inherited from the parent: ${effect}.`);
         expect(line(block, '- Against the parent at the call')).toContain('prose routing and tool rules.');
         const run = h.runs[0]!;
         expect(run.proseRouting).toBe(mode);
@@ -566,8 +572,24 @@ describe("a spawn's tool rule says what the list grants", () => {
 
   test('at the depth limit, names what the process doesn\'t offer there as dropped', async () => {
     expect(await ruleFor(['time--now'], { maxDepth: 1 })).toStartWith(
-      "- Tool rules: only subagent--return; the caller also listed time--now, which isn't offered to it at the call, and none of the other subagent tools at this depth",
+      "- Tool rules: only subagent--return; the caller also listed time--now, which isn't offered to it at the call; at this depth, no subagent tool but subagent--return",
     );
+  });
+
+  // Not registered, so not offered: the depth didn't remove it.
+  test('at the depth limit, names a listed subagent tool the process doesn\'t offer as not offered, not as removed by the depth', async () => {
+    const rule = await ruleFor(['probe--t1', 'subagent--nope'], { maxDepth: 1 });
+    expect(rule).toContain("; the caller also listed subagent--nope, which isn't offered to it at the call");
+    expect(rule).not.toContain('subagent--nope, which this depth removes');
+  });
+
+  // The depth limit's rules come from what the process offers, which
+  // prose_help never is; short of the limit explicit routing would show it.
+  test('at the depth limit under explicit routing, names a listed prose_help as removed by the depth', async () => {
+    const rule = await ruleFor(['probe--t1', 'prose_help'], { maxDepth: 1 }, { proseRouting: 'explicit' });
+    expect(rule).toContain('; it also listed prose_help, which this depth removes');
+    expect(rule).not.toContain("prose_help, which isn't offered");
+    expect(rule).not.toContain('explicit prose routing shows');
   });
 
   // The process offers subagent--fork; the depth removes it.
@@ -579,10 +601,18 @@ describe("a spawn's tool rule says what the list grants", () => {
 
   // agentToolSurface adds prose_help under explicit routing when the
   // stream's rules allow it: it isn't on the board, so it's never "offered".
-  test('under explicit prose routing, a listed prose_help is not dropped, and the rule says the routing shows it', async () => {
+  test('under explicit prose routing, a listed prose_help is not dropped, and the rule counts it and says the routing shows it', async () => {
     const rule = await ruleFor(['probe--t1', 'prose_help'], {}, { proseRouting: 'explicit' });
     expect(rule).not.toContain("prose_help, which isn't offered");
-    expect(rule).toContain('; explicit prose routing shows it prose_help too, which the list allows');
+    expect(rule).toStartWith(
+      "- Tool rules: only these 3 from the caller's list: probe--t1 and subagent--return, as the process offered them at the call, " +
+        'and prose_help, which explicit prose routing shows because the list allows it',
+    );
+    // A list of prose_help alone isn't "only subagent--return".
+    expect(await ruleFor(['prose_help'], {}, { proseRouting: 'explicit' })).toStartWith(
+      "- Tool rules: only these 2 from the caller's list: subagent--return, as the process offered it at the call, " +
+        'and prose_help, which explicit prose routing shows because the list allows it',
+    );
     expect(await ruleFor(['probe--t1'], {}, { proseRouting: 'explicit' })).not.toContain('prose_help');
     expect(await ruleFor(['probe--t1'])).not.toContain('prose_help');
   });
@@ -616,13 +646,57 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
     expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
   });
 
-  test('a fork at the depth limit keeps its restricted parent\'s rules less the subagent tools', async () => {
+  test('a fork at the depth limit keeps what the process offers of its restricted parent\'s rules, less the subagent tools', async () => {
     const { rule, run } = await launch('fork', ['probe--t1', 'subagent--fork'], {}, { maxDepth: 1 });
     expect(rule).toBe(
-      '- Tool rules: the parent is restricted to 2, and it keeps that, less the subagent tools at this depth: ' +
-        'only these 2, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them.',
+      '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
+        'less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them.',
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
+  });
+
+  test("a fork at the depth limit names its parent's rule for a tool the process doesn't offer, which the depth doesn't keep", async () => {
+    const { rule, run } = await launch('fork', ['probe--t1', 'no-such-tool'], {}, { maxDepth: 1 });
+    expect(rule).toBe(
+      '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
+        "less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them; the parent's rules also allow " +
+        "no-such-tool, which isn't offered at the call.",
+    );
+    expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
+  });
+
+  test("under explicit routing, a parent's prose_help is shown short of the depth limit and removed at it, and the routing line follows", async () => {
+    const parent = { allowedTools: ['probe--t1', 'prose_help'], proseRouting: 'explicit' as const };
+    for (const maxDepth of [3, 1]) {
+      const h = await makeHarness({ parent, module: { maxDepth }, modules: [toolModule('probe', 1)] });
+      try {
+        const input = { name: 'kept', task: 't' };
+        seedForkCall(h.framework, 'toolu_kept', input);
+        const res = await h.subagent.handleToolCall(call('fork', 'toolu_kept', input));
+        expect(res.success).toBe(true);
+        await h.asyncPromise('kept');
+        const block = launchBlock(res.data as string);
+        const run = h.runs[0]!;
+        if (maxDepth === 3) {
+          expect(line(block, '- Tool rules')).toBe(
+            "- Tool rules: the parent is restricted to 2, and it keeps that: only these 3: probe--t1 and subagent--return, as the process " +
+              "offered them at the call, and prose_help, which explicit prose routing shows because the parent's rules allow it.",
+          );
+          expect(line(block, '- Prose routing')).toBe(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}${PROSE_HELP}.`);
+          expect(run.surface).toContain('prose_help');
+        } else {
+          expect(line(block, '- Tool rules')).toBe(
+            '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
+              "less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them; the parent's rules also " +
+              'allow prose_help, which this depth removes.',
+          );
+          expect(line(block, '- Prose routing')).toBe(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}.`);
+          expect(run.surface).not.toContain('prose_help');
+        }
+      } finally {
+        await h.cleanup();
+      }
+    }
   });
 
   test("a parent's rule for a tool the process doesn't offer is kept, and said not to be offered", async () => {
@@ -715,15 +789,37 @@ describe('a host that states no provider', () => {
   }
 });
 
+describe("an agent setting that can't be read", () => {
+  test("is said to be, and never counted as matching the parent's", () => {
+    const unreadable = agentSettingsOf({ getRuntimeSettings: () => { throw new Error('no settings'); } });
+    expect(unreadable['same-round think-text policy']).toBe('unreadable');
+    // Only what describeSubagentStart reads of the launch.
+    const launch = { kind: 'fork', parent: { contextBudgetTokens: 1_000 }, proseRouting: 'locus' } as unknown as SubagentLaunch;
+    const text = describeSubagentStart(launch, {
+      inherited: { kind: 'cut-at-call' },
+      contextBudgetTokens: 1_000,
+      proseRouting: 'locus',
+      tools: ['subagent--return'],
+      parentTools: ['subagent--return'],
+      agentSettings: unreadable,
+      parentAgentSettings: unreadable,
+    });
+    const settings = line(text, '- Agent settings');
+    expect(settings).toContain("same-round think-text policy unreadable (the parent stream's: unreadable)");
+    expect(settings).not.toContain('the same as');
+  });
+});
+
 describe('a module without its framework yet', () => {
   test('is built with no config, and answers a launch with an error rather than a throw', async () => {
     const bare = new SubagentModule();
     const res = await bare.handleToolCall(call('spawn', 'toolu_bare', { name: 'early', systemPrompt: 'p', task: 't' }));
     expect(res.success).toBe(false);
     // The missing framework is the reason, not any error.
-    expect(String(res.error)).toStartWith("Couldn't spawn 'early': SubagentModule: framework not set.");
+    // main's words, unprefixed, as for a caller that can't be resolved.
+    expect(String(res.error)).toStartWith('SubagentModule: framework not set.');
     const forked = await bare.handleToolCall(call('fork', 'toolu_bare_fork', { name: 'early-fork', task: 't' }));
-    expect(String(forked.error)).toStartWith("Couldn't fork 'early-fork': SubagentModule: framework not set.");
+    expect(String(forked.error)).toStartWith('SubagentModule: framework not set.');
   });
 });
 
@@ -925,6 +1021,37 @@ describe('a queued launch', () => {
       await h.cleanup();
     }
   });
+
+  test("a parent whose name another agent has taken by the start: the fork's tools aren't compared with that agent's", async () => {
+    const h = await makeHarness({
+      extraAgents: [
+        { name: 'helper', model: 'mock', systemPrompt: 'helper prompt', maxTokens: 256 },
+        { name: 'stranger', model: 'mock', systemPrompt: 'stranger prompt', maxTokens: 256, allowedTools: ['subagent--return'] },
+      ],
+      module: { maxConcurrent: 1 },
+    });
+    try {
+      await queueBehindAHeldFork(h);
+      const child = { name: 'child', task: 'outlive the caller' };
+      seedForkCall(h.framework, 'toolu_child', child, 'helper');
+      const res = await h.subagent.handleToolCall(call('fork', 'toolu_child', child, 'helper'));
+      expect(res.success).toBe(true);
+      // The helper leaves, and another agent is registered under its name.
+      const agents = (h.framework as unknown as { agents: Map<string, unknown> }).agents;
+      h.unregister('helper');
+      agents.set('helper', agents.get('stranger'));
+      h.releaseHeld();
+      await h.asyncPromise('first');
+      await h.asyncPromise('child');
+
+      const run = h.runs.find((r) => r.name.startsWith('child-'))!;
+      const start = startSection(run.firstContext);
+      expect(start).toContain("The parent stream's tools couldn't be read for comparison.");
+      expect(start).not.toContain('Compared with what the parent stream has now');
+    } finally {
+      await h.cleanup();
+    }
+  });
 });
 
 describe('the first request a fork actually sends', () => {
@@ -992,7 +1119,7 @@ describe('the first request a fork actually sends', () => {
   // A spawn's Tools line lists its surface in full, and the request it sends
   // must carry exactly those: under explicit routing, prose_help only when
   // its list allows it.
-  for (const [tools, sent] of [
+  for (const [tools, sends] of [
     [['extra--t1'], ['extra--t1', 'subagent--return']],
     [['extra--t1', 'prose_help'], ['extra--t1', 'prose_help', 'subagent--return']],
   ] as const) {
@@ -1005,15 +1132,22 @@ describe('the first request a fork actually sends', () => {
         const request = adapter.getRequestLog().map((r) => r.request).find((r) => r.model === 'mock-spawn');
         expect(request).toBeDefined();
         const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
-        expect([...toolNames].sort()).toEqual([...sent]);
+        expect([...toolNames].sort()).toEqual([...sends]);
         const wire = JSON.stringify(request!.messages);
         const toolsLine = wire.split('\\n').find((l) => l.startsWith('- Tools: '));
         expect(toolsLine).toBeDefined();
         expect(toolsLine).toStartWith(`- Tools: ${toolNames.length} available to this stream: `);
         for (const name of toolNames) expect(toolsLine).toContain(name);
         const rule = wire.split('\\n').find((l) => l.startsWith('- Tool rules: '))!;
-        if (tools.includes('prose_help' as never)) expect(rule).toContain('; explicit prose routing shows it prose_help too, which the list allows');
-        else expect(rule).not.toContain('prose_help');
+        const routing = wire.split('\\n').find((l) => l.startsWith('- Prose routing: '))!;
+        if (tools.includes('prose_help' as never)) {
+          expect(rule).toContain(', and prose_help, which explicit prose routing shows because the list allows it');
+          expect(routing).toBe(sent(`- Prose routing: explicit, inherited from the caller: ${ROUTING_EFFECT.explicit}${PROSE_HELP}.`));
+        } else {
+          expect(rule).not.toContain('prose_help');
+          // Not shown the tool, so not pointed to it.
+          expect(routing).toBe(sent(`- Prose routing: explicit, inherited from the caller: ${ROUTING_EFFECT.explicit}.`));
+        }
       } finally {
         await cleanup();
       }
