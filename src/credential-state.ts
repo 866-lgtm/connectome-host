@@ -317,7 +317,8 @@ export class CredentialMonitor {
         this.meterVerdict = {
           kind: 'quota-unreadable',
           message: `${this.source.provider} quota cannot be read (${trim(snapshot.error)}) — ` +
-            'no spent-quota hold is possible for this credential; a 429 will be retried as a throttle',
+            'no spent-quota hold is possible for this credential; a 429 that states a retry-after holds ' +
+            "the agent's turns until then, and one that doesn't is retried as a throttle",
           rotatable: this.source.canRefresh(),
           actions: [{ id: 'recheck', label: 'Re-read quota' }],
         };

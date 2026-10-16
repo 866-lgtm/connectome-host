@@ -16,6 +16,7 @@ import { dirname, isAbsolute, resolve } from 'node:path';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
+import { REASONING_EFFORTS, type ReasoningEffort } from './modules/settings-module.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -248,6 +249,9 @@ export interface RecipeAgent {
    * chapterx CLI-sim's "<cmd>cat untitled.txt</cmd>"). Prefill formatter only. */
   prefillUserMessage?: string;
   systemPrompt: string;
+  /** Agent Framework exact-name tool allowlist. Omitted preserves its 'all' default.
+   * This configures tool visibility; dispatch enforcement belongs to the framework. */
+  allowedTools?: 'all' | string[];
   maxTokens?: number;
   /**
    * Per-agent stream token budget — the accumulated-input ceiling at which the
@@ -332,6 +336,10 @@ export interface RecipeAgent {
      * 'omitted' returns empty text + signature only. Models 4.7+ default
      * to 'omitted' server-side. */
     display?: 'summarized' | 'omitted';
+    /** Anthropic streaming effort baseline, independent of enabled. Explicit agent
+     * settings override it until reset; compression calls are unaffected. Other
+     * providers ignore this field; OpenAI uses responses.reasoningEffort. */
+    effort?: ReasoningEffort;
   };
   /** OpenAI Responses settings. Reasoning applies to both OpenAI providers;
    * compaction and serviceTier are API-key transport settings. */
@@ -1574,6 +1582,7 @@ const RECIPE_KEYS = [
   'sessionNaming', 'codeExecution', 'conversations', 'subconscious', 'toolClassOverrides',
 ] as const;
 const RECIPE_AGENT_KEYS = [
+  'allowedTools',
   'name', 'model', 'timezone', 'provider', 'baseUrl', 'formatter', 'retry', 'prefillUserMessage',
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',
@@ -1707,6 +1716,12 @@ export function validateRecipe(raw: unknown): Recipe {
     agent.systemPrompt = '';
   } else if (typeof agent.systemPrompt !== 'string') {
     throw new Error('Recipe agent "systemPrompt" must be a string when present');
+  }
+
+  if (agent.allowedTools !== undefined && agent.allowedTools !== 'all' &&
+      (!Array.isArray(agent.allowedTools) ||
+       !Array.from(agent.allowedTools).every((tool) => typeof tool === 'string'))) {
+    throw new Error("Recipe agent.allowedTools must be 'all' or an array of tool-name strings.");
   }
 
   if (agent.provider !== undefined &&
@@ -1956,6 +1971,11 @@ export function validateRecipe(raw: unknown): Recipe {
     }
     if (thinking.display !== undefined && thinking.display !== 'summarized' && thinking.display !== 'omitted') {
       throw new Error('Recipe agent.thinking.display must be "summarized" or "omitted".');
+    }
+    if (thinking.effort !== undefined && (
+      typeof thinking.effort !== 'string' || !REASONING_EFFORTS.includes(thinking.effort as ReasoningEffort)
+    )) {
+      throw new Error(`Recipe agent.thinking.effort must be one of: ${REASONING_EFFORTS.join(', ')}.`);
     }
     if (thinking.enabled === true && typeof thinking.budgetTokens === 'number' && typeof agent.maxTokens === 'number') {
       if (thinking.budgetTokens >= agent.maxTokens) {

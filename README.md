@@ -194,11 +194,11 @@ Per server, `requestTimeoutMs` raises the framework's JSON-RPC timeout (60 s
 by default) for slow tools, and `agent.retry` passes a Membrane retry policy
 through for flaky gateways.
 
-Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the host's `DISCORD_SUPPRESSED_REACTIONS_BASELINE`, then the entry's `env`, then `AGENT_TIMEZONE`. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
+Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the entry's `env`, then the host's `AGENT_TIMEZONE`. agent-framework then adds its derived `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the entry's `env` sets one with tokens, or, for an `inheritEnv` entry, the host's own environment does. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
 
 Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server. Put a full-inheritance grant in the recipe or operator server file instead.
 
-Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file.
+Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file. Likewise, a `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's environment becomes an inheriting child's whole baseline, in place of agent-framework's protective default. The framework logs when it does.
 
 ### Feature sets and tool names
 
@@ -312,6 +312,31 @@ action is pasting a new token. A credentials file with a refresh token
 (`ANTHROPIC_OAUTH_CREDENTIALS_FILE`) makes "Refresh token" available and warns
 30 minutes before expiry. See the credential-alerts note under the ChatGPT
 provider and [docs/subscription-transport.md](docs/subscription-transport.md).
+
+### OpenAI reasoning
+
+For `openai-responses` and `openai-codex`, primary-agent reasoning is configured
+under `agent.responses`. Omitted settings default to `reasoningEffort: "high"`
+and `reasoningContext: "all_turns"`. Add the following to an existing recipe to
+request a higher effort:
+
+```json
+{
+  "agent": {
+    "responses": {
+      "reasoningEffort": "xhigh",
+      "reasoningContext": "all_turns"
+    }
+  }
+}
+```
+
+The host accepts `none`, `low`, `medium`, `high`, `xhigh`, or `max` for
+`reasoningEffort`, and `current_turn` or `all_turns` for `reasoningContext`. The
+selected model must support the requested effort. These settings apply to the
+primary agent; `modules.retrieval` has its own reasoning setting described below.
+Memory sizing and compression-model settings are covered in
+`docs/AGENT-ONBOARDING.md`.
 
 ### ChatGPT subscription provider
 

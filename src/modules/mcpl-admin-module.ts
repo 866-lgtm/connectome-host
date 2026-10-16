@@ -44,6 +44,8 @@ import {
   serverProvisions,
   lostByReplacement,
   composeMcplChildEnv,
+  cleartextCredential,
+  cleartextCarrierText,
   overlayEntryProblem,
   overlayEntryReplaces,
   overlayEntryTombstones,
@@ -245,9 +247,9 @@ export class McplAdminModule implements Module {
             command: { type: 'string', description: 'Executable to spawn (stdio transport). Mutually exclusive with url.' },
             args: { type: 'array', items: { type: 'string' }, description: 'Arguments for the command.' },
             env: { type: 'object', description: 'Environment variables for the spawned process.' },
-            url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command.' },
-            token: { type: 'string', description: 'Bearer token for WebSocket auth (only when the operator hands you one — prefer `access`).' },
-            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle.' },
+            url: { type: 'string', description: 'WebSocket URL (websocket transport). Mutually exclusive with command. A user, password or `token` parameter in it is a credential, which mcpl_deploy takes only over wss://, or ws:// to this machine (for example, localhost or a loopback address).' },
+            token: { type: 'string', description: 'Token for WebSocket auth, sent as the url\'s `token` parameter (only when the operator hands you one — prefer `access`). mcpl_deploy takes it only with a wss:// url, or ws:// to this machine (for example, localhost or a loopback address).' },
+            access: { type: 'string', description: 'Name of a host-managed access grant (e.g. "eidoverse"): the host attaches your standing credentials to the connection automatically. Nothing for you to obtain or handle. mcpl_deploy takes it only with a wss:// url, or ws:// to this machine (for example, localhost or a loopback address).' },
             toolPrefix: { type: 'string', description: 'Tool namespace prefix. Default: mcpl--<id>.' },
             reconnect: { type: 'boolean', description: 'Auto-reconnect on transport failure. Default: true for websocket URLs (a bounced server comes back on its own), false for stdio. Note: does NOT respawn a crashed child — use mcpl_restart for that.' },
             enabledFeatureSets: { type: 'array', items: { type: 'string' }, description: 'Feature-set allowlist (* wildcard). Omit or pass [] for all offered.' },
@@ -486,7 +488,7 @@ export class McplAdminModule implements Module {
       if (typeof input.access === 'string' && !this.identity) {
         return fail(
           '`access` names a host-managed access grant, but this deployment has no identity ' +
-          'configured — ask your operator to enable it (recipe `identity`), or supply a `token`.',
+          'configured — ask your operator to enable it (recipe `identity`), or supply a `token` (over wss://, or ws:// to this machine).',
         );
       }
       fields.access = typeof input.access === 'string' ? input.access.trim() : input.access;
@@ -506,6 +508,22 @@ export class McplAdminModule implements Module {
     if (problem) return fail(`mcpl_deploy refused: the entry would be malformed (${problem}), so nothing was saved.`);
     const entry = fields as AgentOverlayEntry;
 
+    // A credential sent over ws:// to another machine (cleartextCredential
+    // names the carriers it recognizes) can be read by anyone on the network
+    // between. A deploy doesn't send one there. An operator who knows that
+    // network is private can put the server in the recipe, where it loads
+    // with a warning.
+    const cleartext = cleartextCredential(entry);
+    if (cleartext) {
+      const configured = framework.listMcplServers().some(s => s.id === id);
+      return fail(
+        `mcpl_deploy refused: ${cleartextCarrierText(cleartext.carrier, entry.access)} would go to ${cleartext.host} ` +
+        'over unencrypted ws://, where anyone on the network between can read it. Use a wss:// url, or, if that ' +
+        'network is private, ask your operator to add the server to the recipe. Nothing was saved.' +
+        (configured ? ` The server already configured as "${id}" is unchanged.` : ''),
+      );
+    }
+
     // Persist to the overlay first — a connect failure still leaves the entry
     // in place so the agent can fix the server and mcpl_restart it.
     const overlay = readAgentOverlay(this.overlayPath);
@@ -514,8 +532,10 @@ export class McplAdminModule implements Module {
 
     const config = resolveOverlayEntry(id, entry, this.overlayPath) as unknown as McplServerConfig;
     // The child's env as the boot composes it for every server
-    // (composeMcplChildEnv): the refusal-reaction baseline as a default the
-    // entry's own env overrides, and the host's AGENT_TIMEZONE over both.
+    // (composeMcplChildEnv): the entry's own env, with the host's
+    // AGENT_TIMEZONE over it. agent-framework adds its reaction-suppression
+    // default when the child spawns, unless the entry sets a baseline with
+    // tokens.
     config.env = composeMcplChildEnv(config.env as Record<string, string> | undefined, this.timeZone);
     if (entry.access && this.identity) {
       const identity = this.identity;

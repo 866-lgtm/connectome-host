@@ -24,17 +24,15 @@
  */
 
 import {
-  AnthropicXmlFormatter,
   BedrockAdapter,
   Membrane,
   MockAdapter,
-  NativeFormatter,
   OpenAIResponsesAPIAdapter,
-  OpenAIResponsesFormatter,
   OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
 import { LoggingAnthropicAdapter, offPathRefusalAlert } from './logging-adapter.js';
+import { recipeFormatter } from './recipe-formatter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
@@ -66,7 +64,7 @@ import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
-import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
+import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
 import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
 import { setCallLogPath } from './bug-report.js';
@@ -523,10 +521,11 @@ async function createFramework(
   const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => {
     const withEnv: { id: string; command?: string; url?: string; [k: string]: unknown } = {
       ...server,
-      // Stdio MCPL children inherit a single agent-facing wall clock plus the
-      // framework's refusal-annotation suppression baseline (operator env
-      // supersedes the baseline; see composeMcplChildEnv). Protocol
-      // timestamps remain UTC; only their rendered text uses AGENT_TIMEZONE.
+      // Stdio MCPL children share the recipe's agent-facing wall clock.
+      // The framework derives the reaction-suppression default when the
+      // child spawns; a baseline with tokens in the server's env (or, with
+      // inheritEnv, in the host's own) replaces it. Protocol timestamps
+      // remain UTC; only their rendered text uses AGENT_TIMEZONE.
       env: composeMcplChildEnv(server.env as Record<string, string> | undefined, timeZone),
     };
     // `access` is a declarative name (recipe/file/overlay); the credential
@@ -544,6 +543,15 @@ async function createFramework(
         );
       }
     }
+    // A credential over ws:// to another machine is readable on the network
+    // between. mcpl_deploy refuses one; an operator's recipe, or an overlay
+    // entry saved before that refusal, still loads, with this warning. A
+    // grant counts only where the identity attaches its credential.
+    const cleartext = cleartextCredentialWarning(server.id, {
+      ...withEnv,
+      access: withEnv.accessProvider ? withEnv.access : undefined,
+    });
+    if (cleartext) console.error(cleartext);
     return withEnv;
   });
 
@@ -981,7 +989,7 @@ async function main() {
   // SettingsModule constructed early so the adapter can read its state for
   // cross-cutting concerns (currently: reasoning). It's wired into the
   // framework's module list inside createFramework().
-  const settingsModule = new SettingsModule();
+  const settingsModule = new SettingsModule(recipe.agent.thinking?.effort);
 
   // Append each LLM request/response/error to a JSONL log per process lifetime
   // (matches the Hermes-era `llm-calls.<iso>.jsonl` visibility). The adapter
@@ -1261,11 +1269,7 @@ async function main() {
     // gives generic retryable errors — e.g. a gateway 502 — zero retries; only
     // 529/overloaded_error has a dedicated schedule.
     ...(recipe.agent.retry ? { retry: recipe.agent.retry } : {}),
-    formatter: provider === 'openai-responses' || provider === 'openai-codex'
-      ? new OpenAIResponsesFormatter()
-      : recipe.agent.formatter === 'anthropic-xml'
-        ? new AnthropicXmlFormatter()
-        : new NativeFormatter(),
+    formatter: recipeFormatter(recipe.agent.formatter, provider),
     // Caching default for internal callers (autobio compression,
     // executeMerge), which read Membrane's defaultPromptCaching rather
     // than the per-agent flag. Applies on EVERY provider whenever the
