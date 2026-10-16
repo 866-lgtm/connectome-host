@@ -362,7 +362,7 @@ describe('settings', () => {
 
 describe('modules that offer no tools of their own', () => {
   test('instructions names its workspace file and heading, says what a missing heading means, and names the tools that read and edit it', async () => {
-    const r = await new InstructionsModule({ path: 'shared/AGENTS.md' }).handleToolCall(call('edit'));
+    const r = await new InstructionsModule({ path: 'shared/AGENTS.md', agentName: 'resident' }).handleToolCall(call('edit'));
     expect(r.error).toContain('"instructions--edit"');
     expect(r.error).toContain(
       'Your instructions are read from the workspace file shared/AGENTS.md each turn and put in your context ' +
@@ -377,7 +377,7 @@ describe('modules that offer no tools of their own', () => {
     expect(r.error).toContain("workspace--read shows the workspace's stored copy, which on a read-only mount can be older than the file.");
     expect(r.error).toContain('workspace--edit');
 
-    const bare = await new InstructionsModule({ path: 'shared/AGENTS.md', header: '  ' }).handleToolCall(call('edit'));
+    const bare = await new InstructionsModule({ path: 'shared/AGENTS.md', header: '  ', agentName: 'resident' }).handleToolCall(call('edit'));
     expect(bare.error).toContain('put in your context, so the text there is the current one. If they are missing from your context,');
     expect(bare.error).not.toContain('heading');
   });

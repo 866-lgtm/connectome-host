@@ -10,12 +10,26 @@
  * per-turn overlays, so edits take effect on the next turn and stale copies
  * never accumulate in history.
  *
- * Fail-open by design: a missing mount, missing file, or any read error
- * yields no injection (never a blocked inference). An agent running without
- * its instructions must not be a silent state, so the first failure for each
- * distinct reason is logged and raised as an `instructions-unavailable` ops
- * alert, which the TUI, the ops webhook and the status channels show; once
- * the file loads again, `instructions-unavailable-clear` stands it down.
+ * Fail-open by design: a missing mount, missing file, any read error, or a
+ * read that hasn't finished within its budget yields no injection (never a
+ * blocked inference). An agent running without its instructions must not be
+ * a silent state, so each distinct reason is logged and raised once as an
+ * `instructions-unavailable` ops alert, which the TUI, the ops webhook and
+ * the status channels show. Once the file loads again,
+ * `instructions-unavailable-clear` stands it down, and a later loss alerts
+ * afresh, whatever its reason.
+ *
+ * One read is in flight at a time. A turn that comes while it's pending
+ * waits on it rather than starting another, until its budget, counted from
+ * the read's start, runs out; a turn after that injects nothing at once. So
+ * a read that never finishes (a FIFO at the path, which agent-framework
+ * 0.22.1 opens and waits on) leaves agents without their instructions until
+ * it finishes, the session is switched or the host restarts, and no further
+ * read starts meanwhile.
+ *
+ * The host keeps one instance across session switches, as it keeps the
+ * notices module, so an alert raised in one session is stood down in the
+ * next once the file loads there.
  *
  * Requires the workspace module: the configured path is a mount-prefixed
  * workspace path ("<mountName>/<relativePath>"). validateRecipe enforces the
@@ -55,7 +69,21 @@ export interface WorkspaceDiskReader {
   readFileFromDisk(
     mountPrefixedPath: string,
     options: { maxBytes: number },
-  ): Promise<{ bytes: Buffer; size: number; truncated: boolean }>;
+  ): Promise<DiskRead>;
+}
+
+type DiskRead = { bytes: Buffer; size: number; truncated: boolean };
+
+/** A read of the file under way, which every turn that comes while it's
+ *  pending waits on, so a read that never finishes holds one open file. */
+interface PendingRead {
+  /** What the read gave, or why it gave nothing. */
+  outcome: Promise<{ read: DiskRead } | { error: unknown }>;
+  /** When its budget runs out, counted from its start. */
+  deadline: number;
+  /** Set when the session it was started for stops: what it gives after
+   *  that changes nothing. */
+  ended: boolean;
 }
 
 export interface InstructionsModuleConfig {
@@ -70,7 +98,7 @@ export interface InstructionsModuleConfig {
   /** The agent the host runs, whose name the module's ops alerts carry: the
    *  host gives it, as it gives the notices module the same name, which
    *  posts only that agent's alerts. Not a recipe field. */
-  agentName?: string;
+  agentName: string;
 }
 
 export const DEFAULT_INSTRUCTIONS_PATH = 'instructions/AGENTS.md';
@@ -83,8 +111,10 @@ export class InstructionsModule implements Module {
 
   // gatherContext is one bounded file read — well under 2s. A modest
   // explicit budget keeps a wedged filesystem from eating the registry-wide
-  // 15s default before inference proceeds without us.
-  readonly contextTimeoutMs = 2000;
+  // 15s default before inference proceeds without us. The read's own budget
+  // is three quarters of it (readBudgetMs), so a read that hangs raises the
+  // alert before the registry gives up on the turn with only a console line.
+  readonly contextTimeoutMs: number = 2000;
 
   private readonly path: string;
   private readonly header: string;
@@ -99,13 +129,15 @@ export class InstructionsModule implements Module {
   private warned = new Set<string>();
   /** Whether an instructions-unavailable alert is up, awaiting its clear. */
   private alerted = false;
+  /** The read in flight, if one is. */
+  private pending: PendingRead | null = null;
 
-  constructor(config: InstructionsModuleConfig = {}) {
+  constructor(config: InstructionsModuleConfig) {
     this.path = config.path ?? DEFAULT_INSTRUCTIONS_PATH;
     this.header = config.header ?? DEFAULT_INSTRUCTIONS_HEADER;
     this.maxBytes = config.maxBytes ?? DEFAULT_INSTRUCTIONS_MAX_BYTES;
     this.position = config.position ?? 'system';
-    this.agentName = config.agentName ?? 'unknown';
+    this.agentName = config.agentName;
   }
 
   /** Peer injection (same pattern as setFramework/setIdentity elsewhere). */
@@ -118,8 +150,19 @@ export class InstructionsModule implements Module {
   }
 
   async stop(): Promise<void> {
+    // The host keeps this module across session switches, and what it reads
+    // belongs to the session that's ending: the next session gives its own
+    // workspace, whose mounts can be other directories (the `_config` mount
+    // sits in each session's store). A read under way ends with it. The
+    // reasons warned about go, so the next session's first failing read
+    // raises the alert again for the TUI, which drops its alerts at a
+    // switch. An alert that's up stays marked, so the next session's first
+    // successful read stands it down where it's still shown: the web UI's
+    // alert strip and the notices module's episode outlive the switch.
+    if (this.pending) this.pending.ended = true;
+    this.pending = null;
+    this.workspace = null;
     this.warned.clear();
-    this.alerted = false;
     this.ctx = null;
   }
 
@@ -155,19 +198,29 @@ export class InstructionsModule implements Module {
    * share the one living document (that is the point of the module).
    */
   async gatherContext(_agentName: string): Promise<ContextInjection[]> {
-    if (!this.workspace) {
+    const workspace = this.workspace;
+    if (!workspace) {
       this.unavailable('the workspace module isn\'t wired, so no instructions can be read');
       return [];
     }
-    let read: { bytes: Buffer; size: number; truncated: boolean };
-    try {
-      read = await this.workspace.readFileFromDisk(this.path, { maxBytes: this.maxBytes });
-    } catch (error) {
-      // Fail open: missing file or any read error never blocks inference.
-      this.unavailable(this.reasonFor(error));
+    const pending = this.pending ?? this.startRead(workspace);
+    const outcome = await this.within(pending);
+    // Its session stopped while this turn waited: the next one reads afresh.
+    if (pending.ended) return [];
+    // Fail open: a missing file, any read error or a read that hasn't
+    // finished never blocks inference.
+    if (outcome === 'late') {
+      this.unavailable(
+        `reading "${this.path}" hasn't finished after ${this.readBudgetMs / 1000} s, and no other read ` +
+        'starts until it finishes, the session is switched or the host restarts',
+      );
       return [];
     }
-    const { bytes, size, truncated } = read;
+    if ('error' in outcome) {
+      this.unavailable(this.reasonFor(outcome.error));
+      return [];
+    }
+    const { bytes, size, truncated } = outcome.read;
 
     let content: string;
     if (truncated) {
@@ -200,8 +253,8 @@ export class InstructionsModule implements Module {
       content = bytes.toString('utf-8');
     }
 
-    // Recovered: stand down an alert that's up, and let a future recurrence
-    // of a previous reason warn again.
+    // Recovered: stand down an alert that's up, and let a later loss warn
+    // again, whatever its reason.
     this.warned.clear();
     if (this.alerted) {
       this.alerted = false;
@@ -216,18 +269,66 @@ export class InstructionsModule implements Module {
     ];
   }
 
+  /** How long a read may take: three quarters of the registry's budget for
+   *  this module, counted from the read's start. */
+  private get readBudgetMs(): number {
+    return this.contextTimeoutMs * 0.75;
+  }
+
+  /** Start the one read in flight. Once it settles, the next turn reads
+   *  afresh, unless a stop has already put another in its place. */
+  private startRead(workspace: WorkspaceDiskReader): PendingRead {
+    const pending: PendingRead = {
+      outcome: workspace.readFileFromDisk(this.path, { maxBytes: this.maxBytes }).then(
+        (read) => ({ read }),
+        (error: unknown) => ({ error }),
+      ),
+      deadline: Date.now() + this.readBudgetMs,
+      ended: false,
+    };
+    void pending.outcome.then(() => {
+      if (this.pending === pending) this.pending = null;
+    });
+    this.pending = pending;
+    return pending;
+  }
+
+  /** What the read gave, or 'late' once its deadline has passed: at once for
+   *  a turn that comes after it, so a read that hangs costs later turns no
+   *  wait. */
+  private async within(pending: PendingRead): Promise<{ read: DiskRead } | { error: unknown } | 'late'> {
+    const left = pending.deadline - Date.now();
+    if (left <= 0) return 'late';
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<'late'>((resolve) => {
+      timer = setTimeout(() => resolve('late'), left);
+    });
+    try {
+      return await Promise.race([pending.outcome, late]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   /** Why the read gave nothing, with what puts it right where the read's
    *  own message (which names the mount-prefixed path) doesn't say. */
   private reasonFor(error: unknown): string {
     const code = (error as { code?: unknown } | null)?.code;
     if (code === 'symlink') return `"${this.path}" is a link, which its mount doesn't follow: put the file itself at that path`;
-    if (code === 'escape') return `"${this.path}" leads outside its mount: put the file itself at that path`;
+    // The read refuses a file that is itself a link before it checks where
+    // the file lies, and a recipe's mounts don't follow links, so an escape
+    // comes from a linked directory on the path that leads out of the mount:
+    // a file put "at that path" would go through it.
+    if (code === 'escape') {
+      return `"${this.path}" lies outside its mount, through a linked directory on its path: move the file ` +
+        'into the mount, out from behind that link';
+    }
     return error instanceof Error ? error.message : String(error);
   }
 
   /** No instructions this turn: log it and raise one ops alert per distinct
-   *  reason, under the host's agent's name, since one loss reaches every
-   *  agent it runs, subagents included. */
+   *  reason until the file loads again, under the host's agent's name, since
+   *  one loss reaches every agent it runs, subagents included. */
   private unavailable(reason: string): void {
     if (this.warned.has(reason)) return;
     this.warned.add(reason);

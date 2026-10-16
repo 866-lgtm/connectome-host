@@ -93,10 +93,10 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
 
   test('a path no mount holds or leading out of it, a link the mount refuses, and one leading outside it are forbidden, and say why', async () => {
     const cases: Array<[string, string]> = [
-      ['files/link.txt', 'Forbidden: Symlinks are not allowed: files/link.txt'],
-      ['files/out.txt', 'Forbidden: Symlink escape detected: files/out.txt'],
-      ['nope/x.txt', 'Forbidden: Unknown mount: "nope". Available: files'],
-      ['files/..%2Fx.txt', 'Forbidden: Path traversal detected: "files/../x.txt" resolves outside mount "files"'],
+      ['files/link.txt', 'Symlinks are not allowed: files/link.txt'],
+      ['files/out.txt', 'Symlink escape detected: files/out.txt'],
+      ['nope/x.txt', 'Unknown mount: "nope". Available: files'],
+      ['files/..%2Fx.txt', 'Path traversal detected: "files/../x.txt" resolves outside mount "files"'],
     ];
     for (const [path, body] of cases) {
       const res = await fetch(`${baseUrl}/files/${path}`);
@@ -107,9 +107,9 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
 
   test('a path the read gives no file for is not found, and says why', async () => {
     const cases: Array<[string, string]> = [
-      ['files/gone.txt', 'Not found: File not found: files/gone.txt'],
-      ['files/album', 'Not found: Path is a directory: files/album'],
-      ['files/moving.txt', 'Not found: File changed during read: files/moving.txt'],
+      ['files/gone.txt', 'File not found: files/gone.txt'],
+      ['files/album', 'Path is a directory: files/album'],
+      ['files/moving.txt', 'File changed during read: files/moving.txt'],
     ];
     for (const [path, body] of cases) {
       const res = await fetch(`${baseUrl}/files/${path}`);
@@ -161,9 +161,11 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
       expect(await get('plain/v2.png/')).toEqual({ status: 200, type: 'image/png', body: 'the second version' });
       const link = await get('plain/latest.png');
       expect(link.status).toBe(403);
-      expect(link.body).toBe('Forbidden: Symlinks are not allowed: plain/latest.png');
+      expect(link.body).toBe('Symlinks are not allowed: plain/latest.png');
       // A linked directory is followed while what it leads to stays inside
-      // the mount: agent-framework refuses only a file that is itself a link.
+      // the mount: agent-framework refuses a file that is itself a link, and
+      // one whose canonical path leaves the mount, not a directory link that
+      // stays inside it.
       expect(await get('plain/d/note.json')).toMatchObject({ status: 200, body: '{"through":"a linked directory"}' });
       expect(await get('follow/latest.png')).toMatchObject({ status: 200, body: 'the followed version' });
     } finally {

@@ -5,13 +5,15 @@
  * link policy and reads a file only if its canonical path lies inside the
  * mount. The stand-in read refuses one path, and every path also resolves by
  * its text to a real file holding a hint, which a read that went around
- * readFileFromDisk would find instead.
+ * readFileFromDisk would find instead. agent-framework's own read runs too,
+ * on a real mount whose one link leads to a file inside it.
  */
 import { afterAll, describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WorkspaceReadError, type ModuleContext, type TraceEvent } from '@animalabs/agent-framework';
+import { JsStore } from '@animalabs/chronicle';
+import { WorkspaceModule, WorkspaceReadError, type ModuleContext, type TraceEvent } from '@animalabs/agent-framework';
 import { ActivityModule } from '../src/modules/activity-module.js';
 
 describe("the origin hint comes only from what the mount's own read gives", () => {
@@ -37,6 +39,11 @@ describe("the origin hint comes only from what the mount's own read gives", () =
         return { bytes, size: bytes.byteLength, truncated: false };
       },
     };
+    return { ...(await moduleOver(workspace)), asked };
+  }
+
+  /** An activity module reading through `workspace`, with the typing notices it sent. */
+  async function moduleOver(workspace: unknown) {
     const typing: Array<{ channel: string; metadata: unknown }> = [];
     const listeners = new Set<(event: TraceEvent) => void>();
     const framework = {
@@ -54,7 +61,7 @@ describe("the origin hint comes only from what the mount's own read gives", () =
       getModule: (name: string) => (name === 'workspace' ? workspace : undefined),
     } as unknown as ModuleContext);
     module.setFramework(framework as never);
-    return { module, asked, typing, trace };
+    return { module, typing, trace };
   }
 
   test('a file the read gives sets the topic, one it refuses sets nothing, and only the head is asked for', async () => {
@@ -81,5 +88,36 @@ describe("the origin hint comes only from what the mount's own read gives", () =
     trace('inference:started');
     expect(typing.at(-1)).toEqual({ channel: 'zulip:ops', metadata: { topic: 'from-the-mount' } });
     expect(asked.map((a) => a.path)).toEqual(['files/refused.md', 'files/given.md']);
+  });
+
+  test("agent-framework's read: a file that is itself a link gives no hint, and only a file's first 2048 bytes are read for one", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'activity-origin-real-'));
+    dirs.push(dir);
+    const files = join(dir, 'files');
+    mkdirSync(files);
+    writeFileSync(join(files, 'note.md'), 'origin: zulip#ops#through-a-link\n');
+    symlinkSync('note.md', join(files, 'linked.md'));
+    writeFileSync(join(files, 'late.md'), `${'x'.repeat(3000)}\norigin: zulip#ops#past-the-head\n`);
+    writeFileSync(join(files, 'early.md'), `origin: zulip#ops#in-the-head\n${'x'.repeat(5000)}\n`);
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const real = new WorkspaceModule({ mounts: [{ name: 'files', path: files, mode: 'read-only', watch: 'never' }] });
+    real.initStore(store);
+    try {
+      const { module, typing, trace } = await moduleOver(real);
+      const topicAfter = async (path: string) => {
+        await module.onProcess({ type: 'workspace:modified', paths: [path] } as never, {} as never);
+        trace('inference:started');
+        trace('inference:completed');
+        return (typing.at(-1)!.metadata as { topic?: string } | undefined)?.topic;
+      };
+      // A recipe's mounts don't follow links, so the read refuses a file that
+      // is itself a link, even one naming a file in the same mount.
+      expect(await topicAfter('files/linked.md')).toBeUndefined();
+      expect(await topicAfter('files/late.md')).toBeUndefined();
+      expect(await topicAfter('files/early.md')).toBe('in-the-head');
+      expect(await topicAfter('files/note.md')).toBe('through-a-link');
+    } finally {
+      (store as { close?: () => void }).close?.();
+    }
   });
 });
