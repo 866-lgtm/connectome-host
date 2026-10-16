@@ -24,6 +24,8 @@ import type { ContextInjection } from '@animalabs/context-manager';
 import { randomUUID } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -147,7 +149,7 @@ export class LessonsModule implements Module {
             id: { type: 'string', description: 'Lesson ID' },
             content: { type: 'string', description: 'Updated content' },
             tags: { type: 'array', items: { type: 'string' }, description: 'Updated tags' },
-            confidence: { type: 'number', description: 'Updated confidence' },
+            confidence: { type: 'number', description: 'Updated confidence, from 0 to 1' },
             evidence: { type: 'array', items: { type: 'string' }, description: 'Additional evidence' },
           },
           required: ['id'],
@@ -220,16 +222,17 @@ export class LessonsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    const input: unknown = call.input ?? {};
     switch (call.name) {
-      case 'create': return this.handleCreate(call.input as CreateInput);
-      case 'update': return this.handleUpdate(call.input as UpdateInput);
-      case 'deprecate': return this.handleDeprecate(call.input as DeprecateInput);
-      case 'query': return this.handleQuery(call.input as QueryInput);
-      case 'list': return this.handleList(call.input as ListInput);
-      case 'boost': return this.handleBoost(call.input as IdInput);
-      case 'demote': return this.handleDemote(call.input as IdInput);
+      case 'create': return this.handleCreate(input as CreateInput);
+      case 'update': return this.handleUpdate(input as UpdateInput);
+      case 'deprecate': return this.handleDeprecate(input as DeprecateInput);
+      case 'query': return this.handleQuery(input as QueryInput);
+      case 'list': return this.handleList(input as ListInput);
+      case 'boost': return this.handleBoost(input as IdInput);
+      case 'demote': return this.handleDemote(input as IdInput);
       default:
-        return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
+        return unknownToolResult(this, call.name);
     }
   }
 
@@ -250,6 +253,13 @@ export class LessonsModule implements Module {
   // =========================================================================
 
   private handleCreate(input: CreateInput): ToolResult {
+    // A lesson stored without its content or tags makes every later query by
+    // text or by tags fail, and retrieval reads every field as given.
+    const problems = inputProblems(input, true);
+    if (problems.length > 0) {
+      return { success: false, isError: true, error: `Nothing was created: ${problems.join('; ')}.` };
+    }
+
     const lesson: Lesson = {
       id: randomUUID().slice(0, 8),
       content: input.content,
@@ -269,13 +279,15 @@ export class LessonsModule implements Module {
 
   private handleUpdate(input: UpdateInput): ToolResult {
     const lesson = this.state.lessons.find(l => l.id === input.id);
-    if (!lesson) {
-      return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
+    const problems = inputProblems(input, false);
+    if (!lesson) return notFound('updated', input.id, problems.join('; ') || undefined);
+    if (problems.length > 0) {
+      return { success: false, isError: true, error: `Nothing was updated: ${problems.join('; ')}.` };
     }
 
     if (input.content !== undefined) lesson.content = input.content;
     if (input.tags !== undefined) lesson.tags = input.tags;
-    if (input.confidence !== undefined) lesson.confidence = Math.max(0, Math.min(1, input.confidence));
+    if (input.confidence !== undefined) lesson.confidence = input.confidence;
     if (input.evidence !== undefined) {
       // Merge evidence, dedup
       const existing = new Set(lesson.evidence);
@@ -290,9 +302,14 @@ export class LessonsModule implements Module {
 
   private handleDeprecate(input: DeprecateInput): ToolResult {
     const lesson = this.state.lessons.find(l => l.id === input.id);
-    if (!lesson) {
-      return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
-    }
+    const reason: unknown = input.reason;
+    const reasonProblem = typeof reason === 'string'
+      ? reason.trim() === '' ? 'reason is blank: say why the lesson is no longer accurate' : undefined
+      : reason === undefined
+        ? 'reason is missing: say why the lesson is no longer accurate'
+        : `reason must be text, not ${shown(reason)}`;
+    if (!lesson) return notFound('deprecated', input.id, reasonProblem);
+    if (reasonProblem) return { success: false, isError: true, error: `Nothing was deprecated: ${reasonProblem}.` };
 
     lesson.deprecated = true;
     lesson.deprecationReason = input.reason;
@@ -391,9 +408,7 @@ export class LessonsModule implements Module {
 
   private handleBoost(input: IdInput): ToolResult {
     const lesson = this.state.lessons.find(l => l.id === input.id);
-    if (!lesson) {
-      return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
-    }
+    if (!lesson) return notFound('boosted', input.id);
 
     // Diminishing returns boost
     lesson.confidence = Math.min(1, lesson.confidence + 0.1 * (1 - lesson.confidence));
@@ -405,9 +420,7 @@ export class LessonsModule implements Module {
 
   private handleDemote(input: IdInput): ToolResult {
     const lesson = this.state.lessons.find(l => l.id === input.id);
-    if (!lesson) {
-      return { success: false, error: `Lesson not found: ${input.id}`, isError: true };
-    }
+    if (!lesson) return notFound('demoted', input.id);
 
     // Diminishing returns demote
     lesson.confidence = Math.max(0, lesson.confidence - 0.1 * lesson.confidence);
@@ -462,4 +475,53 @@ export class LessonsModule implements Module {
       // Best-effort — don't break the module if the file can't be written
     }
   }
+}
+
+/** What's wrong with the fields a create or update gives, each named with the
+ *  value given. create needs content and tags; update takes any of them. */
+function inputProblems(
+  input: { content?: unknown; tags?: unknown; confidence?: unknown; evidence?: unknown },
+  isCreate: boolean,
+): string[] {
+  const problems: string[] = [];
+  const textList = (value: unknown) => Array.isArray(value) && value.every(t => typeof t === 'string');
+  // A field left out keeps its value on update; null is a value, and not
+  // one any field takes.
+  const orKeep = (what: string) => (isCreate ? '' : `, or leave it out to keep the current ${what}`);
+  if (input.content === undefined) {
+    if (isCreate) problems.push('content is missing: give the lesson as text');
+  } else if (typeof input.content !== 'string') {
+    problems.push(`content must be the lesson as text${orKeep('text')}, not ${shown(input.content)}`);
+  } else if (input.content.trim() === '') {
+    problems.push(`content is blank: give the lesson as text${orKeep('text')}`);
+  }
+  if (input.tags === undefined) {
+    if (isCreate) problems.push('tags is missing: give a list of tags, such as ["process"]');
+  } else if (!textList(input.tags)) {
+    problems.push(`tags must be a list of text, such as ["process"]${orKeep('tags')}, not ${shown(input.tags)}`);
+  }
+  if (input.confidence !== undefined
+    && !(typeof input.confidence === 'number' && input.confidence >= 0 && input.confidence <= 1)) {
+    problems.push(`confidence must be a number from 0 to 1, such as 0.8, not ${shown(input.confidence)}`);
+  }
+  if (input.evidence !== undefined && !textList(input.evidence)) {
+    problems.push(`evidence must be a list of text, such as ["stream:topic:messageId"], not ${shown(input.evidence)}`);
+  }
+  return problems;
+}
+
+/** An update, deprecate, boost or demote whose id matches no lesson, with
+ *  any other problem in the call named beside it. */
+function notFound(verb: 'updated' | 'deprecated' | 'boosted' | 'demoted', id: unknown, also?: string): ToolResult {
+  const which = id === undefined || id === ''
+    ? 'id is missing: give the lesson\'s id'
+    : `no lesson has the id ${shown(id)}`;
+  return {
+    success: false,
+    isError: true,
+    error:
+      `Nothing was ${verb}: ${which}${also ? `; ${also}` : ''}. ` +
+      'lessons--list shows lessons with their ids, the first 50 unless you give a larger limit (deprecated ' +
+      'ones too, with includeDeprecated: true), and lessons--query finds lessons by text or tags.',
+  };
 }
