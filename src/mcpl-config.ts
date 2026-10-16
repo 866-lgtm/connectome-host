@@ -572,10 +572,11 @@ export function saveAgentOverlay(
  * other keys are kept as JSON.parse reads them: no reader acts on them, but
  * they're whoever wrote them's, such as an entry under a misspelled key. A
  * root of null is refused by both files' readers, and every save follows a
- * read of its file, so a save never meets one; any other root that isn't an
- * object holds no entries for any reader, and is replaced. A file that
- * doesn't parse is never overwritten: its readers refuse it, so the save
- * refuses too, without quoting it.
+ * read of its file, so a save meets one only when another writer put it
+ * there after that read; it's replaced then, as any other root that isn't
+ * an object is, since such a root holds no entries for any reader. A file
+ * that doesn't parse is never overwritten: its readers refuse it, so the
+ * save refuses too, without quoting it.
  */
 function writeServersFile(path: string, servers: Record<string, unknown>): void {
   let root: Record<string, unknown> = {};

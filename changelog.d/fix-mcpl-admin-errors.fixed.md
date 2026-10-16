@@ -10,14 +10,19 @@
     record itself are refused, and the unload's refusal points a loaded
     server to `persist: false`. `mcpl_list` lists the servers, with the
     sources the overlay decides as unknown, and an unload for this session
-    goes on. Each tool says it in one wording: why the file can't be read,
-    that the next host start will stop on it until it's fixed, and the
-    repair. For a file that isn't valid JSON or holds `null`, that is to
-    fix it (or have the operator fix it), and why not to move it aside. For
-    one that can't be opened or read, such as a directory in its place, it
-    is to ask the operator to make it readable. Before, a deploy passed the
-    file-system error on with no step. The boot, which stops on such a
-    file, keeps its operator message.
+    of a server that's loaded, or the operator's, goes on. A restart goes
+    on too, and its note says that a deploy, and an unload that persists,
+    are refused meanwhile. Each tool says it in one wording, an unload
+    that can't read the file when it reads it again after the disconnect
+    included: why the file can't be read, that the next host start will
+    stop on it, and the repair. For a file that isn't valid JSON or holds
+    `null`, the start stops until it's fixed, and the repair is to fix it
+    (or have the operator fix it), with why not to move it aside. For one
+    that can't be opened or read, such as a directory in its place, the
+    start stops while it can't be read, and the repair is to ask the
+    operator to make it readable. Before, a deploy passed the file-system
+    error on with no step. The boot, which stops on such a file, keeps its
+    operator message.
   - `mcpl_deploy` names every problem with its arguments in one refusal,
     where it named only the first, so an agent fixes them in one call: an
     argument the tool doesn't take, the id, the command or url, an `access`
@@ -30,8 +35,10 @@
     that copies a url entry from its overlay sends `transport`, which
     `mcpl_deploy` writes into each url entry it saves but sets itself.
     `mcpl_unload` also refuses a `persist` given as anything but true or
-    false (`null` leaves the default, as an unspecified field does in a
-    deploy). Before, such an argument was dropped and the call went on
+    false (`null` leaves the default in a tool call, as an unspecified
+    field does in a deploy; through `utils`, agent-framework refuses a
+    `null` for a true-or-false field before the module sees it). Before,
+    such an argument was dropped and the call went on
     without it, and any `persist` but `false` counted as true. So a
     misspelled `disabledTools` left the server with no deny-list, a
     `command` given to a restart left the server running its old one while
@@ -47,7 +54,8 @@
     failed, and the next host start stopped on it. An env value JSON can't
     write (`Infinity`, `NaN`), which would have been saved as `null`, is
     refused too.
-  - A deploy whose overlay can't be saved says no server was connected or
+  - A deploy whose overlay can't be saved names the file, which an error
+    from the write itself doesn't, and says no server was connected or
     restarted, and, when the save failed before writing anything, that
     nothing was deployed. For a save that may have stopped partway (a full
     disk, say, or any failure not known to come before the write), it says
@@ -90,8 +98,9 @@
   and a `null` root threw a `TypeError` naming nothing. The boot's message
   for such a file changes accordingly. `mcpl_list`, which failed on such a
   file, now lists the servers, with the sources the file decides as
-  unknown, and says the file is the operator's to fix and that only the
-  listing reads it.
+  unknown, and says that the next host start will stop on the file before
+  it loads any server, that the file is the operator's to fix, and that
+  only the listing reads it.
 - An overlay entry that names no command and no url is logged at the boot
   as "it names no command to run and no url to dial", in place of "it names
   nothing to run or dial".

@@ -505,14 +505,19 @@ export class McplAdminModule implements Module {
       fileServers = readMcplServersFile(this.configPath);
     } catch (error) {
       // The operator's file, which the boot read at its start, and stops on
-      // as it does on the overlay. Of these tools, only this listing reads
-      // it again, for each server's source. Its parse errors name it; a
-      // file-system error, such as a directory in its place, needn't.
+      // as it does on the overlay, before it loads any server, so the
+      // overlay's lines above say what a start loads once it gets past the
+      // file. Of these tools, only this listing reads it again, for each
+      // server's source. Its parse errors name it; a file-system error, such
+      // as a directory in its place, needn't. A file-system error can be
+      // this process's alone (EMFILE, say), so the start is said to stop
+      // while the file can't be read, not until it's fixed.
       const system = typeof (error as { code?: unknown } | null)?.code === 'string';
       notes.push(
         `The operator's server file${system ? `, ${this.configPath},` : ''} couldn't be read (${reasonText(error)}), so ` +
-        'this list can\'t show which servers it defines. The next host start will stop on the file until it\'s fixed. ' +
-        'It\'s theirs to fix, so ask your operator. Of these tools, only this listing reads it.',
+        'this list can\'t show which servers it defines. The next host start will stop on the file ' +
+        `${system ? 'while it can\'t be read' : 'until it\'s fixed'}, before it loads any server. It's theirs to fix, so ` +
+        'ask your operator. Of these tools, only this listing reads it.',
       );
     }
 
@@ -572,8 +577,8 @@ export class McplAdminModule implements Module {
           : `${id}: UNLOADED (tombstoned in your overlay — ${this.tombstoneAdvice(id)})`);
       } else if (!liveIds.has(id)) {
         lines.push(
-          `${id}: NOT LOADED (in your overlay but not connected: the next host start loads it, and ${DEPLOY} with its ` +
-          'command or url loads it now)',
+          `${id}: NOT LOADED (in your overlay but not connected: the next host start loads it, and ${DEPLOY} with each ` +
+          'of its fields loads it now, since a deploy replaces the entry whole)',
         );
       }
     }
@@ -787,10 +792,12 @@ export class McplAdminModule implements Module {
     } catch (error) {
       // A save that may have stopped partway may have written the new entry
       // whole, which the next host start loads, so only a save that wrote
-      // nothing says nothing was deployed.
+      // nothing says nothing was deployed. Bun's errors from the write
+      // itself (ENOSPC, say) name no file, so the text names it.
       const cut = partway(error);
       return fail(
-        `${cut ? 'Saving' : 'Nothing was deployed: saving'} your overlay failed (${reasonText(error)}), so no server ` +
+        `${cut ? 'Saving' : 'Nothing was deployed: saving'} your overlay file, ${this.overlayPath}, failed ` +
+        `(${reasonText(error)}), so no server ` +
         `was connected or restarted. Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your ` +
         `operator.${cut ? PARTWAY_TEXT : ''}`,
       );
@@ -862,13 +869,16 @@ export class McplAdminModule implements Module {
     // The overlay is read before the restart, so a restart that throws still
     // carries what it says, and an overlay file that can't be read costs only
     // that: the restart's own outcome is what the receipt reports. Neither
-    // error readAgentOverlay throws quotes the file.
+    // error readAgentOverlay throws quotes the file. The connect remedy names
+    // a deploy and an unload, so the note says which of them the file stops.
     let overlay: Record<string, AgentOverlayEntry> | null = null;
     let unreadable = '';
     try {
       overlay = readAgentOverlay(this.overlayPath);
     } catch (error) {
-      unreadable = ` ${capital(this.unusableOverlay(error, 'nothing is said here about your entry'))}`;
+      unreadable = ` ${capital(this.unusableOverlay(
+        error, `nothing is said here about your entry, and ${DEPLOY} and an ${UNLOAD} that persists are refused`,
+      ))}`;
     }
     // agent-framework restarts only a server it holds a configuration for,
     // and listMcplServers lists exactly those, so this is its own test, made
@@ -955,7 +965,8 @@ export class McplAdminModule implements Module {
         return `It isn't loaded in this session any more, so ${RESTART} can't reach it.` +
           (restartOf
             ? this.notLoadedAdvice(id, restartOf, false)
-            : ` ${DEPLOY} with its command or url can load it again once your overlay file is fixed.`);
+            : ` ${DEPLOY} with each of its fields can load it again once your overlay file is fixed, since a deploy ` +
+              'replaces the entry whole.');
       }
       return `It isn't loaded in this session, so ${RESTART} can't reach it. Your entry is saved, so the next host ` +
         `start loads it; once the cause is fixed, call ${DEPLOY} again to load it now. ${UNLOAD} removes the saved ` +
@@ -1005,8 +1016,8 @@ export class McplAdminModule implements Module {
       return note ? this.overlayNote(id, overlay, false) : '';
     }
     if (overlayEntryReplaces(entry)) {
-      return ` Your overlay has an entry for "${id}", so the next host start loads it; ${DEPLOY} with its command ` +
-        'or url loads it now.';
+      return ` Your overlay has an entry for "${id}", so the next host start loads it; ${DEPLOY} with each of its ` +
+        'fields loads it now, since a deploy replaces the entry whole.';
     }
     if (this.operatorServers.has(id)) {
       return ` Your operator defines "${id}", so the next host start loads it again; ${DEPLOY} would load your own ` +
@@ -1016,17 +1027,20 @@ export class McplAdminModule implements Module {
   }
 
   /** An overlay file readAgentOverlay can't read, in one wording for every
-   *  tool: the reason, naming the file, then `so`, what the call can't do
-   *  without it; that the next host start will stop on it, since the boot
-   *  reads the file with no catch and readAgentOverlay throws only where the
-   *  boot does too; and the repair, then, after a call `again` it stopped,
-   *  to call it again. A file that isn't JSON or holds null is the agent's
-   *  to fix if it can edit it, and one that can't be opened or read is the
-   *  operator's. Starts in lower case. */
+   *  tool and every read: the reason, naming the file, then `so`, what the
+   *  call can't do without it; that the next host start will stop on it,
+   *  since the boot reads the file with no catch and readAgentOverlay throws
+   *  only where the boot does too; and the repair, then, after a call
+   *  `again` it stopped, to call it again. A file that isn't JSON or holds
+   *  null stops each start until it's fixed, and is the agent's to fix if it
+   *  can edit it. One that can't be opened or read is the operator's, and
+   *  stops a start only while it can't be read, since the failure can be
+   *  this process's alone (EMFILE, say). Starts in lower case. */
   private unusableOverlay(error: unknown, so?: string, again?: string): string {
     const unreadable = error instanceof OverlayUnreadableError;
     return `${unreadable ? reasonText(error) : `your overlay file, ${this.overlayPath}, couldn't be read (${reasonText(error)})`}` +
-      `${so ? `, so ${so}` : ''}. The next host start will stop on the file until it's fixed. ` +
+      `${so ? `, so ${so}` : ''}. The next host start will stop on the file ` +
+      `${unreadable ? 'until it\'s fixed' : 'while it can\'t be read'}. ` +
       (unreadable ? overlayRepair(again) : `Ask your operator to make the file readable${again ? `, then call ${again} again` : ''}.`);
   }
 
@@ -1129,12 +1143,21 @@ export class McplAdminModule implements Module {
     // so a write for another id that landed meanwhile (its deploy, say) is
     // kept. No call for this id can land meanwhile (forServer). The server
     // is already gone if this fails, so the receipt says so, and what the
-    // next start loads; an unload of it again records it.
+    // next start loads; an unload of it again records it. This is the one
+    // read of the overlay that follows an await in its call, so it's the one
+    // whose file can have become unreadable since the call began; a failure
+    // here is said as the first read's would be.
     progress.changed = true;
+    let held: Record<string, AgentOverlayEntry>;
     try {
-      // A copy when it isn't read again, so a save that fails leaves
-      // `overlay` as the file still holds it, for the receipt.
-      const current = known ? readAgentOverlay(this.overlayPath) : { ...overlay };
+      held = known ? readAgentOverlay(this.overlayPath) : overlay;
+    } catch (error) {
+      return fail(`${head} But ${this.unusableOverlay(error, 'the unload isn\'t recorded', UNLOAD)}`);
+    }
+    // The change goes into a copy, so `held` stays what the file holds, for
+    // the receipt of a save that fails.
+    const current = { ...held };
+    try {
       const entry = entryOf(current, id);
       // An agent-deployed entry is removed, and so is a malformed one for an
       // id the operator doesn't define, which loads nothing. Otherwise a
@@ -1153,20 +1176,18 @@ export class McplAdminModule implements Module {
       saveAgentOverlay(this.overlayPath, current);
       return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
     } catch (error) {
-      // A file that can't be read as an overlay, as read again after the
-      // disconnect, stops the next start, whatever it held before. A save
-      // that may have stopped partway leaves the file's content, and so what
-      // the next start loads, unknown; if it wrote the change whole, there's
-      // nothing left for a retry to record.
-      if (error instanceof OverlayUnreadableError) {
-        return fail(`${head} But ${this.unusableOverlay(error, 'the unload isn\'t recorded', UNLOAD)}`);
-      }
+      // A save that may have stopped partway leaves the file's content, and
+      // so what the next start loads, unknown; if it wrote the change whole,
+      // there's nothing left for a retry to record. One that wrote nothing
+      // leaves the file as it was read. Bun's errors from the write itself
+      // (ENOSPC, say) name no file, so the text names it.
       return fail(
         `${head} ${partway(error)
-          ? `But saving your overlay failed (${reasonText(error)}).${PARTWAY_TEXT} If the file doesn't hold the ` +
-            `unload, ${UNLOAD} "${id}" again records it once the file can be read and written.`
-          : `But your overlay couldn't be updated (${reasonText(error)}), so the unload isn't recorded: ` +
-            `${this.nextStart(id, overlay)} ${UNLOAD} "${id}" again records it once the file can be read and written.`}`,
+          ? `But saving your overlay file, ${this.overlayPath}, failed (${reasonText(error)}).${PARTWAY_TEXT} If the ` +
+            `file doesn't hold the unload, ${UNLOAD} "${id}" again records it once the file can be read and written.`
+          : `But your overlay file, ${this.overlayPath}, couldn't be updated (${reasonText(error)}), so the unload isn't ` +
+            `recorded: ${this.nextStart(id, held)} ${UNLOAD} "${id}" again records it once the file can be read and ` +
+            'written.'}`,
       );
     }
   }
