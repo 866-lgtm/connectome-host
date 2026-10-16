@@ -43,6 +43,7 @@ import type {
   ToolResult,
 } from '@animalabs/agent-framework';
 import type { ContextInjection } from '@animalabs/context-manager';
+import { unknownToolResult } from './unknown-tool.js';
 
 /**
  * The slice of WorkspaceModule this module reads through: its disk read,
@@ -129,11 +130,20 @@ export class InstructionsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return {
-      success: false,
-      error: `InstructionsModule has no tool "${call.name}"`,
-      isError: true,
-    };
+    // True whether or not the last read worked: the module fails open, so the
+    // agent is told how to tell, not that the text is there.
+    const heading = this.header.trim();
+    return unknownToolResult(
+      this,
+      call.name,
+      `Your instructions are read from the workspace file ${this.path} each turn and put in your context` +
+      (heading ? ` under the heading ${JSON.stringify(heading)}` : '') +
+      ', so the text there is the current one. If ' +
+      (heading ? 'that heading is' : 'they are') +
+      " missing from your context, the file couldn't be read, and whoever runs this host can see why in " +
+      "its log. workspace--read shows the workspace's stored copy, which on a read-only mount can be older " +
+      'than the file. workspace--edit changes the file where its mount allows writing.',
+    );
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {

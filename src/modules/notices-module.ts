@@ -53,6 +53,7 @@ import type {
   ToolResult,
   TraceEvent,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 
 export type NoticeTier = 'silent' | 'status' | 'reply';
 
@@ -120,6 +121,9 @@ const CLOSES_ON_SUCCESS: ReadonlySet<string> = new Set([
  *  that component reconnects. */
 const COMPONENT_KINDS: ReadonlySet<string> = new Set(['mcpl-down']);
 
+/** The two markers an episode can write; see markerForm. */
+type MarkerForm = 'unanswered' | 'status';
+
 const DEFAULT_QUIET_MS = 60_000;
 /** Owed clear lines kept per channel whose server stays absent. */
 const OWED_LINES_CAP = 20;
@@ -167,7 +171,8 @@ interface Episode {
   /** Pending quiet-deadline timer handle and the time it is aimed at. */
   quietTimer?: unknown;
   quietDue?: number;
-  markerWritten: boolean;
+  /** The markers this episode has written: one of each form. */
+  markedForms: Set<MarkerForm>;
 }
 
 /** A clear / "back" line owed to a channel whose server was absent. `key`
@@ -386,7 +391,7 @@ export class NoticesModule implements Module {
   getTools(): ToolDefinition[] { return []; }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -496,7 +501,7 @@ export class NoticesModule implements Module {
     }
     const ep: Episode = {
       key, kinds: new Map([[kind, { message, tier, until, at: this.now(), seq: 0 }]]), since: this.now(),
-      notified: new Map(), replyPosting: new Set(), pending: new Set(), statusHeard: new Map(), statusPosting: new Map(), statusOwedClear: new Map(), nextSeq: 1, markerWritten: false,
+      notified: new Map(), replyPosting: new Set(), pending: new Set(), statusHeard: new Map(), statusPosting: new Map(), statusOwedClear: new Map(), nextSeq: 1, markedForms: new Set(),
     };
     this.episodes.set(key, ep);
     this.scheduleStatus(ep);
@@ -796,9 +801,12 @@ export class NoticesModule implements Module {
     }
     if (result.success) {
       ep?.pending.delete(channelId);
-      if (ep && opts.track && opts.kind !== undefined && !ep.markerWritten) {
-        ep.markerWritten = true;
-        this.writeMarker(ep, channelId, text, opts.kind);
+      if (ep && opts.track && opts.kind !== undefined && !COMPONENT_KINDS.has(opts.kind)) {
+        const form = this.markerForm(opts.kind);
+        if (!ep.markedForms.has(form)) {
+          ep.markedForms.add(form);
+          this.writeMarker(ep, channelId, text, opts.kind, form);
+        }
       }
       return { ok: true, reflush: false };
     }
@@ -819,18 +827,33 @@ export class NoticesModule implements Module {
     return { ok: false, reflush: false };
   }
 
-  /** One chronicle marker per episode so the agent learns, on recovery,
-   *  that the host spoke in its channel while it could not. System-flagged:
-   *  no inference is requested (same as the framework's own markers). */
-  private writeMarker(ep: Episode, channelId: string, text: string, kind: string): void {
-    if (!this.config.agentName || COMPONENT_KINDS.has(kind)) return;
+  /** Which marker a kind gets: "unanswered" when it means the agent couldn't
+   *  answer, as a reply-tier kind does and as a kind that closes on the
+   *  agent's own next inference does (its own turns were failing);
+   *  otherwise "status", a notice for whoever runs the host (a credential
+   *  expiring, say) with nothing in it for the agent to do. */
+  private markerForm(kind: string): MarkerForm {
+    return this.tierFor(kind) === 'reply' || CLOSES_ON_SUCCESS.has(kind) ? 'unanswered' : 'status';
+  }
+
+  /** One chronicle marker per episode and form, so the agent learns, on
+   *  recovery, that the host spoke in its channel while it could not; an
+   *  episode with a kind of each form gets both. Component kinds get none.
+   *  System-flagged: no inference is requested (same as the framework's own
+   *  markers). */
+  private writeMarker(ep: Episode, channelId: string, text: string, kind: string, form: MarkerForm): void {
+    if (!this.config.agentName) return;
+    const marker = form === 'unanswered'
+      ? `[host-notice] While you could not respond (${kind}), the host posted this in ${channelId}: "${text}"`
+      : `[host-notice] The host posted this status notice in ${channelId} about ${kind}, for whoever runs ` +
+        `it; nothing in it needs you to act: "${text}"`;
     try {
       const agent = this.framework?.getAgent(this.config.agentName);
       agent?.getContextManager().addMessage(
         'user',
         [{
           type: 'text',
-          text: `[host-notice] While you could not respond (${kind}), the host posted this in ${channelId}: "${text}"`,
+          text: marker,
         }],
         { system: true, kind: 'host-notice', alertKind: kind, channelId } as unknown as Record<string, unknown>,
       );
