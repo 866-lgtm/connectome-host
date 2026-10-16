@@ -628,8 +628,9 @@ describe('mcpl_unload', () => {
   });
 
   // The unload used to disconnect first and read the overlay after, so a
-  // file the boot stops on left the server down with nothing recorded.
-  test('an overlay the boot would stop on refuses the unload, with the server still loaded', async () => {
+  // file the boot stops on left the server down with nothing recorded. Only
+  // the record needs the file, so an unload for this session goes on.
+  test('an overlay the boot would stop on refuses a persisting unload, with the server still loaded, and a session-only one goes on', async () => {
     const { stub, servers, calls } = makeStubFramework();
     await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
       .connectMcplServer({ id: 'discord', command: 'node' });
@@ -640,13 +641,59 @@ describe('mcpl_unload', () => {
     // Said to the agent, not in the boot's words for the operator.
     expectSays(
       result.error,
-      'mcpl-admin--mcpl_unload failed, and nothing was changed', `your overlay file, ${overlayPath}, isn't valid JSON`,
-      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again',
+      `Nothing was unloaded: your overlay file, ${overlayPath}, isn't valid JSON, so the unload can't be recorded in it.`,
+      'The next host start will stop on the file until it\'s fixed.',
+      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
       'Don\'t move it aside',
+      'To stop "discord" for this session in the meantime, call mcpl-admin--mcpl_unload with `persist: false`.',
     );
     expect(result.error).not.toContain('the agent overlay');
     expect(calls).toEqual(['connect:discord']);
     expect(servers.has('discord')).toBe(true);
+
+    const session = await call(mod, 'mcpl_unload', { id: 'discord', persist: false });
+    expect(session.data).toBe(
+      `Unloaded server "discord" — its tools are gone from your toolset. Session-only. Your overlay file, ${overlayPath}, ` +
+      'isn\'t valid JSON. The next host start will stop on the file until it\'s fixed. Fix the file (or, if you can\'t ' +
+      'edit it, ask your operator to). Don\'t move it aside: the operator\'s servers you unloaded would load again, and ' +
+      'your deployments would be dropped.',
+    );
+    expect(servers.has('discord')).toBe(false);
+    expect(readFileSync(overlayPath, 'utf-8')).toBe('{ not json');
+  });
+
+  // Only the overlay could name an id that's neither loaded nor the
+  // operator's, and an operator's server that isn't loaded has nothing to
+  // stop this session, so only its session-only unload goes on.
+  test('with an overlay the boot would stop on, an unload of a server that isn\'t loaded goes on only for an operator\'s server, for this session', async () => {
+    const { stub, calls } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'discord', command: 'node' });
+    const mod = makeModule(stub);
+    mod.setOperatorServers([{ id: 'op', command: 'operator-server' }]);
+    writeFileSync(overlayPath, 'null');
+    const unknownId = (persist: boolean) => call(mod, 'mcpl_unload', { id: 'mine', persist });
+    for (const persist of [true, false]) {
+      expectSays(
+        (await unknownId(persist)).error,
+        'Nothing was unloaded: no server "mine" is loaded or defined by your operator. Loaded: "discord".',
+        `Your overlay file, ${overlayPath}, holds null, not an object with mcplServers, so whether it names "mine" isn't known.`,
+        'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
+      );
+    }
+    const persisting = String((await call(mod, 'mcpl_unload', { id: 'op' })).error);
+    expectSays(
+      persisting, `Nothing was unloaded: your overlay file, ${overlayPath}, holds null, not an object with mcplServers, so the ` +
+      'unload can\'t be recorded in it.',
+    );
+    // Nothing of it runs this session, so a session-only unload isn't offered.
+    expect(persisting).not.toContain('persist: false');
+    expect((await call(mod, 'mcpl_unload', { id: 'op', persist: false })).data).toStartWith(
+      `Server "op" wasn't loaded in this session. Session-only. Your overlay file, ${overlayPath}, holds null, not an ` +
+      'object with mcplServers. The next host start will stop on the file until it\'s fixed.',
+    );
+    expect(calls).toEqual(['connect:discord']);
+    expect(readFileSync(overlayPath, 'utf-8')).toBe('null');
   });
 
   test('a disconnect that fails changes nothing in the overlay, and says so', async () => {
@@ -689,10 +736,10 @@ describe('mcpl_unload', () => {
     expectSays(
       failed.error,
       'Unloaded server "discord" — its tools are gone from your toolset.',
-      `But your overlay couldn't be updated (your overlay file, ${overlayPath}, isn't valid JSON), so the unload isn't recorded`,
-      'the next host start will stop on the file until it\'s fixed.',
-      'mcpl-admin--mcpl_unload "discord" again records it once the file can be read and written',
-      'Fix the file (or, if you can\'t edit it, ask your operator to).', 'Don\'t move it aside',
+      `But your overlay file, ${overlayPath}, isn't valid JSON, so the unload isn't recorded.`,
+      'The next host start will stop on the file until it\'s fixed.',
+      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
+      'Don\'t move it aside',
     );
     expect(servers.has('discord')).toBe(false);
     writeFileSync(overlayPath, JSON.stringify({ mcplServers: {} }));
@@ -1198,8 +1245,9 @@ describe('an overlay entry that replaces the operator definition', () => {
     expect(result.success).toBe(true);
     expectSays(
       result.data,
-      'Restarted server "shell" — connected, 1 tools.', `Your overlay file, ${overlayPath}, isn't valid JSON.`,
-      'Nothing is said here about your entry', 'the next host start will stop on the file until it\'s fixed',
+      'Restarted server "shell" — connected, 1 tools.',
+      `Your overlay file, ${overlayPath}, isn't valid JSON, so nothing is said here about your entry.`,
+      'The next host start will stop on the file until it\'s fixed.',
       'Fix the file (or, if you can\'t edit it, ask your operator to).', 'Don\'t move it aside',
     );
     expect(String(result.data)).not.toContain('s3cret');
@@ -1444,7 +1492,8 @@ describe('a failed connect or restart says the state it left', () => {
     expectSays(
       result, 'It isn\'t loaded in this session any more, so mcpl-admin--mcpl_restart can\'t reach it.',
       'mcpl-admin--mcpl_deploy with its command or url can load it again once your overlay file is fixed.',
-      `Your overlay file, ${overlayPath}, isn't valid JSON.`, 'Fix the file (or, if you can\'t edit it, ask your operator to).',
+      `Your overlay file, ${overlayPath}, isn't valid JSON, so nothing is said here about your entry.`,
+      'Fix the file (or, if you can\'t edit it, ask your operator to).',
     );
     expect(result).not.toContain('loads it now');
   });
@@ -1460,8 +1509,9 @@ describe('a failed connect or restart says the state it left', () => {
     const restarted = await call(mod, 'mcpl_restart', { id: 'tool' });
     expect(restarted.success).toBe(true);
     expectSays(
-      restarted.data, 'Restarted server "tool"', 'Nothing is said here about your entry, and the next host start will stop on ' +
-      'the file until it\'s fixed. Ask your operator to make the file readable.',
+      restarted.data, 'Restarted server "tool"', `Your overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR',
+      '), so nothing is said here about your entry. The next host start will stop on the file until it\'s fixed. Ask your ' +
+      'operator to make the file readable.',
     );
   });
 
@@ -1601,24 +1651,27 @@ describe('a failed call says what changed and what to do', () => {
     expect(existsSync(overlayPath)).toBe(false);
   });
 
-  test("an overlay that isn't JSON, or holds null, is said to the agent, with nothing saved or connected", async () => {
+  test("an overlay that isn't JSON, or holds null, refuses a deploy and leaves the listing, said to the agent, with nothing saved or connected", async () => {
     const { stub, calls } = makeStubFramework();
     const mod = makeModule(stub);
-    const repair = (name: string) => [
-      `Fix the file (or, if you can't edit it, ask your operator to), then call mcpl-admin--${name} again.`,
-      'Don\'t move it aside: the operator\'s servers you unloaded would load again, and your deployments would be dropped.',
-    ];
+    const notAside = 'Don\'t move it aside: the operator\'s servers you unloaded would load again, and your deployments would be dropped.';
     for (const [text, problem] of [['{ not json', "isn't valid JSON"], ['null', 'holds null, not an object with mcplServers']] as const) {
       writeFileSync(overlayPath, text);
       const deployed = (await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).error;
       expectSays(
-        deployed, 'mcpl-admin--mcpl_deploy failed, and nothing was changed', `your overlay file, ${overlayPath}, ${problem}`,
-        ...repair('mcpl_deploy'),
+        deployed,
+        `Nothing was deployed or saved: your overlay file, ${overlayPath}, ${problem}, so your entry can't be saved in it.`,
+        'The next host start will stop on the file until it\'s fixed.',
+        'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_deploy again.', notAside,
       );
       expect(deployed).not.toContain('the agent overlay');
-      const listed = (await call(mod, 'mcpl_list')).error;
-      expectSays(listed, 'mcpl-admin--mcpl_list failed: ', `your overlay file, ${overlayPath}, ${problem}`, ...repair('mcpl_list'));
-      expect(listed).not.toContain('nothing was changed');
+      // A deploy can't add a server until the file is fixed, so the empty
+      // listing doesn't offer one.
+      expect((await call(mod, 'mcpl_list')).data).toBe(
+        `No MCPL servers are loaded.\nYour overlay file, ${overlayPath}, ${problem}, so this list can't show your ` +
+        'overlay\'s own entries, or which servers they define. The next host start will stop on the file until it\'s ' +
+        `fixed. Fix the file (or, if you can't edit it, ask your operator to). ${notAside}`,
+      );
       expect(readFileSync(overlayPath, 'utf-8')).toBe(text);
     }
     expect(calls).toEqual([]);
@@ -1684,24 +1737,76 @@ describe('a failed call says what changed and what to do', () => {
     }
   });
 
-  test("an operator's server file that isn't JSON fails only the listing, naming the file and never quoting it", async () => {
+  // The operator's file decides only the label of a server the overlay
+  // doesn't define, so the listing goes on without it.
+  test("an operator's server file that isn't JSON leaves the listing with what it decides unknown, naming the file and never quoting it", async () => {
     const { stub } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'chat', command: 'node' });
     const mod = makeModule(stub);
     const configPath = join(dir, 'mcpl-servers.json');
     writeFileSync(configPath, '{ "mcplServers": { "chat": { "env": { "TOKEN": s3cret } } } }');
-    const listed = (await call(mod, 'mcpl_list')).error;
+    expect((await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).success).toBe(true);
+    const fileLine = (problem: string) =>
+      `The operator's server file couldn't be read (${configPath} ${problem}), so this list can't show which servers it ` +
+      'defines. The next host start will stop on the file until it\'s fixed. It\'s theirs to fix, so ask your operator. ' +
+      'Of these tools, only this listing reads it.';
+    const listed = String((await call(mod, 'mcpl_list')).data);
     expectSays(
-      listed, 'mcpl-admin--mcpl_list failed', `the operator's server file couldn't be read (${configPath} isn't valid JSON)`,
-      'ask your operator', 'mcpl-admin--mcpl_deploy, mcpl-admin--mcpl_restart and mcpl-admin--mcpl_unload don\'t read it',
+      listed, 'MCPL servers (2):\n', 'source=unknown, node', 'prefix=mcpl--mytool, source=agent-overlay, node',
+      `\n${fileLine('isn\'t valid JSON')}`,
     );
     expect(listed).not.toContain('s3cret');
-    expect((await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).success).toBe(true);
     // A root of null is named too.
     writeFileSync(configPath, 'null');
+    expect(String((await call(mod, 'mcpl_list')).data)).toEndWith(`\n${fileLine('holds null, not an object with mcplServers')}`);
+    // With the overlay unreadable too, each file's line says what it can't show.
+    writeFileSync(overlayPath, '{ not json');
+    const both = String((await call(mod, 'mcpl_list')).data);
+    expect(both.split('source=unknown').length - 1).toBe(2);
     expectSays(
-      (await call(mod, 'mcpl_list')).error,
-      `the operator's server file couldn't be read (${configPath} holds null, not an object with mcplServers)`,
+      both,
+      `\nYour overlay file, ${overlayPath}, isn't valid JSON, so this list can't show your overlay's own entries, or which ` +
+      'servers they define.',
+      `\n${fileLine('holds null, not an object with mcplServers')}`,
     );
+    // A file-system error needn't name the file, so the line does.
+    rmSync(configPath);
+    mkdirSync(configPath);
+    expectSays(
+      String((await call(mod, 'mcpl_list')).data),
+      `\nThe operator's server file, ${configPath}, couldn't be read (EISDIR`,
+      '), so this list can\'t show which servers it defines. The next host start will stop on the file until it\'s fixed.',
+    );
+  });
+
+  // A file the module can't open or read stops the next start like one that
+  // isn't JSON, and making it readable is the operator's.
+  test('an overlay that can\'t be read at all is the operator\'s to make readable, for each tool', async () => {
+    const { stub, calls } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'shell', command: 'node' });
+    const mod = makeModule(stub);
+    mkdirSync(overlayPath);
+    // The file is named, since a file-system error need not name it.
+    const unreadable = (so: string) => [`our overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR', `), so ${so}. The next host start will ` +
+      'stop on the file until it\'s fixed. Ask your operator to make the file readable'];
+    expectSays(
+      (await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).error, 'Nothing was deployed or saved: your overlay',
+      ...unreadable('your entry can\'t be saved in it'), ', then call mcpl-admin--mcpl_deploy again.',
+    );
+    const listed = String((await call(mod, 'mcpl_list')).data);
+    expectSays(
+      listed, 'shell: CONNECTED', 'source=unknown', '\nYour overlay file',
+      ...unreadable('this list can\'t show your overlay\'s own entries, or which servers they define'),
+    );
+    expect(listed).toEndWith('Ask your operator to make the file readable.');
+    expectSays(
+      (await call(mod, 'mcpl_unload', { id: 'shell' })).error, 'Nothing was unloaded: your overlay',
+      ...unreadable('the unload can\'t be recorded in it'), ', then call mcpl-admin--mcpl_unload again.',
+      'To stop "shell" for this session in the meantime, call mcpl-admin--mcpl_unload with `persist: false`.',
+    );
+    expect(calls).toEqual(['connect:shell']);
   });
 
   test('a restart or an unload with no id says so, and an unload refuses a key it doesn\'t take', async () => {

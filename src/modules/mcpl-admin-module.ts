@@ -418,15 +418,15 @@ export class McplAdminModule implements Module {
       // restart, a disconnect, the unload's record) catches its own failure
       // and says what it changed. Whether one had run when this throw came is
       // the call's own record, not an assumption about which reads can throw.
-      const repair = error instanceof OverlayUnreadableError ? ` ${overlayRepair(tool(call.name))}` : '';
+      // Each tool answers an overlay it can't read itself (unusableOverlay).
       if (progress.changed) {
         return fail(
           `${tool(call.name)} failed partway: ${sentence(reasonText(error))} What it changed before then stays ` +
-          `changed; ${LIST} shows each server's state.${repair}`,
+          `changed; ${LIST} shows each server's state.`,
         );
       }
       const failed = call.name === 'mcpl_list' ? 'failed' : 'failed, and nothing was changed';
-      return fail(`${tool(call.name)} ${failed}: ${sentence(reasonText(error))}${repair}`);
+      return fail(`${tool(call.name)} ${failed}: ${sentence(reasonText(error))}`);
     }
   }
 
@@ -488,16 +488,31 @@ export class McplAdminModule implements Module {
         toolClasses?: ServerToolClass[];
       }
     >;
-    const overlay = readAgentOverlay(this.overlayPath);
-    let fileServers: ReturnType<typeof readMcplServersFile>;
+    // The two files decide only each server's source and the overlay's own
+    // lines; the live states come from the framework. So a file that can't
+    // be read leaves what it decides unknown, and a closing line says why,
+    // rather than the listing failing when a broken file may be why it's
+    // wanted.
+    const notes: string[] = [];
+    let overlay: Record<string, AgentOverlayEntry> | null = null;
+    try {
+      overlay = readAgentOverlay(this.overlayPath);
+    } catch (error) {
+      notes.push(capital(this.unusableOverlay(error, 'this list can\'t show your overlay\'s own entries, or which servers they define')));
+    }
+    let fileServers: ReturnType<typeof readMcplServersFile> | null = null;
     try {
       fileServers = readMcplServersFile(this.configPath);
     } catch (error) {
-      // The operator's file, which the boot read at its start. Of these
-      // tools, only this listing reads it again, for each server's source.
-      return fail(
-        `${LIST} failed: the operator's server file couldn't be read (${reasonText(error)}). ` +
-        `It's theirs to fix, so ask your operator. ${DEPLOY}, ${RESTART} and ${UNLOAD} don't read it, and still work.`,
+      // The operator's file, which the boot read at its start, and stops on
+      // as it does on the overlay. Of these tools, only this listing reads
+      // it again, for each server's source. Its parse errors name it; a
+      // file-system error, such as a directory in its place, needn't.
+      const system = typeof (error as { code?: unknown } | null)?.code === 'string';
+      notes.push(
+        `The operator's server file${system ? `, ${this.configPath},` : ''} couldn't be read (${reasonText(error)}), so ` +
+        'this list can\'t show which servers it defines. The next host start will stop on the file until it\'s fixed. ' +
+        'It\'s theirs to fix, so ask your operator. Of these tools, only this listing reads it.',
       );
     }
 
@@ -505,13 +520,17 @@ export class McplAdminModule implements Module {
     for (const s of live) {
       // The overlay is the source only for an entry that put a server in
       // place, the same test the boot's applyAgentOverlay makes.
-      const replacement = this.replacement(s.id, overlay);
-      const overlaySource = replacement
-        ? `agent-overlay (replaces the operator's definition${replacement.lost ? `; lacks its ${replacement.lost}` : ''})`
-        : 'agent-overlay';
-      const source = overlayEntryReplaces(entryOf(overlay, s.id))
-        ? overlaySource
-        : Object.hasOwn(fileServers, s.id) ? 'file/recipe' : 'recipe';
+      let source: string;
+      if (overlay === null) {
+        source = 'unknown';
+      } else if (overlayEntryReplaces(entryOf(overlay, s.id))) {
+        const replacement = this.replacement(s.id, overlay);
+        source = replacement
+          ? `agent-overlay (replaces the operator's definition${replacement.lost ? `; lacks its ${replacement.lost}` : ''})`
+          : 'agent-overlay';
+      } else {
+        source = fileServers === null ? 'unknown' : Object.hasOwn(fileServers, s.id) ? 'file/recipe' : 'recipe';
+      }
       // The command, else the url, as main labelled it. The framework's status
       // carries no transport, so for a definition that names both, this can't
       // tell which one the framework opened.
@@ -538,7 +557,7 @@ export class McplAdminModule implements Module {
     // The overlay's entries the live list doesn't explain: malformed ones,
     // tombstones, and entries that aren't currently loaded
     const liveIds = new Set(live.map(s => s.id));
-    for (const [id, entry] of Object.entries(overlay)) {
+    for (const [id, entry] of Object.entries(overlay ?? {})) {
       const problem = overlayEntryProblem(entry);
       if (problem !== null) {
         lines.push(
@@ -559,10 +578,12 @@ export class McplAdminModule implements Module {
       }
     }
 
+    const closing = notes.map((n) => `\n${n}`).join('');
     if (lines.length === 0) {
-      return ok(`No MCPL servers are loaded. Use ${DEPLOY} to add one.`);
+      // A deploy needs the overlay, so it's offered only when that can be read.
+      return ok(`No MCPL servers are loaded.${overlay ? ` Use ${DEPLOY} to add one.` : ''}${closing}`);
     }
-    return ok(`MCPL servers (${lines.length}):\n` + lines.map(l => `  ${l}`).join('\n'));
+    return ok(`MCPL servers (${lines.length}):\n` + lines.map(l => `  ${l}`).join('\n') + closing);
   }
 
   /** The fields the tool `name` declares, read from its own definition, so
@@ -594,8 +615,8 @@ export class McplAdminModule implements Module {
     // id, the command or url, an access grant this host can't serve, each
     // malformed field, and a tool prefix another holds. Only the cleartext
     // check comes after, since it reads a url the refusal has found valid.
-    // An overlay file that can't be read is answered first and alone, through
-    // the catch-all, since no deploy can succeed until it's fixed.
+    // An overlay file that can't be read is answered first and alone, since
+    // no deploy can be saved until it's fixed.
     const problems: string[] = [];
     const undeclared = this.undeclared('mcpl_deploy', input);
     if (undeclared) problems.push(undeclared.text);
@@ -713,8 +734,13 @@ export class McplAdminModule implements Module {
     if (malformed) problems.push(`The entry would be malformed: ${problem}.`);
 
     // The overlay, for the prefix check and the save. One that can't be read
-    // stops the call here, through the catch-all, before anything changes.
-    const overlay = readAgentOverlay(this.overlayPath);
+    // stops the call here, before anything changes.
+    let overlay: Record<string, AgentOverlayEntry>;
+    try {
+      overlay = readAgentOverlay(this.overlayPath);
+    } catch (error) {
+      return fail(`Nothing was deployed or saved: ${this.unusableOverlay(error, 'your entry can\'t be saved in it', DEPLOY)}`);
+    }
     // A prefix given is checked whatever the id, so the refusal names it
     // beside an id problem; the default needs a valid id to be known.
     if (typeof fields.toolPrefix === 'string' || (idOk && fields.toolPrefix === undefined)) {
@@ -842,13 +868,7 @@ export class McplAdminModule implements Module {
     try {
       overlay = readAgentOverlay(this.overlayPath);
     } catch (error) {
-      // readAgentOverlay throws only where the boot does too: a file it
-      // can't read, that isn't JSON, or whose root is null. So the next
-      // start stops on it.
-      unreadable = ` ${capital(sentence(reasonText(error)))} Nothing is said here about your entry, and the next host ` +
-        `start will stop on the file until it's fixed. ${error instanceof OverlayUnreadableError
-          ? overlayRepair()
-          : 'Ask your operator to make the file readable.'}`;
+      unreadable = ` ${capital(this.unusableOverlay(error, 'nothing is said here about your entry'))}`;
     }
     // agent-framework restarts only a server it holds a configuration for,
     // and listMcplServers lists exactly those, so this is its own test, made
@@ -995,6 +1015,21 @@ export class McplAdminModule implements Module {
     return ` Neither your overlay nor your operator defines "${id}".`;
   }
 
+  /** An overlay file readAgentOverlay can't read, in one wording for every
+   *  tool: the reason, naming the file, then `so`, what the call can't do
+   *  without it; that the next host start will stop on it, since the boot
+   *  reads the file with no catch and readAgentOverlay throws only where the
+   *  boot does too; and the repair, then, after a call `again` it stopped,
+   *  to call it again. A file that isn't JSON or holds null is the agent's
+   *  to fix if it can edit it, and one that can't be opened or read is the
+   *  operator's. Starts in lower case. */
+  private unusableOverlay(error: unknown, so?: string, again?: string): string {
+    const unreadable = error instanceof OverlayUnreadableError;
+    return `${unreadable ? reasonText(error) : `your overlay file, ${this.overlayPath}, couldn't be read (${reasonText(error)})`}` +
+      `${so ? `, so ${so}` : ''}. The next host start will stop on the file until it's fixed. ` +
+      (unreadable ? overlayRepair(again) : `Ask your operator to make the file readable${again ? `, then call ${again} again` : ''}.`);
+  }
+
   /** What the next host start loads for `id`, read from `overlay` as this
    *  call leaves it, as a clause for a receipt. */
   private nextStart(id: string, overlay: Record<string, AgentOverlayEntry>): string {
@@ -1034,17 +1069,36 @@ export class McplAdminModule implements Module {
     const loaded = framework.listMcplServers().map((s) => s.id);
     const known = loaded.includes(id);
     const operator = this.operatorServers.has(id);
-    // Read before anything changes: a file the boot would stop on refuses
-    // the unload here, with the server still loaded. An operator's server
-    // that isn't loaded can still be unloaded, so that it stays unloaded at
-    // the next start: one that failed to start, or one whose earlier unload
-    // disconnected it but couldn't save.
-    const overlay = readAgentOverlay(this.overlayPath);
-    if (!known && !operator && entryOf(overlay, id) === undefined) {
-      return fail(
-        `Nothing was unloaded: no server "${id}" is loaded, defined by your operator, or in your overlay. ` +
-        `${loaded.length > 0 ? `Loaded: ${loaded.map((s) => `"${s}"`).join(', ')}.` : 'None is loaded.'}`,
-      );
+    const loadedText = loaded.length > 0 ? `Loaded: ${loaded.map((s) => `"${s}"`).join(', ')}.` : 'None is loaded.';
+    // Read before anything changes. A file that can't be read refuses what
+    // needs it, with the server still loaded: a persisting unload, which
+    // records itself there, and an id only the file could name. A
+    // session-only unload of a server that's loaded or the operator's goes
+    // on, since the file decides only its receipt's next-start clause. An
+    // operator's server that isn't loaded can still be unloaded, so that it
+    // stays unloaded at the next start: one that failed to start, or one
+    // whose earlier unload disconnected it but couldn't save.
+    let read: { overlay: Record<string, AgentOverlayEntry> } | { error: unknown };
+    try {
+      read = { overlay: readAgentOverlay(this.overlayPath) };
+    } catch (error) {
+      read = { error };
+    }
+    if ('error' in read) {
+      if (!known && !operator) {
+        return fail(
+          `Nothing was unloaded: no server "${id}" is loaded or defined by your operator. ${loadedText} ` +
+          capital(this.unusableOverlay(read.error, `whether it names "${id}" isn't known`, UNLOAD)),
+        );
+      }
+      if (persist) {
+        return fail(
+          `Nothing was unloaded: ${this.unusableOverlay(read.error, 'the unload can\'t be recorded in it', UNLOAD)}` +
+          (known ? ` To stop "${id}" for this session in the meantime, call ${UNLOAD} with \`persist: false\`.` : ''),
+        );
+      }
+    } else if (!known && !operator && entryOf(read.overlay, id) === undefined) {
+      return fail(`Nothing was unloaded: no server "${id}" is loaded, defined by your operator, or in your overlay. ${loadedText}`);
     }
 
     // Only a listed server is disconnected: an id the overlay alone names
@@ -1065,6 +1119,10 @@ export class McplAdminModule implements Module {
     const head = known
       ? `Unloaded server "${id}" — its tools are gone from your toolset.`
       : `Server "${id}" wasn't loaded in this session.`;
+    // A file that can't be read comes this far only for a session-only
+    // unload: what needs the file was refused above.
+    if ('error' in read) return ok(`${head} Session-only. ${capital(this.unusableOverlay(read.error))}`);
+    const overlay = read.overlay;
     if (!persist) return ok(`${head} Session-only: ${this.nextStart(id, overlay)}`);
 
     // Read again after the disconnect and saved with nothing awaited between,
@@ -1095,19 +1153,20 @@ export class McplAdminModule implements Module {
       saveAgentOverlay(this.overlayPath, current);
       return ok(`${head} Tombstoned in your overlay — it stays unloaded across host restarts; ${this.tombstoneAdvice(id)}.`);
     } catch (error) {
-      // A save that may have stopped partway leaves the file's content, and
-      // so what the next start loads, unknown; if it wrote the change whole,
-      // there's nothing left for a retry to record. A file that can't be read
-      // as an overlay stops the next start, whatever it held before.
-      const unreadable = error instanceof OverlayUnreadableError;
+      // A file that can't be read as an overlay, as read again after the
+      // disconnect, stops the next start, whatever it held before. A save
+      // that may have stopped partway leaves the file's content, and so what
+      // the next start loads, unknown; if it wrote the change whole, there's
+      // nothing left for a retry to record.
+      if (error instanceof OverlayUnreadableError) {
+        return fail(`${head} But ${this.unusableOverlay(error, 'the unload isn\'t recorded', UNLOAD)}`);
+      }
       return fail(
         `${head} ${partway(error)
           ? `But saving your overlay failed (${reasonText(error)}).${PARTWAY_TEXT} If the file doesn't hold the ` +
             `unload, ${UNLOAD} "${id}" again records it once the file can be read and written.`
           : `But your overlay couldn't be updated (${reasonText(error)}), so the unload isn't recorded: ` +
-            `${unreadable ? 'the next host start will stop on the file until it\'s fixed.' : this.nextStart(id, overlay)} ` +
-            `${UNLOAD} "${id}" again records it once the file can be read and written.`}` +
-        `${unreadable ? ` ${overlayRepair()}` : ''}`,
+            `${this.nextStart(id, overlay)} ${UNLOAD} "${id}" again records it once the file can be read and written.`}`,
       );
     }
   }

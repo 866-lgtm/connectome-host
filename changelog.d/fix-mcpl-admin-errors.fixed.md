@@ -3,11 +3,21 @@
   the tools the way the agent calls them (`mcpl-admin--mcpl_deploy`), so a
   remedy can be followed as written. The tool descriptions are unchanged.
   - A call that fails says whether it changed anything: nothing, or that it
-    stopped partway, from the call's own record of its changes. When the
-    agent overlay isn't valid JSON, or holds `null`, the agent is told in
-    its own terms, with how to repair the file (or have the operator repair
-    it) and why not to move it aside, on every tool's path. The boot, which
-    stops on such a file, keeps its operator message.
+    stopped partway, from the call's own record of its changes.
+  - An agent overlay that can't be read stops only the calls that need it.
+    Before, it stopped every call but a restart, `mcpl_list` and a
+    session-only `mcpl_unload` included. A deploy and an unload that would
+    record itself are refused, and the unload's refusal points a loaded
+    server to `persist: false`. `mcpl_list` lists the servers, with the
+    sources the overlay decides as unknown, and an unload for this session
+    goes on. Each tool says it in one wording: why the file can't be read,
+    that the next host start will stop on it until it's fixed, and the
+    repair. For a file that isn't valid JSON or holds `null`, that is to
+    fix it (or have the operator fix it), and why not to move it aside. For
+    one that can't be opened or read, such as a directory in its place, it
+    is to ask the operator to make it readable. Before, a deploy passed the
+    file-system error on with no step. The boot, which stops on such a
+    file, keeps its operator message.
   - `mcpl_deploy` names every problem with its arguments in one refusal,
     where it named only the first, so an agent fixes them in one call: an
     argument the tool doesn't take, the id, the command or url, an `access`
@@ -16,16 +26,19 @@
     A credential it would send over `ws://` to another machine is refused
     after that, once the url is known to be valid.
   - `mcpl_deploy`, `mcpl_restart` and `mcpl_unload` now refuse an argument
-    they don't take, naming it beside the arguments they take, and
-    `mcpl_unload` refuses a `persist` given as anything but true or false
-    (`null` leaves the default, as an unspecified field does in a deploy).
-    Before, such an argument was dropped and the call went on without it,
-    and any `persist` but `false` counted as true. So a misspelled `disabledTools`
-    left the server with no deny-list, a `command` given to a restart left
-    the server running its old one while the reply said it had restarted,
-    and a misspelled `persist: false`, or `persist: "false"`, made an unload
-    meant for this session persist, with nothing said. A restart given one
-    of `mcpl_deploy`'s arguments is pointed to a deploy.
+    they don't take, naming it beside the arguments they take. An agent
+    that copies a url entry from its overlay sends `transport`, which
+    `mcpl_deploy` writes into each url entry it saves but sets itself.
+    `mcpl_unload` also refuses a `persist` given as anything but true or
+    false (`null` leaves the default, as an unspecified field does in a
+    deploy). Before, such an argument was dropped and the call went on
+    without it, and any `persist` but `false` counted as true. So a
+    misspelled `disabledTools` left the server with no deny-list, a
+    `command` given to a restart left the server running its old one while
+    the reply said it had restarted, and a misspelled `persist: false`, or
+    `persist: "false"`, made an unload meant for this session persist, with
+    nothing said. A restart given one of `mcpl_deploy`'s arguments is
+    pointed to a deploy.
   - A url that isn't `ws://` or `wss://`, and a tool prefix that a module,
     a server loaded now, or a server the next host start configures holds,
     are refused before anything is saved. Before, such a url was saved,
@@ -75,8 +88,10 @@
   a `TypeError`. Before, JSON.parse's own message came through, which names
   no file and can quote the file's text, a token in an env block included,
   and a `null` root threw a `TypeError` naming nothing. The boot's message
-  for such a file changes accordingly. `mcpl_list` also says the other
-  three tools don't read that file.
+  for such a file changes accordingly. `mcpl_list`, which failed on such a
+  file, now lists the servers, with the sources the file decides as
+  unknown, and says the file is the operator's to fix and that only the
+  listing reads it.
 - An overlay entry that names no command and no url is logged at the boot
   as "it names no command to run and no url to dial", in place of "it names
   nothing to run or dial".
