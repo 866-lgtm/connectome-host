@@ -164,8 +164,10 @@ export class RetrievalModule implements Module {
         return [];
       }
 
+      // A lesson with no content has nothing to inject, though its tags
+      // could still match: it would be injected as a blank entry.
       lessons = lessonsModule.getLessons().filter(
-        l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3)
+        l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3) && l.content.trim() !== ''
       );
       if (lessons.length === 0) {
         trace?.finish('no-eligible-lessons');
