@@ -734,6 +734,11 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   let toolRule: string;
   // The rules are the caller's own: the line says so itself.
   let inherited = false;
+  // prose_help isn't on the board: explicit prose routing shows it to a
+  // stream whose rules allow it (agentToolSurface checks canUseTool), so
+  // there it's neither dropped nor unoffered, though the process doesn't
+  // offer it at the call.
+  const shownHelp = launch.proseRouting === 'explicit' && allowed !== 'all' && allowed.includes('prose_help');
   if (allowed === 'all') {
     // Only an unrestricted caller's launch without a list, short of the
     // depth limit, is unrestricted.
@@ -741,10 +746,7 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   } else if (requested !== undefined) {
     // What the list grants, not the list: subagent--return named once, and
     // each listed name the stream doesn't get named with why.
-    // Explicit prose routing shows prose_help whatever the list says
-    // (agentToolSurface), so a listed one isn't dropped.
-    const explicitHelp = launch.proseRouting === 'explicit';
-    const dropped = [...new Set(requested)].filter((name) => !granted.includes(name) && !(explicitHelp && name === 'prose_help'));
+    const dropped = [...new Set(requested)].filter((name) => !granted.includes(name) && !(shownHelp && name === 'prose_help'));
     // A restricted caller's list only narrows: a name it doesn't allow is
     // dropped by its rules, whatever else holds.
     const byCaller = callerRules === 'all' ? [] : dropped.filter((name) => !callerRules.includes(name));
@@ -763,12 +765,12 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     if (notOffered.length > 0) toolRule += `; the caller also listed ${joinAll(notOffered)}, which ${notOffered.length === 1 ? 'isn\'t' : 'aren\'t'} offered to it at the call`;
     if (byDepth.length > 0) toolRule += `; it also listed ${joinAll(byDepth)}, which this depth removes`;
     if (launch.tools.depthLimited) toolRule += ', and none of the other subagent tools at this depth';
-    if (explicitHelp && !granted.includes('prose_help')) toolRule += '; explicit prose routing shows it prose_help too, whatever the list says';
+    if (shownHelp) toolRule += '; explicit prose routing shows it prose_help too, which the list allows';
   } else if (callerRules !== 'all') {
     // A fork, or a spawn without a list, keeps a restricted caller's rules,
     // with subagent--return.
     inherited = true;
-    const unoffered = allowed.filter((name) => !granted.includes(name));
+    const unoffered = allowed.filter((name) => !granted.includes(name) && !(shownHelp && name === 'prose_help'));
     const n = callerRules.length;
     toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and it keeps that${launch.tools.depthLimited ? ', less the subagent tools at this depth' : ''}: ` +
       (granted.length === 1
@@ -777,6 +779,7 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     if (unoffered.length > 0) {
       toolRule += `; ${them}'s rules also allow ${joinSome(unoffered)}, which ${unoffered.length === 1 ? 'isn\'t' : 'aren\'t'} offered at the call`;
     }
+    if (shownHelp) toolRule += `; explicit prose routing shows it prose_help too, which ${them}'s rules allow`;
   } else {
     // An unrestricted caller's launch at the depth limit.
     toolRule = 'every tool the process offers except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
@@ -2333,16 +2336,19 @@ export class SubagentModule implements Module {
    * The tools an ephemeral stream is shown at its first inference. The
    * framework builds that surface (agentToolSurface) from the shared board
    * filtered by the agent's own permissions, plus prose_help under explicit
-   * prose routing. An ephemeral agent has no presentation and isn't the
-   * subconscious, so nothing else applies, and it isn't registered until its
-   * run starts, so listToolClasses can't be asked yet. The orientation test
-   * checks this against listToolClasses once the stream is registered.
+   * prose routing when those permissions allow it (agent-framework 0.22.1's
+   * availableToolsForPresentation). An ephemeral agent has no presentation
+   * and isn't the subconscious, so nothing else applies, and it isn't
+   * registered until its run starts, so listToolClasses can't be asked yet.
+   * The orientation tests set this against listToolClasses once the stream
+   * is registered, and against the request it sends, so a change in the
+   * framework's rule fails them.
    */
   private streamSurface(agent: { canUseTool(name: string): boolean; proseRouting: ProseRouting }): string[] {
     const names = this.getFramework().getAllTools()
       .filter((t) => agent.canUseTool(t.name))
       .map((t) => t.name);
-    if (agent.proseRouting === 'explicit' && !names.includes('prose_help')) names.push('prose_help');
+    if (agent.proseRouting === 'explicit' && agent.canUseTool('prose_help') && !names.includes('prose_help')) names.push('prose_help');
     return names;
   }
 

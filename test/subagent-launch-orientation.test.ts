@@ -338,10 +338,13 @@ describe('fork orientation', () => {
       expect(block).toContain('- Tool rules: every tool the process offers except the subagent tools, keeping subagent--return: no further forks or spawns at this depth; the parent has no restriction.');
       const run = h.runs[0]!;
       expect(run.proseRouting).toBe('explicit');
-      expect(run.surface).toContain('prose_help');
+      // The depth limit's rules hold the board's tools only, and the
+      // framework shows prose_help only to a stream its rules allow.
+      expect(run.surface).not.toContain('prose_help');
       expect(run.surface).not.toContain('subagent--fork');
       const parentTools = h.framework.listToolClasses('parent').map((t) => t.tool);
       const missing = parentTools.filter((n) => !run.surface.includes(n));
+      expect(missing).toContain('prose_help');
       expect(missing.length).toBeGreaterThan(1);
       const tools = line(startSection(run.firstContext), '- Tools:');
       expect(tools).toStartWith(`- Tools: ${run.surface.length} available to this stream. Compared with what the parent stream has now, it doesn't have `);
@@ -574,13 +577,18 @@ describe("a spawn's tool rule says what the list grants", () => {
     expect(rule).not.toContain("subagent--fork, which isn't offered");
   });
 
-  // agentToolSurface adds prose_help under explicit routing, whatever the
-  // list says.
+  // agentToolSurface adds prose_help under explicit routing when the
+  // stream's rules allow it: it isn't on the board, so it's never "offered".
   test('under explicit prose routing, a listed prose_help is not dropped, and the rule says the routing shows it', async () => {
     const rule = await ruleFor(['probe--t1', 'prose_help'], {}, { proseRouting: 'explicit' });
     expect(rule).not.toContain("prose_help, which isn't offered");
-    expect(rule).toContain('; explicit prose routing shows it prose_help too, whatever the list says');
+    expect(rule).toContain('; explicit prose routing shows it prose_help too, which the list allows');
+    expect(await ruleFor(['probe--t1'], {}, { proseRouting: 'explicit' })).not.toContain('prose_help');
     expect(await ruleFor(['probe--t1'])).not.toContain('prose_help');
+  });
+
+  test('without explicit routing, a listed prose_help is named as not offered', async () => {
+    expect(await ruleFor(['probe--t1', 'prose_help'])).toContain("; the caller also listed prose_help, which isn't offered to it at the call");
   });
 });
 
@@ -948,7 +956,8 @@ describe('the first request a fork actually sends', () => {
 
   test('a depth-limited fork under explicit prose routing sends exactly the tools its orientation names', async () => {
     // The two rules the surface mirror applies beyond the board: the depth
-    // limit's allowlist, and prose_help under explicit routing.
+    // limit's allowlist, and prose_help under explicit routing only where
+    // the stream's rules allow it, which the depth limit's don't.
     const { adapter, subagent, framework, cleanup } = await realHarness({
       parent: { proseRouting: 'explicit' }, module: { maxDepth: 1 },
     });
@@ -962,7 +971,7 @@ describe('the first request a fork actually sends', () => {
       const wire = JSON.stringify(request!.messages);
       expect(wire).toContain(sent(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}.`));
       const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
-      expect(toolNames).toContain('prose_help');
+      expect(toolNames).not.toContain('prose_help');
       expect(toolNames).toContain('subagent--return');
       expect(toolNames).not.toContain('subagent--fork');
       const parentTools = framework.listToolClasses('parent').map((t) => t.tool);
@@ -981,26 +990,35 @@ describe('the first request a fork actually sends', () => {
   });
 
   // A spawn's Tools line lists its surface in full, and the request it sends
-  // must carry exactly those, prose_help under explicit routing included.
-  test('a spawn with a tool the board offers sends exactly the tools its orientation lists', async () => {
-    const { adapter, subagent, cleanup } = await realHarness({ parent: { proseRouting: 'explicit' } });
-    try {
-      const input = { name: 'worker', systemPrompt: 'p', task: 'say done', model: 'mock-spawn', sync: true, tools: ['extra--t1'] };
-      const res = await subagent.handleToolCall(call('spawn', 'toolu_worker', input));
-      expect(res.success).toBe(true);
-      const request = adapter.getRequestLog().map((r) => r.request).find((r) => r.model === 'mock-spawn');
-      expect(request).toBeDefined();
-      const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
-      expect([...toolNames].sort()).toEqual(['extra--t1', 'prose_help', 'subagent--return']);
-      const wire = JSON.stringify(request!.messages);
-      const toolsLine = wire.split('\\n').find((l) => l.startsWith('- Tools: '));
-      expect(toolsLine).toBeDefined();
-      expect(toolsLine).toStartWith(`- Tools: ${toolNames.length} available to this stream: `);
-      for (const name of toolNames) expect(toolsLine).toContain(name);
-    } finally {
-      await cleanup();
-    }
-  });
+  // must carry exactly those: under explicit routing, prose_help only when
+  // its list allows it.
+  for (const [tools, sent] of [
+    [['extra--t1'], ['extra--t1', 'subagent--return']],
+    [['extra--t1', 'prose_help'], ['extra--t1', 'prose_help', 'subagent--return']],
+  ] as const) {
+    test(`a spawn listing ${tools.join(' and ')} under explicit routing sends exactly the tools its orientation lists`, async () => {
+      const { adapter, subagent, cleanup } = await realHarness({ parent: { proseRouting: 'explicit' } });
+      try {
+        const input = { name: 'worker', systemPrompt: 'p', task: 'say done', model: 'mock-spawn', sync: true, tools: [...tools] };
+        const res = await subagent.handleToolCall(call('spawn', 'toolu_worker', input));
+        expect(res.success).toBe(true);
+        const request = adapter.getRequestLog().map((r) => r.request).find((r) => r.model === 'mock-spawn');
+        expect(request).toBeDefined();
+        const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
+        expect([...toolNames].sort()).toEqual([...sent]);
+        const wire = JSON.stringify(request!.messages);
+        const toolsLine = wire.split('\\n').find((l) => l.startsWith('- Tools: '));
+        expect(toolsLine).toBeDefined();
+        expect(toolsLine).toStartWith(`- Tools: ${toolNames.length} available to this stream: `);
+        for (const name of toolNames) expect(toolsLine).toContain(name);
+        const rule = wire.split('\\n').find((l) => l.startsWith('- Tool rules: '))!;
+        if (tools.includes('prose_help' as never)) expect(rule).toContain('; explicit prose routing shows it prose_help too, which the list allows');
+        else expect(rule).not.toContain('prose_help');
+      } finally {
+        await cleanup();
+      }
+    });
+  }
 
   test('carries the orientation, and its tools are the ones the orientation names', async () => {
     const { adapter, subagent, framework, cleanup } = await realHarness();
