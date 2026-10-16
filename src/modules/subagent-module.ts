@@ -745,7 +745,7 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. To give the subagent a utility, list `utils` and the utility\'s own name (module--name). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
             timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
