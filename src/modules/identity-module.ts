@@ -70,8 +70,9 @@ function diskRemedy(error: WorkspaceReadError): string {
     case 'directory':
       return 'Name a file, not a directory.';
     case 'symlink':
-      return 'It\'s a link, and this mount doesn\'t follow links. If the file it points to is in the workspace, name that ' +
-        'file by its own path; if not, an upload can\'t send it, though your operator can put it in the workspace.';
+      // The workspace's tools don't show where a link points, so the agent may not know.
+      return 'It\'s a link, and this mount doesn\'t follow links. If you know it points to a file in the workspace, name ' +
+        'that file by its own path; otherwise an upload can\'t send it, though your operator can put the file in the workspace.';
     case 'escape':
       return 'It leads, through a link, to a file outside the workspace, and an upload sends only files inside it. If ' +
         'that file should be sent, your operator can put it in the workspace.';
@@ -177,7 +178,7 @@ interface IdentityRecord {
 
 /** A registration the identity service answered 200 for, held in memory
  *  because this host couldn't record it: its record couldn't be saved, or
- *  the reply couldn't be read, when `sub` is null. */
+ *  no id could be read from the reply, when `sub` is null. */
 type HeldRegistration = Omit<IdentityRecord, 'sub'> & { sub: string | null };
 
 function ok(data: unknown): ToolResult {
@@ -355,8 +356,8 @@ export class IdentityModule implements Module {
   }
 
   /** The registered principal id (`agent:<name>@<domain>`), if any: null too
-   *  for a registration held in memory whose reply couldn't be read. Throws
-   *  an IdentityError when the record can't be read. */
+   *  for a registration held in memory whose reply named no id this host
+   *  could read. Throws an IdentityError when the record can't be read. */
   sub(): string | null {
     return this.record()?.sub ?? null;
   }
@@ -364,8 +365,8 @@ export class IdentityModule implements Module {
   /**
    * Exchange a key-proof for a fresh aid1 token for `audience`. Called per
    * MCPL dial (connect + every reconnect) and by HTTP helpers — which is
-   * what lets audience tokens be short-lived. Throws an IdentityError when
-   * unregistered, unreachable or refused, with a sentence for each reader:
+   * what lets audience tokens be short-lived. Throws an IdentityError
+   * whenever it can't give access, with a sentence for each reader:
    * its message for whoever runs the host, who reads it in the MCPL dial's
    * log line on every reconnect (agent-framework's transport logs a failed
    * provider and dials without it, so the agent never sees it there), and
@@ -756,17 +757,24 @@ export class IdentityModule implements Module {
           'here. Send JSON content as `body` instead; a binary file can\'t be uploaded from this host.',
         );
       }
+      const contentType = typeof input.contentType === 'string' && input.contentType
+        ? input.contentType
+        : guessContentType(input.fromFile);
+      // fetch refuses a header value it can't send (a line break, a NUL, a
+      // character past Latin-1) before it connects, which the catch below
+      // would word as no reply. The runtime's own Headers refuses the same
+      // values, so asking it first keeps the rule the runtime's.
+      try {
+        new Headers({ 'content-type': contentType });
+      } catch {
+        return fail(
+          `Nothing was sent: \`contentType\` ${shown(input.contentType)} can't be sent as a header. Pass one such as ` +
+          '"audio/mpeg", or leave it out to have it inferred from the file\'s extension.',
+        );
+      }
       const read = await this.readUpload(workspace, input.fromFile, service);
       if ('refusal' in read) return fail(read.refusal);
-      upload = {
-        bytes: read.bytes,
-        contentType:
-          typeof input.contentType === 'string' && input.contentType
-            ? input.contentType
-            : guessContentType(input.fromFile),
-        path: input.fromFile,
-        from: read.from,
-      };
+      upload = { bytes: read.bytes, contentType, path: input.fromFile, from: read.from };
     }
 
     let access: string;
@@ -954,8 +962,9 @@ export class IdentityModule implements Module {
    * inside the mount (it checks the canonical path it opened), so an upload
    * sends only what the mount allows, and its errors name the mount-prefixed
    * path, never the host's. The store's copy stands in only where disk has no
-   * file (diskHasNoFile): one the resident wrote through the workspace and
-   * never materialized, or one whose mount's directory is gone. Any other
+   * file (diskHasNoFile), such as one the resident wrote through the workspace
+   * and never materialized, one removed from disk after the workspace took it
+   * in, or one whose mount's directory is gone. Any other
    * refusal (a link the mount refuses or one leading out of it, a directory,
    * a file disk can't read) stops the upload, since the store's copy can
    * differ from disk's: an upload never sends another file than the one the
@@ -1045,7 +1054,7 @@ export class IdentityModule implements Module {
     // the log says how to record it by hand, should the service hold it.
     const unknownToOperator = (what: string): void => {
       console.error(
-        `[identity] registering this host as "${name}" with ${home}: the service ${what}, so whether it registered ` +
+        `[identity] registering this host as ${JSON.stringify(name)} with ${home}: the service ${what}, so whether it registered ` +
           `this host is unknown; if it holds this registration, record it by hand. ${this.recordByHand(name, null, timestamp)}`,
       );
     };
@@ -1102,7 +1111,7 @@ export class IdentityModule implements Module {
     // and logged with it, since a reason such as "key already enrolled" is
     // the operator's to act on. The host knows nothing of a registration the
     // service holds, so the log gives no record to write.
-    console.error(`[identity] registering this host as "${name}" with ${home}: the service answered ${status}: ${error}.`);
+    console.error(`[identity] registering this host as ${JSON.stringify(name)} with ${home}: the service answered ${status}: ${error}.`);
     return fail(
       `The identity service at ${home} answered the registration with ${status}: ${error}. If an earlier call got no ` +
       'reply, a fault of the service\'s own, or a 400 not about the name, that call may have registered this host, so ' +
@@ -1115,8 +1124,8 @@ export class IdentityModule implements Module {
   /**
    * Keep a registration the identity service answered 200 for. The service
    * holds it from then on, so registering again would be refused. When this
-   * host can't record it (the record can't be saved, or the reply naming it
-   * couldn't be read), it holds the registration in memory for this session,
+   * host can't record it (the record can't be saved, or no id could be read
+   * from the reply), it holds the registration in memory for this session,
    * so status and access work until the host restarts, and the operator is
    * asked to record it.
    */
@@ -1133,8 +1142,8 @@ export class IdentityModule implements Module {
       );
       this.held = { sub, name, home, enrolledAt };
       return fail(
-        `The identity service at ${home} answered that it registered this host as "${name}" (200), but its reply ` +
-        `couldn't be read, so this host couldn't record it. ${holding} Ask your operator to record this registration ` +
+        `The identity service at ${home} answered that it registered this host as "${name}" (200), but no id could ` +
+        `be read from its reply, so this host couldn't record it. ${holding} Ask your operator to record this registration ` +
         'on this host by hand, with the id the identity service holds for it, before the host restarts.',
       );
     }
@@ -1156,6 +1165,11 @@ export class IdentityModule implements Module {
         'this registration by hand, before the host restarts.',
       );
     }
+    // The log says so too: after an unknown outcome, its last word was to
+    // record the registration by hand, which this host has now done.
+    console.error(
+      `[identity] registered this host as ${JSON.stringify(name)} with ${home} (${sub}), recorded at ${this.recordPath}.`,
+    );
     // Note what is NOT returned: the first token the home node minted. The
     // host fetches its own, fresh, per use — the agent never holds one.
     return ok({

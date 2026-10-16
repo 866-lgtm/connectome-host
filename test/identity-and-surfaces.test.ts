@@ -573,7 +573,7 @@ describe('identity: what the agent reads when a call fails', () => {
     it("says what to do about each of disk's refusals", async () => {
       const cases: Array<[WorkspaceReadError, string]> = [
         [new WorkspaceReadError('directory', 'Path is a directory: files/grid.png', 'lstat'), 'Name a file, not a directory.'],
-        [new WorkspaceReadError('symlink', 'Symlinks are not allowed: files/grid.png', 'lstat'), 'If the file it points to is in the workspace, name that file by its own path; if not, an upload can\'t send it'],
+        [new WorkspaceReadError('symlink', 'Symlinks are not allowed: files/grid.png', 'lstat'), 'If you know it points to a file in the workspace, name that file by its own path; otherwise an upload can\'t send it, though your operator can put the file in the workspace.'],
         [new WorkspaceReadError('escape', 'Symlink escape detected: files/grid.png', 'realpath'), 'your operator can put it in the workspace'],
         [new WorkspaceReadError('changed', 'File changed during read: files/grid.png', 'stat', 'ENOENT'), 'calling again reads it afresh'],
         [new WorkspaceReadError('mount_unavailable', 'Mount unavailable: files', 'realpath_root', 'EACCES'), 'ask your operator, giving them this reason'],
@@ -584,6 +584,31 @@ describe('identity: what the agent reads when a call fails', () => {
         expectSays((await upload(mod)).error, 'couldn\'t be read from disk', remedy);
         expect(seen.orrery).toBe(0);
       }
+    });
+
+    // fetch refuses a header value it can't send before it connects, which
+    // would read as no reply. The runtime's own Headers is asked first.
+    it("refuses a content type the runtime can't send as a header, before the file is read", async () => {
+      let reads = 0;
+      const ws = {
+        ...workspaceFor(null),
+        readFileFromDisk: async () => { reads++; return { bytes: onDisk, size: onDisk.byteLength, truncated: false }; },
+      };
+      const { mod, ready, seen } = registeredModule({ workspace: ws });
+      await ready;
+      const send = (contentType: string) =>
+        mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile: 'files/grid.png', contentType }));
+      for (const contentType of ['audio/mpeg\nx', 'a\u0000b', '\u2603/x']) {
+        expectSays(
+          (await send(contentType)).error, `Nothing was sent: \`contentType\` ${JSON.stringify(contentType)} can't be sent as a header.`,
+          'Pass one such as "audio/mpeg", or leave it out to have it inferred from the file\'s extension.',
+        );
+      }
+      expect(reads).toBe(0);
+      expect(seen.orrery).toBe(0);
+      // One the runtime takes goes out as given.
+      expect(((await send('audio/mpeg; name="x y"')).data as any).sent.contentType).toBe('audio/mpeg; name="x y"');
+      expect(seen.bodies).toEqual([onDisk]);
     });
 
     // A file can grow after the disk read's size check, and is then read whole.
@@ -977,6 +1002,46 @@ describe('identity: what the agent reads when a call fails', () => {
     expectSays((await join_('B')).error, 'Nothing changed: this host is already registered as "A"', 'only until it restarts', 'ask them to');
   });
 
+  // After an unknown outcome, the log's last word was to record the
+  // registration by hand. A retry that registers records it, and says so.
+  it('logs each registration it records, so a retry after no reply settles the log', async () => {
+    let enroll = (): Response => { throw new Error('connection reset'); };
+    const { mod, dir } = registeredModule({ register: false, enroll: () => enroll() });
+    const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    let first = '';
+    let retry: Awaited<ReturnType<IdentityModule['handleToolCall']>> | undefined;
+    const lines = await logged(async () => {
+      first = String((await join_()).error);
+      enroll = () => new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+      retry = await join_();
+    });
+    expectSays(first, 'gave no reply (connection reset)');
+    expect(retry!.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+    expect(lines).toHaveLength(2);
+    expectSays(lines[0], 'whether it registered this host is unknown', 'record it by hand');
+    expect(lines[1]).toBe(`[identity] registered this host as "A" with id.test (agent:a@guest), recorded at ${join(dir, 'k.json')}.`);
+    expect(JSON.parse(readFileSync(join(dir, 'k.json'), 'utf8'))).toMatchObject({ sub: 'agent:a@guest', name: 'A', home: 'id.test' });
+  });
+
+  // The agent's name goes into the log quoted as JSON, so each registration
+  // line stays one line, whatever name the agent asked for.
+  it('quotes the name in every registration line it logs', async () => {
+    let enroll = () => new Response(JSON.stringify({ error: 'name taken' }), { status: 403 });
+    const { mod } = registeredModule({ register: false, enroll: () => enroll() });
+    const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A\nB' }));
+    const taken = await logged(async () => { await join_(); });
+    expect(taken).toEqual(['[identity] registering this host as "A\\nB" with id.test: the service answered 403: name taken.']);
+    enroll = () => new Response(JSON.stringify({ error: 'bad name (1-32 chars, alnum/space/_/./-)' }), { status: 400 });
+    const bad = await logged(async () => { await join_(); });
+    expect(bad).toHaveLength(1);
+    expectSays(bad[0], '[identity] registering this host as "A\\nB" with id.test: the service answered with 400: bad name');
+    enroll = () => new Response(JSON.stringify({ sub: 'agent:ab@guest' }), { status: 200 });
+    const recorded = await logged(async () => { await join_(); });
+    expect(recorded).toHaveLength(1);
+    expectSays(recorded[0], '[identity] registered this host as "A\\nB" with id.test (agent:ab@guest)');
+    for (const line of [...taken, ...bad, ...recorded]) expect(line).not.toContain('\n');
+  });
+
   // A 400 can come before the service registers anything or after it, as
   // archipelago-home's "no audience configured" does, so it says neither.
   it('accept_invite: a 400 leaves whether the host is registered unknown, and sends a name problem back to the name', async () => {
@@ -1001,7 +1066,7 @@ describe('identity: what the agent reads when a call fails', () => {
   });
 
   // The guard is cleared however the registration ends, a throw included.
-  it('takes a registration again after one failed before anything was sent', async () => {
+  it('releases its in-flight guard when a registration fails before sending, so a later call registers', async () => {
     const { mod, dir } = registeredModule({ register: false });
     mkdirSync(join(dir, 'k.pem')); // a key path that can't be read as a key
     for (const name of ['A', 'B']) {
@@ -1009,6 +1074,10 @@ describe('identity: what the agent reads when a call fails', () => {
       expectSays(res.error, 'identity--accept_invite failed before anything was sent: this host\'s identity couldn\'t be loaded');
       expect(res.error).not.toContain('under way');
     }
+    rmSync(join(dir, 'k.pem'), { recursive: true });
+    let registered: Awaited<ReturnType<IdentityModule['handleToolCall']>> | undefined;
+    await logged(async () => { registered = await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' })); });
+    expect(registered!.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
   });
 
   // The service holds a registration under the key that made it, so a new
@@ -1068,11 +1137,12 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(readdirSync(fresh.dir)).toEqual(['k.pem']);
   });
 
-  // A call to /enroll or /token that hangs ends after 15 seconds as no reply.
-  // The limit is asked of AbortSignal.timeout, which here answers with a
-  // 20 ms signal, and the service never answers: each call ends only when its
-  // signal fires, as fetch's does.
-  it('gives /enroll and /token 15 seconds each, after which a call that hangs counts as no reply', async () => {
+  // A call to /enroll or /token that hangs ends after 15 seconds: a
+  // registration as no reply, and access as unreachable. The limit is asked
+  // of AbortSignal.timeout, which here answers with a 20 ms signal, and the
+  // service never answers: each call ends only when its signal fires, with
+  // the signal's own reason, as fetch's does.
+  it('gives /enroll and /token 15 seconds each, after which a hung registration reads as no reply and access as unreachable', async () => {
     const real = AbortSignal.timeout.bind(AbortSignal);
     const limits: number[] = [];
     const timeout = spyOn(AbortSignal, 'timeout').mockImplementation((ms: number) => {
@@ -1089,10 +1159,10 @@ describe('identity: what the agent reads when a call fails', () => {
         })) as typeof fetch,
       });
       const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
-      expectSays((await join_()).error, 'gave no reply (', 'whether it registered this host is unknown');
+      expectSays((await join_()).error, 'gave no reply (The operation timed out.)', 'whether it registered this host is unknown');
       // The in-flight guard is released: a second call goes out, and isn't refused as under way.
       const again = String((await join_()).error);
-      expectSays(again, 'gave no reply (');
+      expectSays(again, 'gave no reply (The operation timed out.)');
       expect(again).not.toContain('under way');
       writeFileSync(join(dir, 'k.json'), JSON.stringify({ sub: 'agent:a@guest', name: 'A', home: 'id.test', enrolledAt: 'then' }));
       let thrown: unknown;
@@ -1102,21 +1172,21 @@ describe('identity: what the agent reads when a call fails', () => {
         thrown = err;
       }
       expect(thrown).toBeInstanceOf(IdentityError);
-      expectSays((thrown as IdentityError).message, 'couldn\'t be reached for access to "orrery"');
+      expectSays((thrown as IdentityError).message, 'couldn\'t be reached for access to "orrery" (The operation timed out.)');
       expect(limits).toEqual([15_000, 15_000, 15_000]);
     } finally {
       timeout.mockRestore();
     }
   });
 
-  it("holds a registration whose reply couldn't be read, and asks the operator to record it", async () => {
+  it('holds a registration whose reply named no id it could read, and asks the operator to record it', async () => {
     const { mod, dir } = registeredModule({ register: false, enroll: () => new Response('<html>registered</html>', { status: 200 }) });
     let answer = '';
     const lines = await logged(async () => {
       answer = String((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error);
     });
     expectSays(
-      answer, 'answered that it registered this host as "A" (200), but its reply couldn\'t be read', 'holds the registration until it restarts',
+      answer, 'answered that it registered this host as "A" (200), but no id could be read from its reply', 'holds the registration until it restarts',
       'Don\'t call identity--accept_invite again', 'record this registration on this host by hand',
     );
     expect(existsSync(join(dir, 'k.json'))).toBe(false);
@@ -1156,7 +1226,7 @@ describe('identity: what the agent reads when a call fails', () => {
   it('reads a reply body that can\'t be read, or is not a JSON object, as one that names nothing', async () => {
     const held = registeredModule({ register: false, enroll: () => new Response('null', { status: 200 }) });
     const answer = String((await held.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error);
-    expectSays(answer, 'answered that it registered this host as "A" (200), but its reply couldn\'t be read');
+    expectSays(answer, 'answered that it registered this host as "A" (200), but no id could be read from its reply');
     expect(answer).not.toContain('before anything was sent');
     const cut = registeredModule({
       register: false,
@@ -1164,7 +1234,7 @@ describe('identity: what the agent reads when a call fails', () => {
     });
     expectSays(
       (await cut.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error,
-      'answered that it registered this host as "A" (200), but its reply couldn\'t be read',
+      'answered that it registered this host as "A" (200), but no id could be read from its reply',
     );
     const refused = registeredModule({ register: false, enroll: () => new Response('[]', { status: 403 }) });
     expectSays(
