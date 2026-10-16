@@ -11,10 +11,9 @@
   one line when lessons load, and retrieval no longer injects a lesson
   with no content. An entry in the shared lessons file that isn't an
   object is left out, the log says how many, and the next save writes the
-  file with the lessons this host holds. A lesson stored without an id is
-  marked and logged as one no lesson tool can reach, with nothing to do
-  about it. A shared file that holds just `null` reads as holding no
-  lessons, where it stopped lessons from loading.
+  file with the lessons this host holds. A shared file that holds just
+  `null` reads as holding no lessons, where it stopped lessons from
+  loading.
 - A lesson stored with a confidence outside 0 to 1, such as 85 meant as
   85%, or with one that isn't a number, is ranked and filtered as the
   nearer end of that range: 85 ranks as 1, the top of the range, beside
@@ -29,3 +28,10 @@
   the web viewer's lessons list, headless mode, retrieval and `/export`'s
   markdown show the confidence a lesson is ranked by, the markdown with
   each lesson's mark, and `/export`'s JSON holds the lessons as stored.
+- `lessons--update`, `lessons--deprecate`, `lessons--boost` and
+  `lessons--demote` refuse an id that's missing, empty or not text, saying
+  so, before looking a lesson up. A call with no id used to edit the first
+  lesson stored without one, and one with a number reached a lesson stored
+  with that number though each tool's id is text. A lesson stored without
+  an id, with an empty one or with one that isn't text is marked and
+  logged as one no call can name.

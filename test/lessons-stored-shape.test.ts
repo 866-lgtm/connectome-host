@@ -417,13 +417,15 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
           deprecated: undefined,
           needsFix: "Stored without usable content or tags, and with a confidence that isn't a number, and without an id. " +
             'Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval leaves it ' +
-            "out. No lesson tool can reach a lesson without an id, so there's nothing to do about it.",
+            "out. Lesson tools find a lesson by an id that's non-empty text, so none can reach this one, and there's " +
+            'nothing to do about it.',
         }]);
         expect((await h.m.handleToolCall(call('query', { tags: ['x'], text: 'y' }))).success).toBe(true);
         expect(h.warnings).toEqual([
-          "[lessons] a lesson with no id is stored without usable content or tags, and with a confidence that isn't a " +
-            'number. Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval ' +
-            "leaves it out. No lesson tool can reach a lesson without an id, so there's nothing to do about it.",
+          "[lessons] a lesson without an id is stored without usable content or tags, and with a confidence that isn't " +
+            'a number. Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval ' +
+            "leaves it out. Lesson tools find a lesson by an id that's non-empty text, so none can reach it, and " +
+            "there's nothing to do about it.",
         ]);
         expect(h.stored()).toEqual([value]);
       } finally { h.cleanup(); }
@@ -453,21 +455,53 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     } finally { h.cleanup(); }
   });
 
-  test('a lesson with no id is marked and logged without a remedy, since no lesson tool can reach it', async () => {
+  test('a lesson no call can name is marked and logged without a remedy: without an id, with an empty one, or one that isn\'t text', async () => {
     const noId = stored('x', { content: 'alpha' });
     delete noId.id;
-    const h = await loaded([noId, stored('withid', { content: 'beta' })]);
+    const h = await loaded([noId, stored('', { content: 'beta' }), stored(5 as unknown as string, { content: 'gamma' }), stored('withid', { content: 'delta' })]);
+    const tail = (it: string) => `Queries and retrieval read its tags as empty. Lesson tools find a lesson by an id that's non-empty text, so none can reach ${it}, and there's nothing to do about it.`;
     try {
       const listed = ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons;
       expect(listed.map(l => [l.id, l.needsFix])).toEqual([
-        [undefined, 'Stored without usable tags, and without an id. Queries and retrieval read its tags as empty. ' +
-          "No lesson tool can reach a lesson without an id, so there's nothing to do about it."],
+        [undefined, `Stored without usable tags, and without an id. ${tail('this one')}`],
+        ['', `Stored without usable tags, and with an empty id. ${tail('this one')}`],
+        [5, `Stored without usable tags, and with an id that isn't text (5). ${tail('this one')}`],
         ['withid', 'Stored without usable tags: give its tags with lessons--update, or deprecate this lesson.'],
       ]);
-      expect(h.warnings[0]).toBe(
-        '[lessons] a lesson with no id is stored without usable tags. Queries and retrieval read its tags as empty. ' +
-        "No lesson tool can reach a lesson without an id, so there's nothing to do about it.",
-      );
+      expect(h.warnings.slice(0, 3)).toEqual([
+        `[lessons] a lesson without an id is stored without usable tags. ${tail('it')}`,
+        `[lessons] a lesson with an empty id is stored without usable tags. ${tail('it')}`,
+        `[lessons] a lesson with an id that isn't text (5) is stored without usable tags. ${tail('it')}`,
+      ]);
+    } finally { h.cleanup(); }
+  });
+
+  test('update, deprecate, boost and demote refuse an id that\'s missing, empty or not text, before looking a lesson up', async () => {
+    const noId = stored('x', { content: 'alpha', tags: ['t'] });
+    delete noId.id;
+    const h = await loaded([noId, stored('', { content: 'beta', tags: ['t'] }), stored(5 as unknown as string, { content: 'gamma', tags: ['t'] })]);
+    const before = structuredClone(h.m.getLessonRecords().map(r => r.stored));
+    const calls = [
+      ['update', 'updated', { content: 'given with no id' }],
+      ['deprecate', 'deprecated', { reason: 'given with no id' }],
+      ['boost', 'boosted', {}],
+      ['demote', 'demoted', {}],
+    ] as const;
+    try {
+      for (const [tool, done, extra] of calls) {
+        for (const [id, why] of [
+          [undefined, "id is missing: give the lesson's id"],
+          ['', "id is missing: give the lesson's id"],
+          [5, 'id must be text, such as the id lessons--list shows, not 5'],
+        ] as const) {
+          const input = id === undefined ? { ...extra } : { id, ...extra };
+          const r = await h.m.handleToolCall(call(tool, input));
+          expect(r).toMatchObject({ success: false, isError: true });
+          expect(r.error).toStartWith(`Nothing was ${done}: ${why}. lessons--list shows lessons with their ids`);
+        }
+      }
+      // Nothing was changed by any of them.
+      expect(h.m.getLessonRecords().map(r => r.stored)).toEqual(before);
     } finally { h.cleanup(); }
   });
 });

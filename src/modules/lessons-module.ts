@@ -310,7 +310,7 @@ export class LessonsModule implements Module {
   }
 
   private handleUpdate(input: UpdateInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = findLesson(this.state.lessons, input.id);
     const problems = inputProblems(input, false);
     if (!lesson) return notFound('updated', input.id, problems.join('; ') || undefined);
     if (problems.length > 0) {
@@ -334,7 +334,7 @@ export class LessonsModule implements Module {
   }
 
   private handleDeprecate(input: DeprecateInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = findLesson(this.state.lessons, input.id);
     const reason: unknown = input.reason;
     const reasonProblem = typeof reason === 'string'
       ? reason.trim() === '' ? 'reason is blank: say why the lesson is no longer accurate' : undefined
@@ -446,7 +446,7 @@ export class LessonsModule implements Module {
   }
 
   private handleBoost(input: IdInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = findLesson(this.state.lessons, input.id);
     if (!lesson) return notFound('boosted', input.id);
 
     const refused = adjustRefusal(lesson, 'boost');
@@ -463,7 +463,7 @@ export class LessonsModule implements Module {
   }
 
   private handleDemote(input: IdInput): ToolResult {
-    const lesson = this.state.lessons.find(l => l.id === input.id);
+    const lesson = findLesson(this.state.lessons, input.id);
     if (!lesson) return notFound('demoted', input.id);
 
     const refused = adjustRefusal(lesson, 'demote');
@@ -621,19 +621,37 @@ function fixPhrase(f: Faults): { give: string; orDeprecate: boolean } {
   return { give: [...fields, ...confidence].join(', and '), orDeprecate: fields.length > 0 };
 }
 
-/** Whether a lesson tool can reach a stored lesson: update, deprecate,
- *  boost and demote all find it by its id, which is text. */
-function reachable(l: StoredLesson): boolean {
-  return typeof l.id === 'string';
+/** The lesson a call's id names: only an id that's non-empty text names
+ *  one. A call without an id used to find the first lesson stored without
+ *  one, since undefined === undefined. */
+function findLesson(lessons: StoredLesson[], id: unknown): StoredLesson | undefined {
+  return idProblem(id) ? undefined : lessons.find(l => l.id === id);
+}
+
+/** Why a call's id can't name a lesson, if it can't. */
+function idProblem(id: unknown): string | undefined {
+  if (id === undefined || id === '') return 'id is missing: give the lesson\'s id';
+  if (typeof id !== 'string') return `id must be text, such as the id lessons--list shows, not ${shown(id)}`;
+  return undefined;
+}
+
+/** Why no call can name a stored lesson, as a phrase after "and", if none
+ *  can: lesson tools find a lesson by an id that's non-empty text. */
+function idFault(l: StoredLesson): string | undefined {
+  if (l.id === undefined) return 'without an id';
+  if (l.id === '') return 'with an empty id';
+  if (typeof l.id !== 'string') return `with an id that isn't text (${shown(l.id)})`;
+  return undefined;
 }
 
 /** What the agent's list and query say a stored lesson needs, if anything. */
 function needsFix(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
   if (!f) return undefined;
-  if (!reachable(l)) {
-    return `Stored ${storedPhrase(f)}, and without an id. ${readsPhrase(f)}. No lesson tool can reach a lesson ` +
-      "without an id, so there's nothing to do about it.";
+  const unnamed = idFault(l);
+  if (unnamed) {
+    return `Stored ${storedPhrase(f)}, and ${unnamed}. ${readsPhrase(f)}. Lesson tools find a lesson by an id ` +
+      "that's non-empty text, so none can reach this one, and there's nothing to do about it.";
   }
   const { give, orDeprecate } = fixPhrase(f);
   return `Stored ${storedPhrase(f)}: give ${give} with lessons--update${orDeprecate ? ', or deprecate this lesson' : ''}.`;
@@ -644,9 +662,10 @@ function needsFix(l: StoredLesson): string | undefined {
 function loadLine(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
   if (!f) return undefined;
-  if (!reachable(l)) {
-    return `[lessons] a lesson with no id is stored ${storedPhrase(f)}. ${readsPhrase(f)}. No lesson tool can ` +
-      "reach a lesson without an id, so there's nothing to do about it.";
+  const unnamed = idFault(l);
+  if (unnamed) {
+    return `[lessons] a lesson ${unnamed} is stored ${storedPhrase(f)}. ${readsPhrase(f)}. Lesson tools find a ` +
+      "lesson by an id that's non-empty text, so none can reach it, and there's nothing to do about it.";
   }
   const { give, orDeprecate } = fixPhrase(f);
   return `[lessons] lesson ${JSON.stringify(l.id)} is stored ${storedPhrase(f)}. ` +
@@ -753,9 +772,7 @@ function inputProblems(
 /** An update, deprecate, boost or demote whose id matches no lesson, with
  *  any other problem in the call named beside it. */
 function notFound(verb: 'updated' | 'deprecated' | 'boosted' | 'demoted', id: unknown, also?: string): ToolResult {
-  const which = id === undefined || id === ''
-    ? 'id is missing: give the lesson\'s id'
-    : `no lesson has the id ${shown(id)}`;
+  const which = idProblem(id) ?? `no lesson has the id ${shown(id)}`;
   return {
     success: false,
     isError: true,
