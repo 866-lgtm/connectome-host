@@ -22,6 +22,7 @@ import {
 } from './Health';
 import { BranchPanel } from './Branches';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
+import { planHealthAlerts } from './health-alerts';
 import {
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
@@ -206,7 +207,10 @@ export function App() {
       return next;
     });
   };
+  /** Keys of the rows /healthz reconciliation created (see health-alerts.ts). */
+  const reconciledAlertKeys = new Set<string>();
   const removeOpsAlert = (key: string): void => {
+    reconciledAlertKeys.delete(key);
     setOpsAlerts((prev) => {
       if (!prev.has(key)) return prev;
       const next = new Map(prev);
@@ -226,6 +230,7 @@ export function App() {
       removeOpsAlert(`${agent}:${kind.slice(0, -'-clear'.length)}`);
       return;
     }
+    reconciledAlertKeys.delete(`${agent}:${kind}`);
     upsertOpsAlert(kind, agent, message, true, readActions((e.data as { actions?: unknown } | undefined)?.actions));
   };
 
@@ -306,34 +311,11 @@ export function App() {
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
     applyCredentialState(h.credential, 'local');
-    const quarantine = h.compressionQuarantine ?? {};
-    for (const [agent, q] of Object.entries(quarantine)) {
-      const key = `${agent}:compression-quarantine`;
-      if ((q.count ?? 0) > 0) {
-        if (!opsAlerts().has(key)) {
-          upsertOpsAlert('compression-quarantine', agent,
-            `${q.count} chunk(s) in compression quarantine — spans stay raw and will eventually exhaust the context budget.`,
-            false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
-    }
-    for (const a of h.agents ?? []) {
-      const key = `${a.name}:inference-exhausted`;
-      const streak = a.consecutiveInferenceFailures ?? 0;
-      if (streak >= 3) {
-        const message = `${streak} consecutive inference failures — agent is down.`
-          + (a.lastInference?.lastError ? ` Last: ${a.lastInference.lastError}` : '');
-        // Only touch the entry when the condition actually changed —
-        // rewriting `at` every poll would show a perpetual "5s ago" and
-        // re-sort the strip on every cycle.
-        if (opsAlerts().get(key)?.message !== message) {
-          upsertOpsAlert('inference-exhausted', a.name, message, false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
+    const plan = planHealthAlerts(h, opsAlerts(), reconciledAlertKeys);
+    for (const key of plan.remove) removeOpsAlert(key);
+    for (const u of plan.upsert) {
+      upsertOpsAlert(u.kind, u.agent, u.message, false);
+      reconciledAlertKeys.add(`${u.agent}:${u.kind}`);
     }
   };
 
