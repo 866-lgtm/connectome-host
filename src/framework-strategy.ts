@@ -6,6 +6,7 @@ import {
 } from '@animalabs/agent-framework';
 import type { Recipe, RecipeKvUnifiedConfig, RecipeStrategy } from './recipe.js';
 import { anthropicCacheReadMultiplier } from './call-pricing.js';
+import { effectiveContextBudgetTokens, resolvePromptCaching } from './framework-agent-config.js';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { isBuiltinStrategyType, type ExtensionRegistry } from './extensions.js';
 
@@ -60,19 +61,9 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'identityReminderSilent',
 ];
 
-/** Compile budget for a recipe that omits `agent.contextBudgetTokens`. Sized
- *  for the 1M-window models; a recipe on a smaller window must set its own
- *  (budget + maxTokens has to fit under the window). */
-export const DEFAULT_CONTEXT_BUDGET_TOKENS = 300_000;
-
 /** Verbatim tail for a recipe that omits `strategy.recentWindowTokens`, as a
  *  share of the compile budget: 120k of the default 300k. */
 export const DEFAULT_RECENT_WINDOW_RATIO = 0.4;
-
-/** The compile budget the agent runs with: the recipe's, else the default. */
-export function effectiveContextBudgetTokens(recipe: Recipe): number {
-  return recipe.agent.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
-}
 
 /**
  * The kv-unified block a recipe gets when it selects kv-unified (or leaves
@@ -83,12 +74,16 @@ export function effectiveContextBudgetTokens(recipe: Recipe): number {
  *  - writes: 2x on the 1-hour cache, 1.25x on the 5-minute one (Bedrock only
  *    has the 5-minute cache), 1x on OpenAI (no write premium);
  *  - reads: the model's rate from the pricing table (0.025x Fable 5.1 /
- *    Mythos 5.1, 0.05x Opus 5.5, 0.1x elsewhere), 0.1x on OpenAI.
+ *    Mythos 5.1, 0.05x Opus 5.5, 0.1x elsewhere), 0.1x on OpenAI;
+ *  - prompt caching off (`agent.promptCaching: false`, or a Bedrock model
+ *    without caching): 1 and 1, every token at the base price, so no layout
+ *    is preferred for cache savings the agent never gets.
  */
 export function standardKvUnifiedConfig(recipe: Recipe, model: string): RecipeKvUnifiedConfig {
   const provider = recipe.agent.provider;
   const openai = provider === 'openai-responses' || provider === 'openai-codex';
   const ttl = provider === 'bedrock' ? '5m' : (recipe.agent.cacheTtl ?? '1h');
+  const uncached = resolvePromptCaching(recipe, model) === false;
   return {
     policy: {
       alpha: 0.7,
@@ -98,8 +93,8 @@ export function standardKvUnifiedConfig(recipe: Recipe, model: string): RecipeKv
       budgetOverLambda: 4_000,
       cacheLambda: 1,
       cacheScale: 100_000,
-      cacheReadPrice: openai ? 0.1 : anthropicCacheReadMultiplier(model),
-      cacheWritePrice: openai ? 1 : ttl === '5m' ? 1.25 : 2,
+      cacheReadPrice: uncached ? 1 : openai ? 0.1 : anthropicCacheReadMultiplier(model),
+      cacheWritePrice: uncached || openai ? 1 : ttl === '5m' ? 1.25 : 2,
       continuityLambda: 1,
       continuityScale: 100_000,
       continuityRecencyHalfLifeTokens: 100_000,

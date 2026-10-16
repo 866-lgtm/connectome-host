@@ -43,7 +43,7 @@ import { parseFleetRoute } from './modules/fleet-types.js';
 import { handleCommand, resetBranchState } from './commands.js';
 import { formatQuotaReadout } from './quota-meter.js';
 import { takeRecipeWarnings } from './recipe.js';
-import { effectiveContextBudgetTokens } from './framework-strategy.js';
+import { effectiveContextBudgetTokens } from './framework-agent-config.js';
 
 /** Format a token count compactly: 1.2M / 3.5k / 42. */
 export function fmtTokens(n: number): string {

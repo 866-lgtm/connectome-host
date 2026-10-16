@@ -302,9 +302,12 @@ model scale the three window numbers down together — e.g. `contextBudgetTokens
 and keep everything under `strategy` as is; chunk size, merge fan-in and the
 fallback rungs are window-independent.
 
-**System prompt: keep it minimal.** Leave it empty (`""` is valid; the request then carries
-no system block at all), or write a few sentences at most. Most long-running residents run
-a single sentence or nothing. Why:
+**System prompt: keep it minimal.** Leave it empty, or write a few sentences at most. Most
+long-running residents run a single sentence or nothing. `""` is valid: under kv-unified (the
+default) the request then carries no system block at all. A resident pinned to kv-stable or
+another solver is different: there membrane (0.5.87) can send `""` as an empty system block
+with a cache marker, which the API may refuse. Give such a resident one short sentence
+instead, until membrane leaves an empty system block out. Why minimal:
 
 - **The agent's identity lives in its memory.** That means the imported history and everything
   it lives through afterwards, which the strategy keeps in context. A long persona or rulebook

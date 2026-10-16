@@ -15,7 +15,8 @@
     failing at load. The block's cache prices are matched to what the provider bills, as
     multiples of base input: writes 2 on the 1-hour cache, 1.25 on the 5-minute cache and on
     Bedrock, 1 on OpenAI; reads 0.1, except 0.05 on Claude Opus 5.5 and 0.025 on Claude
-    Fable 5.1 / Mythos 5.1. A written block must still be complete.
+    Fable 5.1 / Mythos 5.1. With prompt caching off (`agent.promptCaching: false`, or a
+    Bedrock model without caching) both are 1. A written block must still be complete.
   - The built-in default recipe (no recipe argument and no saved recipe, or `--no-recipe`)
     now has an empty system prompt and takes all of these defaults.
   - Unchanged: recipes that set these fields explicitly, and complete `kvUnified` blocks,
@@ -23,3 +24,5 @@
     block.
 - `agent.strategy.kvUnified.hysteresisCertificate` is now part of the recipe type, and a
   non-boolean value fails at recipe load. It was already passed through.
+- The context curve panel, when it can't read the live budget, falls back to the recipe's
+  budget or the 300k default, not 200k.

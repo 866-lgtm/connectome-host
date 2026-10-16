@@ -1,8 +1,18 @@
 import { AgentFramework } from '@animalabs/agent-framework';
 import type { Recipe } from './recipe.js';
-import { DEFAULT_CONTEXT_BUDGET_TOKENS, effectiveContextBudgetTokens } from './framework-strategy.js';
 
 type AgentConfig = Parameters<typeof AgentFramework.create>[0]['agents'][number];
+
+/** Compile budget for a recipe that omits `agent.contextBudgetTokens`. Sized
+ *  for the 1M-window models; a recipe on a smaller window must set its own
+ *  (budget + maxTokens has to fit under the window). */
+export const DEFAULT_CONTEXT_BUDGET_TOKENS = 300_000;
+
+/** The compile budget the recipe configures: its own, else the default. A
+ *  runtime override (agent settings) can still move the live budget. */
+export function effectiveContextBudgetTokens(recipe: Recipe): number {
+  return recipe.agent.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+}
 
 export type FrameworkAgentConfig = AgentConfig & {
   // Forward recipe fields that newer Agent Framework releases understand

@@ -56,6 +56,11 @@ describe('standard-recipe memory defaults', () => {
     // OpenAI: no write premium
     expect(prices({ provider: 'openai-codex' }, 'gpt-5.6-sol')).toEqual([0.1, 1]);
     expect(prices({ provider: 'openai-responses' }, 'gpt-6')).toEqual([0.1, 1]);
+    // Caching off: no cache prices at all, so no layout is preferred for savings never received
+    expect(prices({ promptCaching: false }, 'claude-opus-4-6')).toEqual([1, 1]);
+    expect(prices({ promptCaching: false, provider: 'openai-codex' }, 'gpt-5.6-sol')).toEqual([1, 1]);
+    // Bedrock's own gate: a model without caching there
+    expect(prices({ provider: 'bedrock' }, 'apac.anthropic.claude-3-5-sonnet-20241022-v2:0')).toEqual([1, 1]);
   });
 
   test('the standard block is otherwise the production policy', () => {
