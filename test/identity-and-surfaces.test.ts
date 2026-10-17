@@ -1405,6 +1405,8 @@ describe('identity: what the agent reads when a call fails', () => {
     const status = (await mod.handleToolCall(call('status', {}))).data as Record<string, unknown>;
     expect(status).toMatchObject({ registeredAs: 'B', id: 'agent:b@guest' });
     expect(String(status.note)).not.toContain('only until it restarts');
+    // Access signs with this host's key, whatever the record names.
+    expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
     // Dropped, not set aside: with the record gone too, nothing is recorded
     // or held, and the held registration is in the log line from its start.
     rmSync(join(dir, 'k.json'));

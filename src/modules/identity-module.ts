@@ -523,11 +523,13 @@ export class IdentityModule implements Module {
    * holds in memory because it couldn't record it. Null only when there is
    * neither. The file comes first, since the operator is asked to record a
    * held registration by hand while the host runs: once the file holds a
-   * registration, the hold is dropped, as the host records it now. Every
-   * field of a hold is in the log line written when it began (the record to
-   * write by hand), so a record written that differs from it loses nothing
-   * only the hold knew. With nothing held, a record file that can't be read,
-   * or holds no registration, throws (recordFile).
+   * registration, the hold is dropped, and the registration reads as one the
+   * host recorded itself, a record removed later included. A record that
+   * differs from the hold is the operator's to correct: every field of the
+   * hold is in the log line written when it began (the record to write by
+   * hand), and access signs with this host's key whatever the record names.
+   * With nothing held, a record file that can't be read, or holds no
+   * registration, throws (recordFile).
    */
   private record(): IdentityRecord | HeldRegistration | null {
     let rec: IdentityRecord | null;
@@ -1023,8 +1025,11 @@ export class IdentityModule implements Module {
     let onDisk: WorkspaceReadError;
     try {
       const fromDisk = await workspace.readFileFromDisk(path, { maxBytes: UPLOAD_BODY_MAX });
-      // A read cut at the cap is of a file over it. A file that grows after
-      // the read's size check is read whole, so the bound is held here too.
+      // A read cut at the cap is of a file over it. agent-framework 0.22.1
+      // reads a file that grows after the read's size check whole, so the
+      // bound is held here too. Once the host's agent-framework floor
+      // includes anima-research/agent-framework#409, readFileFromDisk keeps
+      // maxBytes itself, and this second condition can go.
       if (fromDisk.truncated || fromDisk.bytes.byteLength > UPLOAD_BODY_MAX) {
         return overLimit(Math.max(fromDisk.size, fromDisk.bytes.byteLength), `"${path}"`);
       }
