@@ -145,13 +145,17 @@ never do.
   smoke run answers; CI runs it on pull requests
   too, and by hand it runs from the repository root after
   `npm run build:web:ci`, for example before `git push --follow-tags`,
-  warning when the working tree differs from `HEAD`, or when it packed an
-  untracked file git ignores, since npm packs the working tree), publishes
+  warning when the working tree differs from `HEAD`, since npm packs the
+  working tree), publishes
   `@animalabs/connectome-host` to npm with the Web UI that check built once
   it has passed, and creates the GitHub release with that section as its
   notes. Nothing is installed or built in the publish job, which can mint
-  the publish credential. `prepublishOnly` refuses to publish a tree
-  without the built Web UI, there and in a hand `npm publish` alike. The
+  the publish credential. `prepack` refuses to pack a tree without the
+  built Web UI, or a pack that would carry a file git ignores outside it,
+  such as a local recipe in `recipes/`, so `npm pack` and `npm publish`,
+  and bun's, stop there, in the publish job and by hand alike, unless
+  scripts are off (`--ignore-scripts`, which skips the release holds
+  too). The
   root `postinstall` builds the Web UI only in a checkout, where `web/` is:
   the package doesn't ship `web/`, so on a registry install it does
   nothing. When the check fails on a tag, the

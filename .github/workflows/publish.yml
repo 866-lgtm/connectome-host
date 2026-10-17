@@ -155,8 +155,9 @@ jobs:
       # The Web UI this run's pack-check job built and checked, which
       # package.json's files packs with the tree. Nothing is installed or
       # built here, so no dependency's install script runs where the
-      # id-token is. prepublishOnly, which needs only node, refuses a tree
-      # without the Web UI and checks the release holds.
+      # id-token is. prepublishOnly checks the release holds, and prepack,
+      # which needs only node and git, refuses a tree without the Web UI or
+      # one that would pack a file git ignores.
       - name: Take the checked Web UI
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:

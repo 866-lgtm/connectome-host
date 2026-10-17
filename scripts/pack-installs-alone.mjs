@@ -29,9 +29,9 @@
 // dependencies' install scripts, and publishes the Web UI that job built;
 // to check by hand, build the Web UI and run it from the repository root,
 // for example before `git push --follow-tags`. npm pack packs the working
-// tree, so it warns when that differs from HEAD, and when it packed
-// untracked files git ignores, which `files` packs from a directory it
-// lists all the same, where the publish workflow packs a clean checkout.
+// tree, so it warns when that differs from HEAD, where the publish workflow
+// packs a clean checkout; prepack's scripts/pack-contents.mjs stops a pack
+// that would carry a file git ignores.
 // A failed install is tried again, three attempts in all,
 // PACK_INSTALLS_ALONE_RETRY_DELAY_MS apart (default 15000), to get past a
 // registry blip; one that runs out of time isn't.
@@ -75,20 +75,6 @@ function changesFromHead() {
   const status = spawnSync("git", ["status", "--porcelain", "--untracked-files=all"], { encoding: "utf8" });
   if (status.status !== 0) return [];
   return status.stdout.split("\n").filter(Boolean).map((line) => line.slice(3));
-}
-
-/** The packed paths that are untracked files git ignores, the built Web UI
- *  aside, or none outside a git checkout. A tracked file git would ignore
- *  is in the publish workflow's clean checkout too, so it isn't one. */
-function packedButIgnored(paths) {
-  const result = spawnSync("git", ["check-ignore", "--stdin", "-z"], {
-    input: paths.join("\0"),
-    encoding: "utf8",
-    maxBuffer: MAX_BUFFER,
-  });
-  // 1: none of them is ignored; 128: not a git checkout.
-  if (result.status !== 0) return [];
-  return result.stdout.split("\0").filter((path) => path !== "" && !path.startsWith(`${dirname(WEB_UI)}/`));
 }
 
 /** The local files a built index.html names in its quoted src and href
@@ -176,14 +162,6 @@ function main() {
     }
     const packed = records[0];
     const files = packed.files.map((file) => file.path);
-    const ignored = packedButIgnored(files);
-    if (ignored.length > 0) {
-      console.error(
-        `pack-installs-alone: warning: npm packed ${ignored.length} ${ignored.length === 1 ? "file that is" : "files that are"} ` +
-          `untracked and that git ignores (${some(ignored)}): package.json's files packs them from a directory it ` +
-          "lists all the same, where the publish workflow packs a clean checkout, which has none.",
-      );
-    }
     const tarball = join(work, packed.filename);
     const dir = join(work, "install");
     mkdirSync(dir);

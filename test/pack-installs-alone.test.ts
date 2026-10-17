@@ -259,19 +259,7 @@ test("a working tree that differs from HEAD gets a warning, and is checked as it
   );
   // The untracked file went into the package that was checked.
   assert.equal(files(result.stdout), files(clean.stdout) + 1);
-  // An untracked file git ignores, in a directory files lists, is packed all
-  // the same, and git status doesn't show it.
-  rmSync(join(dir, "src", "untracked.ts"));
-  mkdirSync(join(dir, "src", "tmp-zz"));
-  writeFileSync(join(dir, "src", "tmp-zz", "scratch.ts"), "export const zz = 1;\n");
-  const ignored = await check(dir);
-  assert.equal(ignored.code, 0, ignored.stderr);
-  assert.doesNotMatch(ignored.stderr, /the working tree differs/);
-  assert.match(
-    ignored.stderr,
-    /^pack-installs-alone: warning: npm packed 1 file that is untracked and that git ignores \(src\/tmp-zz\/scratch\.ts\): package\.json's files packs them from a directory it lists all the same, where the publish workflow packs a clean checkout, which has none\.$/m,
-  );
-}, TIMEOUT_MS * 3);
+}, TIMEOUT_MS * 2);
 
 test("@opentui/core must load in the installed tree, its native package with it", async () => {
   // Bundled, so the offline install takes it from the tarball.

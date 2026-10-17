@@ -1,13 +1,13 @@
 // This repository's wiring of scripts/release-holds.mjs, a copy of
 // agent-framework's, whose own suite tests the check itself (see the
 // script's header). Each case runs npm or bun with this repository's
-// preversion and prepublishOnly entries against a local stand-in for
-// GitHub's issues endpoint, or runs the script with this repository's own
-// package.json, so the hooks that make a release stop, and the repository
-// they ask, are tested here.
+// preversion, prepublishOnly and prepack entries against a local stand-in
+// for GitHub's issues endpoint, or runs the script with this repository's
+// own package.json, so the hooks that make a release stop, and the
+// repository they ask, are tested here.
 import { afterAll, test } from "bun:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingHttpHeaders } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -18,6 +18,7 @@ import { fileURLToPath } from "node:url";
 const SCRIPT = fileURLToPath(
   new URL("../scripts/release-holds.mjs", import.meta.url),
 );
+const PACK_CONTENTS = fileURLToPath(new URL("../scripts/pack-contents.mjs", import.meta.url));
 const PACKAGE_JSON = fileURLToPath(new URL("../package.json", import.meta.url));
 
 interface Seen {
@@ -89,22 +90,22 @@ function exec(
 // Under node, not the test runner's bun: npm runs it with node.
 const run = (cwd: string, env: Record<string, string>) => exec("node", [SCRIPT], cwd, env);
 
-/** A throwaway package whose preversion and prepublishOnly are this
- *  repository's own, with the script beside it, and the built Web UI that
- *  prepublishOnly also requires, unless `webUi` is false. */
-function wiredProject(webUi = true): string {
+/** A throwaway package whose preversion, prepublishOnly and prepack are this
+ *  repository's own, with their scripts beside them, in a git checkout with
+ *  the built Web UI that prepack requires. */
+function wiredProject(): string {
   const scripts = (JSON.parse(readFileSync(PACKAGE_JSON, "utf8")) as { scripts: Record<string, string> }).scripts;
   const dir = project({
     ...PKG,
-    scripts: { preversion: scripts.preversion, prepublishOnly: scripts.prepublishOnly },
+    scripts: { preversion: scripts.preversion, prepublishOnly: scripts.prepublishOnly, prepack: scripts.prepack },
   });
   mkdirSync(join(dir, "scripts"));
   copyFileSync(SCRIPT, join(dir, "scripts", "release-holds.mjs"));
+  copyFileSync(PACK_CONTENTS, join(dir, "scripts", "pack-contents.mjs"));
   writeFileSync(join(dir, ".npmrc"), "");
-  if (webUi) {
-    mkdirSync(join(dir, "dist", "web"), { recursive: true });
-    writeFileSync(join(dir, "dist", "web", "index.html"), "");
-  }
+  mkdirSync(join(dir, "dist", "web"), { recursive: true });
+  writeFileSync(join(dir, "dist", "web", "index.html"), "");
+  execFileSync("git", ["init", "-q"], { cwd: dir });
   return dir;
 }
 
@@ -192,19 +193,6 @@ test("this repository's prepublishOnly stops npm publish while a hold is open", 
     assert.notEqual(result.code, 0);
     assert.match(result.stderr, /#300 DefaultErrorPolicy/);
     assert.match(result.stderr, /then run npm publish again\./);
-  } finally {
-    await gh.close();
-  }
-}, 30_000);
-
-test("this repository's prepublishOnly refuses a tree without the built Web UI, before it asks about holds", async () => {
-  const gh = await github(200, []);
-  try {
-    const dir = wiredProject(false);
-    const result = await npm(dir, ["publish", "--dry-run"], gh.url);
-    assert.notEqual(result.code, 0);
-    assert.match(result.stderr, /dist\/web\/index\.html is missing: the package carries the Web UI built, so build it \(npm run build:web:ci\) before publishing\./);
-    assert.ok(!gh.seen.some((s) => s.url.startsWith("/repos/")));
   } finally {
     await gh.close();
   }
