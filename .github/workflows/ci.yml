@@ -74,10 +74,13 @@ jobs:
   # the registry as it stands, not from this branch's lockfile, so a new
   # upstream release can turn it red on a change that touched nothing it
   # installs: when it fails, rerunning it on main tells a change's own break
-  # from the registry's drift.
+  # from the registry's drift. Its limit is above the script's own, which
+  # add up to 73 minutes at most, so a hang outside them ends here, not at
+  # GitHub's 6 hours.
   pack-check:
     name: Packed release installs on its own
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0

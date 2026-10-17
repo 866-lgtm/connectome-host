@@ -37,7 +37,10 @@
 // registry blip; one that runs out of time isn't.
 // PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS and
 // PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS set the install's and the smoke run's
-// limits in milliseconds (defaults 900000 and 120000).
+// limits in milliseconds (defaults 900000 and 120000); npm pack has the
+// install's. A child that outlives its limit is killed, not asked to stop:
+// one that handles SIGTERM, as a dependency's new release could, would keep
+// running past it.
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
@@ -107,7 +110,7 @@ class TimeoutError extends CheckError {}
  *  and running out of time says that `what` didn't finish. */
 function run(file, args, options, what, message) {
   try {
-    execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], ...options });
+    execFileSync(file, args, { stdio: ["ignore", "inherit", "inherit"], killSignal: "SIGKILL", ...options });
   } catch (error) {
     if (error?.code === "ENOENT") throw new CheckError(`couldn't run ${file}: it isn't on PATH.`);
     if (error?.code === "ETIMEDOUT") throw new TimeoutError(`${what} didn't finish within ${options.timeout / 1000} s.`);
@@ -150,10 +153,13 @@ function main() {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "inherit"],
         maxBuffer: MAX_BUFFER,
+        timeout: installTimeoutMs,
+        killSignal: "SIGKILL",
       });
     } catch (error) {
       if (error?.code === "ENOENT") throw new CheckError("couldn't run npm: it isn't on PATH.");
       process.stderr.write(error?.stdout ?? out);
+      if (error?.code === "ETIMEDOUT") throw new CheckError(`npm pack didn't finish within ${installTimeoutMs / 1000} s.`);
       throw new CheckError("npm pack failed (its output is above).");
     }
     // npm 11 prints an array of records, npm 12 an object keyed by name.
@@ -269,6 +275,7 @@ function main() {
       input: `${SMOKE_MESSAGE}\n`,
       encoding: "utf8",
       timeout: smokeTimeoutMs,
+      killSignal: "SIGKILL",
       maxBuffer: MAX_BUFFER,
       env: { ...process.env, DATA_DIR: join(work, "data") },
     });

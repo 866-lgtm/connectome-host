@@ -296,11 +296,14 @@ test("@opentui/core must load in the installed tree, its native package with it"
   );
 }, TIMEOUT_MS * 3);
 
-test("a smoke run that doesn't finish is stopped at its limit, and the limit must be a number", async () => {
-  const slow = await check(
-    standIn({}, `${HOST}await new Promise((resolve) => setTimeout(resolve, 30_000));\n`),
-    { PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS: "2000" },
-  );
+// A child that ignores SIGTERM and would end on its own only after 90 s, so
+// a check that only asked it to stop at its limit would take that long.
+const DEAF = `process.on("SIGTERM", () => {});\nawait new Promise((resolve) => setTimeout(resolve, 90_000));\n`;
+
+test("a smoke run that doesn't finish is stopped at its limit, even one that ignores SIGTERM, and the limit must be a number", async () => {
+  const start = Date.now();
+  const slow = await check(standIn({}, `${HOST}${DEAF}`), { PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS: "2000" });
+  assert.ok(Date.now() - start < 60_000, `took ${Date.now() - start} ms`);
   assert.equal(slow.code, 1);
   assert.match(slow.stderr, /didn't finish within 2 s \(its output is above\)\.\n$/);
   for (const value of ["", "2m", "0"]) {
@@ -308,7 +311,7 @@ test("a smoke run that doesn't finish is stopped at its limit, and the limit mus
     assert.equal(bad.code, 1);
     assert.equal(bad.stderr, `pack-installs-alone: PACK_INSTALLS_ALONE_SMOKE_TIMEOUT_MS is '${value}', not a whole number of milliseconds.\n`);
   }
-}, TIMEOUT_MS);
+}, TIMEOUT_MS * 2);
 
 test("an install that fails once and then succeeds passes on its second attempt", async () => {
   const blip = npmShim(`if (args[0] === "install" && !fs.existsSync(bin + "/failed")) { fs.writeFileSync(bin + "/failed", ""); console.error("zz: registry blip"); process.exit(1); }\npass();`);
@@ -319,13 +322,24 @@ test("an install that fails once and then succeeds passes on its second attempt"
   assert.match(result.stdout, /installs on its own with npm /);
 }, TIMEOUT_MS * 2);
 
-test("an install that runs out of time fails at once, saying so, without another attempt", async () => {
-  const slow = npmShim(`if (args[0] === "install") setTimeout(() => {}, 30_000);\nelse pass();`);
+test("an install that runs out of time, even one that ignores SIGTERM, fails at once, saying so, without another attempt", async () => {
+  const slow = npmShim(`if (args[0] === "install") { process.on("SIGTERM", () => {}); setTimeout(() => {}, 90_000); }\nelse pass();`);
+  const start = Date.now();
   const result = await check(standIn({}), { ...withPath(slow), PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000" });
+  assert.ok(Date.now() - start < 60_000, `took ${Date.now() - start} ms`);
   assert.equal(result.code, 1);
   assert.match(result.stderr, /pack-installs-alone: the install of zz-host-1\.0\.0\.tgz didn't finish within 2 s\.\n$/);
   assert.doesNotMatch(result.stderr, /attempt 1 of 3/);
-}, TIMEOUT_MS);
+}, TIMEOUT_MS * 2);
+
+test("npm pack that runs out of the install's time, even ignoring SIGTERM, fails, saying so", async () => {
+  const slow = npmShim(`if (args[0] === "pack") { process.on("SIGTERM", () => {}); setTimeout(() => {}, 90_000); }\nelse pass();`);
+  const start = Date.now();
+  const result = await check(standIn({}), { ...withPath(slow), PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000" });
+  assert.ok(Date.now() - start < 60_000, `took ${Date.now() - start} ms`);
+  assert.equal(result.code, 1);
+  assert.match(result.stderr, /pack-installs-alone: npm pack didn't finish within 2 s\.\n$/);
+}, TIMEOUT_MS * 2);
 
 test("npm pack that fails, or prints anything but one record with a filename and its files, fails by name", async () => {
   const failing = npmShim(`if (args[0] === "pack") { console.error("zz: pack failed"); process.exit(1); }\npass();`);

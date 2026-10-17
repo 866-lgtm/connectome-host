@@ -45,11 +45,13 @@ jobs:
         with:
           bun-version: 1.3.14
 
-      # --ignore-scripts, as in ci.yml: the root postinstall's non-strict
+      # npm ci, as in ci.yml: a tag doesn't wait for CI, and npm ci installs
+      # what package-lock.json pins, where `npm install` would re-resolve it.
+      # --ignore-scripts, as in ci.yml too: the root postinstall's non-strict
       # `npm --prefix web install` would heal a broken web/package-lock.json
       # on disk before the strict step below reads it.
       - name: Install dependencies
-        run: npm install --ignore-scripts
+        run: npm ci --ignore-scripts --no-audit --no-fund
 
       - name: Build web assets
         run: npm run build:web:ci
@@ -69,9 +71,12 @@ jobs:
   # its own, so the install scripts the Web UI's build runs never see the
   # publish job's id-token; publish needs it, the GitHub release notes
   # don't. It runs on a dispatch from a branch too, which publishes nothing.
+  # Its limit is above the script's own, which add up to 73 minutes at
+  # most, so a hang outside them ends here, not at GitHub's 6 hours.
   pack-check:
     name: Packed release installs on its own
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       contents: read
 
