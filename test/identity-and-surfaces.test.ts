@@ -686,18 +686,24 @@ describe('identity request: fromFile reads only what the mount allows', () => {
 
   // The store holds only what the resident wrote or what the sync took from
   // regular files inside the mount, so the copy that stands in is the
-  // workspace's own, whatever is (or isn't) on disk at the path now.
-  it("sends the workspace's own copy of a file deleted from disk, and where a link leads nowhere", async () => {
+  // workspace's own, whatever is (or isn't) on disk at the path now. Each
+  // case is its own test with one fixture, as every other test here is, so
+  // no test carries two fixtures' work against its time limit.
+  it("sends the workspace's own copy of a file deleted from disk", async () => {
     const { mountDir, workspace, bodies, upload } = await mounted();
     writeFileSync(join(mountDir, 'old.txt'), 'synced before it was deleted');
     expect('data' in (await workspace.readBinary('files/old.txt'))).toBe(true); // the workspace takes it in
     rmSync(join(mountDir, 'old.txt'));
     expect((await upload('files/old.txt')).success).toBe(true);
-    const following = await mounted({ followSymlinks: true });
-    symlinkSync(join(following.outside, 'missing.txt'), join(following.mountDir, 'gone.txt'));
-    await following.putInStore('files/gone.txt', 'written through the workspace');
-    expect((await following.upload('files/gone.txt')).success).toBe(true);
-    expect([...bodies, ...following.bodies].map(String)).toEqual(['synced before it was deleted', 'written through the workspace']);
+    expect(bodies.map(String)).toEqual(['synced before it was deleted']);
+  });
+
+  it("sends the workspace's own copy where a link leads nowhere", async () => {
+    const { mountDir, outside, putInStore, bodies, upload } = await mounted({ followSymlinks: true });
+    symlinkSync(join(outside, 'missing.txt'), join(mountDir, 'gone.txt'));
+    await putInStore('files/gone.txt', 'written through the workspace');
+    expect((await upload('files/gone.txt')).success).toBe(true);
+    expect(bodies.map(String)).toEqual(['written through the workspace']);
   });
 
   it("sends the workspace's copy where disk has no file: never materialized, under a file, a name disk can't hold, a gone mount", async () => {
