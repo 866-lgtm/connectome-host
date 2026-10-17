@@ -305,9 +305,10 @@ fallback rungs are window-independent.
 **System prompt: keep it minimal.** Leave it empty, or write a few sentences at most. Most
 long-running residents run a single sentence or nothing. `""` is valid: under kv-unified (the
 default) the request then carries no system block at all. A resident pinned to kv-stable or
-another solver is different: there membrane (0.5.87) can send `""` as an empty system block
-with a cache marker, which the API may refuse. Give such a resident one short sentence
-instead, until membrane leaves an empty system block out. Why minimal:
+another solver is different: there membrane 0.5.87 and earlier can send `""` as an empty
+system block with a cache marker, which the API may refuse. Membrane leaves it out from the
+release after 0.5.87 (antra-tess/membrane#145); until the host runs that release, give such a
+resident one short sentence instead. Why minimal:
 
 - **The agent's identity lives in its memory.** That means the imported history and everything
   it lives through afterwards, which the strategy keeps in context. A long persona or rulebook
