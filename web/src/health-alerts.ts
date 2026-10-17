@@ -12,6 +12,7 @@
  */
 
 import type { HealthSnapshot } from './Health';
+import { quarantineHeld } from '@conhost/web/quarantine-alert';
 
 export interface HealthAlertUpsert {
   kind: string;
@@ -46,7 +47,7 @@ export function planHealthAlerts(
         plan.upsert.push({
           kind: QUARANTINE,
           agent,
-          message: `${q.count} chunk(s) in compression quarantine — spans stay raw and will eventually exhaust the context budget.`,
+          message: `${quarantineHeld(q)} — spans stay raw and will eventually exhaust the context budget.`,
         });
       }
     } else {
