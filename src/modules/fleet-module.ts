@@ -1814,11 +1814,14 @@ export class FleetModule implements Module {
             `reach this host. fleet--restart keeps that subscription, ` +
             // env reaches a child only from this host's recipe (autoStart),
             // never through fleet--launch, and a child adopted at a host's
-            // start keeps the subscription it had.
+            // start keeps the subscription it had. A restored record takes env
+            // from its recipe entry even when that entry's autoStart is false,
+            // and start() launches only entries whose autoStart isn't.
             (fromChild.env !== undefined
               ? `and fleet--launch can't pass the env '${input.from}' was started with, so a relaunch would lose ` +
-                `it. Ask the user to add inference:speech to its subscription in this host's recipe; this host ` +
-                `starts it with that subscription at its next start, if '${input.from}' isn't running then.`
+                `it. Ask the user to add inference:speech to its subscription in this host's recipe, and to turn ` +
+                `its autoStart on there if it's set to false; this host then starts it with that subscription at ` +
+                `its next start, if '${input.from}' isn't running then.`
               : `so fleet--kill '${input.from}', then fleet--launch it again with the recipe, dataDir and ` +
                 `autoRestart that fleet--status shows for it, and a subscription that includes inference:speech.`),
       };
@@ -1938,10 +1941,15 @@ export class FleetModule implements Module {
 
   /** fleet--await's answer when a child it waits on has stopped, whether
    *  before the wait or during it. The idle children it names leave out
-   *  that child, which may have gone idle before it stopped. */
+   *  every child that has stopped, that one included, since each may have
+   *  gone idle before it stopped. */
   private awaitedChildStopped(c: FleetChild, idle: string[]): string {
+    const running = idle.filter((n) => {
+      const status = this.children.get(n)?.status;
+      return status !== 'crashed' && status !== 'exited';
+    });
     return `Child '${c.name}' has ${c.status}${stoppedHow(c)}, so there's no idle to wait for. Idle so far: ` +
-      `${listed(idle.filter((n) => n !== c.name))}. fleet--peek for '${c.name}' shows its last events, and ` +
+      `${listed(running)}. fleet--peek for '${c.name}' shows its last events, and ` +
       `fleet--restart for '${c.name}' starts it again.`;
   }
 

@@ -180,18 +180,21 @@ describe('fleet refusals name what the agent can do', () => {
       "Child 'busy' has crashed (code=1), so there's no idle to wait for. Idle so far: none. fleet--peek for " +
       "'busy' shows its last events, and fleet--restart for 'busy' starts it again.",
     );
-    // Gone idle, then crashed: it isn't named idle beside its own stop.
-    const idleThenCrash = join(dir, 'crash-idle');
-    expect((await launch('idler', { idle: true, crashOnFile: idleThenCrash })).success).toBe(true);
-    await until(async () => (await call('peek', { name: 'idler' })).data.events
-      .some((e: { phase?: string }) => e.phase === 'idle'));
-    writeFileSync(idleThenCrash, '');
-    await until(async () => (await call('status', { name: 'idler' })).data.status === 'crashed');
-    expect((await call('await', { names: ['idler', 'done'] })).error).toBe(
+    // Gone idle, then crashed: neither it nor another awaited child that did
+    // the same is named idle.
+    for (const name of ['idler', 'idler-2']) {
+      const idleThenCrash = join(dir, `crash-${name}`);
+      expect((await launch(name, { idle: true, crashOnFile: idleThenCrash })).success).toBe(true);
+      await until(async () => (await call('peek', { name })).data.events
+        .some((e: { phase?: string }) => e.phase === 'idle'));
+      writeFileSync(idleThenCrash, '');
+      await until(async () => (await call('status', { name })).data.status === 'crashed');
+    }
+    expect((await call('await', { names: ['idler', 'idler-2', 'done'] })).error).toBe(
       "Child 'idler' has crashed (code=1), so there's no idle to wait for. Idle so far: 'done'. fleet--peek for " +
       "'idler' shows its last events, and fleet--restart for 'idler' starts it again.",
     );
-  });
+  }, 20_000);
 
   // The exit handler schedules autoRestart's retry, perhaps after the error
   // is written, so the error says one may come and how to stop it.
@@ -307,8 +310,9 @@ describe('fleet refusals name what the agent can do', () => {
     expect((await launch('dst')).success).toBe(true);
     expect((await call('relay', { from: 'src', to: 'dst' })).error).toEndWith(
       "fleet--restart keeps that subscription, and fleet--launch can't pass the env 'src' was started with, so a " +
-      "relaunch would lose it. Ask the user to add inference:speech to its subscription in this host's recipe; " +
-      "this host starts it with that subscription at its next start, if 'src' isn't running then.",
+      "relaunch would lose it. Ask the user to add inference:speech to its subscription in this host's recipe, " +
+      "and to turn its autoStart on there if it's set to false; this host then starts it with that subscription " +
+      "at its next start, if 'src' isn't running then.",
     );
   });
 
