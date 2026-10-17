@@ -163,7 +163,8 @@ const CONTENT_TYPES: Record<string, string> = {
 
 function guessContentType(path: string): string {
   const ext = path.slice(path.lastIndexOf('.') + 1).toLowerCase();
-  return CONTENT_TYPES[ext] ?? 'application/octet-stream';
+  // The table's own entry, never a name every object inherits (constructor).
+  return Object.hasOwn(CONTENT_TYPES, ext) ? CONTENT_TYPES[ext] : 'application/octet-stream';
 }
 const RESPONSE_INLINE_MAX = 24 * 1024;
 const RESPONSE_BODY_MAX = 64 * 1024 * 1024;
@@ -1109,9 +1110,17 @@ export class IdentityModule implements Module {
     // anything (the invite, the proof, the name, the key). Worded as the
     // service's answer all the same, with its reason for the agent to read,
     // and logged with it, since a reason such as "key already enrolled" is
-    // the operator's to act on. The host knows nothing of a registration the
-    // service holds, so the log gives no record to write.
-    console.error(`[identity] registering this host as ${JSON.stringify(name)} with ${home}: the service answered ${status}: ${error}.`);
+    // the operator's to act on. Both allow for an earlier call whose outcome
+    // was unknown, which may have registered this host: an operator often
+    // reads the log from its last line, and after such a call this refusal is
+    // that line. The host keeps no note of earlier outcomes, so the log points
+    // to that call's line for the record to write.
+    console.error(
+      `[identity] registering this host as ${JSON.stringify(name)} with ${home}: the service answered ${status}: ${error}. ` +
+        'If an earlier call got no reply, a fault of the service\'s own, or a 400 not about the name, it may have ' +
+        'registered this host: check the service, and if it holds this registration, record it by hand as that call\'s ' +
+        'line says.',
+    );
     return fail(
       `The identity service at ${home} answered the registration with ${status}: ${error}. If an earlier call got no ` +
       'reply, a fault of the service\'s own, or a 400 not about the name, that call may have registered this host, so ' +
@@ -1136,7 +1145,7 @@ export class IdentityModule implements Module {
       'call identity--accept_invite again: the service already holds this registration.';
     if (sub === null) {
       console.error(
-        `[identity] ${home} answered 200 to registering this host as "${name}", but no id could be read from its ` +
+        `[identity] ${home} answered 200 to registering this host as ${JSON.stringify(name)}, but no id could be read from its ` +
           `reply, so it wasn't recorded. This host holds it in memory only until it restarts. ` +
           this.recordByHand(name, null, enrolledAt),
       );

@@ -477,6 +477,11 @@ async function logged(run: () => Promise<void>): Promise<string[]> {
   return lines;
 }
 
+/** What a refused registration's log line adds for an earlier call whose outcome was unknown. */
+const EARLIER_CALL =
+  'If an earlier call got no reply, a fault of the service\'s own, or a 400 not about the name, it may have registered ' +
+  'this host: check the service, and if it holds this registration, record it by hand as that call\'s line says.';
+
 /**
  * An identity module registered with a fake identity service, its `/token`
  * and `/enroll` answers chosen per test, and one service, orrery, whose
@@ -594,7 +599,14 @@ describe('identity: what the agent reads when a call fails', () => {
         ...workspaceFor(null),
         readFileFromDisk: async () => { reads++; return { bytes: onDisk, size: onDisk.byteLength, truncated: false }; },
       };
-      const { mod, ready, seen } = registeredModule({ workspace: ws });
+      const types: string[] = [];
+      const { mod, ready, seen } = registeredModule({
+        workspace: ws,
+        orrery: (init) => {
+          types.push(String((init?.headers as Record<string, string> | undefined)?.['content-type']));
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+      });
       await ready;
       const send = (contentType: string) =>
         mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile: 'files/grid.png', contentType }));
@@ -606,9 +618,31 @@ describe('identity: what the agent reads when a call fails', () => {
       }
       expect(reads).toBe(0);
       expect(seen.orrery).toBe(0);
-      // One the runtime takes goes out as given.
-      expect(((await send('audio/mpeg; name="x y"')).data as any).sent.contentType).toBe('audio/mpeg; name="x y"');
-      expect(seen.bodies).toEqual([onDisk]);
+      // One the runtime takes goes out as given, in the header and the receipt, past ASCII too.
+      for (const contentType of ['audio/mpeg; name="x y"', 'audio/mpeg; name="\u00e9"']) {
+        expect(((await send(contentType)).data as any).sent.contentType).toBe(contentType);
+      }
+      expect(types).toEqual(['audio/mpeg; name="x y"', 'audio/mpeg; name="\u00e9"']);
+      expect(seen.bodies).toEqual([onDisk, onDisk]);
+    });
+
+    // The extension is looked up in the table's own entries, never in a name
+    // every object inherits.
+    it('types a file whose extension names an inherited member as application/octet-stream', async () => {
+      const types: string[] = [];
+      const { mod, ready } = registeredModule({
+        workspace: workspaceFor(null),
+        orrery: (init) => {
+          types.push(String((init?.headers as Record<string, string> | undefined)?.['content-type']));
+          return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { 'content-type': 'application/json' } });
+        },
+      });
+      await ready;
+      for (const fromFile of ['files/x.constructor', 'files/x.__proto__']) {
+        const sent = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/up', method: 'PUT', fromFile }));
+        expect((sent.data as any).sent).toEqual({ path: fromFile, size: onDisk.byteLength, contentType: 'application/octet-stream', from: 'disk' });
+      }
+      expect(types).toEqual(['application/octet-stream', 'application/octet-stream']);
     });
 
     // A file can grow after the disk read's size check, and is then read whole.
@@ -945,8 +979,9 @@ describe('identity: what the agent reads when a call fails', () => {
     const join_ = (name = 'A') => mod.handleToolCall(call('accept_invite', { invite: 'inv', name }));
     let refused = '';
     const refusedLog = await logged(async () => { refused = String((await join_()).error); });
-    // The operator's log has the answer and its reason, such as a key the service already holds.
-    expect(refusedLog).toContain('[identity] registering this host as "A" with id.test: the service answered 403: name taken.');
+    // The operator's log has the answer and its reason, such as a key the service already holds, and allows
+    // for an earlier call as the agent's text does.
+    expect(refusedLog).toContain(`[identity] registering this host as "A" with id.test: the service answered 403: name taken. ${EARLIER_CALL}`);
     expectSays(
       refused, 'answered the registration with 403: name taken.',
       'If an earlier call got no reply, a fault of the service\'s own, or a 400 not about the name',
@@ -991,6 +1026,8 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(unrecorded!.error).not.toContain(dir);
     expect(unrecorded!.error).not.toContain('key');
     expect(unrecorded!.error).not.toContain('EISDIR');
+    // The failure's line is the log's only one: no line says the record was written.
+    expect(lines).toHaveLength(1);
     // The log says where the record goes and what to write in it.
     expect(lines.some((line) => line.includes('EISDIR') && line.includes('only until it restarts') &&
       line.includes(`to ${join(dir, 'k.json')}`) && line.includes('"sub":"agent:a@guest","name":"A","home":"id.test"'))).toBe(true);
@@ -1023,6 +1060,23 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(JSON.parse(readFileSync(join(dir, 'k.json'), 'utf8'))).toMatchObject({ sub: 'agent:a@guest', name: 'A', home: 'id.test' });
   });
 
+  // An operator often reads the log from its last line. After an unknown
+  // outcome, a refused retry is that line, so it allows for the earlier call
+  // as the agent's text does, though the host keeps no note of that call.
+  it('logs a refused retry after no reply allowing for the earlier call', async () => {
+    let enroll = (): Response => { throw new Error('connection reset'); };
+    const { mod } = registeredModule({ register: false, enroll: () => enroll() });
+    const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    const lines = await logged(async () => {
+      await join_();
+      enroll = () => new Response(JSON.stringify({ error: 'invite exhausted' }), { status: 403 });
+      await join_();
+    });
+    expect(lines).toHaveLength(2);
+    expectSays(lines[0], 'whether it registered this host is unknown', 'record it by hand');
+    expect(lines[1]).toBe(`[identity] registering this host as "A" with id.test: the service answered 403: invite exhausted. ${EARLIER_CALL}`);
+  });
+
   // The agent's name goes into the log quoted as JSON, so each registration
   // line stays one line, whatever name the agent asked for.
   it('quotes the name in every registration line it logs', async () => {
@@ -1030,16 +1084,21 @@ describe('identity: what the agent reads when a call fails', () => {
     const { mod } = registeredModule({ register: false, enroll: () => enroll() });
     const join_ = () => mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A\nB' }));
     const taken = await logged(async () => { await join_(); });
-    expect(taken).toEqual(['[identity] registering this host as "A\\nB" with id.test: the service answered 403: name taken.']);
+    expect(taken).toEqual([`[identity] registering this host as "A\\nB" with id.test: the service answered 403: name taken. ${EARLIER_CALL}`]);
     enroll = () => new Response(JSON.stringify({ error: 'bad name (1-32 chars, alnum/space/_/./-)' }), { status: 400 });
     const bad = await logged(async () => { await join_(); });
     expect(bad).toHaveLength(1);
     expectSays(bad[0], '[identity] registering this host as "A\\nB" with id.test: the service answered with 400: bad name');
+    // A 200 whose reply names no id is held in memory, so it gets a module of its own.
+    const noId = registeredModule({ register: false, enroll: () => new Response('{}', { status: 200 }) });
+    const held = await logged(async () => { await noId.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A\nB' })); });
+    expect(held).toHaveLength(1);
+    expectSays(held[0], '[identity] id.test answered 200 to registering this host as "A\\nB", but no id could be read');
     enroll = () => new Response(JSON.stringify({ sub: 'agent:ab@guest' }), { status: 200 });
     const recorded = await logged(async () => { await join_(); });
     expect(recorded).toHaveLength(1);
     expectSays(recorded[0], '[identity] registered this host as "A\\nB" with id.test (agent:ab@guest)');
-    for (const line of [...taken, ...bad, ...recorded]) expect(line).not.toContain('\n');
+    for (const line of [...taken, ...bad, ...held, ...recorded]) expect(line).not.toContain('\n');
   });
 
   // A 400 can come before the service registers anything or after it, as
