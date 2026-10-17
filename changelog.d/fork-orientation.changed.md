@@ -5,6 +5,7 @@
   - **The refusal names each part that was cut, and what to do:**
     - a long task: shorten or split it, or put the detail in a file and pass the path, giving a spawn a tool that can read it (a fork's own tools must be able to);
     - a spawn's orientation, which names its tools in full: give the spawn a shorter tools list;
-    - a fork's orientation: launch it as `subagent--spawn` instead, with a short tools list and a task that fits one message, since a spawn's task is a message of its own; for a fork that would inherit its parent's context, the refusal adds that a spawn inherits none of it.
+    - a fork's orientation: launch it as `subagent--spawn` instead, with a short tools list and a task that fits one message, since a spawn's task is a message of its own; for a fork that would inherit its parent's context, the refusal adds that a spawn inherits none of it;
+    - a fork whose call, or that call's result, isn't in its first context: the same.
   - **The refusal is never retried, and never read as a rate limit:** it's the launch's outcome, not a provider failure.
   - **Async launches:** an async launch still answers at once with its receipt. Its refusal comes afterwards as the subagent's failure notice, by the path every async failure takes: the notice is added to the primary agent's context, and an inference is requested for the agent that launched it.

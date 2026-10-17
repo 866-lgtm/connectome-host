@@ -367,10 +367,12 @@ export type LaunchDelivery =
 
 /**
  * What a launch promises that a stream's compiled first context lacks:
- * 'orientation' when the orientation (and, for a fork, the rest of its
- * result's head) isn't there whole; 'task' when a spawn's or parentless
+ * 'orientation' when the orientation isn't there whole: for a fork, when
+ * its result is there but doesn't begin with its whole head (framing,
+ * orientation and return instruction); 'task' when a spawn's or parentless
  * fork's task text isn't; 'call' when a fork's own call, which carries its
- * whole task, isn't there with that task. Empty when everything arrived.
+ * whole task, isn't there with that task, or its result isn't there at
+ * all. Empty when everything arrived.
  */
 export function undeliveredLaunchParts(
   messages: ReadonlyArray<{ content: ContentBlock[] }>,
@@ -397,12 +399,18 @@ export function undeliveredLaunchParts(
       ? (result.content as Array<{ type?: unknown; text?: unknown }>)
           .map((c) => (c.type === 'text' && typeof c.text === 'string' ? c.text : '')).join('')
       : '';
-  if (!resultText.startsWith(delivery.head)) cut.push('orientation');
+  // A fork's call and its result arrive or go together: the context
+  // manager's recent window keeps the newest messages first and drops a
+  // leading result whose call it left out (context-manager 0.14.1's
+  // emitRecentNewestFirst), and its cap passes a tool call whole. So only
+  // the cap cuts a result that is there, and a result that isn't there is
+  // the call's part to say.
+  if (result !== undefined && !resultText.startsWith(delivery.head)) cut.push('orientation');
   const call = blocks.find((b) => {
     const block = b as { type?: unknown; id?: unknown };
     return block.type === 'tool_use' && block.id === delivery.callId;
   }) as { input?: { task?: unknown } } | undefined;
-  if (call?.input?.task !== delivery.task) cut.push('call');
+  if (result === undefined || call?.input?.task !== delivery.task) cut.push('call');
   return cut;
 }
 const FALLBACK_SUBAGENT_MODEL = 'claude-haiku-4-5-20251001';
@@ -478,7 +486,8 @@ export interface SubagentLaunch {
      *  subagent--return; 'all' only for an unrestricted caller's fork or
      *  spawn without a list, short of the depth limit. */
     allowed: 'all' | string[];
-    /** The spawn caller's own list (subagent--return is always added). */
+    /** The spawn caller's own list, as given: `allowed` is what gets
+     *  subagent--return. */
     requested?: string[];
     /** The names of `allowed` the process offers at the call, which is
      *  what the description can say the stream gets; present when `allowed`
@@ -731,7 +740,8 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   const depth = launch.tools.depthLimited;
   const explicit = launch.proseRouting === 'explicit';
   // prose_help isn't on the board: explicit prose routing shows it to a
-  // stream whose rules allow it (agentToolSurface checks canUseTool), so a
+  // stream whose rules allow it (agent-framework's
+  // availableToolsForPresentation checks canUseTool), so a
   // stream gets it though the process doesn't offer it at the call. The
   // depth limit's rules, built from what the process offers, never hold it.
   const shownHelp = explicit && allowed !== 'all' && allowed.includes('prose_help');
@@ -795,10 +805,13 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     // offers of them, less the subagent tools.
     inherited = true;
     const n = callerRules.length;
+    // Short of the depth limit it keeps the rules whole, and is given what
+    // the process offers of them: two facts, so that a stream given only
+    // subagent--return isn't read as keeping only that.
     toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and ` +
       (depth
         ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools: ${gets('', '')}`
-        : `it keeps that: ${gets('', ', as the process offered them at the call')}`);
+        : `this stream keeps those rules; it's given ${gets('', ', as the process offered them at the call')}`);
     const missing = notGiven(callerRules);
     if (missing.length > 0) toolRule += `; ${them}'s rules also allow ${joinSome(missing)}, which this stream isn't given at the call`;
   } else {
@@ -2315,7 +2328,9 @@ export class SubagentModule implements Module {
       tools: {
         allowed: allowed === 'all' ? 'all' : [...allowed],
         ...(requestedTools !== undefined ? { requested: [...requestedTools] } : {}),
-        ...(allowed !== 'all' ? { granted: allowed.filter((name) => name === 'subagent--return' || offered.has(name)) } : {}),
+        // Each name once: the stream gets a tool once however often its list
+        // names it (canUseTool tests membership).
+        ...(allowed !== 'all' ? { granted: [...new Set(allowed)].filter((name) => name === 'subagent--return' || offered.has(name)) } : {}),
         // filterToolNames' own threshold.
         depthLimited: callerDepth + 1 >= this.maxDepth,
       },
@@ -2380,9 +2395,11 @@ export class SubagentModule implements Module {
 
   /** Why a launch is refused when its stream wouldn't read what it
    *  promises: each part that was cut, and the way out for it. A fork takes
-   *  no tools list, so its way out for a long orientation is a spawn with
-   *  one, which inherits nothing: worth saying when the fork would have
-   *  inherited its parent's context, as a fork with a call does. */
+   *  no tools list, so its way out for a long orientation, or for a call the
+   *  context lost, is a spawn with a short one, so that the spawn's own
+   *  orientation fits, and a spawn inherits nothing: worth saying when the
+   *  fork would have inherited its parent's context, as a fork with a call
+   *  does. */
   private launchRefusal(
     kind: 'spawn' | 'fork',
     name: string,
@@ -2391,20 +2408,22 @@ export class SubagentModule implements Module {
   ): SubagentLaunchRefused {
     const inheritsContext = delivery.kind === 'fork-result';
     const cap = formatTokens(SUBAGENT_STRATEGY.maxMessageTokens);
+    // A spawn's task is a message of its own, which the cap can cut, as a
+    // parentless fork's is; a fork with a parent carries its task whole in
+    // its call, so the spawn it becomes needs a task that fits one message.
+    const asSpawn = 'launch it as subagent--spawn instead, with a short tools list and a task that fits one message';
+    const inherits = inheritsContext ? ', though a spawn inherits none of this context' : '';
     const reasons = cut.map((part) => {
       if (part === 'orientation') {
         return kind === 'spawn'
           ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
-          // A spawn's task is a message of its own, which the cap cuts, where
-          // a fork's rides whole in its call.
-          : `its orientation is longer than one message holds (${cap}): launch it as subagent--spawn instead, with a short tools list and a task that fits one message` +
-            (inheritsContext ? ', though a spawn inherits none of this context' : '');
+          : `its orientation is longer than one message holds (${cap}): ${asSpawn}${inherits}`;
       }
       if (part === 'task') {
         return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
           `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
       }
-      return `the fork call that carries its task isn't in the context it would start from: launch it as subagent--spawn instead, with a task that fits one message (${cap})`;
+      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${asSpawn} (${cap})${inherits}`;
     });
     return new SubagentLaunchRefused(`Subagent ${name} wasn't launched: ${reasons.join('; and ')}.`);
   }
