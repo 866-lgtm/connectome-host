@@ -93,6 +93,11 @@ describe('reading the grants file', () => {
     expect(read).toEqual({ kind: 'unreadable', problem: 'can\'t be checked (boom)' });
   });
 
+  // Each of the two reads checks a value nested 100,000 deep until the stack
+  // overflows. That takes seconds, and on a busy machine it has run past the
+  // default 5 s limit, so the case has a limit of its own. The time is the
+  // overflow's, not the depth's: 50,000 deep takes as long. The depth stays,
+  // since a shallower value might not overflow the check on another platform.
   test('a value too deep to check gives no grants, not a throw', () => {
     const deep = '['.repeat(100_000) + ']'.repeat(100_000);
     writeFileSync(path, `{"observers": [{"key": "${key('A')}", "label": "x", "scopes": [${deep}]}]}`);
@@ -102,7 +107,7 @@ describe('reading the grants file', () => {
     expect(read.kind).toBe('unreadable');
     expect(read.problem).toStartWith('can\'t be checked (');
     expect(loadObserversFile(path)).toBeNull();
-  });
+  }, 20_000);
 });
 
 describe('the registry', () => {
