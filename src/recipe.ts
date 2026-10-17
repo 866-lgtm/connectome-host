@@ -724,7 +724,7 @@ export interface RecipeModules {
    * the alternative when the file is maintained outside the agent (edits
    * then propagate to the injection but not to `workspace--read`, which
    * serves Chronicle). A missing FILE remains fail-open at runtime: no
-   * injection, warn once.
+   * injection, with a log line and an `instructions-unavailable` ops alert.
    *
    * Cache economics: with position 'system' the injected block sits in the
    * prompt-cache prefix of every agent, so each EDIT to the file is a
@@ -743,8 +743,9 @@ export interface RecipeModules {
     /**
      * Truncate content beyond this many bytes, appending a
      * "[truncated: first N of M bytes]" marker (N may sit up to 3 bytes
-     * under the cap when a multibyte character straddles it). At most this
-     * many bytes are ever read from disk. Default 32768.
+     * under the cap when a multibyte character straddles it). Reads ask for
+     * no more than this, which agent-framework 0.22.1 exceeds only for a
+     * file that grows while it's read. Default 32768.
      */
     maxBytes?: number;
     /** Where the block lands: 'system' (default) | 'beforeUser' | 'afterUser'. */
