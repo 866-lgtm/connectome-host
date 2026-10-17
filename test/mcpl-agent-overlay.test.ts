@@ -12,6 +12,8 @@ import {
   readAgentOverlay,
   saveAgentOverlay,
   saveMcplServers,
+  readMcplServersFile,
+  loadMcplServers,
   applyAgentOverlay,
   resolveOverlayEntry,
   serverProvisions,
@@ -54,6 +56,44 @@ describe('readAgentOverlay / saveAgentOverlay', () => {
       saveAgentOverlay(path, entries);
       expect(readAgentOverlay(path)).toEqual(entries);
     });
+  });
+
+  // JSON.parse's own message names no file, and can quote the text (Bun
+  // names the token it didn't expect, V8 quotes a stretch), which can hold
+  // credentials: the boot, the operator's /mcp commands and mcpl_list
+  // showed it. A root of null threw a TypeError naming nothing.
+  test("the operator's servers file that isn't JSON, or holds null, is named and never quoted, at the boot and in an edit", () => {
+    withTmp((dir) => {
+      const path = join(dir, 'mcpl-servers.json');
+      writeFileSync(path, '{ "mcplServers": { "chat": { "env": { "TOKEN": s3cret } } } }');
+      for (const read of [readMcplServersFile, loadMcplServers]) {
+        expect(() => read(path)).toThrow(`${path} isn't valid JSON`);
+        try { read(path); } catch (error) {
+          // Still a SyntaxError, the class a bug report names.
+          expect(error).toBeInstanceOf(SyntaxError);
+          expect(String(error)).not.toContain('s3cret');
+        }
+      }
+      writeFileSync(path, 'null');
+      for (const read of [readMcplServersFile, loadMcplServers]) {
+        expect(() => read(path)).toThrow(`${path} holds null, not an object with mcplServers`);
+        // A TypeError, as main threw for it, unnamed.
+        expect(() => read(path)).toThrow(TypeError);
+      }
+    });
+  });
+
+  // Each check of the strict reading joins the others, so a regression to
+  // stopping at the first problem fails here.
+  test('the strict reading names every problem of an entry at once, a list read for an empty name whatever else it holds', () => {
+    expect(overlayEntryProblem(
+      { command: 5, transport: 'ws', args: 'x', env: { A: null }, enabledTools: [1, ''], reconnect: 'yes' },
+      { strict: true },
+    )).toBe(
+      "its command isn't text; its transport is neither stdio nor websocket; its args aren't a list of text; its env A " +
+      "isn't text, a finite number or true/false; its enabledTools isn't a list of names; its enabledTools holds an empty name, " +
+      'which matches nothing; its reconnect is neither true nor false',
+    );
   });
 
   // Both servers files keep the root's other keys on a save; a root that
@@ -544,14 +584,25 @@ describe('what an overlay replacement lacks of the operator definition', () => {
 
   test('a new write is held to the plain shapes the boot reads leniently (strict)', () => {
     for (const [entry, problem] of [
-      [{ command: 'node', env: { A: null } }, "its env A isn't text, a number or true/false"],
-      [{ command: 'node', env: { A: ['x'], B: {} } }, "its env A, B aren't text, a number or true/false"],
+      [{ command: 'node', env: { A: null } }, "its env A isn't text, a finite number or true/false"],
+      [{ command: 'node', env: { A: ['x'], B: {} } }, "its env A, B aren't text, a finite number or true/false"],
       [{ transport: 'ws', url: 'wss://w/mcpl' }, 'its transport is neither stdio nor websocket'],
       [{ command: 'node', toolPrefix: 5 }, "its toolPrefix isn't text"],
     ] as const) {
       expect(overlayEntryProblem(entry, { strict: true })).toBe(problem);
       expect(overlayEntryProblem(entry)).toBeNull();
     }
+  });
+
+  // A number JSON can't write (a file's 1e400 parses as Infinity) is refused
+  // for a new write, which would save null in its place, while the boot reads
+  // args as main did: every number as its text.
+  test('a number JSON can\'t write is refused for a new write, and read as its text in the boot\'s args', () => {
+    expect(overlayEntryProblem({ command: 'node', env: { BIG: Infinity } }, { strict: true }))
+      .toBe("its env BIG isn't text, a finite number or true/false");
+    expect(overlayEntryProblem({ command: 'node', args: ['--size', 1e400] })).toBeNull();
+    expect(resolveOverlayEntry('big', { command: 'node', args: ['--size', 1e400] } as AgentOverlayEntry, '/o.json')?.args)
+      .toEqual(['--size', 'Infinity']);
   });
 
   // A wrong kind is refused for a new write, and the boot passes it on as
@@ -584,7 +635,7 @@ describe('what an overlay replacement lacks of the operator definition', () => {
   });
 
   test('an entry naming nothing is skipped, and one the framework fails to open passes on, as on main', () => {
-    expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names nothing to run or dial');
+    expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names no command to run and no url to dial');
     // The framework logs the failed connect, and main loaded these the same way.
     expect(overlayEntryProblem({ transport: 'websocket', command: 'node' })).toBeNull();
     expect(overlayEntryProblem({ transport: 'stdio', url: 'wss://w/mcpl' })).toBeNull();
@@ -622,10 +673,10 @@ describe('what an overlay replacement lacks of the operator definition', () => {
     withTmp((dir) => {
       const path = join(dir, 'mcpl-servers.agent.json');
       writeFileSync(path, JSON.stringify({ mcplServers: { shell: { toolPrefix: 'y' } } }));
-      expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names nothing to run or dial');
+      expect(overlayEntryProblem({ toolPrefix: 'y' })).toBe('it names no command to run and no url to dial');
       expect(applyAgentOverlay([shell], path)).toEqual([shell]);
       expect(overlayWarnings([shell], path)).toEqual([
-        `[mcpl] server "shell": the agent overlay (${path}) entry is malformed (it names nothing to run or dial), so the boot skips it and the operator's definition loads`,
+        `[mcpl] server "shell": the agent overlay (${path}) entry is malformed (it names no command to run and no url to dial), so the boot skips it and the operator's definition loads`,
       ]);
     });
   });
@@ -897,9 +948,9 @@ describe('what an overlay replacement lacks of the operator definition', () => {
     });
   });
 
-  // The receipt says an overlay entry can't name host variables, but the
-  // likeliest next move is to write one anyway: `${VAR}` there reaches the
-  // child as literal text, so it supplies nothing.
+  // The receipt says naming a host variable in an overlay entry wouldn't fill
+  // it in, and the likeliest next move is to write one anyway: `${VAR}` there
+  // reaches the child as literal text, so it supplies nothing.
   test('a value that names a host variable supplies nothing, and is named, never shown', () => {
     expect(lostByReplacement(serverProvisions(shell), {
       command: 'node',
