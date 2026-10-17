@@ -210,6 +210,8 @@ function resolveModel(recipe: Recipe): string {
 
 /** The host's one NoticesModule, kept across session switches (see createFramework). */
 let noticesRef: NoticesModule | null = null;
+/** The host's one InstructionsModule, kept across session switches (see createFramework). */
+let instructionsRef: InstructionsModule | null = null;
 
 async function createFramework(
   membrane: Membrane,
@@ -345,12 +347,17 @@ async function createFramework(
   // via gatherContext. Requires the workspace module; validateRecipe rejects
   // the instructions+`workspace: false` pairing, so workspaceModule is
   // non-null here (the guard keeps the module fail-open regardless).
+  // ONE instance per host process, reused across session switches, as the
+  // notices module is: an instructions-unavailable alert raised in one
+  // session is stood down in the next once the file loads there. Its stop()
+  // lets go of the old session's workspace, so it's given this one's.
   if (modules.instructions) {
     const instructionsConfig =
       typeof modules.instructions === 'object' ? modules.instructions : {};
-    const instructionsModule = new InstructionsModule(instructionsConfig);
-    if (workspaceModule) instructionsModule.setWorkspace(workspaceModule);
-    moduleInstances.push(instructionsModule);
+    // Its alerts carry the agent's name, as the notices module's filter expects.
+    instructionsRef ??= new InstructionsModule({ ...instructionsConfig, agentName });
+    if (workspaceModule) instructionsRef.setWorkspace(workspaceModule);
+    moduleInstances.push(instructionsRef);
   }
 
   // Activity (typing indicators) — opt-in per recipe

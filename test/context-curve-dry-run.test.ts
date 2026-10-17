@@ -66,6 +66,21 @@ describe('the context curve', () => {
     expect(curve.verdict).toBeNull();   // no feasibility preview on this framework
   });
 
+  test("without a live budget it falls back to the recipe's effective budget, the 300k default when unset", async () => {
+    const calls: unknown[][] = [];
+    const app = appWith(async (...args: unknown[]) => {
+      calls.push(args);
+      return { messages: [] };
+    });
+    (app.framework as unknown as { getAgentRuntimeSettings: () => unknown }).getAgentRuntimeSettings = () => ({});
+
+    await buildContextCurve(app, 'scout');
+    (app.recipe.agent as { contextBudgetTokens?: number }).contextBudgetTokens = 180_000;
+    await buildContextCurve(app, 'scout');
+
+    expect(calls.map((c) => (c[0] as { maxTokens: number }).maxTokens)).toEqual([300_000, 180_000]);
+  });
+
   test("a summary's first and last dates are its messages' earliest and latest by time", async () => {
     // The store gives timestamps as Dates, which the default sort orders by
     // their text, weekday first: these fall out of time order that way in

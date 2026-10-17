@@ -20,7 +20,6 @@ import type {
   TraceEvent,
   WorkspaceModule,
 } from '@animalabs/agent-framework';
-import { open } from 'node:fs/promises';
 import { unknownToolResult } from './unknown-tool.js';
 import { shown } from './shown.js';
 
@@ -45,6 +44,9 @@ const TURN_END_TRACES: ReadonlySet<string> = new Set([
 interface ActivityState {
   channels: string[];
 }
+
+/** How much of a file's head the origin hint is read from. */
+const ORIGIN_HEAD_BYTES = 2048;
 
 /**
  * Parse a loose origin hint out of a file's top lines. Used when an inference
@@ -264,28 +266,25 @@ export class ActivityModule implements Module {
     if (!workspace) return;
 
     for (const mountPath of mountPaths) {
-      const abs = workspace.resolveAbsolutePath(mountPath);
-      if (!abs) continue;
-
       try {
-        const fd = await open(abs, 'r');
-        try {
-          const buf = Buffer.alloc(2048);
-          const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-          const head = buf.toString('utf8', 0, bytesRead);
-
-          const origin = parseOriginHint(head);
-          if (origin && this.channels.has(origin.channelId)) {
-            // Merge with any existing metadata so other keys (e.g. senderEmail)
-            // survive if the origin refresh is subsequent to an incoming message.
-            const prior = this.lastMetadata.get(origin.channelId) ?? {};
-            this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
-          }
-        } finally {
-          await fd.close();
+        // readFileFromDisk refuses a file that is itself a link unless the
+        // mount follows links, reads a file only if its canonical path lies
+        // inside the mount, and is asked for no more than the head the hint
+        // needs.
+        const { bytes } = await workspace.readFileFromDisk(mountPath, { maxBytes: ORIGIN_HEAD_BYTES });
+        // agent-framework 0.22.1 reads a file that grows after the read's
+        // size check whole, so the head is cut here too. Once the host's
+        // agent-framework floor includes anima-research/agent-framework#409,
+        // readFileFromDisk keeps maxBytes itself, and this cut can go.
+        const origin = parseOriginHint(bytes.subarray(0, ORIGIN_HEAD_BYTES).toString('utf8'));
+        if (origin && this.channels.has(origin.channelId)) {
+          // Merge with any existing metadata so other keys (e.g. senderEmail)
+          // survive if the origin refresh is subsequent to an incoming message.
+          const prior = this.lastMetadata.get(origin.channelId) ?? {};
+          this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
         }
       } catch {
-        // File unreadable / gone / etc. — silently skip.
+        // Unreadable, gone, or refused by the mount: silently skip.
       }
     }
   }
