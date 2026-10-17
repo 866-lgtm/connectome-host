@@ -485,10 +485,6 @@ export interface SubagentLaunch {
      *  is a list. Short of the depth limit `allowed` keeps every name, so a
      *  tool registered later still reaches the stream. */
     granted?: string[];
-    /** The names the spawn's list or the caller's rules hold that the
-     *  process didn't offer at the call (subagent--return aside), prose_help
-     *  among them, since it isn't on the board. */
-    unoffered: string[];
     /** At the sub-fork depth limit: only what the process offers at the
      *  call, and no subagent tools but subagent--return. */
     depthLimited: boolean;
@@ -587,13 +583,14 @@ function joinAll(items: readonly string[]): string {
 }
 
 /** A partial list: up to SOME_NAMES named and the rest counted ("a, b, …
- *  and 890 more"). It's for the caller's restriction, which describes
- *  another stream, and for the tools a fork has beyond its parent's, which
- *  its request defines in full anyway. Everything else an orientation lists
- *  is named in full with joinAll: a spawn's or parentless fork's whole
- *  surface, the names a spawn's caller listed, and the parent's tools a
- *  fork lacks. So a spawn's long orientation comes from its own tools, and
- *  a shorter tools list shortens it. */
+ *  and 890 more"). It's for the caller's restriction and the caller's
+ *  rules a stream isn't given, which describe another stream, and for the
+ *  tools a fork has beyond its parent's, which its request defines in full
+ *  anyway. Everything else an orientation lists is named in full with
+ *  joinAll: a spawn's or parentless fork's whole surface, the names a
+ *  spawn's caller listed, and the parent's tools a fork lacks. So a spawn's
+ *  long orientation comes from its own tools, and a shorter tools list
+ *  shortens it. */
 const SOME_NAMES = 10;
 function joinSome(items: readonly string[]): string {
   if (items.length <= SOME_NAMES) return joinAll(items);
@@ -731,16 +728,13 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   const requested = launch.tools.requested;
   const callerRules = p?.allowedTools ?? 'all';
   const granted = launch.tools.granted ?? (allowed === 'all' ? [] : allowed);
-  const unoffered = launch.tools.unoffered;
   const depth = launch.tools.depthLimited;
   const explicit = launch.proseRouting === 'explicit';
   // prose_help isn't on the board: explicit prose routing shows it to a
-  // stream whose rules allow it (agentToolSurface checks canUseTool), so
-  // there it's neither dropped nor unoffered, though the process doesn't
-  // offer it at the call. The depth limit's rules, built from what the
-  // process offers, never hold it, so there the depth removes it.
+  // stream whose rules allow it (agentToolSurface checks canUseTool), so a
+  // stream gets it though the process doesn't offer it at the call. The
+  // depth limit's rules, built from what the process offers, never hold it.
   const shownHelp = explicit && allowed !== 'all' && allowed.includes('prose_help');
-  const helpByDepth = explicit && depth;
 
   // The stream runs its caller's prose routing, so with a calling stream it
   // is the same by construction; without one the framework's default
@@ -760,16 +754,24 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
       });
 
   // What the stream gets of its rules: what the process offered at the call,
-  // and prose_help where explicit prose routing shows it.
-  const gets = (fromList: string, allows: string, offeredAt: string): string => {
+  // subagent--return among it, and prose_help where explicit prose routing
+  // shows it.
+  const gets = (fromList: string, offeredAt: string): string => {
     if (!shownHelp) {
-      return granted.length === 1
-        ? 'only subagent--return'
-        : `only these ${granted.length}${fromList}${offeredAt}: ${joinAll(granted)}, subagent--return among them`;
+      return granted.length === 1 ? 'only subagent--return' : `only these ${granted.length}${fromList}${offeredAt}: ${joinAll(granted)}`;
     }
-    const offered = granted.length === 1 ? 'subagent--return, as the process offered it at the call' : `${joinAll(granted)}, as the process offered them at the call`;
-    return `only these ${granted.length + 1}${fromList}: ${offered}, and prose_help, which explicit prose routing shows because ${allows}`;
+    const offered = granted.length === 1
+      ? 'subagent--return, as the process offered it at the call'
+      : `${joinAll(granted)}, as the process offered them at the call`;
+    return `only these ${granted.length + 1}${fromList}: ${offered}, and prose_help, which explicit prose routing shows`;
   };
+  // The names the stream's rules came from, a spawn's list or else the
+  // caller's own rules, that it isn't given at the call, in one list: kept
+  // in its rules for a tool the process doesn't offer yet, or left out of
+  // them. The stream can't act on which, and the caller, who could, chose
+  // them.
+  const notGiven = (held: readonly string[]): string[] =>
+    [...new Set(held)].filter((name) => !granted.includes(name) && !(shownHelp && name === 'prose_help'));
   let toolRule: string;
   // The rules are the caller's own: the line says so itself.
   let inherited = false;
@@ -778,24 +780,14 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     // depth limit, is unrestricted.
     toolRule = 'no restriction';
   } else if (requested !== undefined) {
-    // What the list grants, not the list: subagent--return named once, and
-    // each listed name the stream doesn't get named with one reason.
-    const dropped = [...new Set(requested)].filter((name) => !granted.includes(name) && !(shownHelp && name === 'prose_help'));
-    // A restricted caller's list only narrows: a name it doesn't allow is
-    // dropped by its rules, whatever else holds.
-    const byCaller = callerRules === 'all' ? [] : dropped.filter((name) => !callerRules.includes(name));
-    const notOffered = dropped.filter((name) => !byCaller.includes(name) && unoffered.includes(name) && !(helpByDepth && name === 'prose_help'));
-    // What's left the depth removed: the subagent tools the process offers,
-    // and prose_help under explicit routing. Short of the limit, nothing is.
-    const byDepth = dropped.filter((name) => !byCaller.includes(name) && !notOffered.includes(name));
-    // The grant is the board at the call; the stream's own Tools line says
-    // what it's shown when it starts.
+    // What the list grants, not the list: subagent--return named once. The
+    // grant is the board at the call; the stream's own Tools line says what
+    // it's shown when it starts.
     toolRule = granted.length === 1 && !shownHelp
       ? `only subagent--return${requested.length === 0 ? ': the caller listed no tools' : ''}`
-      : gets(" from the caller's list", 'the list allows it', ', as the process offered them at the call');
-    if (byCaller.length > 0) toolRule += `; the caller also listed ${joinAll(byCaller)}, which its own rules don't allow`;
-    if (notOffered.length > 0) toolRule += `; the caller also listed ${joinAll(notOffered)}, which ${notOffered.length === 1 ? 'isn\'t' : 'aren\'t'} offered to it at the call`;
-    if (byDepth.length > 0) toolRule += `; it also listed ${joinAll(byDepth)}, which this depth removes`;
+      : gets(" from the caller's list", ', as the process offered them at the call');
+    const missing = notGiven(requested);
+    if (missing.length > 0) toolRule += `; the caller's list also names ${joinAll(missing)}, which this stream isn't given at the call`;
     if (depth) toolRule += '; at this depth, no subagent tool but subagent--return';
   } else if (callerRules !== 'all') {
     // A fork, or a spawn without a list, keeps a restricted caller's rules,
@@ -805,16 +797,10 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     const n = callerRules.length;
     toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and ` +
       (depth
-        ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools: ${gets('', `${them}'s rules allow it`, '')}`
-        : `it keeps that: ${gets('', `${them}'s rules allow it`, ', as the process offered them at the call')}`);
-    // The rest of the caller's rules, each with why the stream doesn't get it.
-    const unofferedRules = callerRules.filter((name) => unoffered.includes(name) && !(name === 'prose_help' && (shownHelp || helpByDepth)));
-    const also: string[] = [];
-    if (unofferedRules.length > 0) {
-      also.push(`${joinSome(unofferedRules)}, which ${unofferedRules.length === 1 ? 'isn\'t' : 'aren\'t'} offered at the call`);
-    }
-    if (helpByDepth && callerRules.includes('prose_help')) also.push('prose_help, which this depth removes');
-    if (also.length > 0) toolRule += `; ${them}'s rules also allow ${also.join(', and ')}`;
+        ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools: ${gets('', '')}`
+        : `it keeps that: ${gets('', ', as the process offered them at the call')}`);
+    const missing = notGiven(callerRules);
+    if (missing.length > 0) toolRule += `; ${them}'s rules also allow ${joinSome(missing)}, which this stream isn't given at the call`;
   } else {
     // An unrestricted caller's launch at the depth limit.
     toolRule = 'every tool the process offers at the call except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
@@ -2291,11 +2277,8 @@ export class SubagentModule implements Module {
     // tools): resolved now and kept through the slot wait and every retry.
     const allowed = this.filterToolNames(requestedTools, callerDepth, parentAgent);
     // What the process offers now, which the description can say the stream
-    // gets, and the names the list or the caller's rules hold that it
-    // doesn't, each of which the description gives a reason for.
+    // gets.
     const offered = this.offeredNames();
-    const mentioned = new Set([...(requestedTools ?? []), ...(Array.isArray(parentAgent?.allowedTools) ? parentAgent.allowedTools : [])]);
-    const unoffered = [...mentioned].filter((name) => name !== 'subagent--return' && !offered.has(name));
 
     // The parent's context settings at the call, from supported surfaces
     // only: its runtime settings (budget, and the strategy's recent tail when
@@ -2333,7 +2316,6 @@ export class SubagentModule implements Module {
         allowed: allowed === 'all' ? 'all' : [...allowed],
         ...(requestedTools !== undefined ? { requested: [...requestedTools] } : {}),
         ...(allowed !== 'all' ? { granted: allowed.filter((name) => name === 'subagent--return' || offered.has(name)) } : {}),
-        unoffered,
         // filterToolNames' own threshold.
         depthLimited: callerDepth + 1 >= this.maxDepth,
       },
@@ -2413,14 +2395,16 @@ export class SubagentModule implements Module {
       if (part === 'orientation') {
         return kind === 'spawn'
           ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
-          : `its orientation is longer than one message holds (${cap}): launch it as subagent--spawn with a short tools list instead` +
+          // A spawn's task is a message of its own, which the cap cuts, where
+          // a fork's rides whole in its call.
+          : `its orientation is longer than one message holds (${cap}): launch it as subagent--spawn instead, with a short tools list and a task that fits one message` +
             (inheritsContext ? ', though a spawn inherits none of this context' : '');
       }
       if (part === 'task') {
         return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
           `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
       }
-      return "the fork call that carries its task isn't in the context it would start from: launch it as subagent--spawn with the task instead";
+      return `the fork call that carries its task isn't in the context it would start from: launch it as subagent--spawn instead, with a task that fits one message (${cap})`;
     });
     return new SubagentLaunchRefused(`Subagent ${name} wasn't launched: ${reasons.join('; and ')}.`);
   }

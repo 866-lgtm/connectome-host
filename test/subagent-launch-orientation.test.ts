@@ -365,7 +365,7 @@ describe('fork orientation', () => {
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_fork_11', input));
       await h.asyncPromise('wide');
       const block = launchBlock(res.data as string);
-      expect(block).toContain('- Tool rules: the parent is restricted to 1, and it keeps that: only these 2, as the process offered them at the call: agent_settings and subagent--return, subagent--return among them.');
+      expect(block).toContain('- Tool rules: the parent is restricted to 1, and it keeps that: only these 2, as the process offered them at the call: agent_settings and subagent--return.');
       expect(line(block, '- Against the parent at the call:')).toMatch(/Same: [^.]*tool rules/);
       const run = h.runs[0]!;
       expect(run.allowedTools).toEqual(['agent_settings', 'subagent--return']);
@@ -526,7 +526,7 @@ describe('spawn orientation', () => {
       expect(block).toContain('- Lineage: spawned by stream "parent" as a separate agent with its own system prompt and task; it inherits none of the caller\'s context; depth 1 of 3.');
       expect(block).toContain('- System prompt: supplied by the caller for this spawn.');
       expect(block).toContain(`- Prose routing: disabled, inherited from the caller: ${ROUTING_EFFECT.disabled}.`);
-      expect(block).toContain("- Tool rules: only subagent--return; the caller also listed time--now, which isn't offered to it at the call; the caller has no restriction.");
+      expect(block).toContain("- Tool rules: only subagent--return; the caller's list also names time--now, which this stream isn't given at the call; the caller has no restriction.");
       expect(input.tools).toEqual(['time--now']); // the caller's array is not mutated
       const run = h.runs[0]!;
       expect(run.proseRouting).toBe('disabled');
@@ -557,12 +557,14 @@ describe("a spawn's tool rule says what the list grants", () => {
   }
 
   test('names subagent--return once, even when the caller listed it', async () => {
-    expect(await ruleFor(['probe--t1', 'subagent--return'])).toStartWith("- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them");
+    const rule = await ruleFor(['probe--t1', 'subagent--return']);
+    expect(rule).toBe("- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return; the caller has no restriction.");
+    expect(rule.split('subagent--return').length - 1).toBe(1);
   });
 
-  test("names a listed tool the process doesn't offer as not offered, below the depth limit too", async () => {
+  test("names a listed tool the stream isn't given at the call in one list, with no reason, below the depth limit too", async () => {
     expect(await ruleFor(['probe--t1', 'no-such-tool'])).toStartWith(
-      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them; the caller also listed no-such-tool, which isn't offered to it at the call",
+      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return; the caller's list also names no-such-tool, which this stream isn't given at the call",
     );
   });
 
@@ -570,33 +572,23 @@ describe("a spawn's tool rule says what the list grants", () => {
     expect(await ruleFor([])).toStartWith('- Tool rules: only subagent--return: the caller listed no tools');
   });
 
-  test('at the depth limit, names what the process doesn\'t offer there as dropped', async () => {
+  test('at the depth limit, names what the stream isn\'t given at the call and that it can\'t fork or spawn', async () => {
     expect(await ruleFor(['time--now'], { maxDepth: 1 })).toStartWith(
-      "- Tool rules: only subagent--return; the caller also listed time--now, which isn't offered to it at the call; at this depth, no subagent tool but subagent--return",
+      "- Tool rules: only subagent--return; the caller's list also names time--now, which this stream isn't given at the call; at this depth, no subagent tool but subagent--return",
     );
   });
 
-  // Not registered, so not offered: the depth didn't remove it.
-  test('at the depth limit, names a listed subagent tool the process doesn\'t offer as not offered, not as removed by the depth', async () => {
-    const rule = await ruleFor(['probe--t1', 'subagent--nope'], { maxDepth: 1 });
-    expect(rule).toContain("; the caller also listed subagent--nope, which isn't offered to it at the call");
-    expect(rule).not.toContain('subagent--nope, which this depth removes');
-  });
-
-  // The depth limit's rules come from what the process offers, which
-  // prose_help never is; short of the limit explicit routing would show it.
-  test('at the depth limit under explicit routing, names a listed prose_help as removed by the depth', async () => {
-    const rule = await ruleFor(['probe--t1', 'prose_help'], { maxDepth: 1 }, { proseRouting: 'explicit' });
-    expect(rule).toContain('; it also listed prose_help, which this depth removes');
-    expect(rule).not.toContain("prose_help, which isn't offered");
-    expect(rule).not.toContain('explicit prose routing shows');
-  });
-
-  // The process offers subagent--fork; the depth removes it.
-  test('at the depth limit, names a listed subagent tool as removed by the depth, not as not offered', async () => {
-    const rule = await ruleFor(['probe--t1', 'subagent--fork'], { maxDepth: 1 });
-    expect(rule).toContain('; it also listed subagent--fork, which this depth removes');
-    expect(rule).not.toContain("subagent--fork, which isn't offered");
+  // Whatever kept a name out (not offered at the call, removed by the depth,
+  // or prose_help, which explicit routing shows short of the limit), it's
+  // named in the one list, with no reason.
+  test('at the depth limit, a listed tool the stream isn\'t given is named in the one list, whatever kept it out', async () => {
+    for (const [name, parent] of [['subagent--nope', {}], ['subagent--fork', {}], ['prose_help', { proseRouting: 'explicit' as const }]] as const) {
+      const rule = await ruleFor(['probe--t1', name], { maxDepth: 1 }, parent);
+      expect(rule).toContain(`; the caller's list also names ${name}, which this stream isn't given at the call`);
+      expect(rule).not.toContain('offered to it');
+      expect(rule).not.toContain('depth removes');
+      expect(rule).not.toContain('explicit prose routing shows');
+    }
   });
 
   // agentToolSurface adds prose_help under explicit routing when the
@@ -606,19 +598,19 @@ describe("a spawn's tool rule says what the list grants", () => {
     expect(rule).not.toContain("prose_help, which isn't offered");
     expect(rule).toStartWith(
       "- Tool rules: only these 3 from the caller's list: probe--t1 and subagent--return, as the process offered them at the call, " +
-        'and prose_help, which explicit prose routing shows because the list allows it',
+        'and prose_help, which explicit prose routing shows',
     );
     // A list of prose_help alone isn't "only subagent--return".
     expect(await ruleFor(['prose_help'], {}, { proseRouting: 'explicit' })).toStartWith(
       "- Tool rules: only these 2 from the caller's list: subagent--return, as the process offered it at the call, " +
-        'and prose_help, which explicit prose routing shows because the list allows it',
+        'and prose_help, which explicit prose routing shows',
     );
     expect(await ruleFor(['probe--t1'], {}, { proseRouting: 'explicit' })).not.toContain('prose_help');
     expect(await ruleFor(['probe--t1'])).not.toContain('prose_help');
   });
 
-  test('without explicit routing, a listed prose_help is named as not offered', async () => {
-    expect(await ruleFor(['probe--t1', 'prose_help'])).toContain("; the caller also listed prose_help, which isn't offered to it at the call");
+  test("without explicit routing, a listed prose_help is named with the rest the stream isn't given at the call", async () => {
+    expect(await ruleFor(['probe--t1', 'prose_help'])).toContain("; the caller's list also names prose_help, which this stream isn't given at the call");
   });
 });
 
@@ -637,20 +629,20 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
     }
   }
 
-  test("a spawn's listed tool that the caller's own rules don't allow is named as theirs to drop", async () => {
+  test("a spawn's listed tool that the caller's own rules don't allow is named with the rest the stream isn't given at the call", async () => {
     const { rule, run } = await launch('spawn', ['probe--t1', 'subagent--spawn'], { tools: ['probe--t1', 'agent_settings'] });
     expect(rule).toBe(
-      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return, subagent--return among them; " +
-        "the caller also listed agent_settings, which its own rules don't allow; the caller is restricted to 2: probe--t1 and subagent--spawn.",
+      "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return; " +
+        "the caller's list also names agent_settings, which this stream isn't given at the call; the caller is restricted to 2: probe--t1 and subagent--spawn.",
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
   });
 
-  test('a fork at the depth limit keeps what the process offers of its restricted parent\'s rules, less the subagent tools', async () => {
+  test('a fork at the depth limit keeps what the process offers of its restricted parent\'s rules, less the subagent tools, and names the rest', async () => {
     const { rule, run } = await launch('fork', ['probe--t1', 'subagent--fork'], {}, { maxDepth: 1 });
     expect(rule).toBe(
       '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
-        'less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them.',
+        "less the subagent tools: only these 2: probe--t1 and subagent--return; the parent's rules also allow subagent--fork, which this stream isn't given at the call.",
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
   });
@@ -659,8 +651,8 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
     const { rule, run } = await launch('fork', ['probe--t1', 'no-such-tool'], {}, { maxDepth: 1 });
     expect(rule).toBe(
       '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
-        "less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them; the parent's rules also allow " +
-        "no-such-tool, which isn't offered at the call.",
+        "less the subagent tools: only these 2: probe--t1 and subagent--return; the parent's rules also allow " +
+        "no-such-tool, which this stream isn't given at the call.",
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'subagent--return']);
   });
@@ -680,15 +672,15 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
         if (maxDepth === 3) {
           expect(line(block, '- Tool rules')).toBe(
             "- Tool rules: the parent is restricted to 2, and it keeps that: only these 3: probe--t1 and subagent--return, as the process " +
-              "offered them at the call, and prose_help, which explicit prose routing shows because the parent's rules allow it.",
+              'offered them at the call, and prose_help, which explicit prose routing shows.',
           );
           expect(line(block, '- Prose routing')).toBe(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}${PROSE_HELP}.`);
           expect(run.surface).toContain('prose_help');
         } else {
           expect(line(block, '- Tool rules')).toBe(
             '- Tool rules: the parent is restricted to 2, and at this depth it keeps only what the process offers of that at the call, ' +
-              "less the subagent tools: only these 2: probe--t1 and subagent--return, subagent--return among them; the parent's rules also " +
-              'allow prose_help, which this depth removes.',
+              "less the subagent tools: only these 2: probe--t1 and subagent--return; the parent's rules also " +
+              "allow prose_help, which this stream isn't given at the call.",
           );
           expect(line(block, '- Prose routing')).toBe(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}.`);
           expect(run.surface).not.toContain('prose_help');
@@ -699,11 +691,11 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
     }
   });
 
-  test("a parent's rule for a tool the process doesn't offer is kept, and said not to be offered", async () => {
+  test("a parent's rule for a tool the process doesn't offer is kept, and named among what the stream isn't given at the call", async () => {
     const { rule, run } = await launch('fork', ['probe--t1', 'no-such-tool'], {});
     expect(rule).toBe(
       '- Tool rules: the parent is restricted to 2, and it keeps that: only these 2, as the process offered them at the call: ' +
-        "probe--t1 and subagent--return, subagent--return among them; the parent's rules also allow no-such-tool, which isn't offered at the call.",
+        "probe--t1 and subagent--return; the parent's rules also allow no-such-tool, which this stream isn't given at the call.",
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'no-such-tool', 'subagent--return']);
   });
@@ -1141,7 +1133,7 @@ describe('the first request a fork actually sends', () => {
         const rule = wire.split('\\n').find((l) => l.startsWith('- Tool rules: '))!;
         const routing = wire.split('\\n').find((l) => l.startsWith('- Prose routing: '))!;
         if (tools.includes('prose_help' as never)) {
-          expect(rule).toContain(', and prose_help, which explicit prose routing shows because the list allows it');
+          expect(rule).toContain(', and prose_help, which explicit prose routing shows');
           expect(routing).toBe(sent(`- Prose routing: explicit, inherited from the caller: ${ROUTING_EFFECT.explicit}${PROSE_HELP}.`));
         } else {
           expect(rule).not.toContain('prose_help');
@@ -1153,6 +1145,33 @@ describe('the first request a fork actually sends', () => {
       }
     });
   }
+
+  // Only explicit routing shows prose_help: under locus routing a list that
+  // allows it gets neither the tool nor a line saying it has it.
+  test('a spawn listing prose_help under locus routing is sent neither it nor a Tools line naming it', async () => {
+    const { adapter, subagent, cleanup } = await realHarness({ parent: { proseRouting: 'locus' } });
+    try {
+      const input = { name: 'worker', systemPrompt: 'p', task: 'say done', model: 'mock-spawn', sync: true, tools: ['extra--t1', 'prose_help'] };
+      const res = await subagent.handleToolCall(call('spawn', 'toolu_worker', input));
+      expect(res.success).toBe(true);
+      const request = adapter.getRequestLog().map((r) => r.request).find((r) => r.model === 'mock-spawn');
+      expect(request).toBeDefined();
+      const toolNames = (request!.tools ?? []).map((t) => (t as { name: string }).name);
+      expect([...toolNames].sort()).toEqual(['extra--t1', 'subagent--return']);
+      const wire = JSON.stringify(request!.messages);
+      const toolsLine = wire.split('\\n').find((l) => l.startsWith('- Tools: '));
+      expect(toolsLine).toBeDefined();
+      expect(toolsLine).toStartWith('- Tools: 2 available to this stream: ');
+      expect(toolsLine).not.toContain('prose_help');
+      const rule = wire.split('\\n').find((l) => l.startsWith('- Tool rules: '))!;
+      expect(rule).toContain("; the caller's list also names prose_help, which this stream isn't given at the call");
+      expect(rule).not.toContain('explicit prose routing shows');
+      const routing = wire.split('\\n').find((l) => l.startsWith('- Prose routing: '))!;
+      expect(routing).toBe(sent(`- Prose routing: locus, inherited from the caller: ${ROUTING_EFFECT.locus}.`));
+    } finally {
+      await cleanup();
+    }
+  });
 
   test('carries the orientation, and its tools are the ones the orientation names', async () => {
     const { adapter, subagent, framework, cleanup } = await realHarness();
@@ -1302,7 +1321,7 @@ describe('what a stream first reads is what its launch promises', () => {
       expect(fork.success).toBe(false);
       // With no parent there is no context to lose by spawning instead.
       expect(String(fork.error)).toBe(
-        "Subagent wide-fork wasn't launched: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn with a short tools list instead.",
+        "Subagent wide-fork wasn't launched: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn instead, with a short tools list and a task that fits one message.",
       );
       expect(p.requestFor('mock-wide-fork')).toBeUndefined();
     } finally {
@@ -1526,15 +1545,15 @@ describe('what a stream first reads is what its launch promises', () => {
     const ownMessages = { kind: 'message', orientation: 'ORIENT', taskBlock: 'TASK' };
     expect(refuse('fork', 'f', ['orientation'], ownMessages).message).toBe(
       "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
-      'launch it as subagent--spawn with a short tools list instead.',
+      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message.',
     );
     expect(refuse('fork', 'f', ['orientation'], withCall).message).toBe(
       "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
-      'launch it as subagent--spawn with a short tools list instead, though a spawn inherits none of this context.',
+      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message, though a spawn inherits none of this context.',
     );
     expect(refuse('fork', 'f', ['call'], withCall).message).toBe(
       "Subagent f wasn't launched: the fork call that carries its task isn't in the context it would start from: " +
-      'launch it as subagent--spawn with the task instead.',
+      'launch it as subagent--spawn instead, with a task that fits one message (10,000 tokens).',
     );
     expect(refuse('spawn', 's', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
   });
@@ -1635,7 +1654,7 @@ describe('lists about another stream are named in part, so only the stream\'s ow
       } as never);
       expect(result.success).toBe(true);
       const wire = JSON.stringify(h.requestFor('mock-from-narrow')!.messages);
-      expect(wire).toContain('- Tool rules: the parent is restricted to 2, and it keeps that: only these 2, as the process offered them at the call: subagent--fork and subagent--return, subagent--return among them.');
+      expect(wire).toContain('- Tool rules: the parent is restricted to 2, and it keeps that: only these 2, as the process offered them at the call: subagent--fork and subagent--return.');
       expect(wire).not.toContain('bulk--');
     } finally {
       await h.cleanup();
