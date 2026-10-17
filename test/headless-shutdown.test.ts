@@ -1,9 +1,10 @@
 import { test, expect } from 'bun:test';
 import { spawn } from 'node:child_process';
 import { mkdtempSync, realpathSync, existsSync, readFileSync, rmSync } from 'node:fs';
-import { connect, type Socket } from 'node:net';
+import { type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { connectWhenAccepting } from './ipc-connect.js';
 
 for (const mode of ['healthy', 'failure', 'delayed-failure', 'ready-window']) {
   test(`headless shutdown ${mode} reports exit status and cleans IPC artifacts`, async () => {
@@ -26,7 +27,7 @@ for (const mode of ['healthy', 'failure', 'delayed-failure', 'ready-window']) {
         if (performance.now() >= deadline) throw new Error(`Startup timed out: ${output}`);
         await new Promise(resolve => setTimeout(resolve, 10));
       }
-      socket = connect(socketPath);
+      socket = await connectWhenAccepting(socketPath);
       await new Promise<void>((resolve, reject) => {
         let buffer = '';
         socket!.setEncoding('utf8');

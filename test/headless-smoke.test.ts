@@ -14,9 +14,10 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { connect as netConnect, type Socket } from 'node:net';
+import { type Socket } from 'node:net';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { connectWhenAccepting } from './ipc-connect.js';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(TEST_DIR, '..');
@@ -69,18 +70,6 @@ async function waitFor(check: () => boolean, timeoutMs: number, label: string): 
   throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
 }
 
-async function connectSocket(path: string, timeoutMs = 3_000): Promise<Socket> {
-  return new Promise((resolveConn, rejectConn) => {
-    const s = netConnect(path);
-    const timer = setTimeout(() => {
-      s.destroy();
-      rejectConn(new Error(`socket connect timeout: ${path}`));
-    }, timeoutMs);
-    s.once('connect', () => { clearTimeout(timer); resolveConn(s); });
-    s.once('error', (err) => { clearTimeout(timer); rejectConn(err); });
-  });
-}
-
 // --- test ----------------------------------------------------------------
 
 describe('headless daemon — Phase 1', () => {
@@ -125,7 +114,7 @@ describe('headless daemon — Phase 1', () => {
 
   test('protocol: ready → subscribe → command → reconnect → shutdown', async () => {
     // -- Connect 1: receive ready, run /help --
-    const sock1 = await connectSocket(socketPath);
+    const sock1 = await connectWhenAccepting(socketPath);
     const r1 = lineReader(sock1);
 
     await waitFor(
@@ -153,7 +142,7 @@ describe('headless daemon — Phase 1', () => {
     expect(child.exitCode).toBeNull();
 
     // -- Connect 2: fresh ready event --
-    const sock2 = await connectSocket(socketPath);
+    const sock2 = await connectWhenAccepting(socketPath);
     const r2 = lineReader(sock2);
 
     await waitFor(
