@@ -353,7 +353,9 @@ host's standard `kvUnified` block (§5b) + same-model compression (`compressionM
 back to `agent.model`) + `summaryParticipant` = `agent.name`. Omitted sizes: a
 `contextBudgetTokens` of 300k (for 1M-window models — set your own on a smaller window,
 §11.1), a `recentWindowTokens` of 40% of the budget (120k at 300k), and a `maxStreamTokens`
-of 320k when the budget is also omitted, else 150k. A resident whose store was built under
+of 320k when the budget is also omitted, else 150k. That tail is worked out once, from the
+recipe's budget: if you lower the budget at runtime on a recipe without its own tail, lower
+`tailTokens` with it, or compiles fail once the history fills the tail. A resident whose store was built under
 `kv-stable` must pin `"foldingStrategy": "kv-stable"` before it moves to such a host, or
 the upgrade switches its solver. The host's built-in default recipe (`bun src/index.ts`
 with no recipe) is just these defaults with an empty system prompt. Keep the skeleton's
