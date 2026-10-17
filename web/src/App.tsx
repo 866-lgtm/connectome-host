@@ -21,8 +21,8 @@ import {
   type OpsAlert, type HealthSnapshot, type CredentialInfo, type CredentialAction,
 } from './Health';
 import { BranchPanel } from './Branches';
-import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
+import { planHealthAlerts } from './health-alerts';
 import {
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
@@ -299,7 +299,7 @@ export function App() {
   };
 
   /** /healthz snapshot — feeds the Health tab and reconciles durable-state
-   *  alerts (quarantine, hard-down) so a page opened mid-incident alarms
+   *  alerts (quarantine, inference-exhausted) so a page opened mid-incident alarms
    *  without waiting for the next klaxon re-fire. */
   const [health, setHealth] = createSignal<HealthSnapshot | null>(null);
   const [healthErr, setHealthErr] = createSignal<string | null>(null);
@@ -307,34 +307,10 @@ export function App() {
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
     applyCredentialState(h.credential, 'local');
-    const quarantine = h.compressionQuarantine ?? {};
-    for (const [agent, q] of Object.entries(quarantine)) {
-      const key = `${agent}:compression-quarantine`;
-      if ((q.count ?? 0) > 0) {
-        if (!opsAlerts().has(key)) {
-          upsertOpsAlert('compression-quarantine', agent,
-            `${quarantineHeld(q)} — spans stay raw and will eventually exhaust the context budget.`,
-            false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
-    }
-    for (const a of h.agents ?? []) {
-      const key = `${a.name}:inference-exhausted`;
-      const streak = a.consecutiveInferenceFailures ?? 0;
-      if (streak >= 3) {
-        const message = `${streak} consecutive inference failures — agent is down.`
-          + (a.lastInference?.lastError ? ` Last: ${a.lastInference.lastError}` : '');
-        // Only touch the entry when the condition actually changed —
-        // rewriting `at` every poll would show a perpetual "5s ago" and
-        // re-sort the strip on every cycle.
-        if (opsAlerts().get(key)?.message !== message) {
-          upsertOpsAlert('inference-exhausted', a.name, message, false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
+    const plan = planHealthAlerts(h, opsAlerts());
+    for (const key of plan.remove) removeOpsAlert(key);
+    for (const u of plan.upsert) {
+      upsertOpsAlert(u.kind, u.agent, u.message, false);
     }
   };
 
@@ -378,7 +354,7 @@ export function App() {
   };
 
   /** Local-alert reconciliation when the panel scope is parked on a child:
-   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  the strip's durable-state alerts (quarantine, inference-exhausted) are host-level
    *  and must keep reconciling regardless of what the Health tab inspects. */
   const reconcileLocalAlerts = async (): Promise<void> => {
     if (healthDenied) return;
@@ -1301,7 +1277,7 @@ export function App() {
       wire.close();
     });
 
-    // Health poll: durable-state alerts (quarantine, hard-down) must not
+    // Health poll: durable-state alerts (quarantine, inference-exhausted) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
     // honest without meaningful load (counts-only JSON). With the scope on a
     // fleet child, loadHealth feeds the Health tab from that child and a

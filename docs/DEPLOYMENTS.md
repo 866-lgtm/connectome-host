@@ -90,6 +90,15 @@ Labels/units follow `cc.<agent>.agent` (launchd) / `<agent>-agent.service`
 (systemd). (launchd: a plain `kill`/`stop` respawns via KeepAlive — use `bootout`
 to stop, `kickstart -k` to restart.)
 
+A restart can make auxiliary model calls before any user message: agent-framework
+immediately drains restored Context Manager compression/merge debt. This happens only
+when the store has pending maintenance, and it is visible in the new process's
+`llm-calls.<iso>.jsonl`; it is not an agent wake or a user turn. To avoid it, stop the
+resident first, then drain the debt offline with `bun scripts/warmup-session.ts
+<session> --agent <recipe agent.name> --data-dir <DATA_DIR> --model <compressionModel>`.
+Recipes that change `--l1-budget`, `--l2-budget`, `--l3-budget`, or
+`--merge-threshold` must pass the same values to the warmup command.
+
 **Logs / observability** (`data/` below is `DATA_DIR`, default `./data` under
 the working directory):
 - discord-mcpl debug log: `data/discord-mcpl-debug.log` (incoming, attachments,

@@ -57,10 +57,46 @@ jobs:
       - name: Test
         run: npm test
 
+  # The tarball npm publish makes from this tree, installed alone into an
+  # empty directory with its dependencies from npm, install scripts
+  # included, then run there (see scripts/pack-installs-alone.mjs): the Web
+  # UI builds, src/index.ts's static and literal dynamic imports resolve
+  # (computed ones, such as recipe extensions, aside), @opentui/core loads,
+  # and a smoke run of the README's offline recipe answers, with the Web UI
+  # off and a queued reply. It certifies the install of node 24's npm, which
+  # runs a dependency's install scripts; npm 12 and bun skip them by
+  # default. A job of its own, so the install scripts it runs never see the
+  # publish job's id-token; publish needs it, the GitHub release notes
+  # don't. It runs on a dispatch from a branch too, which publishes nothing.
+  pack-check:
+    name: Packed release installs on its own
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+        with:
+          node-version: 24
+
+      # bun runs the host.
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.3.14
+
+      - name: Packed release installs on its own
+        run: node scripts/pack-installs-alone.mjs
+
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    needs: build-and-test
+    needs: [build-and-test, pack-check]
     if: startsWith(github.ref, 'refs/tags/v')
 
     # OIDC trusted publishing: GitHub mints a short-lived id-token, npm CLI
