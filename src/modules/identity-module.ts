@@ -184,10 +184,11 @@ type HeldRegistration = Omit<IdentityRecord, 'sub'> & { sub: string | null };
 
 /**
  * What this process knows of a registration beyond its record: one held in
- * memory because it couldn't be recorded, and whether one is under way. It
- * is kept per record file rather than per module, since the host builds a
- * new IdentityModule at each session switch while a registration belongs to
- * the deployment: a session switch keeps both, and a restart ends them.
+ * memory because it couldn't be recorded, until its record file holds one,
+ * and whether one is under way. It is kept per record file rather than per
+ * module, since the host builds a new IdentityModule at each session switch
+ * while a registration belongs to the deployment: a session switch keeps
+ * both, and a restart ends them.
  */
 interface RegistrationState {
   held: HeldRegistration | null;
@@ -518,15 +519,35 @@ export class IdentityModule implements Module {
   }
 
   /**
-   * This host's registration: one this process holds in memory, since it
-   * couldn't be recorded, or else the record file's. Null only when there is
-   * no record file. A record file that can't be read, or holds no
-   * registration, throws an IdentityError: whether this host is registered
-   * is then unknown, which is never "not registered", since registering again
-   * would be refused if it is.
+   * This host's registration: the record file's, or else one this process
+   * holds in memory because it couldn't record it. Null only when there is
+   * neither. The file comes first, since the operator is asked to record a
+   * held registration by hand while the host runs: once the file holds a
+   * registration, the hold is dropped, as the host records it now. Every
+   * field of a hold is in the log line written when it began (the record to
+   * write by hand), so a record written that differs from it loses nothing
+   * only the hold knew. With nothing held, a record file that can't be read,
+   * or holds no registration, throws (recordFile).
    */
   private record(): IdentityRecord | HeldRegistration | null {
-    if (this.state.held) return this.state.held;
+    let rec: IdentityRecord | null;
+    try {
+      rec = this.recordFile();
+    } catch (err) {
+      if (this.state.held) return this.state.held;
+      throw err;
+    }
+    if (rec) this.state.held = null;
+    return rec ?? this.state.held;
+  }
+
+  /**
+   * The record file's registration. Null only when there is no record file.
+   * A record file that can't be read, or holds no registration, throws an
+   * IdentityError: whether this host is registered is then unknown, which is
+   * never "not registered", since registering again would be refused if it is.
+   */
+  private recordFile(): IdentityRecord | null {
     let text: string;
     try {
       text = readFileSync(this.recordPath, 'utf8');
@@ -1045,9 +1066,19 @@ export class IdentityModule implements Module {
       );
     }
     // One registration at a time: a second call while one is under way
-    // would be refused by the service, or register this host twice.
+    // would be refused by the service, or register this host twice. The
+    // first call's answer goes to that call, which a session switch leaves in
+    // the stopped session, so the refusal says what status shows instead:
+    // never the outcome itself, which status can't show when it's unknown.
+    // The call ends within IDENTITY_TIMEOUT_MS, the limit its fetch is given,
+    // the reply's body included.
     if (this.state.enrolling) {
-      return fail('Nothing was sent: a registration is already under way on this host, and its own answer will say how it went.');
+      return fail(
+        'Nothing was sent: a registration is already under way on this host, and its answer goes to the call that ' +
+        `started it, which may be in an earlier session. It ends within ${IDENTITY_TIMEOUT_MS / 1000} seconds, and ` +
+        'identity--status then shows this host\'s registration if it recorded or holds one. If it shows none, call ' +
+        'identity--accept_invite again with the same code and name.',
+      );
     }
     const existing = this.record();
     if (existing) {
@@ -1154,7 +1185,8 @@ export class IdentityModule implements Module {
    * host can't record it (the record can't be saved, or no id could be read
    * from the reply), it holds the registration in memory until the host
    * restarts, across session switches, so status and access work until
-   * then, and the operator is asked to record it.
+   * then, and the operator is asked to record it. A record they write is
+   * what the host reads from then on (record).
    */
   private registered(name: string, sub: string | null, enrolledAt: string): ToolResult {
     const home = this.config.home;

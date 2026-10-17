@@ -1343,10 +1343,16 @@ describe('identity: what the agent reads when a call fails', () => {
     let answer!: (res: Response) => void;
     const { mod, dir } = registeredModule({ register: false, enroll: () => new Promise<Response>((resolve) => { answer = resolve; }) });
     const first = mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    // Its answer goes to the first call, which a switch leaves in another
+    // session, so the refusal says what status shows, never the outcome.
+    const refusal = String((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error);
     expectSays(
-      (await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
-      'Nothing was sent: a registration is already under way on this host', 'its own answer will say how it went',
+      refusal, 'Nothing was sent: a registration is already under way on this host, and its answer goes to the call ' +
+        'that started it, which may be in an earlier session.', 'It ends within 15 seconds, and identity--status then ' +
+        'shows this host\'s registration if it recorded or holds one.', 'If it shows none, call identity--accept_invite ' +
+        'again with the same code and name.',
     );
+    expect(refusal).not.toContain('its own answer');
     // A session switch builds a new module for the same key, which refuses it too.
     const switched = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
     expectSays(
@@ -1356,6 +1362,55 @@ describe('identity: what the agent reads when a call fails', () => {
     answer(new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 }));
     expect((await first).success).toBe(true);
     expectSays((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error, 'already registered as "A"');
+  });
+
+  // The operator is asked to record a held registration by hand while the
+  // host runs. Once they have, the file is what the host reads, and the hold
+  // is dropped.
+  it('reads a record written by hand while it holds the registration, and drops the hold', async () => {
+    const { mod, dir } = registeredModule({ register: false, enroll: () => new Response('<html>registered</html>', { status: 200 }) });
+    const lines = await logged(async () => { await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' })); });
+    const byHand = lines.find((line) => line.includes('no id could be read from its reply'));
+    expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: null });
+    // A copy made as written, without the id, holds no registration, so the
+    // hold still answers, as it does for a record file that can't be read.
+    const asWritten = byHand!.match(/write (\{.*?\}) to /)![1];
+    writeFileSync(join(dir, 'k.json'), asWritten);
+    const stillHeld = await mod.handleToolCall(call('status', {}));
+    expect(stillHeld.data).toMatchObject({ registeredAs: 'A', id: null });
+    expectSays((stillHeld.data as any).note, 'only until it restarts');
+    // The record as the log says to write it, with the id added.
+    writeFileSync(join(dir, 'k.json'), JSON.stringify({ ...JSON.parse(asWritten), sub: 'agent:a@guest' }));
+    const status = (await mod.handleToolCall(call('status', {}))).data as Record<string, unknown>;
+    expect(status).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+    expect(String(status.note)).not.toContain('only until it restarts');
+    const again = String((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).error);
+    expectSays(again, 'Nothing changed: this host is already registered as "A" (agent:a@guest)');
+    expect(again).not.toContain('only until it restarts');
+    // The module a session switch builds reads it the same way.
+    const switched = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
+    expect((await switched.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+  });
+
+  // A record written by hand that isn't the held registration is the
+  // operator's to write: the file is read, and the hold is dropped all the
+  // same, since the log line written when it began keeps every field of it.
+  it('drops the hold for a record written by hand that differs from it, whose fields its log line kept', async () => {
+    const { mod, dir } = registeredModule({ register: false });
+    // The record can't be written: a directory where its temporary file goes.
+    mkdirSync(join(dir, 'k.json.tmp'));
+    const lines = await logged(async () => { await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' })); });
+    expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+    writeFileSync(join(dir, 'k.json'), JSON.stringify({ sub: 'agent:b@guest', name: 'B', home: 'id.test', enrolledAt: '2026-10-01T00:00:00.000Z' }));
+    const status = (await mod.handleToolCall(call('status', {}))).data as Record<string, unknown>;
+    expect(status).toMatchObject({ registeredAs: 'B', id: 'agent:b@guest' });
+    expect(String(status.note)).not.toContain('only until it restarts');
+    // Dropped, not set aside: with the record gone too, nothing is recorded
+    // or held, and the held registration is in the log line from its start.
+    rmSync(join(dir, 'k.json'));
+    expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: null });
+    expect(lines.some((line) => line.includes('only until it restarts') &&
+      line.includes('"sub":"agent:a@guest","name":"A","home":"id.test","enrolledAt":'))).toBe(true);
   });
 
   // A session switch stops the module whose registration is under way and
