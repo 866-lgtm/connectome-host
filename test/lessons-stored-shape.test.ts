@@ -368,6 +368,17 @@ describe('two stored lessons that share an id', () => {
       }
     } finally { h.cleanup(); }
   });
+
+  test('the lesson tools reach the first of them', async () => {
+    const h = await loaded([
+      stored('dup', { content: 'first', tags: ['process'], confidence: 0.9 }),
+      stored('dup', { content: 'second', tags: ['process'], confidence: 85 }),
+    ]);
+    try {
+      expect((await h.m.handleToolCall(call('update', { id: 'dup', confidence: 0.85 }))).success).toBe(true);
+      expect(h.stored().map(l => [l.content, l.confidence])).toEqual([['first', 0.85], ['second', 85]]);
+    } finally { h.cleanup(); }
+  });
 });
 
 describe('evidence, and entries in the shared file that aren\'t lessons', () => {
@@ -421,6 +432,8 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
             'nothing to do about it.',
         }]);
         expect((await h.m.handleToolCall(call('query', { tags: ['x'], text: 'y' }))).success).toBe(true);
+        // Readers get its read fields alone: no index keys from text or a list.
+        expect(h.m.getLessons()).toEqual([{ content: '', tags: [], evidence: [], confidence: 0 }]);
         expect(h.warnings).toEqual([
           "[lessons] a lesson without an id is stored without usable content or tags, and with a confidence that isn't " +
             'a number. Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval ' +
@@ -437,7 +450,7 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     try {
       expect(h.m.getLessons().map(l => l.id)).toEqual(['shared']);
       expect(h.warnings).toHaveLength(1);
-      expect(h.warnings[0]).toMatch(/^\[lessons\] the shared lessons file .+ has 2 entries that aren't lessons \(not objects\)\. They're left out, and the next save writes the file with the lessons this host holds\.$/);
+      expect(h.warnings[0]).toMatch(/^\[lessons\] the shared lessons file .+ has 2 entries that aren't lessons \(not objects\)\. They're left out of what this host loads, and the next save writes the file with the lessons this host holds\.$/);
       await h.m.handleToolCall(call('boost', { id: 'shared' }));
       expect(h.file().lessons.map(l => l.id)).toEqual(['shared']);
     } finally { h.cleanup(); }
@@ -449,7 +462,10 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     const h = await loaded([5, stored('local', { content: 'here', tags: ['x'] })] as unknown as AnyObj[],
       [5, stored('shared', { content: 'from the file', tags: ['x'] })] as AnyObj[]);
     try {
-      expect(h.warnings[0]).toMatch(/has 1 entry that isn't a lesson \(not an object\)\. It's left out, and the next save writes the file with the lessons this host holds\.$/);
+      // The skipped entry's line, then the state's 5's own, each once.
+      expect(h.warnings).toHaveLength(2);
+      expect(h.warnings[0]).toMatch(/has 1 entry that isn't a lesson \(not an object\)\. It's left out of what this host loads, and the next save writes the file with the lessons this host holds\.$/);
+      expect(h.warnings[1]).toStartWith('[lessons] a lesson without an id is stored without usable content or tags');
       await h.m.handleToolCall(call('boost', { id: 'local' }));
       expect(h.file().lessons.map(l => (l as AnyObj | number) === 5 ? 5 : l.id)).toEqual([5, 'local', 'shared']);
     } finally { h.cleanup(); }
@@ -468,10 +484,33 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
         [5, `Stored without usable tags, and with an id that isn't text (5). ${tail('this one')}`],
         ['withid', 'Stored without usable tags: give its tags with lessons--update, or deprecate this lesson.'],
       ]);
+      // Three unnamed lines, then the named lesson's own, each once.
+      expect(h.warnings).toHaveLength(4);
       expect(h.warnings.slice(0, 3)).toEqual([
         `[lessons] a lesson without an id is stored without usable tags. ${tail('it')}`,
         `[lessons] a lesson with an empty id is stored without usable tags. ${tail('it')}`,
         `[lessons] a lesson with an id that isn't text (5) is stored without usable tags. ${tail('it')}`,
+      ]);
+      expect(h.warnings[3]).toStartWith('[lessons] lesson "withid" is stored without usable tags.');
+    } finally { h.cleanup(); }
+  });
+
+  test('a whole lesson no call can name is marked and logged too', async () => {
+    const noId = stored('x', { content: 'alpha', tags: ['t'] });
+    delete noId.id;
+    const h = await loaded([noId, stored('', { content: 'beta', tags: ['t'] }), stored(5 as unknown as string, { content: 'gamma', tags: ['t'] })]);
+    const tail = (it: string) => `Lesson tools find a lesson by an id that's non-empty text, so none can reach ${it}, and there's nothing to do about it.`;
+    try {
+      const listed = ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons;
+      expect(listed.map(l => [l.id, l.needsFix])).toEqual([
+        [undefined, `Stored without an id. ${tail('this one')}`],
+        ['', `Stored with an empty id. ${tail('this one')}`],
+        [5, `Stored with an id that isn't text (5). ${tail('this one')}`],
+      ]);
+      expect(h.warnings).toEqual([
+        `[lessons] a lesson is stored without an id. ${tail('it')}`,
+        `[lessons] a lesson is stored with an empty id. ${tail('it')}`,
+        `[lessons] a lesson is stored with an id that isn't text (5). ${tail('it')}`,
       ]);
     } finally { h.cleanup(); }
   });
@@ -491,7 +530,7 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
       for (const [tool, done, extra] of calls) {
         for (const [id, why] of [
           [undefined, "id is missing: give the lesson's id"],
-          ['', "id is missing: give the lesson's id"],
+          ['', "id is empty: give the lesson's id"],
           [5, 'id must be text, such as the id lessons--list shows, not 5'],
         ] as const) {
           const input = id === undefined ? { ...extra } : { id, ...extra };
@@ -512,7 +551,7 @@ describe('a shared file that holds one entry that isn\'t a lesson, or no lessons
     try {
       expect(h.m.getLessons().map(l => l.id)).toEqual(['shared']);
       expect(h.warnings).toHaveLength(1);
-      expect(h.warnings[0]).toMatch(/^\[lessons\] the shared lessons file .+ has 1 entry that isn't a lesson \(not an object\)\. It's left out, and the next save writes the file with the lessons this host holds\.$/);
+      expect(h.warnings[0]).toMatch(/^\[lessons\] the shared lessons file .+ has 1 entry that isn't a lesson \(not an object\)\. It's left out of what this host loads, and the next save writes the file with the lessons this host holds\.$/);
     } finally { h.cleanup(); }
   });
 
@@ -547,7 +586,7 @@ describe('/export', () => {
       expect(json.lessons).toEqual(h.stored());
       const md = readFileSync(join(dir, 'output', 'lessons-export.md'), 'utf-8');
       expect(md).toContain(
-        '- **[100%]** alpha  \n  _Sources: s:1_  \n  _Needs fixing: Stored with confidence 85, outside 0 to 1: give a ' +
+        '- **[100%]** alpha  \n  _Sources: s:1_  \n  _Stored with confidence 85, outside 0 to 1: give a ' +
         'confidence from 0 to 1, such as 0.85, with lessons--update._\n',
       );
       expect(md).toContain('- **[60%]** beta\n');

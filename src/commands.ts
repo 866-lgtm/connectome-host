@@ -880,7 +880,7 @@ export function handleExport(app: AppContext): CommandResult {
       const conf = (l.confidence * 100).toFixed(0);
       md += `- **[${conf}%]** ${l.content}`;
       if (l.evidence.length) md += `  \n  _Sources: ${l.evidence.join(', ')}_`;
-      if (needsFix) md += `  \n  _Needs fixing: ${needsFix}_`;
+      if (needsFix) md += `  \n  _${needsFix}_`;
       md += '\n';
     }
     md += '\n';

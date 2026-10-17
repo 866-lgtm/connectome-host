@@ -492,8 +492,9 @@ export class LessonsModule implements Module {
     let global: unknown;
     try {
       // A number JSON can't hold, such as 1e999, parses as Infinity, which
-      // the module's store refuses to save. It's read as null, a confidence
-      // that isn't a number, which a save writes back as it is.
+      // the module's store refuses to save. It's read as null wherever it
+      // sits: a confidence of 1e999 reads as one that isn't a number, and
+      // an id of 1e999 as one that isn't text. A save writes the null back.
       global = JSON.parse(readFileSync(this.globalPath, 'utf-8'), (_key, value: unknown) =>
         typeof value === 'number' && !Number.isFinite(value) ? null : value);
     } catch {
@@ -511,9 +512,9 @@ export class LessonsModule implements Module {
     if (skipped > 0) {
       console.warn(skipped === 1
         ? `[lessons] the shared lessons file ${this.globalPath} has 1 entry that isn't a lesson (not an object). ` +
-          "It's left out, and the next save writes the file with the lessons this host holds."
+          "It's left out of what this host loads, and the next save writes the file with the lessons this host holds."
         : `[lessons] the shared lessons file ${this.globalPath} has ${skipped} entries that aren't lessons (not objects). ` +
-          "They're left out, and the next save writes the file with the lessons this host holds.");
+          "They're left out of what this host loads, and the next save writes the file with the lessons this host holds.");
     }
     for (const gl of entries) {
       const existing = byId.get(gl.id);
@@ -630,7 +631,8 @@ function findLesson(lessons: StoredLesson[], id: unknown): StoredLesson | undefi
 
 /** Why a call's id can't name a lesson, if it can't. */
 function idProblem(id: unknown): string | undefined {
-  if (id === undefined || id === '') return 'id is missing: give the lesson\'s id';
+  if (id === undefined) return 'id is missing: give the lesson\'s id';
+  if (id === '') return 'id is empty: give the lesson\'s id';
   if (typeof id !== 'string') return `id must be text, such as the id lessons--list shows, not ${shown(id)}`;
   return undefined;
 }
@@ -647,12 +649,13 @@ function idFault(l: StoredLesson): string | undefined {
 /** What the agent's list and query say a stored lesson needs, if anything. */
 function needsFix(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
-  if (!f) return undefined;
   const unnamed = idFault(l);
   if (unnamed) {
-    return `Stored ${storedPhrase(f)}, and ${unnamed}. ${readsPhrase(f)}. Lesson tools find a lesson by an id ` +
-      "that's non-empty text, so none can reach this one, and there's nothing to do about it.";
+    const what = f ? `Stored ${storedPhrase(f)}, and ${unnamed}. ${readsPhrase(f)}.` : `Stored ${unnamed}.`;
+    return `${what} Lesson tools find a lesson by an id that's non-empty text, so none can reach this one, ` +
+      "and there's nothing to do about it.";
   }
+  if (!f) return undefined;
   const { give, orDeprecate } = fixPhrase(f);
   return `Stored ${storedPhrase(f)}: give ${give} with lessons--update${orDeprecate ? ', or deprecate this lesson' : ''}.`;
 }
@@ -661,12 +664,13 @@ function needsFix(l: StoredLesson): string | undefined {
  *  once per load, with what readers make of them and what fixes them. */
 function loadLine(l: StoredLesson): string | undefined {
   const f = faultsOf(l);
-  if (!f) return undefined;
   const unnamed = idFault(l);
   if (unnamed) {
-    return `[lessons] a lesson ${unnamed} is stored ${storedPhrase(f)}. ${readsPhrase(f)}. Lesson tools find a ` +
-      "lesson by an id that's non-empty text, so none can reach it, and there's nothing to do about it.";
+    const what = f ? `a lesson ${unnamed} is stored ${storedPhrase(f)}. ${readsPhrase(f)}.` : `a lesson is stored ${unnamed}.`;
+    return `[lessons] ${what} Lesson tools find a lesson by an id that's non-empty text, so none can reach it, ` +
+      "and there's nothing to do about it.";
   }
+  if (!f) return undefined;
   const { give, orDeprecate } = fixPhrase(f);
   return `[lessons] lesson ${JSON.stringify(l.id)} is stored ${storedPhrase(f)}. ` +
     `${readsPhrase(f)}${f.content ? ',' : ''} until the lesson is updated with ` +
@@ -709,7 +713,9 @@ function readable(l: StoredLesson): Lesson {
     return l as Lesson;
   }
   return {
-    ...l,
+    // A bare value the state holds has no fields to keep: spread, text or a
+    // list would give index keys.
+    ...((isRecord(l) ? l : {}) as StoredLesson),
     content: typeof l.content === 'string' ? l.content : '',
     tags: textEntries(l.tags),
     evidence: textEntries(storedEvidence(l.evidence)),
