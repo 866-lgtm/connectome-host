@@ -3,7 +3,7 @@
 // `llm-calls.<iso>.jsonl` visibility we lose on the connectome stack by
 // default. Successful calls keep a compact request summary; the full raw
 // request is retained only for refusals and errors, where forensic inspection
-// matters. Serializing the full raw + normalized request on every tool-loop
+// matters (a keepalive poke's only with full payloads: see below). Serializing the full raw + normalized request on every tool-loop
 // turn previously created several simultaneous copies of a large context and
 // contributed to production OOMs.
 //
@@ -15,7 +15,11 @@
 // representations are kept under separate keys for occasional cross-reference.
 //
 // The summary also carries `effort` when the wire request set
-// `output_config.effort`, so a reasoning_effort change is checkable here.
+// `output_config.effort`, so a reasoning_effort change is checkable here,
+// and `lineage`, membrane's cache lineage key of the wire request (model,
+// system and tools), which the call ledger measures cache gaps within. A
+// call that fails before membrane builds its request names none, and a
+// keepalive row names its receipt's key.
 //
 // One file per process lifetime (timestamped at construction). Each line is a
 // JSON object with shape:
@@ -29,22 +33,18 @@
 // changes what the caller gets, with one older exception: the capture hook
 // keeps an error thrown by a caller's own onRequest hook from failing the
 // call. Logging runs after the provider call, outside its try.
-// A keepalive row also carries `keepalive: { key, lane, startedAt, request? }`:
-// the lineage it refreshed, its lane, when its send began, and for a failed or
-// refused poke the replayed request's identity (a hash of its bytes). Such a
-// row keeps the request whole unless it is the one this process last kept for
-// that lineage, so later rows of that request name it by that identity.
+// A keepalive row also carries `keepalive: { key, lane, startedAt }`: the
+// lineage it refreshed, its lane, and when its send began. It keeps the
+// replayed request only with full payloads on, whatever its outcome.
 
-import { AnthropicAdapter } from '@animalabs/membrane';
+import { AnthropicAdapter, cacheLineageKey } from '@animalabs/membrane';
 import type {
   ProviderRequest,
   ProviderResponse,
   ProviderRequestOptions,
   StreamCallbacks,
   KeepaliveCall,
-  KeepaliveUsage,
 } from '@animalabs/membrane';
-import { createHash } from 'node:crypto';
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { describeErrorObject } from './logging-error-fields.js';
@@ -117,52 +117,14 @@ function envFlag(value: string | undefined, name = 'LLM_CALLS_FULL_PAYLOADS'): b
   return false;
 }
 
-/** How many lineages a LineageRequests remembers. membrane tracks four by
- *  default. Forgetting one costs a repeated alert or one more whole copy of
- *  its request, never a name for a request whose row wasn't written. */
-const LINEAGES_REMEMBERED = 16;
-
-/**
- * Per keepalive lineage, the replayed request something was last recorded
- * for: a refusal the dragnet heard, or a row that kept the request whole.
- * One request per lineage, as membrane replays one. Bounded, the lineage
- * noted longest ago forgotten first. A lineage is noted again each time its
- * memory is used: the refusal memory at each refused poke of the lineage
- * that it hears (an observer that throws hasn't heard it), the kept requests
- * at each failed or refused row of it that is written.
- */
-class LineageRequests {
-  private readonly requests = new Map<string, string>();
-
-  /** Whether `request` is the one last noted for `lineage`. */
-  has(lineage: string, request: string): boolean {
-    return this.requests.get(lineage) === request;
-  }
-
-  note(lineage: string, request: string): void {
-    this.requests.delete(lineage);
-    this.requests.set(lineage, request);
-    if (this.requests.size > LINEAGES_REMEMBERED) {
-      this.requests.delete(this.requests.keys().next().value as string);
-    }
-  }
-}
-
-/** A replayed request's identity in llm-calls rows: a hash of its bytes. */
-function requestId(request: Record<string, unknown>): string {
-  return createHash('sha256').update(JSON.stringify(request)).digest('hex').slice(0, 16);
-}
-
 /** What the off-path refusal dragnet hears of one refused call. */
 export interface OffPathRefusal {
-  kind: 'complete' | 'keepalive';
+  kind: 'complete';
   category?: string;
   model: string;
   messages: number;
   /** The whole prompt the call sent: uncached input, cache reads and cache writes. */
   inputTokens: number;
-  /** A keepalive poke's replayed request, as its llm-calls rows name it. */
-  request?: string;
 }
 
 /**
@@ -177,11 +139,8 @@ export function offPathRefusalAlert(info: OffPathRefusal): {
 } {
   const category = info.category ?? 'unknown';
   const size = `~${Math.round(info.inputTokens / 1000)}k tok`;
-  const message = info.kind === 'keepalive'
-    ? `off-path refusal (category=${category}) on a cache keepalive poke, which replays a ` +
-      `${info.messages}-message request (${size}): a turn sending that context would likely be refused too`
-    : `off-path refusal (category=${category}) on a ${info.messages}-message complete() call ` +
-      `(${size}) — likely compression/summarizer`;
+  const message = `off-path refusal (category=${category}) on a ${info.messages}-message complete() call ` +
+    `(${size}) — likely compression/summarizer`;
   const { kind: call, ...rest } = info;
   return { kind: 'refusal-offpath', message, data: { call, ...rest } };
 }
@@ -329,35 +288,14 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     };
   }
 
-  /** Per lineage, the replayed request whose refusal the dragnet last heard. */
-  private readonly heardKeepaliveRefusals = new LineageRequests();
-  /** Per lineage, the replayed request a written row last kept whole. */
-  private readonly keptKeepaliveRequests = new LineageRequests();
-
   private readonly warnedEffort = new Set<string>();
   private readonly warnedThinking = new Set<string>();
 
-  /** True after an append threw, which may have left part of a row behind. */
-  private logTorn = false;
-
-  /** Append one record; true when it was written. Never throws. After an
-   *  append that threw, the next row starts on a new line, so a row cut
-   *  short can't take the next one with it. */
-  private log(record: Record<string, unknown>): boolean {
-    let line: string;
+  private log(record: Record<string, unknown>): void {
     try {
-      line = JSON.stringify(record) + '\n';
-    } catch {
-      return false;
-    }
-    try {
-      appendFileSync(this.logPath, this.logTorn ? '\n' + line : line);
-      this.logTorn = false;
-      return true;
+      appendFileSync(this.logPath, JSON.stringify(record) + '\n');
     } catch {
       // never throw from logging
-      this.logTorn = true;
-      return false;
     }
   }
 
@@ -366,26 +304,16 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     const raw = call.request;
     const cache = summarizeCacheControls(raw);
     const response = call.outcome === 'success' ? call.response : undefined;
-    const refused = response?.stop_reason === 'refusal';
     // A failed poke's error takes the shape complete and stream rows give
     // theirs: bounded text, with the classification a membrane error carries.
     const errorFields = call.outcome === 'error' ? describeErrorObject(call.error, true) : undefined;
-    // membrane replays a lineage's latest real request on every poke until a
-    // newer real request replaces it, so a lineage whose pokes fail or are
-    // refused would repeat one request in row after row. Such a row names
-    // what it replayed by a hash of the request's bytes, and keeps the
-    // request whole unless it remembers a row of this lineage that already
-    // did (with full payloads on, every row keeps it).
-    const request = errorFields || refused ? requestId(raw) : undefined;
-    const keepWhole = this.fullPayloads
-      || (request !== undefined && !this.keptKeepaliveRequests.has(call.key, request));
     const effort = (raw.output_config as { effort?: unknown } | undefined)?.effort;
     const record: Record<string, unknown> = {
       type: call.outcome === 'success' ? 'call' : 'error',
       kind: 'keepalive',
       timestamp: new Date(call.startedAt + call.durationMs).toISOString(),
       durationMs: call.durationMs,
-      keepalive: { key: call.key, lane: call.lane, startedAt: call.startedAt, ...(request ? { request } : {}) },
+      keepalive: { key: call.key, lane: call.lane, startedAt: call.startedAt },
       requestSummary: {
         model: raw.model,
         maxTokens: raw.max_tokens,
@@ -394,17 +322,17 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         ...(typeof effort === 'string' ? { effort } : {}),
         cacheBreakpoints: cache.count,
         cacheTtls: cache.ttls,
+        lineage: call.key,
       },
-      rawRequest: keepWhole ? raw : undefined,
+      // A poke replays its lineage's latest real request every refresh
+      // interval, so a row keeps it only with full payloads on, failed and
+      // refused pokes' rows included, where a turn's failed or refused row
+      // keeps its own.
+      rawRequest: this.fullPayloads ? raw : undefined,
       ...(response ? { rawResponse: response } : {}),
       ...errorFields,
     };
-    // A request counts as kept once its row's append succeeds, so a later row
-    // never names a request whose whole copy was lost with its row. A row that
-    // names the kept request notes it again, which keeps its lineage fresh.
-    if (this.log(record) && request !== undefined) {
-      this.keptKeepaliveRequests.note(call.key, request);
-    }
+    this.log(record);
     // A poke spends the same credential as a turn, so the credential monitor
     // hears it too: an idle resident's rejected credential shows at its next
     // poke rather than at its next turn (membrane pokes an idle lineage for a
@@ -414,35 +342,6 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       if (call.outcome === 'error') this.onProviderError?.(call.error, 'keepalive');
       else this.onProviderSuccess?.('keepalive');
     } catch { /* observers never affect provider traffic */ }
-    // A refused poke tells an idle resident's operator that the last real
-    // request of its lineage, a context a later turn builds on, is refused,
-    // before that turn. The dragnet hears a refused request unless it's the
-    // one last heard for that lineage. membrane keeps replaying the same
-    // request every refresh interval (a refusal is a success to its
-    // breaker), and another alert about the same bytes asks nothing new of
-    // the operator, even after a poke of them succeeded. A real call
-    // reseeds the lineage, usually with other bytes, whose refusal is heard
-    // afresh. An observer that throws hasn't heard it, so the next refused
-    // poke of that request tries again.
-    if (refused && request !== undefined) {
-      const heard = this.heardKeepaliveRefusals.has(call.key, request);
-      const usage = response?.usage as KeepaliveUsage | undefined;
-      try {
-        if (!heard) {
-          this.onRefusal?.({
-            kind: 'keepalive',
-            category: (response as { stop_details?: { category?: string } }).stop_details?.category,
-            model: typeof raw.model === 'string' ? raw.model : String(raw.model),
-            messages: Array.isArray(raw.messages) ? raw.messages.length : 0,
-            // The whole prompt the poke replayed: most of it is read from cache.
-            inputTokens: (usage?.input_tokens ?? 0) + (usage?.cache_read_input_tokens ?? 0)
-              + (usage?.cache_creation_input_tokens ?? 0),
-            request,
-          });
-        }
-        this.heardKeepaliveRefusals.note(call.key, request);
-      } catch { /* observers never affect provider traffic */ }
-    }
     // Share the log decoder so live and rehydrated spend use identical vendor
     // fields (including cache-write buckets, geography, and service tier).
     // The ledger comes last, so a throwing ledger observer skips nothing here,
@@ -457,6 +356,12 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
   private requestSummary(request: ProviderRequest, rawRequest: unknown): Record<string, unknown> {
     const cache = rawRequest ? guarded(() => summarizeCacheControls(rawRequest)) : undefined;
     const effort = guarded(() => (rawRequest as { output_config?: { effort?: unknown } } | null | undefined)?.output_config?.effort);
+    // membrane's key for the request's cache lineage (model, system and
+    // tools), which the keepalive names a poke's lineage by: membrane records
+    // the lineage from the same request it hands onRequest.
+    const lineage = rawRequest && typeof rawRequest === 'object'
+      ? guarded(() => cacheLineageKey(rawRequest as Record<string, unknown>))
+      : undefined;
     return {
       model: guarded(() => request.model),
       maxTokens: guarded(() => request.maxTokens),
@@ -464,6 +369,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       tools: guarded(() => request.tools?.length ?? 0),
       ...(typeof effort === 'string' ? { effort } : {}),
       ...(cache ? { cacheBreakpoints: cache.count, cacheTtls: cache.ttls } : {}),
+      ...(typeof lineage === 'string' ? { lineage } : {}),
     };
   }
 
@@ -473,13 +379,11 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * covers ONLY streamed agent turns. Every other model call in the process
    * — compression/summarizer drains, maintenance — flows through this
    * adapter's complete() and previously refused in silence; the 2026-07-15
-   * mythos cascade STARTED there and alerted nowhere. Fired for
-   * kind==='complete' (agent turns stream, so this never double-reports a
-   * refusal the main driver already escalated), and for kind==='keepalive'
-   * when a poke's replayed request is refused, unless it's the one last heard
-   * for that lineage. A poke can replay a turn the main driver already
-   * reported refused; its refusal, tested again while the resident is idle,
-   * is heard once more here.
+   * mythos cascade STARTED there and alerted nowhere. Fired ONLY for
+   * kind==='complete' — agent turns stream, so this never double-reports a
+   * refusal the main driver already escalated. A refused keepalive poke is
+   * logged and fires nothing; a streamed turn the provider refuses is the
+   * framework's to report, as every refused turn is.
    */
   onRefusal?: (info: OffPathRefusal) => void;
 
@@ -494,10 +398,10 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    * carries `error`, whatever its value: a rejection with undefined is a
    * failure, and so is an error whose text is empty. The ledger row's error
    * text is the record's own, bounded (`errorText`), and its model, message
-   * count and cache summary are the record's request summary's (`summary`),
-   * so a row restored from the record after a restart reads the same. A
-   * part the summary couldn't read leaves the model empty or the count 0,
-   * in both. Without a raw request it could read, the live row's cache
+   * count, cache summary and lineage are the record's request summary's
+   * (`summary`), so a row restored from the record after a restart reads
+   * the same. A part the summary couldn't read leaves the model empty or
+   * the count 0, in both. Without a raw request it could read, the live row's cache
    * summary is unknown, and so is the restored row's, unless the raw request
    * the record keeps (a failure's, a refusal's, or any call's with full
    * payloads) can be summarized there: one that reads differently from how
@@ -527,7 +431,8 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
           category: raw0.stop_details?.category,
           model: request.model,
           messages: request.messages.length,
-          // The whole prompt the call sent, as a keepalive refusal reports it.
+          // The whole prompt the call sent: most of a compression call's is
+          // often read from cache.
           inputTokens: (response?.usage.inputTokens ?? 0) + (response?.usage.cacheReadTokens ?? 0)
             + (response?.usage.cacheCreationTokens ?? 0),
         });
@@ -562,6 +467,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
         cacheTtls: summary.cacheTtls as string[] | undefined,
         stopReason: response?.stopReason,
         error: errorText,
+        lineage: text(summary.lineage),
       });
     } catch {
       // A dashboard observer is never allowed to affect provider traffic.

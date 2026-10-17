@@ -60,19 +60,11 @@ test('non-refusal completions and throwing callbacks are harmless', () => {
 });
 
 test("the ops alert says which call refused, and keeps 'refusal-offpath' as failures.log's kind", () => {
-  const keepalive = offPathRefusalAlert({
-    kind: 'keepalive', category: 'cyber', model: 'claude-fable-5', messages: 12, inputTokens: 150_400, request: '0123456789abcdef',
-  });
-  expect(keepalive.kind).toBe('refusal-offpath');
-  expect(keepalive.message).toBe(
-    'off-path refusal (category=cyber) on a cache keepalive poke, which replays a 12-message request (~150k tok): '
-      + 'a turn sending that context would likely be refused too',
-  );
+  const alert = offPathRefusalAlert({ kind: 'complete', category: 'cyber', model: 'claude-fable-5', messages: 37, inputTokens: 64_000 });
+  expect(alert.kind).toBe('refusal-offpath');
+  expect(alert.message).toBe('off-path refusal (category=cyber) on a 37-message complete() call (~64k tok) — likely compression/summarizer');
   // agent-framework's failures.log spreads the data after the alert's kind.
-  expect(keepalive.data).toEqual({
-    call: 'keepalive', category: 'cyber', model: 'claude-fable-5', messages: 12, inputTokens: 150_400, request: '0123456789abcdef',
-  });
-  const complete = offPathRefusalAlert({ kind: 'complete', model: 'claude-fable-5', messages: 37, inputTokens: 64_000 });
-  expect(complete.message).toBe('off-path refusal (category=unknown) on a 37-message complete() call (~64k tok) — likely compression/summarizer');
-  expect(complete.data).toEqual({ call: 'complete', model: 'claude-fable-5', messages: 37, inputTokens: 64_000 });
+  expect(alert.data).toEqual({ call: 'complete', category: 'cyber', model: 'claude-fable-5', messages: 37, inputTokens: 64_000 });
+  const unknown = offPathRefusalAlert({ kind: 'complete', model: 'claude-fable-5', messages: 37, inputTokens: 64_000 });
+  expect(unknown.message).toBe('off-path refusal (category=unknown) on a 37-message complete() call (~64k tok) — likely compression/summarizer');
 });
