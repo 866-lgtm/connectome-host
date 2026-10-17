@@ -302,13 +302,9 @@ model scale the three window numbers down together — e.g. `contextBudgetTokens
 and keep everything under `strategy` as is; chunk size, merge fan-in and the
 fallback rungs are window-independent.
 
-**System prompt: keep it minimal.** Leave it empty, or write a few sentences at most. Most
-long-running residents run a single sentence or nothing. `""` is valid: under kv-unified (the
-default) the request then carries no system block at all. A resident pinned to kv-stable or
-another solver is different: there membrane 0.5.87 and earlier can send `""` as an empty
-system block with a cache marker, which the API may refuse. Membrane leaves it out from the
-release after 0.5.87 (antra-tess/membrane#145); until the host runs that release, give such a
-resident one short sentence instead. Why minimal:
+**System prompt: keep it minimal.** Leave it empty (`""` is valid; the request then carries
+no system block at all), or write a few sentences at most. Most long-running residents run
+a single sentence or nothing. Why:
 
 - **The agent's identity lives in its memory.** That means the imported history and everything
   it lives through afterwards, which the strategy keeps in context. A long persona or rulebook
@@ -451,10 +447,14 @@ The standard block, which the production kv-unified residents run at budgets fro
 `cacheReadPrice` / `cacheWritePrice` are ratios to the model's uncached input price, not
 dollar figures. The host's standard block matches them to what the provider bills:
 
-- **writes:** `2` on the 1-hour cache (the default `cacheTtl`), `1.25` on the 5-minute
-  cache and on Bedrock (5-minute only), `1` on OpenAI (no write premium);
-- **reads:** `0.1` on most models, `0.05` on Claude Opus 5.5, `0.025` on Claude Fable 5.1 /
-  Mythos 5.1; `0.1` on OpenAI.
+- **Claude writes:** `2` on the 1-hour cache (the default `cacheTtl`), `1.25` on the
+  5-minute cache and on Bedrock (5-minute only);
+- **Claude reads:** `0.1` on most models, `0.05` on Claude Opus 5.5, `0.025` on Claude
+  Fable 5.1 / Mythos 5.1;
+- **OpenAI writes:** `1.25` on the API for the GPT-5.6 and GPT-6 families, `1` for older
+  models, and `1` on Codex, whose credit billing has no cache-write charge;
+- **OpenAI reads:** the model's cached-input ratio, the same on the API and in Codex: `0.1`
+  on most models, `0.05` on GPT-6.1 Sol.
 
 Write the block yourself only to change the policy, and then set the prices to match.
 `recentWindowTokens` follows the budget as in §5 (300k tail on a 600k budget, 100k–120k on
