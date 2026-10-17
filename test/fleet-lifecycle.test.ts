@@ -588,20 +588,37 @@ describe('FleetModule lifecycle', () => {
 });
 
 describe('FleetModule lifecycle: every launch answers to stop, kill and newer launches', () => {
-  /** Hold the next ownership reconciliation (the launch's await) until released. */
+  /** Hold the first ownership reconciliation (its await) made once a launch
+   *  made through the hold has begun, until released. A restart's kill
+   *  reconciles before its relaunch begins when the generation it stops
+   *  leaves its pid file behind, as one killed outright does: that one is
+   *  counted apart, in `before`, and passes. A kill's or a stop's
+   *  reconciliation made after a launch has begun counts like the launch's
+   *  own, so each use installs the hold before the launch it holds, and acts
+   *  only once `entered` says that launch is held. */
   function holdReconciliation(fleet: FleetModule) {
     const api = internal(fleet);
     const cleanup = api.cleanupStaleChildFiles.bind(fleet);
+    const launch = api.handleLaunch.bind(fleet);
+    let begun = false;
+    let before = 0;
     let entered = 0;
     let holding = true;
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
+    api.handleLaunch = async (...args) => {
+      begun = true;
+      return launch(...args);
+    };
     api.cleanupStaleChildFiles = async (existing) => {
-      entered++;
-      if (holding) { holding = false; await gate; }
+      if (!begun) before++;
+      else {
+        entered++;
+        if (holding) { holding = false; await gate; }
+      }
       await cleanup(existing);
     };
-    return { entered: () => entered, release };
+    return { before: () => before, entered: () => entered, release };
   }
 
   // stop() during a manual launch's await used to let it spawn a child
@@ -628,6 +645,28 @@ describe('FleetModule lifecycle: every launch answers to stop, kill and newer la
     const held = holdReconciliation(fleet);
     const restart = fleet.handleToolCall({ id: 'restart', name: 'restart', input: { name: 'leaf' } });
     await until(() => held.entered() === 1, 'relaunch reconciling');
+    const killed = await fleet.handleToolCall({ id: 'kill', name: 'kill', input: { name: 'leaf' } });
+    expect(killed.success).toBe(true);
+    held.release();
+    const result = await restart;
+    expect(result.error).toBe("Child 'leaf' wasn't launched: it was killed during reconciliation.");
+    expect(launches(input)).toHaveLength(1);
+  });
+
+  // When the old generation leaves its pid file behind, as a child killed
+  // outright does, the restart's kill reconciles before the relaunch begins.
+  // A kill acknowledged during the relaunch's own reconciliation still stops
+  // the replacement.
+  test('a kill acknowledged during a restart\'s relaunch stops the replacement after the old generation left its pid file', async () => {
+    const { fleet, input } = fixture();
+    expect((await internal(fleet).handleLaunch(input, { viaAutoStart: true })).success).toBe(true);
+    const old = fleet.getChildren().get('leaf')!;
+    old.process!.once('exit', () => writeFileSync(join(input.dataDir, 'headless.pid'), String(old.pid)));
+    const held = holdReconciliation(fleet);
+    const restart = fleet.handleToolCall({ id: 'restart', name: 'restart', input: { name: 'leaf' } });
+    await until(() => held.entered() === 1, 'relaunch reconciling');
+    // The order this case exists for: the restart's kill reconciled first.
+    expect(held.before()).toBe(1);
     const killed = await fleet.handleToolCall({ id: 'kill', name: 'kill', input: { name: 'leaf' } });
     expect(killed.success).toBe(true);
     held.release();
