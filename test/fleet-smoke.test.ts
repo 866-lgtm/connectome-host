@@ -493,20 +493,25 @@ describe('FleetModule — unresolved launch artifacts', () => {
     const kill = spyOn(process, 'kill').mockImplementation(() => {
       throw Object.assign(new Error('permission denied'), { code: 'EPERM' });
     });
+    let child: any;
     try {
       const fleet = await restoreRecord(dataDir, process.pid);
       expect((await launch(fleet, dataDir)).success).toBe(false);
       expect(readFileSync(join(dataDir, 'headless.pid'), 'utf8')).toBe(String(process.pid));
       expect(await (fleet as any).waitForExitByPid(process.pid, 10)).toBe(false);
-      const child = (fleet as any).children.get('guard');
+      child = (fleet as any).children.get('guard');
       child.adopted = true; // Validated adoption is the signal authority under test.
       const result = await fleet.handleToolCall({ id: 'eperm-restart', name: 'restart', input: { name: 'guard' } });
       expect(result.success).toBe(false);
       expect(result.error).toContain("couldn't confirm that it stopped");
       expect(child.status).toBe('starting');
       expect(child.exitedAt).toBeNull();
-      child.adopted = false;
-    } finally { kill.mockRestore(); }
+    } finally {
+      // The record carries this runner's own pid: left adopted, the fleet's
+      // stop() would signal it, so a failed assertion above must not skip this.
+      if (child) child.adopted = false;
+      kill.mockRestore();
+    }
   });
 
   test('unvalidated restored record never signals an unknown live PID', async () => {
