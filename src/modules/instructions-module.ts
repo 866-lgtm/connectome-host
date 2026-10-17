@@ -83,9 +83,6 @@ interface PendingRead {
   /** When its budget runs out, counted from its start, on the monotonic
    *  clock (performance.now), so a step in the wall clock doesn't move it. */
   deadline: number;
-  /** Set when the session it was started for stops: what it gives after
-   *  that changes nothing. */
-  ended: boolean;
 }
 
 export interface InstructionsModuleConfig {
@@ -133,6 +130,10 @@ export class InstructionsModule implements Module {
   private alerted = false;
   /** The read in flight, if one is. */
   private pending: PendingRead | null = null;
+  /** Moved by each stop, so a turn that waited on a read across one, whether
+   *  the read settled before the stop or after, sees that its session
+   *  ended. */
+  private generation = 0;
 
   constructor(config: InstructionsModuleConfig) {
     this.path = config.path ?? DEFAULT_INSTRUCTIONS_PATH;
@@ -163,8 +164,10 @@ export class InstructionsModule implements Module {
     // so the next session's first successful read stands it down where it's
     // still shown: the web UI's alert strip and the notices module's episode
     // outlive the switch. Until the next start, a turn that reaches the
-    // module injects nothing and changes nothing (gatherContext).
-    if (this.pending) this.pending.ended = true;
+    // module injects nothing and changes nothing (gatherContext). One that
+    // reaches it after the next start is the new session's in all the module
+    // holds, and reads and alerts for that session as its own turns do.
+    this.generation++;
     this.pending = null;
     this.workspace = null;
     this.warned.clear();
@@ -212,10 +215,11 @@ export class InstructionsModule implements Module {
       this.unavailable('the workspace module isn\'t wired, so no instructions can be read');
       return [];
     }
+    const generation = this.generation;
     const pending = this.pending ?? this.startRead(workspace);
     const outcome = await this.within(pending);
     // Its session stopped while this turn waited: the next one reads afresh.
-    if (pending.ended) return [];
+    if (this.generation !== generation) return [];
     // Fail open: a missing file, any read error or a read that hasn't
     // finished never blocks inference.
     if (outcome === 'late') {
@@ -232,7 +236,7 @@ export class InstructionsModule implements Module {
     const read = outcome.read;
     // A read cut at the cap is of a file over it. agent-framework 0.22.1
     // reads a file that grows after the read's size check whole, so the cap
-    // is held here too. Once the host's agent-framework floor includes
+    // on what's injected is held here too. Once the host's agent-framework floor includes
     // anima-research/agent-framework#409, readFileFromDisk keeps maxBytes
     // itself, and this second condition can go.
     const over = read.truncated || read.bytes.byteLength > this.maxBytes;
@@ -301,7 +305,6 @@ export class InstructionsModule implements Module {
         (error: unknown) => ({ error }),
       ),
       deadline: performance.now() + this.readBudgetMs,
-      ended: false,
     };
     void pending.outcome.then(() => {
       if (this.pending === pending) this.pending = null;

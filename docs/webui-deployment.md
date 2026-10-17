@@ -194,7 +194,7 @@ travel over the WebSocket.
 | `/healthz` | health JSON: gate state, queued work, per-agent status and last inference |
 | `/quota` | subscription quota windows (`{"subscription": false}` on API keys) |
 | `/media/<messageId>/<block>[?agent=]` | one inline transcript image |
-| `/files/<mount>/<path>` | a workspace file: `403` for a path no mount holds or one leading out of its mount, a file that is itself a link (a recipe's mounts don't follow links) or one whose canonical path leaves its mount, `404` for a file the read can't give, and `503` with no workspace or for a mount whose directory can't be resolved |
+| `/files/<mount>/<path>` | a workspace file: `403` for a path no mount holds or one leading out of its mount, a file that is itself a link (a recipe's mounts don't follow links) or one whose canonical path leaves its mount, `404` for a file the read can't give, a mount whose directory has gone among them, and `503` with no workspace or for a mount the read can't resolve after finding the file |
 | `/curve` | the context-curve page (reads `/debug/context/curve`) |
 | `/debug/context` and `/debug/context/{makeup,coverage,curve,preview,maintenance}` | context debugging — see [`debug-context-api.md`](./debug-context-api.md) |
 | `/debug/retrieval[/view]` | retrieval traces — see [`retrieval-traces.md`](./retrieval-traces.md) |

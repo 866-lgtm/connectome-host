@@ -525,6 +525,35 @@ describe('InstructionsModule', () => {
     expect(nextAlerts.map((a) => a.kind)).toEqual(['instructions-unavailable']);
   });
 
+  // A stop can come once the read has settled and the module has let go of
+  // it, before the turn waiting on it resumes. That turn belongs to the
+  // ended session as much as one that resumes after the read.
+  test('a stop between a read settling and its turn resuming leaves the turn without effect', async () => {
+    const { reader, calls } = settledByTest();
+    const mod = await moduleOver(reader);
+    const stale = mod.gatherContext('resident');
+    expect(calls).toHaveLength(1);
+    // A reaction to the read's outcome after the module's own two, the one
+    // that lets go of the read and the turn's: it runs once the read has
+    // settled and before the turn resumes.
+    const { outcome } = (mod as unknown as { pending: { outcome: Promise<unknown> } }).pending;
+    const stopped = outcome.then(() => mod.stop());
+    calls[0]!.reject(missing());
+    await stopped;
+    expect(await stale).toEqual([]);
+    expect(alerts).toEqual([]);
+    expect(warnSpy).not.toHaveBeenCalled();
+
+    // The next session's own failure, for the same reason, raises its alert.
+    const nextAlerts: Alert[] = [];
+    mod.setWorkspace(reader);
+    await mod.start(contextFor(nextAlerts));
+    const own = mod.gatherContext('resident');
+    calls[1]!.reject(missing());
+    expect(await own).toEqual([]);
+    expect(nextAlerts.map((a) => a.kind)).toEqual(['instructions-unavailable']);
+  });
+
   test('a read that runs past its budget after its session stopped raises nothing in the next session', async () => {
     const { reader, calls } = settledByTest();
     const mod = new QuickInstructionsModule({ agentName: 'resident' });

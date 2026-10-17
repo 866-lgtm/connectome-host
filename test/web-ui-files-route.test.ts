@@ -119,7 +119,7 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
     }
   });
 
-  test("a mount whose directory can't be resolved is unavailable, not a missing file, and says why", async () => {
+  test("a mount the read can't resolve after finding the file is unavailable, not a missing file, and says why", async () => {
     const res = await fetch(`${baseUrl}/files/gone/x.txt`);
     expect(res.status).toBe(503);
     expect(await res.text()).toBe('Mount unavailable: gone');
@@ -175,6 +175,29 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
       // stays inside it.
       expect(await get('plain/d/note.json')).toMatchObject({ status: 200, body: '{"through":"a linked directory"}' });
       expect(await get('follow/latest.png')).toMatchObject({ status: 200, body: 'the followed version' });
+    } finally {
+      workspace = standIn;
+      store.close?.();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // The read looks for the file before it resolves the mount's directory, so
+  // a directory already gone is no file there, not an unavailable mount.
+  test("agent-framework's read: a mount whose directory has gone answers that the file isn't found", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'webui-files-gone-'));
+    const gone = join(dir, 'gone');
+    mkdirSync(gone);
+    writeFileSync(join(gone, 'x.txt'), 'there once');
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    const real = new WorkspaceModule({ mounts: [{ name: 'gone', path: gone, mode: 'read-only', watch: 'never' }] });
+    real.initStore(store);
+    workspace = real;
+    try {
+      rmSync(gone, { recursive: true, force: true });
+      const res = await fetch(`${baseUrl}/files/gone/x.txt`);
+      expect(res.status).toBe(404);
+      expect(await res.text()).toBe('File not found: gone/x.txt');
     } finally {
       workspace = standIn;
       store.close?.();
