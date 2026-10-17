@@ -2,7 +2,7 @@
 // alone into an empty directory with its dependencies from the registry, as
 // `npm install @animalabs/connectome-host` does with the npm on PATH, and
 // runs it there under bun. That npm must run a dependency's install scripts,
-// as npm 11 does, so the postinstall builds the Web UI: npm 12 and bun skip
+// as npm 10 and 11 do, so the postinstall builds the Web UI: npm 12 and bun skip
 // them by default, so their installs have no Web UI, and under npm 12 this
 // check fails at its Web UI step. It checks:
 //   1. the Web UI built: dist/web/index.html is in the installed package;
@@ -137,7 +137,10 @@ function main() {
       try {
         run(
           "npm",
-          ["install", "--no-audit", "--no-fund", "--no-package-lock", tarball],
+          // In the foreground, so the postinstall's warning reaches this
+          // check's output: a Web UI build that fails warns and exits 0, and
+          // npm 10 doesn't show a script's output when it exits 0.
+          ["install", "--no-audit", "--no-fund", "--no-package-lock", "--foreground-scripts", tarball],
           { cwd: dir, timeout: installTimeoutMs },
           `the install of ${packed.filename}`,
           `${packed.filename} didn't install on its own into an empty directory, in ${INSTALL_ATTEMPTS} attempts ` +

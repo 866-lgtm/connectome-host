@@ -102,7 +102,7 @@ add up, so give it room (≈40–80 GB SSD per box is comfortable). Use a recent
 You (the assisting instance) can provision it end-to-end from the provider's initial root/SSH
 access — do this hardening + base setup *first*:
 - create a non-root sudo user, add the operator's SSH **public key**, disable root password login;
-- `apt update && apt install -y git build-essential`, then install **nvm/node ≥ 20** and
+- `apt update && apt install -y git build-essential`, then install **nvm/node ≥ 22.12** and
   **Bun** — plus **`rustup`** only if you'll take the local-checkout path in §4 (building
   chronicle's native module from source; the stock install uses prebuilt binaries);
 - a basic firewall allowing **SSH only** — the webui stays on **loopback**, reached by SSH
@@ -165,7 +165,7 @@ Verify runtimes as the agent user: `node --version`, `bun --version`.
 **Fresh install — from absolutely nothing (no repos, no URLs).** Assume the box has only a
 shell. First, the **hard prerequisites** (install / confirm before anything else; ask the user
 or their box owner if unsure):
-- **git**, **Bun** (`curl -fsSL https://bun.sh/install | bash`), **node ≥ 20** (via `nvm`);
+- **git**, **Bun ≥ 1.4.3** (`curl -fsSL https://bun.sh/install | bash`), **node ≥ 22.12** (via `nvm`);
 - a **Rust toolchain** (`rustup`) — **only for the local-checkout path** below, where you build
   `chronicle`'s native (napi) component from source. The npm `@animalabs/chronicle` package
   ships prebuilt `.node` binaries (linux x64/arm64 glibc, macOS x64/arm64, Windows x64), so the
