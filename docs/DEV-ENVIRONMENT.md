@@ -201,14 +201,15 @@ HEARTBEAT_CONFIG_FILE=<abs>/data/heartbeat-config.json
 
 The host reads `.env`, but a stdio MCPL server sees only what its entry maps
 in `env`, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`, plus a small
-system allowlist and the two variables the host sets for every server,
-`AGENT_TIMEZONE` and `DISCORD_SUPPRESSED_REACTIONS_BASELINE`. For a server
-defined in `mcpl-servers.json`, that is the file's `env`: a recipe can't add
-env to a file server. A variable left only in `.env` is unset for the server,
-unless its entry (in the recipe or `mcpl-servers.json`) sets `inheritEnv:
-true`, which passes the host's whole environment, `.env` and every secret in
-it included, so prefer mapping the variables a server needs. An agent's own
-overlay can't set `inheritEnv`.
+system allowlist, the host's `AGENT_TIMEZONE`, and agent-framework's default
+`DISCORD_SUPPRESSED_REACTIONS_BASELINE` unless the entry sets one with tokens
+(with `inheritEnv: true`, one in the host's own environment counts too). For
+a server defined in `mcpl-servers.json`, that is the file's `env`: a recipe
+can't add env to a file server. A variable left only in `.env` is unset for
+the server, unless its entry (in the recipe or `mcpl-servers.json`) sets
+`inheritEnv: true`, which passes the host's whole environment, `.env` and
+every secret in it included, so prefer mapping the variables a server needs.
+An agent's own overlay can't set `inheritEnv`.
 
 **Run the host (headless), supervised,** from `<agent>-cm/`. Several things
 resolve from the working directory: Bun loads `.env` from it, `data/` is
@@ -233,8 +234,8 @@ systemd user unit in your home directory.
 
 ## 6. Runtimes
 
-- **bun** — runs the host (`bun src/index.ts …`).
-- **node ≥ 20** — runs the MCPL servers (node 22 also fine). nvm fine locally.
+- **bun ≥ 1.4.3** — runs the host (`bun src/index.ts …`).
+- **node ≥ 22.12** — builds the Web UI when the host installs, and runs the MCPL servers. nvm fine locally.
 - **Rust toolchain** — only to build `chronicle` from a checkout; the npm
   package ships prebuilt binaries.
 

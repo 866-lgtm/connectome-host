@@ -3,10 +3,10 @@
 // alone into an empty directory with its dependencies from the registry, and
 // runs it there under bun. The install runs no install scripts, as npm 12
 // and bun install by default, so a dependency that needs its install script
-// to work fails here as it would for them. npm 11 runs install scripts: the
-// package's own postinstall builds the Web UI only in a checkout, where web/
-// is, and no dependency in package-lock.json has one. Build the Web UI
-// first (`npm run build:web:ci`). It checks:
+// to work fails here as it would for them. npm 10 and 11 run install
+// scripts: the package's own postinstall builds the Web UI only in a
+// checkout, where web/ is, and no dependency in package-lock.json has one.
+// Build the Web UI first (`npm run build:web:ci`). It checks:
 //   1. the package carries the Web UI, dist/web/index.html and every local
 //      file its quoted src and href attributes name, as vite writes them,
 //      and tsconfig.json, with which a consumer typechecks the TypeScript

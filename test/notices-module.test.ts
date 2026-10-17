@@ -419,6 +419,22 @@ describe('status channels', () => {
     expect(h.posts[1]!.text).toBe(statusClearText('clerk', 'quota-spent', 'anthropic credential ok'));
   });
 
+  // The instructions module raises this kind when agents run without their
+  // instructions, and its -clear when the file loads again.
+  test('an instructions-unavailable alert reaches the status channels after the quiet window, and its clear follows', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'], quietMs: 60_000 });
+    const lost = 'no instructions injected: "instructions/AGENTS.md" is a link, which its mount doesn\'t follow: put the file itself at that path';
+    h.alert('instructions-unavailable', lost);
+    await h.fireTimers();
+    expect(h.posts.length).toBe(1);
+    expect(h.posts[0]!.channelId).toBe('zulip:ops');
+    expect(h.posts[0]!.text).toContain(`instructions-unavailable: ${lost}`);
+    h.alert('instructions-unavailable-clear', '"instructions/AGENTS.md" loaded again; agents have their instructions');
+    await h.settle();
+    expect(h.posts.length).toBe(2);
+    expect(h.posts[1]!.text).toBe(statusClearText('clerk', 'instructions-unavailable', '"instructions/AGENTS.md" loaded again; agents have their instructions'));
+  });
+
   test('a status channel that also matches the reply scope is told once, as status', async () => {
     const h = await started({ statusChannels: ['zulip:ops'] });
     h.alert('hard-down', 'failing');
@@ -885,5 +901,59 @@ describe('absent chat server', () => {
     expect(warnings.length).toBe(1);
     expect(warnings[0]).toContain('slack, matrix');
     expect(warnings[0]).not.toContain('discord');
+  });
+});
+
+describe('the marker the agent reads', () => {
+  test('a reply-tier notice says the agent could not respond', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'] });
+    h.alert('quota-spent', 'spent', { until: 3_600_000 });
+    await h.settle();
+    expect(h.markers.length).toBe(1);
+    expect(h.markers[0]).toStartWith('[host-notice] While you could not respond (quota-spent), the host posted this in zulip:ops:');
+  });
+
+  test('a status-tier notice says it was for whoever runs the host, and claims no outage', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'] });
+    h.alert('auth-expiring', 'anthropic credential expires in ~30 min');
+    await h.settle();
+    expect(h.markers.length).toBe(1);
+    expect(h.markers[0]).toStartWith(
+      '[host-notice] The host posted this status notice in zulip:ops about auth-expiring, for whoever runs it; ' +
+      'nothing in it needs you to act: "',
+    );
+    expect(h.markers[0]).not.toContain('could not respond');
+  });
+
+  test('a status-tier kind that means the agent\'s own turns were failing says it could not respond', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'] });
+    h.alert('context-refusal', 'the provider refused the context');
+    await h.settle();
+    expect(h.markers.length).toBe(1);
+    expect(h.markers[0]).toStartWith('[host-notice] While you could not respond (context-refusal), the host posted this in zulip:ops:');
+  });
+
+  test('an episode a status kind opened gets the reply marker too, when a reply-tier kind joins it', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'] });
+    h.alert('auth-expiring', 'anthropic credential expires in ~30 min');
+    await h.settle();
+    h.alert('quota-spent', 'spent', { until: 3_600_000 });
+    await h.settle();
+    expect(h.markers.length).toBe(2);
+    expect(h.markers[0]).toStartWith('[host-notice] The host posted this status notice in zulip:ops about auth-expiring');
+    expect(h.markers[1]).toStartWith('[host-notice] While you could not respond (quota-spent), the host posted this in zulip:ops:');
+  });
+
+  test('an episode a reply-tier kind opened gets the status marker too, when a status kind joins it, and one marker of each', async () => {
+    const h = await started({ statusChannels: ['zulip:ops'] });
+    h.alert('quota-spent', 'spent', { until: 3_600_000 });
+    await h.settle();
+    h.alert('auth-expiring', 'anthropic credential expires in ~30 min');
+    await h.settle();
+    h.alert('context-refusal', 'the provider refused the context');
+    await h.settle();
+    expect(h.markers.length).toBe(2);
+    expect(h.markers[0]).toStartWith('[host-notice] While you could not respond (quota-spent), the host posted this in zulip:ops:');
+    expect(h.markers[1]).toStartWith('[host-notice] The host posted this status notice in zulip:ops about auth-expiring');
   });
 });

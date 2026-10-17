@@ -6,12 +6,33 @@
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
-import { REFUSAL_REACTION_BASELINE } from '@animalabs/agent-framework';
 import { namesEnvReference, type RecipeToolLifecycle } from './recipe.js';
 import { validateToolLifecycle } from './tool-lifecycle-config.js';
 
 /** Default config file path, resolved from cwd. */
 export const DEFAULT_CONFIG_PATH = resolve(process.cwd(), 'mcpl-servers.json');
+
+/**
+ * The operator's servers file's root, as JSON.parse reads it, for the boot
+ * (loadMcplServers) and for editing (readMcplServersFile). A file that isn't
+ * valid JSON throws a SyntaxError naming the file, never JSON.parse's own
+ * message, which can quote a stretch of the text, and the file can hold a
+ * token in an env block. A root of null, which neither reader can take
+ * entries from, throws a TypeError naming the file, the class main threw for
+ * it unnamed (reading `mcplServers` of null).
+ */
+function parseServersFile(path: string): unknown {
+  const raw = readFileSync(path, 'utf-8');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) throw new SyntaxError(`${path} isn't valid JSON`);
+    throw error;
+  }
+  if (parsed === null) throw new TypeError(`${path} holds null, not an object with mcplServers`);
+  return parsed;
+}
 
 /**
  * Serializable subset of McplServerConfig (everything except callbacks and scopes).
@@ -60,8 +81,7 @@ export type LoadedServerConfig = ServerFileEntry & { id: string };
 export function loadMcplServers(configPath: string): LoadedServerConfig[] {
   if (!existsSync(configPath)) return [];
 
-  const raw = readFileSync(configPath, 'utf-8');
-  const parsed = JSON.parse(raw) as McplServersFile;
+  const parsed = parseServersFile(configPath) as McplServersFile;
   if (!parsed.mcplServers || typeof parsed.mcplServers !== 'object') return [];
 
   const configDir = dirname(resolve(configPath));
@@ -203,6 +223,21 @@ export interface AgentOverlayFile {
 }
 
 /**
+ * The agent overlay can't be read as an overlay: it isn't valid JSON, or its
+ * root is `null`. Its message is the operator's, for the boot, which stops on
+ * it; the mcpl-admin tools say it to the agent from `path` and `problem`.
+ * Neither quotes the file, which can hold credentials.
+ */
+export class OverlayUnreadableError extends Error {
+  constructor(readonly path: string, readonly problem: 'not-json' | 'null-root') {
+    super(
+      `the agent overlay ${path} ${problem === 'not-json' ? 'isn\'t valid JSON' : 'isn\'t an object with mcplServers'}: ` +
+        'fix it: moving it aside would load every server the agent unloaded and drop its deployments',
+    );
+  }
+}
+
+/**
  * Read the agent overlay file: its entries by id, the root's keys other than
  * `mcplServers`, and `notes` on a file read differently from how it's
  * written, which the startup warnings log.
@@ -219,10 +254,10 @@ export interface AgentOverlayFile {
  *   with a note (main iterated a text's characters, each an entry naming
  *   nothing to run, so nothing loaded).
  *
- * A file that isn't valid JSON, or whose root is `null`, throws an error
- * naming the file, as main threw on both. The boot stops on it until the
- * file is fixed: the file carries the agent's tombstones, so reading past it
- * would load servers the agent unloaded.
+ * A file that isn't valid JSON, or whose root is `null`, throws an
+ * OverlayUnreadableError naming the file, as main threw on both. The boot
+ * stops on it until the file is fixed: the file carries the agent's
+ * tombstones, so reading past it would load servers the agent unloaded.
  * No writer produces those shapes: saveAgentOverlay writes an object root
  * whose `mcplServers` is a map. The error never quotes the file, which can
  * hold credentials.
@@ -234,16 +269,13 @@ export function readAgentOverlayFile(overlayPath: string): {
 } {
   if (!existsSync(overlayPath)) return { servers: {}, otherKeys: [], notes: [] };
   const raw = readFileSync(overlayPath, 'utf-8');
-  const fixIt = 'fix it: moving it aside would load every server the agent unloaded and drop its deployments';
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    throw new Error(`the agent overlay ${overlayPath} isn't valid JSON: ${fixIt}`);
+    throw new OverlayUnreadableError(overlayPath, 'not-json');
   }
-  if (parsed === null) {
-    throw new Error(`the agent overlay ${overlayPath} isn't an object with mcplServers: ${fixIt}`);
-  }
+  if (parsed === null) throw new OverlayUnreadableError(overlayPath, 'null-root');
   if (typeof parsed !== 'object' || Array.isArray(parsed)) {
     return { servers: {}, otherKeys: [], notes: ['has a root that isn\'t an object, so it holds no entries, as main read it'] };
   }
@@ -289,6 +321,16 @@ export type OverlayEntryReading =
 const isPlain = (v: unknown): v is string | number | boolean =>
   typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
 
+/** Plain, as a new write takes it: a number JSON can't write, Infinity or
+ *  NaN (a call's 1e400 parses as Infinity), doesn't count, since the file
+ *  would hold null in its place, not the number given. */
+const isPlainToWrite = (v: unknown): v is string | number | boolean =>
+  isPlain(v) && !(typeof v === 'number' && !Number.isFinite(v));
+
+/** The problem readOverlayEntry gives an entry with neither a command nor a
+ *  url, which mcpl_deploy says in its own words. */
+export const NAMES_NOTHING = 'it names no command to run and no url to dial';
+
 /**
  * Read one agent overlay entry as the boot reads it. Every reader takes this
  * reading (the boot, the startup warnings, mcpl_list, mcpl_restart's note,
@@ -320,8 +362,9 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  *
  * Skipped, so the operator's definition, if any, stays: an entry that isn't
  * an object, and `args` that aren't a list of text, numbers or true/false,
- * on which main stopped the start; an entry that names nothing to run or
- * dial; and a `disabled` that's truthy but not `true`, which main neither
+ * on which main stopped the start; an entry that names no command to run
+ * and no url to dial (NAMES_NOTHING); and a `disabled` that's truthy but not
+ * `true`, which main neither
  * loaded nor took as a tombstone. `disabled: true` is a tombstone, whatever
  * else the entry holds, as main's applyAgentOverlay read it.
  *
@@ -329,6 +372,12 @@ const isPlain = (v: unknown): v is string | number | boolean =>
  * to the plain shapes, text where text is meant, lists of text, an env map
  * of text, numbers or true/false, a transport of stdio or websocket, and a
  * reconnect of true or false, so anything else is refused, not saved.
+ * (mcpl_deploy reads numbers and true/false in a list as their text before
+ * this reading, as the boot reads args, so those are saved as text.) It
+ * names every field that breaks them at once, joined by "; ", so a deploy
+ * isn't refused one field at a time; a field's later checks are skipped
+ * only where its first one leaves nothing to check, such as the items of an
+ * env that isn't a map.
  */
 export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}): OverlayEntryReading {
   if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return { problem: 'it isn\'t an object' };
@@ -339,31 +388,41 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   if (e.disabled === true) return { entry: { disabled: true }, notes: [] };
   if (e.disabled) return { problem: 'its disabled is neither true nor false' };
   if (opts.strict) {
+    const problems: string[] = [];
     for (const k of ['command', 'url', 'token', 'access', 'toolPrefix']) {
-      if (e[k] !== undefined && typeof e[k] !== 'string') return { problem: `its ${k} isn't text` };
+      if (e[k] !== undefined && typeof e[k] !== 'string') problems.push(`its ${k} isn't text`);
     }
     if (e.transport !== undefined && e.transport !== 'stdio' && e.transport !== 'websocket') {
-      return { problem: 'its transport is neither stdio nor websocket' };
+      problems.push('its transport is neither stdio nor websocket');
     }
     if (e.args !== undefined && (!Array.isArray(e.args) || !e.args.every((a) => typeof a === 'string'))) {
-      return { problem: 'its args aren\'t a list of text' };
+      problems.push('its args aren\'t a list of text');
     }
     if (e.env !== undefined) {
-      if (e.env === null || typeof e.env !== 'object' || Array.isArray(e.env)) return { problem: 'its env isn\'t a map of names to values' };
-      const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlain(v)).map(([k]) => k);
-      if (odd.length > 0) return { problem: `its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a number or true/false` };
+      if (e.env === null || typeof e.env !== 'object' || Array.isArray(e.env)) {
+        problems.push('its env isn\'t a map of names to values');
+      } else {
+        const odd = Object.entries(e.env as Record<string, unknown>).filter(([, v]) => !isPlainToWrite(v)).map(([k]) => k);
+        if (odd.length > 0) problems.push(`its env ${odd.join(', ')} ${odd.length === 1 ? 'isn\'t' : 'aren\'t'} text, a finite number or true/false`);
+      }
     }
     for (const k of OVERLAY_NAME_LIST_FIELDS) {
-      if (e[k] !== undefined && (!Array.isArray(e[k]) || !(e[k] as unknown[]).every((x) => typeof x === 'string'))) {
-        return { problem: `its ${k} isn't a list of names` };
+      if (e[k] === undefined) continue;
+      if (!Array.isArray(e[k])) {
+        problems.push(`its ${k} isn't a list of names`);
+        continue;
       }
+      const items = e[k] as unknown[];
+      if (!items.every((x) => typeof x === 'string')) problems.push(`its ${k} isn't a list of names`);
       // An empty name matches nothing, so in an allow-list it's the deny-all
-      // that an empty list is kept from being.
-      if (e[k] !== undefined && (e[k] as string[]).some((x) => x.trim() === '')) {
-        return { problem: `its ${k} holds an empty name, which matches nothing` };
+      // that an empty list is kept from being. Checked among the names a
+      // list holds, whatever else it holds.
+      if (items.some((x) => typeof x === 'string' && x.trim() === '')) {
+        problems.push(`its ${k} holds an empty name, which matches nothing`);
       }
     }
-    if (e.reconnect !== undefined && typeof e.reconnect !== 'boolean') return { problem: 'its reconnect is neither true nor false' };
+    if (e.reconnect !== undefined && typeof e.reconnect !== 'boolean') problems.push('its reconnect is neither true nor false');
+    if (problems.length > 0) return { problem: problems.join('; ') };
   }
   const notes: string[] = [];
   // main resolved args only when truthy, so a falsy one passes on as it did.
@@ -400,7 +459,7 @@ export function readOverlayEntry(raw: unknown, opts: { strict?: boolean } = {}):
   // operator definition with one the framework fails to open.
   if (e.transport === 'websocket' && !e.url && e.command) notes.push('its transport is websocket, with no url to dial, so the framework can\'t open it');
   if (e.transport === 'stdio' && !e.command && e.url) notes.push('its transport is stdio, with no command to spawn, so the framework can\'t open it');
-  if (!e.command && !e.url) return { problem: 'it names nothing to run or dial' };
+  if (!e.command && !e.url) return { problem: NAMES_NOTHING };
   return { entry: e as AgentOverlayEntry, notes };
 }
 
@@ -512,9 +571,12 @@ export function saveAgentOverlay(
  * Write `servers` as a servers file's `mcplServers`, in place. The root's
  * other keys are kept as JSON.parse reads them: no reader acts on them, but
  * they're whoever wrote them's, such as an entry under a misspelled key. A
- * root that isn't an object holds no entries for any reader, and is
- * replaced. A file that doesn't parse is never overwritten: its readers
- * refuse it, so the save refuses too, without quoting it.
+ * root of null is refused by both files' readers, and every save follows a
+ * read of its file, so a save meets one only when another writer put it
+ * there after that read; it's replaced then, as any other root that isn't
+ * an object is, since such a root holds no entries for any reader. A file
+ * that doesn't parse is never overwritten: its readers refuse it, so the
+ * save refuses too, without quoting it.
  */
 function writeServersFile(path: string, servers: Record<string, unknown>): void {
   let root: Record<string, unknown> = {};
@@ -670,10 +732,21 @@ export function applyAgentOverlay<T extends { id: string }>(
   servers: T[],
   overlayPath: string,
 ): Array<T | ({ id: string } & Record<string, unknown>)> {
-  const overlay = readAgentOverlay(overlayPath);
+  return composeOverlay(servers, readAgentOverlay(overlayPath), overlayPath);
+}
+
+/** applyAgentOverlay's work on an overlay already read, such as one a
+ *  deploy is about to save, so it can see what the next start will load. */
+export function composeOverlay<T extends { id: string }>(
+  servers: T[],
+  overlay: Record<string, AgentOverlayEntry>,
+  overlayPath: string,
+): Array<T | ({ id: string } & Record<string, unknown>)> {
   if (Object.keys(overlay).length === 0) return servers;
 
-  // A malformed entry is skipped: neither a tombstone nor a replacement.
+  // A malformed entry is skipped: it neither tombstones nor replaces. An
+  // entry with `disabled: true` is a tombstone whatever else it holds
+  // (readOverlayEntry).
   const result: Array<T | ({ id: string } & Record<string, unknown>)> =
     servers.filter(s => !overlayEntryTombstones(Object.hasOwn(overlay, s.id) ? overlay[s.id] : undefined));
 
@@ -893,13 +966,12 @@ export function overlayWarnings(
 
 /**
  * Read the raw server entries from the config file (for editing).
- * Returns empty object if file doesn't exist.
+ * Returns empty object if file doesn't exist. A file that isn't valid JSON,
+ * or whose root is null, throws as parseServersFile says.
  */
 export function readMcplServersFile(configPath: string): Record<string, ServerFileEntry> {
   if (!existsSync(configPath)) return {};
-  const raw = readFileSync(configPath, 'utf-8');
-  const parsed = JSON.parse(raw) as McplServersFile;
-  return parsed.mcplServers ?? {};
+  return (parseServersFile(configPath) as McplServersFile).mcplServers ?? {};
 }
 
 /**
@@ -912,28 +984,24 @@ export function saveMcplServers(configPath: string, servers: Record<string, Serv
 /**
  * Compose the environment for a stdio MCPL child.
  *
- * Two host-owned values ride along with whatever the server entry declares:
+ * The host supplies AGENT_TIMEZONE after the server env: the agent-facing
+ * wall clock is resolved per-recipe, not a per-server operator knob.
  *
- * - `DISCORD_SUPPRESSED_REACTIONS_BASELINE` — the framework's exported
- *   refusal-annotation set (REFUSAL_REACTION_BASELINE, comma-joined), so a
- *   never-configured Discord adapter defaults to suppressing exactly the
- *   markers this host's framework stamps. Placed BEFORE the spread: an
- *   operator who sets the var on the server entry supersedes the house
- *   baseline — the host injects a default, never overrides a decision. The
- *   adapter's own precedence (file key incl. [] → legacy operator env →
- *   baseline) then decides what is actually enforced; house markers are
- *   Host semantics, and a standalone adapter without this composition stays
- *   honestly unprotected.
- * - `AGENT_TIMEZONE` — after the spread, deliberately: the agent-facing
- *   wall clock is resolved per-recipe by the host and is not a per-server
- *   operator knob.
+ * AgentFramework supplies DISCORD_SUPPRESSED_REACTIONS_BASELINE later,
+ * where it knows its awareness marker and retained recovery outbox emojis.
+ * A host-side refusal-only default would override that complete default.
+ * Explicit operator env passes through unchanged, whatever its type. The
+ * framework then lets a baseline with tokens, as the Discord adapter parses
+ * them, replace its default, and reads any other value (blank, commas
+ * alone, null) as unset. A non-string value counts as its string form, so
+ * `false` or `0` replaces the default. For an inheritEnv entry, a baseline
+ * with tokens in the host's own environment replaces it too.
  */
 export function composeMcplChildEnv(
   serverEnv: Record<string, string> | undefined,
   timeZone: string,
 ): Record<string, string> {
   return {
-    DISCORD_SUPPRESSED_REACTIONS_BASELINE: REFUSAL_REACTION_BASELINE.join(','),
     ...(serverEnv ?? {}),
     AGENT_TIMEZONE: timeZone,
   };

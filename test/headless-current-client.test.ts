@@ -106,11 +106,10 @@ test("a superseded client's disconnect leaves the newer client current", async (
   });
 }, 20_000);
 
-// Bun 1.3.14, the runtime connectome-host's CI pins, closes the whole socket
-// at end(), so a superseded client's later writes never arrive and the rule
-// can't be reached: there this test is skipped. The house's cross-package
-// check runs the suite on Bun 1.4.2, which half-closes the socket as Node
-// does, so the writes arrive and the rule decides.
+// Bun 1.3.14 closes the whole socket at end(), so a superseded client's
+// later writes never arrive and the rule can't be reached: there this test
+// is skipped. Bun 1.4.2 and 1.4.3 half-close the socket as Node does, so the
+// writes arrive and the rule decides.
 test.skipIf(!nodeSockets)("a superseded client's later commands are dropped, not run", async () => {
   await withChild(async ({ dir, log, open }) => {
     // The first client keeps its half of the socket open after the child
