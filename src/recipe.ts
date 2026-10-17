@@ -30,6 +30,7 @@ export interface RecipeStrategy {
   type: 'autobiographical' | 'passthrough' | 'frontdesk' | (string & {});
   // Core window/compression sizing
   headWindowTokens?: number;
+  /** Verbatim tail. When unset, 40% of the compile budget (120k of 300k). */
   recentWindowTokens?: number;
   compressionModel?: string;
   /** Cap compression `max_tokens` at the compression model's OUTPUT ceiling.
@@ -138,12 +139,15 @@ export interface RecipeStrategy {
   /** kv-stable: quality-gap override threshold (§13.4). Default 0.35. */
   kvStableQualityGapRatio?: number;
   compressionSlackRatio?: number;
-  /** Adaptive-resolution fold planner. The host defaults this to 'kv-stable'
-   *  (cache-stable compile plans; see buildFrameworkStrategy) — set explicitly
-   *  only to opt into the legacy planners. */
+  /** Adaptive-resolution fold planner. An omitted value is 'kv-unified', the
+   *  cost-aware solver (see buildFrameworkStrategy). A resident whose store
+   *  was built under 'kv-stable' pins it here. 'flat-profile' /
+   *  'oldest-first' are the legacy planners. */
   foldingStrategy?: 'flat-profile' | 'oldest-first' | 'kv-stable' | 'kv-unified';
-  /** Complete fail-closed policy for the kv-unified solver. No live defaults
-   * are supplied: selecting kv-unified without every field is invalid. */
+  /** Policy for the kv-unified solver. Omitted, the host supplies its standard
+   * block (standardKvUnifiedConfig), with cache prices matched to the
+   * provider, cacheTtl and model. Written out, it must be complete: there is
+   * no per-field merging, so a missing or misspelled field fails at load. */
   kvUnified?: RecipeKvUnifiedConfig;
   speculativeProduction?: boolean;
   /** L1 production holdback: keep the newest N closed chunks out of the
@@ -206,6 +210,9 @@ export interface RecipeKvUnifiedConfig {
   /** Preserve summaries spanning gaps instead of treeifying them. Mutually exclusive
    * with treeifyNonContiguousSummaries; both flags must be explicit. */
   preserveGapBearingSummaries: boolean;
+  /** Skip the full Pareto pass when the previously accepted layout is provably
+   * still selected (context-manager ≥ 0.14). Optional; off unless set. */
+  hysteresisCertificate?: boolean;
 }
 
 export interface RecipeAgent {
@@ -256,11 +263,14 @@ export interface RecipeAgent {
   /**
    * Per-agent stream token budget — the accumulated-input ceiling at which the
    * framework breaks the stream and lets the strategy compress. Mirrors the
-   * runtime `/budget` command. When unset, the framework default (150k) applies.
+   * runtime `/budget` command. When unset: contextBudgetTokens + 20k if the
+   * budget is unset too (320k), else 150k — a recipe that sets its own budget
+   * may be on a 200k-window model.
    */
   maxStreamTokens?: number;
-  /** Per-agent context compile budget (input tokens). When unset, the
-   *  ContextManager default (100k) applies. Raise for large-context models. */
+  /** Per-agent context compile budget (input tokens). When unset, 300k —
+   *  sized for 1M-window models; set it lower on a smaller window
+   *  (budget + maxTokens must fit). */
   contextBudgetTokens?: number;
   /** Prompt-cache TTL ('5m' | '1h') forwarded to the provider. Defaults to
    *  '1h'; set '5m' explicitly for high-frequency, sub-5-minute workloads.
@@ -1220,12 +1230,12 @@ export const DEFAULT_RECIPE: Recipe = {
   agent: {
     name: 'agent',
     cacheTtl: '1h',
-    systemPrompt: [
-      'You are a helpful assistant. You have access to tools provided by connected MCP servers.',
-      'Use them to help the user with their tasks.',
-      '',
-      'You can create persistent notes and write files to `products/` as outputs of your work.',
-    ].join('\n'),
+    // Empty on purpose: identity comes from what the agent lives through,
+    // and the tools describe themselves (docs/AGENT-ONBOARDING.md §5).
+    systemPrompt: '',
+    // No strategy: the host defaults (buildFrameworkStrategy) give
+    // autobiographical + adaptive resolution + kv-unified with the standard
+    // block, a 300k budget and a 120k verbatim tail.
   },
   modules: {
     // subagents + lessons + retrieval deliberately omitted — all opt-in only
@@ -1482,7 +1492,14 @@ async function resolveSystemPrompt(recipe: Recipe): Promise<Recipe> {
 }
 
 function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
-  const selected = strategy.foldingStrategy === 'kv-unified';
+  const type = strategy.type ?? 'autobiographical';
+  // An omitted foldingStrategy is kv-unified under adaptive resolution
+  // (buildFrameworkStrategy), so a kvUnified block there is in use.
+  const selected = strategy.foldingStrategy === 'kv-unified' || (
+    strategy.foldingStrategy === undefined &&
+    strategy.adaptiveResolution !== false &&
+    (type === 'autobiographical' || type === 'frontdesk')
+  );
   const raw = strategy.kvUnified;
   if (!selected) {
     if (raw !== undefined) {
@@ -1490,9 +1507,11 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
     }
     return;
   }
+  // Omitted: the host supplies its standard block (standardKvUnifiedConfig).
+  if (raw === undefined) return;
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
     throw new Error(
-      'Recipe foldingStrategy "kv-unified" requires a complete agent.strategy.kvUnified object; defaults are forbidden.',
+      'Recipe agent.strategy.kvUnified must be a complete object when present (omit it for the standard block).',
     );
   }
   const config = raw as Record<string, unknown>;
@@ -1565,6 +1584,9 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
     throw new Error(
       'Recipe agent.strategy.kvUnified.treeifyNonContiguousSummaries and preserveGapBearingSummaries are mutually exclusive.',
     );
+  }
+  if (config.hysteresisCertificate !== undefined && typeof config.hysteresisCertificate !== 'boolean') {
+    throw new Error('Recipe agent.strategy.kvUnified.hysteresisCertificate must be a boolean when present.');
   }
 }
 

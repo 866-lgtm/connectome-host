@@ -5,20 +5,23 @@
  * authoritative usage buckets. Cache creation MUST remain split by TTL:
  * Anthropic bills 5m writes at 1.25x input and 1h writes at 2x input.
  *
- * Cache READS are 0.1x input on every model but two: Claude Fable 5.1 and
+ * Cache READS are 0.1x input on every model but three: Claude Fable 5.1 and
  * Claude Mythos 5.1 read at 0.025x ($0.25/MTok), a quarter of the 5 pair's
- * rate. That exception is not cosmetic for long-lived agents — a resident
- * re-reading a 260k prefix on every call spends most of its bill on cache
- * reads, so charging them at 0.1x overstates its total roughly fourfold.
+ * rate, and Claude Opus 5.5 at 0.05x ($0.20/MTok). Those exceptions are not
+ * cosmetic for long-lived agents — a resident re-reading a 260k prefix on
+ * every call spends most of its bill on cache reads, so charging them at
+ * 0.1x overstates its total two- to fourfold.
  *
  * Source: https://platform.claude.com/docs/en/about-claude/pricing
- * Snapshot: 2026-09-21. Keep the version string/date auditable; silently
- * changing historical prices would make old JSONL replay disagree with bills.
+ * Snapshot: 2026-10-15 (Opus 5.5 added; it had matched the Opus 5 prefix and
+ * was priced at $5/$25 with 0.1x reads). Keep the version string/date
+ * auditable; silently changing historical prices would make old JSONL replay
+ * disagree with bills.
  */
 
 import type { CallCostBreakdown } from './web/protocol.js';
 
-export const ANTHROPIC_PRICING_VERSION = 'anthropic-public-2026-09-21';
+export const ANTHROPIC_PRICING_VERSION = 'anthropic-public-2026-10-15';
 
 /** Cache reads bill at this multiple of base input on every model that does
  *  not override it. */
@@ -104,6 +107,10 @@ function anthropicBaseRate(model: string): BaseRate | undefined {
   // Fable 5 and Mythos 5 share pricing.
   if (starts(model, 'claude-fable-5', 'claude-mythos-5')) return rate(10, 50);
 
+  // Opus 5.5 before the Opus 5 group, whose 'claude-opus-5' prefix also
+  // matches it: $4/$20, cache reads $0.20 (0.05x).
+  if (starts(model, 'claude-opus-5-5')) return rate(4, 20, 0.05);
+
   if (starts(model,
     'claude-opus-5',
     'claude-opus-4-8',
@@ -133,6 +140,50 @@ function anthropicBaseRate(model: string): BaseRate | undefined {
 
   if (starts(model, 'claude-opus-4-1', 'claude-opus-4-')) return rate(15, 75);
   return undefined;
+}
+
+/**
+ * Cache-read price as a multiple of the model's base input price, for a
+ * Claude model id as a recipe names it: a Bedrock region prefix
+ * (`global.anthropic.`) or a gateway prefix (`anthropic/`) is stripped first.
+ * Models this table doesn't know get the standard 0.1x.
+ */
+export function anthropicCacheReadMultiplier(model: string): number {
+  const bare = model.replace(/^(?:[a-z]+\.)?anthropic[./]/, '');
+  return anthropicBaseRate(bare)?.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER;
+}
+
+/**
+ * OpenAI cache prices as multiples of a model's uncached input, for the
+ * standard kv-unified block (the ledger doesn't price OpenAI calls).
+ *
+ * - Writes: the API bills them at 1.25x for the GPT-5.6 and GPT-6 families
+ *   (the models its pricing table gives a cache-write price) and charges
+ *   nothing extra for the rest. Codex credit billing has no cache-write
+ *   charge on any model.
+ * - Reads: the cached-input rate, the same ratio on the API and in Codex
+ *   credits: 0.05x GPT-6.1 Sol, 0.25x gpt-4.1 / o3 / o4-mini, 0.5x gpt-4o /
+ *   o1 / o3-mini, 0.1x everything else.
+ *
+ * Sources: https://developers.openai.com/api/docs/pricing and
+ * https://learn.chatgpt.com/docs/pricing, read 2026-10-17. A gateway prefix
+ * (`openai/`) is stripped first.
+ */
+export function openaiCacheMultipliers(
+  model: string,
+  transport: 'api' | 'codex',
+): { read: number; write: number } {
+  const bare = model.replace(/^openai\//, '');
+  const writePremium = transport === 'api' && starts(bare, 'gpt-6', 'gpt-5.6');
+  return { read: openaiCacheReadMultiplier(bare), write: writePremium ? 1.25 : 1 };
+}
+
+function openaiCacheReadMultiplier(model: string): number {
+  if (starts(model, 'gpt-6.1-sol')) return 0.05;
+  if (starts(model, 'gpt-4.1', 'o4-mini')) return 0.25;
+  if (starts(model, 'gpt-4o', 'o1', 'o3-mini')) return 0.5;
+  if (starts(model, 'o3')) return 0.25;
+  return DEFAULT_CACHE_READ_MULTIPLIER;
 }
 
 function starts(model: string, ...prefixes: string[]): boolean {

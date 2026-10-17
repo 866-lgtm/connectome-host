@@ -90,11 +90,15 @@ Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
 
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
-the autobiographical memory strategy with adaptive resolution, **KV-stable
-folding** (compile plans that preserve prompt-cache prefixes), compression by
+the autobiographical memory strategy with adaptive resolution, **kv-unified
+folding** (a cost-aware solver that weighs budget fit, prompt-cache cost and
+continuity), a 300k context budget with a 120k verbatim tail, compression by
 the agent's own model, and summaries voiced as the agent itself
-(`summaryParticipant` defaults to `agent.name`). Set a `strategy` block only
-to tune windows/budgets or opt into a different strategy type (`frontdesk`
+(`summaryParticipant` defaults to `agent.name`). The 300k budget assumes a
+1M-window model: on a 200k-window model, set `agent.contextBudgetTokens`
+yourself. Set a `strategy` block only to tune windows/budgets, to pin
+`foldingStrategy: "kv-stable"` for a resident whose store was built under it,
+or to opt into a different strategy type (`frontdesk`
 for channel-staffing agents, `passthrough` for none) — see
 `docs/AGENT-ONBOARDING.md` for sizing guidance on long-lived agents and
 [`docs/AGENT-MEMORY-GUIDE.md`](docs/AGENT-MEMORY-GUIDE.md) for how it works.
