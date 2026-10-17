@@ -835,6 +835,10 @@ export function App() {
     if (welcomeSessionId !== null && msg.session.id !== welcomeSessionId) {
       clearMcpl();
       if (sidebarTab() === 'mcp') refreshMcpl();
+      // An open panel shows the old session: a node of its tree, or its
+      // branches. A node of the new tree can carry an old node's name, and
+      // its stream would join the old lines. So the panel closes.
+      closePanel();
     }
     welcomeSessionId = msg.session.id;
     const key = `${msg.session.id}/${msg.branch.id}`;
