@@ -10,9 +10,13 @@
  * results as user messages + inference-request events. Pass `sync: true`
  * to block until completion.
  *
- * Sync tasks are detachable: user can push them to background mid-flight
- * via Ctrl+B in TUI, or they auto-detach after `timeoutMs` if specified.
- * Both spawn and fork accept `timeoutMs` for per-task execution deadlines.
+ * Sync tasks are detachable: the user can push one to the background
+ * mid-flight with Ctrl+B in the TUI, and one still running at its `timeoutMs`
+ * (default maxExecutionMs, 600 s) moves there itself. A run in the background
+ * goes on until it ends and delivers its result as a message. An async
+ * task's `timeoutMs` is a hard limit on its whole run, retries included,
+ * counted from when it holds a concurrency slot; async tasks have none by
+ * default.
  */
 
 import type {
@@ -139,6 +143,27 @@ export class SubagentTerminated extends Error {
     this.name = 'SubagentTerminated';
   }
 }
+
+/**
+ * A subagent's failure that the module accounts for itself, such as its
+ * prompt over the module's limit or its run past its own time limit.
+ * Running the subagent again as it stands can't change it, so the retry
+ * loop ends on one without reading its words. (Before, the classifiers read
+ * these messages too, so a name or a number in them could make one count as
+ * transient or as a rate limit: a subagent named "migrate" holds "rate", a
+ * 1500 ms limit holds "500".)
+ */
+class SubagentFailure extends Error {
+  override readonly name = 'SubagentFailure';
+}
+
+/** setTimeout's longest delay; a longer one fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+const timerDelay = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0, ms));
+/** How early a timer may fire, by Date.now(): Node's timers can fire up to
+ *  1 ms before the time they were set for (Bun 1.4.3's didn't, in a probe
+ *  of 2,000). */
+const TIMER_SLACK_MS = 2;
 
 /** Persisted subagent state (stored in Chronicle module state).
  *  'cancelled' = terminal-but-benign (user cancel, zombie reclaim, supersession).
@@ -402,6 +427,22 @@ export function materialiseStructuralFork(
 // Module
 // ---------------------------------------------------------------------------
 
+/** A cancel that wins the race with creating a run's agent leaves the
+ *  creation running. The agent it gives is still the module's, so it's
+ *  given back when it comes; a creation that fails leaves nothing. */
+function giveBackWhenCreated(creating: Promise<{ cleanup: () => void }>, name: string): void {
+  creating.then(
+    (created) => {
+      try {
+        created.cleanup();
+      } catch (err) {
+        console.error(`[subagent] ${name}: giving back an agent created after its run was stopped failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+    () => { /* a creation that failed leaves nothing to give back */ },
+  );
+}
+
 export class SubagentModule implements Module {
   readonly name = 'subagent';
 
@@ -416,10 +457,19 @@ export class SubagentModule implements Module {
   // Concurrency control — adaptive rate-limit-aware semaphore
   private configuredMaxConcurrent: number;   // User's ceiling
   private effectiveConcurrent: number;       // Current effective limit (may be reduced)
-  private activeConcurrent = 0;
-  private waitQueue: Array<() => void> = [];
+  /** The slots runs hold, one each. A slot is released once, however its
+   *  run ends, so the count never falls below the runs holding one. */
+  private heldSlots = new Set<object>();
+  private waitQueue: Array<(slot: object) => void> = [];
+  /** The slot each running subagent holds, for a zombie reclaim to release. */
+  private slotOf = new WeakMap<ActiveSubagent, object>();
   private consecutiveSuccesses = 0;
-  private lastRateLimitAt = 0;
+  /** A rate limit has held the effective limit down, at or below the
+   *  configured ceiling, and successes haven't yet brought it back up to it.
+   *  A rate limit at an effective limit of 1 sets it too: the provider has
+   *  just pushed back. While it holds, raising the ceiling leaves the
+   *  effective limit to recover toward it, one step per three successes. */
+  private throttled = false;
   private rateLimitCooldownMs = 30_000;      // Delay after rate limit before releasing next slot
 
   // Periodic zombie reaper. The pre-existing reaper only ran on-demand
@@ -459,6 +509,10 @@ export class SubagentModule implements Module {
   // Live state for peek observability
   private liveSubagents = new Map<string, LiveSubagentState>();          // keyed by displayName
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
+  /** Each attempt's agent name → its run's display name, for the run's
+   *  life, so a cancel reaches the children any attempt spawned, between
+   *  attempts too. frameworkNameIndex holds only the live attempt. */
+  private runOfAttempt = new Map<string, string>();
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
   private lastInputTokens = new Map<string, number>();  // displayName → context size: its latest call's prompt
@@ -497,12 +551,8 @@ export class SubagentModule implements Module {
         // subagent from one that has been silently stuck. Look up the
         // ActiveSubagent record by entry-key (a separate index, since
         // displayName isn't the activeSubagents key directly).
-        for (const sa of this.activeSubagents.values()) {
-          if (sa.name === displayName) {
-            sa.lastActivityAt = Date.now();
-            break;
-          }
-        }
+        const sa = this.runningEntry(displayName);
+        if (sa) sa.lastActivityAt = Date.now();
 
         // inference:usage is emitted at runtime but not in the TraceEvent union — handle it first
         if ((event as { type: string }).type === 'inference:usage') {
@@ -715,10 +765,10 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. To give the subagent a utility, list `utils` and the utility\'s own name (module--name). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'systemPrompt', 'task'],
         },
@@ -739,7 +789,7 @@ export class SubagentModule implements Module {
             model: { type: 'string', description: 'Model override (optional)' },
             maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
             sync: { type: 'boolean', description: 'If true, block until fork completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'task'],
         },
@@ -878,35 +928,27 @@ export class SubagentModule implements Module {
 
   /**
    * Acquire a concurrency slot. Returns how long the caller waited (0 = immediate).
-   * Throws if the slot is not acquired within `slotTimeoutMs`.
+   * Throws if the slot is not acquired within `slotTimeoutMs`, and rejects
+   * with the run's SubagentTerminated if `cancelled`, the run's cancel from
+   * cancelFor, fires while it waits.
    */
-  private async acquireSlot(slotTimeoutMs = 120_000): Promise<{ waitedMs: number }> {
-    if (this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+  private async acquireSlot(slotTimeoutMs = 120_000, cancelled?: Promise<never>): Promise<{ waitedMs: number; slot: object }> {
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
-    // Before queueing, try to reclaim slots from zombie subagents
-    const reclaimedZombies = this.reclaimZombieSlots();
-    if (reclaimedZombies > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+    // Before queueing, try to reclaim slots from zombie subagents. What a
+    // reclaim frees goes to the spawns already waiting first.
+    this.reclaimZombieSlots();
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
     const startWait = Date.now();
-    return new Promise<{ waitedMs: number }>((resolve, reject) => {
+    return new Promise<{ waitedMs: number; slot: object }>((resolve, reject) => {
       const timer = setTimeout(() => {
-        // Remove ourselves from the wait queue
+        // Last-chance zombie reclamation before failing. What it frees goes
+        // to the queue in order, this spawn included.
+        this.reclaimZombieSlots();
         const idx = this.waitQueue.indexOf(onSlot);
-        if (idx >= 0) this.waitQueue.splice(idx, 1);
-
-        // Last-chance zombie reclamation before failing
-        const reclaimed = this.reclaimZombieSlots();
-        if (reclaimed > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-          this.activeConcurrent++;
-          resolve({ waitedMs: Date.now() - startWait });
-          return;
-        }
+        if (idx < 0) return; // a freed slot has reached it
+        this.waitQueue.splice(idx, 1);
 
         // Surface which subagents currently hold the slots, with silence
         // and total runtime. Without this the caller only sees "5/5 in
@@ -928,12 +970,22 @@ export class SubagentModule implements Module {
         ));
       }, slotTimeoutMs);
 
-      const onSlot = () => {
+      const onSlot = (slot: object) => {
         clearTimeout(timer);
-        resolve({ waitedMs: Date.now() - startWait });
+        resolve({ waitedMs: Date.now() - startWait, slot });
       };
 
       this.waitQueue.push(onSlot);
+      // A cancel while it waits takes it out of the queue. One that comes
+      // after a slot reached it ends the run in its setup, before its
+      // attempt starts, or in the attempt's race once it has.
+      cancelled?.catch((err: unknown) => {
+        const idx = this.waitQueue.indexOf(onSlot);
+        if (idx < 0) return;
+        this.waitQueue.splice(idx, 1);
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
@@ -982,11 +1034,8 @@ export class SubagentModule implements Module {
     let reclaimed = 0;
 
     for (const [displayName, live] of this.liveSubagents) {
-      let entry: ActiveSubagent | undefined;
-      for (const e of this.activeSubagents.values()) {
-        if (e.name === displayName) { entry = e; break; }
-      }
-      if (!entry || entry.status !== 'running') continue;
+      const entry = this.runningEntry(displayName);
+      if (!entry) continue;
 
       const silentMs = Date.now() - entry.lastActivityAt;
       // Postmortem 2026-05-28 F3: `!live.requestInFlightSince` protects the
@@ -1011,7 +1060,7 @@ export class SubagentModule implements Module {
         // Cancel the zombie's framework agent
         try {
           const agent = this.getFramework().getAgent(live.frameworkAgentName);
-          if (agent) agent.cancelStream();
+          if (agent) this.stopRun(agent);
         } catch { /* best-effort */ }
 
         // Cancel via cancellation handle (unblocks the Promise.race in runSpawn/runFork)
@@ -1035,10 +1084,10 @@ export class SubagentModule implements Module {
         entry.completedAt = Date.now();
         entry.statusMessage = 'zombie — slot reclaimed';
 
-        // Release the slot (the finally block in runSpawn/runFork will also
-        // call releaseSlot, but that's safe — activeConcurrent just goes to
-        // max(0, activeConcurrent-1) effectively)
-        this.activeConcurrent = Math.max(0, this.activeConcurrent - 1);
+        // Release the zombie's own slot. Its run's finally releases the same
+        // slot, which by then is free, so nothing is released twice.
+        const slot = this.slotOf.get(entry);
+        if (slot) this.releaseSlot(slot);
         reclaimed++;
       }
     }
@@ -1046,12 +1095,60 @@ export class SubagentModule implements Module {
     return reclaimed;
   }
 
-  private releaseSlot(): void {
-    if (this.activeConcurrent <= 0) return; // Guard against double-release (e.g., zombie reclamation + finally)
-    this.activeConcurrent--;
-    if (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
+  /** The running entry for a display name. Spawn and fork entries are
+   *  keyed differently and stay after they end, so a finished entry of the
+   *  other type can share the name; the first match by name alone could be
+   *  that one. */
+  private runningEntry(displayName: string): ActiveSubagent | undefined {
+    for (const e of this.activeSubagents.values()) {
+      if (e.name === displayName && e.status === 'running') return e;
+    }
+    return undefined;
+  }
+
+  private get activeConcurrent(): number {
+    return this.heldSlots.size;
+  }
+
+  private takeSlot(): object {
+    const slot = {};
+    this.heldSlots.add(slot);
+    return slot;
+  }
+
+  /** Release `slot`, if it's still held, and let waiting spawns start. */
+  private releaseSlot(slot: object): void {
+    if (!this.heldSlots.delete(slot)) return; // a zombie reclaim released it already
+    this.admitWaiters();
+  }
+
+  /** Start waiting spawns, in order, while the limit allows. Called wherever
+   *  a slot frees or the limit rises. */
+  private admitWaiters(): void {
+    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
+      this.waitQueue.shift()!(this.takeSlot());
+    }
+  }
+
+  /** Stop a run: cancel its live stream and set its agent idle. At a tool
+   *  boundary the agent reads 'ready', and agent-framework 0.22.1's
+   *  Agent.cancelStream signals a stream only from 'streaming' or
+   *  'waiting_for_tools', so the provider stream would stay parked until
+   *  the run's 15-minute idle watchdog. That stream is cancelled directly,
+   *  the way the framework's own context-budget restart cancels it
+   *  (src/framework.ts, the overBudget branch of the stream driver, about
+   *  line 8265 at v0.22.1); the agent is set idle even if that cancel
+   *  throws. The framework marks its own cancels as its own, in a private
+   *  map, and nothing lets a host do the same, so it records a stopped
+   *  stream as aborted, a failed inference in its log, as it does for a
+   *  user's cancel. A tool call already running isn't stopped: it
+   *  finishes, and the framework drops its result. */
+  private stopRun(agent: Agent): void {
+    const state = agent.state;
+    try {
+      if (state.status === 'ready' && state.stream) state.stream.cancel();
+    } finally {
+      agent.cancelStream();
     }
   }
 
@@ -1072,25 +1169,134 @@ export class SubagentModule implements Module {
       this.effectiveConcurrent++;
       this.consecutiveSuccesses = 0;
     }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
-  /** Call on rate limit error — halves concurrency and applies cooldown. */
-  private async onRateLimitHit(): Promise<void> {
+  /** Call on rate limit error — halves concurrency, and gives the cooldown
+   *  the run then waits, keeping its slot. A run with a deadline cools down
+   *  no later than its deadline; the halving holds either way. */
+  private onRateLimitHit(deadline?: number): number {
     const prev = this.effectiveConcurrent;
     this.effectiveConcurrent = Math.max(1, Math.floor(this.effectiveConcurrent / 2));
     this.consecutiveSuccesses = 0;
-    this.lastRateLimitAt = Date.now();
+    this.throttled = true;
+    const coolMs = deadline === undefined
+      ? this.rateLimitCooldownMs
+      : Math.max(0, Math.min(this.rateLimitCooldownMs, deadline - Date.now()));
     console.error(
       `[subagent] Rate limit hit — concurrency ${prev} → ${this.effectiveConcurrent}, ` +
-      `cooling down ${this.rateLimitCooldownMs}ms`
+      `cooling down ${coolMs}ms`
     );
-    await new Promise(resolve => setTimeout(resolve, this.rateLimitCooldownMs));
+    return coolMs;
   }
 
-  private isRateLimitError(err: unknown): boolean {
+  /** Wait `ms`, unless the run's cancel comes first; then its error. */
+  private async waitOrStop(ms: number, cancelled: Promise<never>): Promise<SubagentTerminated | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([new Promise((resolve) => { timer = setTimeout(resolve, ms); }), cancelled]);
+      return null;
+    } catch (err) {
+      if (err instanceof SubagentTerminated) return err;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** A cancel for one run, by its name, from before the run queues. A name
+   *  means one live run (nameInUse refuses a second), so the name finds it.
+   *  cancelSubagent and the zombie reaper reject it and drop it, and the
+   *  run's end drops it (dispose). Everything the run waits on races it:
+   *  the slot queue, an attempt's setup (creating the agent, a fork's read
+   *  of its parent's context, compiling its prompt), each attempt's race and
+   *  the waits between attempts. A cancel that lands just as compiling
+   *  settles, once the race has taken compile's result, is thrown before the
+   *  attempt starts (throwIfFired). */
+  private cancelFor(name: string): { promise: Promise<never>; throwIfFired(): void; dispose(): void } {
+    let reject!: (err: Error) => void;
+    let fired: Error | null = null;
+    const promise = new Promise<never>((_, r) => { reject = r; });
+    promise.catch(() => { /* raced wherever the run waits; one may be idle */ });
+    const handle = { reject: (err: Error) => { fired ??= err; reject(err); } };
+    this.cancellationHandles.set(name, handle);
+    return {
+      promise,
+      throwIfFired: () => { if (fired) throw fired; },
+      // The name is this run's until its result has come back, which is
+      // after this (nameInUse), so the handle under it is this run's or
+      // none, and deleting it can't drop another run's cancel.
+      dispose: () => { this.cancellationHandles.delete(name); },
+    };
+  }
+
+  /** End a run a cancel or the reaper stopped: 'cancelled', with what it
+   *  had said so far. */
+  private endTerminated(name: string, entry: ActiveSubagent, err: SubagentTerminated, waitedMs: number): SubagentResult {
+    // Postmortem 2026-05-28 P1 #4: terminal-but-benign — 'cancelled', not
+    // 'completed'. Before this, the TUI subagent list rendered these as
+    // "done" while the reducer-driven web tree rendered them red.
+    entry.status = 'cancelled';
+    entry.completedAt = Date.now();
+    entry.statusMessage = err.reason;
+    const notice = this.concurrencyNotice(waitedMs);
+    const label = err.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${err.reason}`;
+    const summary = notice + `[${label}] ` + (err.partialOutput || '(no output yet)');
+    this.emit(name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(name) });
+    return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+  }
+
+  /** What a run under a name starts from, as it queues: no context size an
+   *  earlier run under the name reported, and its own parent link (or none),
+   *  so a parent's cancel reaches it while it waits. Each attempt clears
+   *  the `return` stash as it starts. nameInUse means no other run holds
+   *  the name. */
+  private claimName(name: string, parent: string | undefined): void {
+    this.lastInputTokens.delete(name);
+    if (parent) this.parentMap.set(name, parent);
+    else this.parentMap.delete(name);
+  }
+
+  /** Drop a run's attempts from the index as the run ends: nameInUse keeps
+   *  its name until its result has come back, after this, so every entry
+   *  under the name is this run's. */
+  private forgetAttempts(name: string): void {
+    for (const [agentName, run] of this.runOfAttempt) if (run === name) this.runOfAttempt.delete(agentName);
+  }
+
+  /** End a run cancelled while it waited for a slot: it never started. */
+  private endQueued(name: string, err: SubagentTerminated): SubagentResult {
+    const label = err.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${err.reason}`;
+    const summary = `[${label}] (no output: it was still waiting for a concurrency slot, and never started)`;
+    this.emit(name, { type: 'done', summary });
+    return { summary, findings: [], issues: [], toolCallsCount: 0 };
+  }
+
+  /** The words the classifiers read: the failure's message without the
+   *  ephemeral agent's name, which the framework quotes in its own messages
+   *  ("Ephemeral agent \"spawn-migrate-…\" failed to start inference …") and
+   *  which holds the name the agent chose. agent-framework 0.22.1 gives an
+   *  ephemeral run's failure no other structure to read: it rejects with an
+   *  Error carrying the text, apart from the class agent-framework #343
+   *  adds, which isUnsleptProviderWait reads by name. */
+  private classifiedText(err: Error, agentName?: string): string {
+    const text = agentName ? err.message.split(agentName).join('') : err.message;
+    return text.toLowerCase();
+  }
+
+  private isRateLimitError(err: unknown, agentName?: string): boolean {
     if (!(err instanceof Error)) return false;
-    const msg = err.message.toLowerCase();
-    return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
+    const msg = this.classifiedText(err, agentName);
+    // Rate-limit phrases, not words: "rate" with no letter before it and
+    // "limit" or "exceeded" after it, so "generate", "moderate" or "rated"
+    // isn't a rate limit and "upstream_rate_limit_exceeded" is; "too many
+    // requests", not "too many", which also opens "too many tokens"; and
+    // the status code as a whole number, so a duration such as 14290ms
+    // isn't one.
+    return /(?<![a-z])rate[\s_-]?(limit|exceeded)/.test(msg)
+      || /\b429\b/.test(msg)
+      || /too many (\w+ )?requests/.test(msg);
   }
 
   /** The framework ended the run rather than sleep the stated wait of a
@@ -1110,9 +1316,9 @@ export class SubagentModule implements Module {
   }
 
   /** Transient = worth retrying the whole subagent from scratch. */
-  private isTransientError(err: Error): boolean {
+  private isTransientError(err: Error, agentName?: string): boolean {
     if (this.isUnsleptProviderWait(err)) return false;
-    const msg = err.message.toLowerCase();
+    const msg = this.classifiedText(err, agentName);
     return (
       msg.includes('timeout') ||
       msg.includes('idle') ||
@@ -1121,34 +1327,37 @@ export class SubagentModule implements Module {
       msg.includes('network') ||
       msg.includes('stream aborted') ||
       msg.includes('overloaded') ||
-      msg.includes('529') ||
-      msg.includes('500') ||
-      msg.includes('502') ||
-      msg.includes('503') ||
-      this.isRateLimitError(err)
+      // Whole numbers, so a duration such as 15000ms isn't an HTTP 500.
+      /\b(500|502|503|529)\b/.test(msg) ||
+      this.isRateLimitError(err, agentName)
     );
   }
 
-  /** Set concurrency ceiling at runtime. Also raises effective if below new ceiling. */
+  /** Set the concurrency ceiling at runtime. The effective limit follows it,
+   *  up or down, except that while a rate limit's halving holds, a higher
+   *  ceiling leaves the effective limit to recover toward it after
+   *  successes. Spawns waiting for a slot start as the limit allows. */
   setConcurrency(n: number): void {
     this.configuredMaxConcurrent = Math.max(1, n);
-    if (this.effectiveConcurrent > this.configuredMaxConcurrent) {
+    if (!this.throttled || this.effectiveConcurrent > this.configuredMaxConcurrent) {
       this.effectiveConcurrent = this.configuredMaxConcurrent;
     }
-    // If we were throttled below the new ceiling, let waiters through
-    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
-    }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
   /** Get current concurrency status for observability. */
-  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number } {
+  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number; note?: string } {
+    const held = this.throttled && this.effectiveConcurrent < this.configuredMaxConcurrent;
     return {
       configured: this.configuredMaxConcurrent,
       effective: this.effectiveConcurrent,
       active: this.activeConcurrent,
       queued: this.waitQueue.length,
+      ...(held ? {
+        note: `A rate limit holds the limit at ${this.effectiveConcurrent}. It rises by one after every three ` +
+          `subagents that finish without error, up to ${this.configuredMaxConcurrent}.`,
+      } : {}),
     };
   }
 
@@ -1157,16 +1366,36 @@ export class SubagentModule implements Module {
   // =========================================================================
 
   /**
-   * Force-stop a running subagent. Aborts the active HTTP stream and
-   * causes runSpawn/runFork to return with a "[Stopped by user]" result.
-   * Returns true if the subagent was found and cancelled.
+   * Force-stop a subagent: one running, between attempts, or still waiting
+   * for a concurrency slot. Stops its live stream, if it has one, and makes
+   * runSpawn/runFork return a "[Stopped by user]" result. Returns true if
+   * the subagent was found and cancelled.
    */
   cancelSubagent(displayName: string): boolean {
-    // Cancel children first (bottom-up) so their results propagate before the parent dies
-    this.cancelChildren(displayName);
+    const found = this.cancellationHandles.has(displayName);
+    this.stopTree(displayName);
+    return found;
+  }
+
+  /**
+   * Cancel all running subagents (e.g. on user Esc).
+   * Returns the number of subagents cancelled, each once: a child stopped
+   * through its parent counts there, and its own name then finds nothing.
+   */
+  cancelAll(): number {
+    let count = 0;
+    for (const name of [...this.cancellationHandles.keys()]) count += this.stopTree(name);
+    return count;
+  }
+
+  /** Stop the run named, its children first (bottom-up, so their results
+   *  propagate before the parent's), and return how many runs this stopped. */
+  private stopTree(displayName: string): number {
+    let stopped = 0;
+    for (const child of this.childrenOf(displayName)) stopped += this.stopTree(child);
 
     const handle = this.cancellationHandles.get(displayName);
-    if (!handle) return false;
+    if (!handle) return stopped;
 
     // Abort the active inference stream (cancels the HTTP request)
     const live = this.liveSubagents.get(displayName);
@@ -1174,27 +1403,14 @@ export class SubagentModule implements Module {
     if (live) {
       try {
         const agent = this.getFramework().getAgent(live.frameworkAgentName);
-        if (agent) agent.cancelStream();
+        if (agent) this.stopRun(agent);
       } catch { /* best-effort */ }
     }
 
-    // Unblock the Promise.race in runSpawn/runFork
+    // End the run wherever it waits: the slot queue, an attempt or a back-off
     handle.reject(new SubagentTerminated('cancelled', partial, `Subagent "${displayName}" cancelled by user`));
-    return true;
-  }
-
-  /**
-   * Cancel all running subagents (e.g. on user Esc).
-   * Returns the number of subagents cancelled.
-   */
-  cancelAll(): number {
-    // Collect all cancellable names first to avoid mutation during iteration
-    const names = [...this.cancellationHandles.keys()];
-    let count = 0;
-    for (const name of names) {
-      if (this.cancelSubagent(name)) count++;
-    }
-    return count;
+    this.cancellationHandles.delete(displayName);
+    return stopped + 1;
   }
 
   /**
@@ -1223,27 +1439,16 @@ export class SubagentModule implements Module {
     return result;
   }
 
-  /**
-   * Cancel all children (direct + transitive) of the given display name.
-   * Uses the parentMap to find descendants via framework agent names.
-   */
-  private cancelChildren(displayName: string): void {
-    const live = this.liveSubagents.get(displayName);
-    if (!live) return;
-
-    // Find direct children: entries in parentMap whose parent is this agent's framework name
-    const frameworkName = live.frameworkAgentName;
+  /** The direct children of the run named: the parentMap entries whose
+   *  parent is the framework agent of any of its attempts (runOfAttempt),
+   *  queued children included, since a run takes its parent link when it
+   *  queues. */
+  private childrenOf(displayName: string): string[] {
     const children: string[] = [];
     for (const [childName, parentFrameworkName] of this.parentMap) {
-      if (parentFrameworkName === frameworkName) {
-        children.push(childName);
-      }
+      if (this.runOfAttempt.get(parentFrameworkName) === displayName) children.push(childName);
     }
-
-    // Cancel each child (which recursively cancels its children)
-    for (const child of children) {
-      this.cancelSubagent(child);
-    }
+    return children;
   }
 
   // =========================================================================
@@ -1356,11 +1561,8 @@ export class SubagentModule implements Module {
     const live = this.liveSubagents.get(displayName);
     if (!live) return null;
 
-    // Find the matching ActiveSubagent entry for status/metadata
-    let entry: ActiveSubagent | undefined;
-    for (const e of this.activeSubagents.values()) {
-      if (e.name === displayName) { entry = e; break; }
-    }
+    // The matching ActiveSubagent entry for status/metadata
+    const entry = this.runningEntry(displayName);
 
     let messageCount = 0;
     let lastMessageSnippet = '';
@@ -1434,17 +1636,46 @@ export class SubagentModule implements Module {
     return 4096;
   }
 
-  private withTimeout<T>(promise: Promise<T>, name: string, timeoutMs?: number): Promise<T> {
-    if (timeoutMs === undefined) return promise;
-    return Promise.race([
-      promise,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`Subagent ${name} timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        )
-      ),
-    ]);
+  /** Race an attempt against its run's time limit: `limitMs` long, ending
+   *  at `deadline`, so every attempt shares one limit. At the deadline,
+   *  `stop` ends the run itself, and the error is the module's own, which
+   *  the retry loop doesn't retry. A stop that throws is logged, and the
+   *  limit still ends the attempt. The framework's startup watchdog for the
+   *  attempt ends at the deadline too (watchdogsFor), and its timer can
+   *  fire first, so a failure that ends the attempt at the deadline is
+   *  reported as the time limit, whichever settled it. The timer ends with
+   *  the attempt, so a finished run is never stopped late. */
+  private withTimeout<T>(promise: Promise<T>, name: string, limitMs: number | undefined, deadline: number | undefined, stop: () => void): Promise<T> {
+    if (limitMs === undefined || deadline === undefined) return promise;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          stop();
+        } catch (err) {
+          console.error(`[subagent] ${name}: stopping the run at its time limit failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        reject(this.timedOut(name, limitMs));
+      }, timerDelay(deadline - Date.now()));
+    });
+    const attempt = promise.catch((err: unknown) => {
+      throw deadline - Date.now() <= TIMER_SLACK_MS ? this.timedOut(name, limitMs) : err;
+    });
+    return Promise.race([attempt, limit]).finally(() => clearTimeout(timer));
+  }
+
+  private timedOut(name: string, limitMs: number): SubagentFailure {
+    return new SubagentFailure(`Subagent ${name} timed out after ${limitMs}ms`);
+  }
+
+  /** The framework's watchdogs for an attempt of a run with a deadline: its
+   *  startup watchdog no later than the deadline, so a run whose inference
+   *  hasn't started by then (held behind a provider wait, say) is dropped by
+   *  the framework rather than started after the run was reported timed
+   *  out. Without a deadline, the framework's own. */
+  private watchdogsFor(deadline: number | undefined): { startupTimeoutMs: number } | undefined {
+    if (deadline === undefined) return undefined;
+    return { startupTimeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())) };
   }
 
   // =========================================================================
@@ -1519,13 +1750,15 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    const inUse = this.nameInUse(input.name);
+    if (inUse) return inUse;
+
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runSpawn(input, admission, callerAgentName, callerDepth, timeoutMs);
-      const result = await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs);
-      return result;
+      const promise = this.runSpawn(input, admission, callerAgentName, callerDepth);
+      return this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
@@ -1535,8 +1768,11 @@ export class SubagentModule implements Module {
     this.asyncHandles.set(input.name, { name: input.name, type: 'spawn', promise, parentAgentName });
 
     promise
-      .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
-      .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
+      .then(
+        result => this.deliverAsyncResult(input.name, result, parentAgentName),
+        err => this.deliverAsyncError(input.name, err, parentAgentName),
+      )
+      .catch(err => console.error(`[subagent] delivering ${input.name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
     return { success: true, data: `Subagent '${input.name}' spawned. Running in background.` };
   }
@@ -1561,13 +1797,15 @@ export class SubagentModule implements Module {
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    const inUse = this.nameInUse(input.name);
+    if (inUse) return inUse;
+
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runFork(input, admission, callerAgentName, callerDepth, timeoutMs, callToolUseId);
-      const result = await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs);
-      return result;
+      const promise = this.runFork(input, admission, callerAgentName, callerDepth, undefined, callToolUseId);
+      return this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
@@ -1577,10 +1815,39 @@ export class SubagentModule implements Module {
     this.asyncHandles.set(input.name, { name: input.name, type: 'fork', promise, parentAgentName });
 
     promise
-      .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
-      .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
+      .then(
+        result => this.deliverAsyncResult(input.name, result, parentAgentName),
+        err => this.deliverAsyncError(input.name, err, parentAgentName),
+      )
+      .catch(err => console.error(`[subagent] delivering ${input.name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
     return { success: true, data: `Subagent '${input.name}' forked. Running in background.` };
+  }
+
+  /** A refusal when a subagent already has this name. A name means one
+   *  subagent from its spawn until its result has come back: the agent
+   *  cancels, peeks at and waits for subagents by name, and the module keys
+   *  them by it. Until then an admitted run is in detachableHandles (a sync
+   *  run still blocking its caller, until the call returns or the run moves
+   *  to the background) or asyncHandles (an async run, or a sync one moved to
+   *  the background, until its result is delivered). A run that no longer
+   *  has its cancel was cancelled or reclaimed, or has ended, so it's
+   *  finishing, whatever its entry still says. */
+  private nameInUse(name: string): ToolResult | null {
+    if (!this.asyncHandles.has(name) && !this.detachableHandles.has(name)) return null;
+    const entry = this.runningEntry(name);
+    const state = !this.cancellationHandles.has(name)
+      ? 'is still finishing'
+      : entry
+        ? `is already running (for ${Math.round((Date.now() - entry.startedAt) / 1000)} s)`
+        : 'is already waiting for a concurrency slot';
+    return {
+      success: false,
+      isError: true,
+      error:
+        `Nothing was started: a subagent named '${name}' ${state}, and a name means one subagent ` +
+        `until its result has come back. Choose another name, or wait for that one's result.`,
+    };
   }
 
   private deliverAsyncResult(name: string, result: SubagentResult, parentAgentName: string): void {
@@ -1651,7 +1918,7 @@ export class SubagentModule implements Module {
         if (this.detachableHandles.has(name)) {
           handle.detach();
         }
-      }, autoDetachMs);
+      }, timerDelay(autoDetachMs));
     }
 
     type RaceResult =
@@ -1687,8 +1954,11 @@ export class SubagentModule implements Module {
       // Detached: transition to async — wire up result delivery
       this.asyncHandles.set(name, { name, type, promise, parentAgentName });
       promise
-        .then(result => this.deliverAsyncResult(name, result, parentAgentName))
-        .catch(err => this.deliverAsyncError(name, err, parentAgentName));
+        .then(
+          result => this.deliverAsyncResult(name, result, parentAgentName),
+          err => this.deliverAsyncError(name, err, parentAgentName),
+        )
+        .catch(err => console.error(`[subagent] delivering ${name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
       return {
         success: true,
@@ -1762,8 +2032,23 @@ export class SubagentModule implements Module {
   // =========================================================================
 
   private async runSpawn(input: SpawnInput, admission: SubagentAdmission, _callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+    const cancel = this.cancelFor(input.name);
+    this.claimName(input.name, _callerAgentName);
+    let acquired: { waitedMs: number; slot: object };
+    try {
+      acquired = await this.acquireSlot(undefined, cancel.promise);
+    } catch (err) {
+      cancel.dispose();
+      // A run that never started leaves no parent link behind, whether a
+      // cancel or the slot's timeout ended its wait.
+      this.parentMap.delete(input.name);
+      if (err instanceof SubagentTerminated) return this.endQueued(input.name, err);
+      throw err;
+    }
+    const { waitedMs, slot } = acquired;
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -1772,18 +2057,27 @@ export class SubagentModule implements Module {
       toolCallsCount: 0, findingsCount: 0,
     };
     const entryKey = `spawn-${input.name}`;
-    this.activeSubagents.set(entryKey, entry);
-    if (_callerAgentName) this.parentMap.set(input.name, _callerAgentName);
-    this.persistState();
 
     try {
+      this.activeSubagents.set(entryKey, entry);
+      this.slotOf.set(entry, slot);
+      this.persistState();
+
       const framework = this.getFramework();
       const model = input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
         const agentName = `spawn-${input.name}-${Date.now()}`;
-        const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
+        this.runOfAttempt.set(agentName, input.name);
+        // An attempt starts with no result an earlier attempt, or an earlier
+        // run under the name, stashed with return.
+        this.returnedResults.delete(input.name);
+        // Setup races the run's cancel too, so a cancel ends a run whose
+        // setup never finishes. A reclaim does once the run is registered
+        // (registerLive, below), since the reaper reads registered runs only.
+        let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent({
           name: agentName,
           model,
           systemPrompt: input.systemPrompt,
@@ -1801,6 +2095,16 @@ export class SubagentModule implements Module {
           }),
           allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
         });
+        try {
+          created = await Promise.race([creating, cancel.promise]);
+        } catch (err) {
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs);
+          }
+          throw err;
+        }
+        const { agent, contextManager, cleanup } = created;
 
         // Track depth for recursive fork/spawn calls from this agent
         this.agentDepths.set(agentName, childDepth);
@@ -1812,31 +2116,36 @@ export class SubagentModule implements Module {
           contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
 
           // Pre-validate prompt size
-          const { messages } = await contextManager.compile();
+          const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
+          // The race takes compile's result when compiling settles first, so
+          // a cancel that lands just after is thrown here: the run ends
+          // before its attempt starts, whatever the checks below would find.
+          // Nothing below awaits before the attempt's race.
+          cancel.throwIfFired();
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
+            throw new SubagentFailure(
               `Prompt too large for subagent ${input.name}: ~${est} tokens ` +
               `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
             );
           }
 
-          // Race execution against both timeout and user cancellation
-          const cancelPromise = new Promise<never>((_, reject) => {
-            this.cancellationHandles.set(input.name, { reject });
-          });
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut(input.name, executionTimeoutMs!);
 
+          // Race execution against both timeout and the run's cancel
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
-            cancelPromise,
+            cancel.promise,
           ]);
-
-          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -1857,33 +2166,31 @@ export class SubagentModule implements Module {
           return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
-          this.cancellationHandles.delete(input.name);
 
           // Non-retryable termination (user cancel, zombie reclaim, etc.).
           // Postmortem 2026-05-28 P1 #4: terminal-but-benign — 'cancelled',
           // not 'completed'. Before this, the TUI subagent list rendered these
           // as "done" while the reducer-driven web tree rendered them red.
-          if (lastError instanceof SubagentTerminated) {
-            entry.status = 'cancelled';
-            entry.completedAt = Date.now();
-            entry.statusMessage = lastError.reason;
-            const notice = this.concurrencyNotice(waitedMs);
-            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
-            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
-            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
-          }
+          if (lastError instanceof SubagentTerminated) return this.endTerminated(input.name, entry, lastError, waitedMs);
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          if (this.isRateLimitError(lastError, agentName)) {
+            const stopped = await this.waitOrStop(this.onRateLimitHit(deadline), cancel.promise);
+            if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs);
+          }
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
           );
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
-          await new Promise(resolve => setTimeout(resolve, delay));
+          const stopped = await this.waitOrStop(delay, cancel.promise);
+          if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs);
         } finally {
           this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
@@ -1895,15 +2202,42 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
+      cancel.dispose();
+      this.forgetAttempts(input.name);
       this.persistState();
-      this.releaseSlot();
     }
   }
 
   private async runFork(input: ForkInput, admission: SubagentAdmission, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number, callToolUseId?: string): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+    const cancel = this.cancelFor(input.name);
+    this.claimName(input.name, callerAgentName);
+    let acquired: { waitedMs: number; slot: object };
+    try {
+      acquired = await this.acquireSlot(undefined, cancel.promise);
+    } catch (err) {
+      cancel.dispose();
+      // A run that never started leaves no parent link behind, whether a
+      // cancel or the slot's timeout ended its wait.
+      this.parentMap.delete(input.name);
+      if (err instanceof SubagentTerminated) return this.endQueued(input.name, err);
+      throw err;
+    }
+    const { waitedMs, slot } = acquired;
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -1911,11 +2245,11 @@ export class SubagentModule implements Module {
       status: 'running', startedAt: now, lastActivityAt: now,
       toolCallsCount: 0, findingsCount: 0,
     };
-    this.activeSubagents.set(input.name, entry);
-    if (callerAgentName) this.parentMap.set(input.name, callerAgentName);
-    this.persistState();
-
     try {
+      this.activeSubagents.set(input.name, entry);
+      this.slotOf.set(entry, slot);
+      this.persistState();
+
       const framework = this.getFramework();
 
       const parentAgent = admission.parentAgent;
@@ -1931,8 +2265,16 @@ export class SubagentModule implements Module {
         // framework's agents Map, and the parent's completion promise never resolves.
         const suffix = attempt === 0 ? `d${childDepth}-${Date.now()}` : `d${childDepth}-retry${attempt}-${Date.now()}`;
         const agentName = `${input.name}-${suffix}`;
+        this.runOfAttempt.set(agentName, input.name);
+        // An attempt starts with no result an earlier attempt, or an earlier
+        // run under the name, stashed with return.
+        this.returnedResults.delete(input.name);
 
-        const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
+        // Setup races the run's cancel too, so a cancel ends a run whose
+        // setup never finishes. A reclaim does once the run is registered
+        // (registerLive, below), since the reaper reads registered runs only.
+        let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent({
           name: agentName,
           model,
           systemPrompt,
@@ -1950,6 +2292,16 @@ export class SubagentModule implements Module {
           }),
           allowedTools: admission.allowedTools === 'all' ? 'all' : [...admission.allowedTools],
         });
+        try {
+          created = await Promise.race([creating, cancel.promise]);
+        } catch (err) {
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs);
+          }
+          throw err;
+        }
+        const { agent, contextManager, cleanup } = created;
 
         // Track depth for recursive fork/spawn calls from this agent
         this.agentDepths.set(agentName, childDepth);
@@ -1972,7 +2324,7 @@ export class SubagentModule implements Module {
           // plus a synthetic intention-framed fork tool_use/tool_result.
           if (parentAgent) {
             const parentCM = parentAgent.getContextManager();
-            const { messages: compiled } = await parentCM.compile();
+            const { messages: compiled } = await Promise.race([parentCM.compile(), cancel.promise]);
             const transformed = callToolUseId
               ? materialiseStructuralFork(
                   compiled,
@@ -2020,31 +2372,36 @@ export class SubagentModule implements Module {
           }
 
           // Pre-validate prompt size
-          const { messages } = await contextManager.compile();
+          const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
+          // The race takes compile's result when compiling settles first, so
+          // a cancel that lands just after is thrown here: the run ends
+          // before its attempt starts, whatever the checks below would find.
+          // Nothing below awaits before the attempt's race.
+          cancel.throwIfFired();
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
+            throw new SubagentFailure(
               `Prompt too large for subagent ${input.name}: ~${est} tokens ` +
               `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
             );
           }
 
-          // Race execution against both timeout and user cancellation
-          const cancelPromise = new Promise<never>((_, reject) => {
-            this.cancellationHandles.set(input.name, { reject });
-          });
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut(input.name, executionTimeoutMs!);
 
+          // Race execution against both timeout and the run's cancel
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
-            cancelPromise,
+            cancel.promise,
           ]);
-
-          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -2065,31 +2422,29 @@ export class SubagentModule implements Module {
           return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
-          this.cancellationHandles.delete(input.name);
 
           // Non-retryable termination (user cancel, zombie reclaim, etc.).
           // See P1 #4 comment in runSpawn — 'cancelled', not 'completed'.
-          if (lastError instanceof SubagentTerminated) {
-            entry.status = 'cancelled';
-            entry.completedAt = Date.now();
-            entry.statusMessage = lastError.reason;
-            const notice = this.concurrencyNotice(waitedMs);
-            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
-            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
-            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
-          }
+          if (lastError instanceof SubagentTerminated) return this.endTerminated(input.name, entry, lastError, waitedMs);
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          if (this.isRateLimitError(lastError, agentName)) {
+            const stopped = await this.waitOrStop(this.onRateLimitHit(deadline), cancel.promise);
+            if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs);
+          }
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
           );
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
-          await new Promise(resolve => setTimeout(resolve, delay));
+          const stopped = await this.waitOrStop(delay, cancel.promise);
+          if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs);
         } finally {
           this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
@@ -2101,9 +2456,21 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw err;
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
+      cancel.dispose();
+      this.forgetAttempts(input.name);
       this.persistState();
-      this.releaseSlot();
     }
   }
 

@@ -252,8 +252,11 @@ Framework features configured by top-level recipe keys rather than modules:
   `toolLifecycle` or `inheritEnv`.
 - **Child env.** Stdio servers get agent-framework's allowlist of host
   variables (`CHILD_ENV_ALLOWLIST`: path, home, locale, temp dirs, TLS CA and
-  proxy settings), then `DISCORD_SUPPRESSED_REACTIONS_BASELINE` (the entry can
-  override it), the entry's `env` and `AGENT_TIMEZONE` (`composeMcplChildEnv`).
+  proxy settings), then the entry's `env` and the host's `AGENT_TIMEZONE`
+  (`composeMcplChildEnv`). agent-framework adds its derived
+  `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the
+  entry sets one with tokens, or the host's own environment does for an
+  `inheritEnv` entry.
   Anything else from `.env` must be mapped in the entry's `env`.
   `inheritEnv: true` on an operator entry passes the whole host env. Each
   server's stderr goes to `sessions/<id>/mcpl-stderr/<server>.log` (rotated

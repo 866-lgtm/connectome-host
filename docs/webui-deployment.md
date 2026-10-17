@@ -80,14 +80,40 @@ The module accepts three credentials:
   not send cached Basic credentials on WebSocket upgrades.
 - **Observer device keys** — Ed25519 grants in `$OBSERVERS_FILE` (default
   `DATA_DIR/observers.json`, hot-reloaded; the agent edits it with its
-  `observers--get/grant/revoke` tools). Once the file holds at least one grant,
-  the static app shell is served without auth and `/ws` accepts upgrades that
-  must then present a signed observer hello. Each observer sees only its
-  grant's scopes — `health`, `ops`, `messages`, `tools`, `thinking`, `debug` —
-  and gets a session cookie for the matching HTTP routes (`debug` for
-  `/debug/*` and `/curve`, `health` for `/healthz` and `/quota`, `messages`
-  for `/media/…`). Observers are read-only; `/files/…` and
-  `/debug/retrieval*` stay password-only.
+  `observers--get/grant/revoke` tools). A grant the viewer can't use, such as
+  one with an unknown scope or an expiry that isn't a date, is left out and
+  named in its log, and the file's other grants still apply; a file that isn't
+  valid JSON leaves a running viewer's previous grants in force until it
+  parses, and a viewer that starts on one admits none until then. A key may be
+  written in either base64 alphabet, padded or not, and is the same key either
+  way. Once the file holds at least one usable grant, the static app shell is
+  served without auth and `/ws` accepts upgrades that must then present a
+  signed observer hello. Removing the file takes every grant in it away within
+  about 6 s, once two checks in a row, 3 s apart, find it gone, and the log
+  says so then: no hello is admitted from it, and the shell needs the password
+  again. Revoking or expiring a grant ends the sessions and open connections
+  it gave within about 3 s, and removing the file ends them when it takes the
+  grants away. An entry the viewer can't use counts as no grant. Narrowing a
+  grant in place narrows its sessions for good, ending one it leaves with
+  none of its scopes, and closes its connections, which connect again with
+  the narrower scopes: a grant widened or given again applies from the
+  observer's next hello. A file back by the second check, as after an editor's
+  save that removes it before writing it again, changes nothing, and a read of
+  the file that fails counts as a check that didn't find it, so a read error
+  that passes changes nothing either. One that lasts two checks ends every
+  observer's sessions and connections, since the viewer can't tell who is
+  granted, and viewers stay off until someone reloads them, even once the file
+  reads again. A file that parses but isn't a grants file, such as one whose
+  `observers` isn't a list, holds no grant the viewer can use: at the check
+  that reads it, every observer's sessions end and their connections close as
+  final, so viewers need reloading once the file is fixed. To cut every
+  observer off, remove the file. A file that doesn't parse at all leaves the
+  grants as they were, since an editor's save can be read half-written. Each
+  observer sees only its grant's scopes — `health`, `ops`, `messages`,
+  `tools`, `thinking`, `debug` — and gets a session cookie for the matching
+  HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
+  and `/quota`, `messages` for `/media/…`). Observers are read-only;
+  `/files/…` and `/debug/retrieval*` stay password-only.
 
 ## Caddy
 
