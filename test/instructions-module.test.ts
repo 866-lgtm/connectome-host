@@ -263,10 +263,13 @@ describe('InstructionsModule', () => {
     // agent-framework 0.22.1 reads to its end a file that was within maxBytes
     // when the read took its size and grew while it was read.
     const grown = { bytes: Buffer.from('€'.repeat(10)), size: 5, truncated: false };
-    const mod = await moduleOver({ readFileFromDisk: async () => grown }, { maxBytes: 7 });
+    const asked: Array<{ maxBytes: number }> = [];
+    const mod = await moduleOver({ readFileFromDisk: async (_path, options) => { asked.push(options); return grown; } }, { maxBytes: 7 });
 
     const text = textOf(await mod.gatherContext('a'));
     expect(text).toBe(`${DEFAULT_INSTRUCTIONS_HEADER}\n\n€€\n\n[truncated: first 6 of 30 bytes]`);
+    // The read itself is still asked for no more than the cap.
+    expect(asked).toEqual([{ maxBytes: 7 }]);
   });
 
   test('reads at most maxBytes from an oversized file', async () => {
