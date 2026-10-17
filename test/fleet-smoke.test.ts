@@ -91,7 +91,7 @@ describe('FleetModule — unresolved launch artifacts', () => {
         const result = await launch(fleet, dataDir);
         expect(result.success).toBe(false);
         expect(result.isError).toBe(true);
-        expect(result.error).toContain('reconcile');
+        expect(result.error).toContain('this host has no record of a child in');
         expect(fleet.getChildren().size).toBe(0);
         expect(existsSync(join(dataDir, 'startup.log'))).toBe(false);
         const after = lstatSync(path);
@@ -110,7 +110,8 @@ describe('FleetModule — unresolved launch artifacts', () => {
     const fleet = makeFleet();
     const result = await launch(fleet, dataDir);
     expect(result.success).toBe(false);
-    expect(result.error).toContain('Cannot inspect launch artifact');
+    expect(result.error).toContain(`couldn't check ${join(dataDir, 'ipc.sock')} (ENOTDIR)`);
+    expect(result.error).toEndWith('Give fleet--launch another dataDir, or ask whoever runs this host to check that path.');
     expect(fleet.getChildren().size).toBe(0);
     expect(readFileSync(dataDir, 'utf8')).toBe('unchanged');
   });
@@ -426,7 +427,7 @@ describe('FleetModule — unresolved launch artifacts', () => {
     const result = await launch(fleet, dataDir);
     // Deliberately stop at the existing no-entry-script guard, after reconciliation.
     expect(result.success).toBe(false);
-    expect(result.error).toContain('cannot determine connectome-host script path');
+    expect(result.error).toContain("doesn't know where its own entry script is");
     expect(existsSync(pidPath)).toBe(false);
     expect(existsSync(join(dataDir, 'startup.log'))).toBe(false);
   });
@@ -442,7 +443,7 @@ describe('FleetModule — unresolved launch artifacts', () => {
     const record = fleet.getChildren().get('guard');
     expect(record?.status).toBe('crashed');
     const result = await launch(fleet, dataDir);
-    expect(result.error).toContain('cannot determine connectome-host script path');
+    expect(result.error).toContain("doesn't know where its own entry script is");
     expect(fleet.getChildren().get('guard')).toBe(record!);
   });
 
@@ -501,7 +502,7 @@ describe('FleetModule — unresolved launch artifacts', () => {
       child.adopted = true; // Validated adoption is the signal authority under test.
       const result = await fleet.handleToolCall({ id: 'eperm-restart', name: 'restart', input: { name: 'guard' } });
       expect(result.success).toBe(false);
-      expect(result.error).toContain('death unconfirmed');
+      expect(result.error).toContain("couldn't confirm that it stopped");
       expect(child.status).toBe('starting');
       expect(child.exitedAt).toBeNull();
       child.adopted = false;
@@ -516,7 +517,9 @@ describe('FleetModule — unresolved launch artifacts', () => {
     const kill = spyOn(process, 'kill').mockImplementation((_pid, signal) => { signals.push(signal); return true; });
     try {
       (fleet as any).killAllOnExitSync();
-      expect((await fleet.handleToolCall({ id: 'unknown-kill', name: 'kill', input: { name: 'guard' } })).success).toBe(false);
+      const refused = await fleet.handleToolCall({ id: 'unknown-kill', name: 'kill', input: { name: 'guard' } });
+      expect(refused.success).toBe(false);
+      expect(refused.error).toStartWith("Nothing was stopped: this host isn't attached to child 'guard'");
       await fleet.stop();
       expect(signals).toEqual([]);
       expect(readFileSync(join(dataDir, 'headless.pid'), 'utf8')).toBe(String(process.pid));
@@ -663,6 +666,12 @@ describe('FleetModule — unresolved launch artifacts', () => {
         expect(lstatSync(old.socketPath).ino).toBe(inode);
         expect(restored.getChildren().get('guard')?.socket).toBeNull();
         expect(restored.getChildren().get('guard')?.status).toBe(failure === 'dead persisted PID' ? 'crashed' : 'starting');
+        if (failure === 'adoption PID mismatch') {
+          expect(restored.getChildren().get('guard')?.exitReason).toBe(
+            `adopt failed: the process answering on its socket reported pid ${old.pid}, not the recorded pid ` +
+            `${process.pid}, so a process other than the recorded child now serves its data directory`,
+          );
+        }
         const blocked = restored.getChildren().get('guard')!;
         const savedSubscription = [...blocked.subscription];
         const savedStatus = blocked.status;
@@ -789,7 +798,8 @@ describe('FleetModule — unresolved launch artifacts', () => {
     try {
       const result = await owner.handleToolCall({ id: 'unconfirmed-kill', name: 'kill', input: { name: 'guard' } });
       expect(result.success).toBe(false);
-      expect(result.error).toContain('death unconfirmed');
+      expect(result.error).toContain("couldn't confirm that it stopped");
+      expect(result.error).toEndWith(`if it still shows ready or starting, ask whoever runs this host to check pid ${child.pid}.`);
       expect(cleanup).not.toHaveBeenCalled();
       expect(readFileSync(pidPath, 'utf8')).toBe(pidBytes);
       const after = lstatSync(child.socketPath, { bigint: true });
@@ -1103,7 +1113,7 @@ describe('FleetModule — Phase 2', () => {
   test('handlers reject unknown child names', async () => {
     const send = await fleet.handleToolCall({ id: 't-u-send', name: 'send', input: { name: 'ghost', content: 'hi' } });
     expect(send.success).toBe(false);
-    expect(send.error).toMatch(/Unknown child/);
+    expect(send.error).toStartWith("There's no child named 'ghost', so nothing was sent.");
 
     const peek = await fleet.handleToolCall({ id: 't-u-peek', name: 'peek', input: { name: 'ghost' } });
     expect(peek.success).toBe(false);
@@ -1193,7 +1203,7 @@ describe('FleetModule — Phase 4 autoStart + allowlist', () => {
       input: { name: 'nope', recipe: bogus, dataDir: join(tmpDir, 'nope') },
     });
     expect(res.success).toBe(false);
-    expect(res.error).toMatch(/allowlist/i);
+    expect(res.error).toContain("isn't one this host lets its agent launch");
 
     // Listed path should be accepted.
     const ok = await fleet.handleToolCall({

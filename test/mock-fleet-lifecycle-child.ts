@@ -12,6 +12,8 @@ import { join } from 'node:path';
 
 const options = JSON.parse(readFileSync(process.argv[2]!, 'utf8')) as {
   ready?: boolean;
+  /** Report idle after ready, as a child that has finished its work does. */
+  idle?: boolean;
   crashBeforeSocket?: boolean;
   noSocket?: boolean;
   crashOnFile?: string;
@@ -79,10 +81,13 @@ const server = createServer((socket) => {
       const command = JSON.parse(line);
       if (command.type === 'shutdown') process.exit(0);
       if (command.type === 'command' && command.command === '/crash') process.exit(1);
+      // Close the connection and keep running, as when another client connects.
+      if (command.type === 'command' && command.command === '/drop') socket.destroy();
     }
   });
   if (options.ready !== false) {
     socket.write(JSON.stringify({ type: 'lifecycle', phase: 'ready', pid: process.pid, ts: Date.now() }) + '\n');
+    if (options.idle) socket.write(JSON.stringify({ type: 'lifecycle', phase: 'idle', ts: Date.now() }) + '\n');
   }
 });
 server.listen(socketPath);
