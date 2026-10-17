@@ -774,7 +774,7 @@ describe('mcpl_unload', () => {
       'Unloaded server "discord" — its tools are gone from your toolset.',
       `But your overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR',
       '), so the unload isn\'t recorded. The next host start will stop on the file while it can\'t be read. Ask your ' +
-      'operator to make the file readable, then call mcpl-admin--mcpl_unload again.',
+      'operator to fix it, then call mcpl-admin--mcpl_unload again.',
     );
     for (const said of ['couldn\'t be updated', 'aving your overlay', 'loads it again']) expect(failed).not.toContain(said);
     expect(servers.has('discord')).toBe(false);
@@ -1396,7 +1396,8 @@ describe('restart and deploy report the connection they read', () => {
     expectSays(
       result.error,
       'Restarted server "world", but it isn\'t connected', 'it keeps retrying on its own, so it may still connect, which ' +
-      'mcpl-admin--mcpl_list shows', 'If its command, args or url is wrong, call mcpl-admin--mcpl_deploy with the right one',
+      'mcpl-admin--mcpl_list shows', 'If its command, args or url is wrong, call mcpl-admin--mcpl_deploy with each of its ' +
+      'fields, the wrong one corrected, since a deploy replaces the entry whole;',
       'call mcpl-admin--mcpl_restart once it\'s fixed', 'mcpl-admin--mcpl_unload unloads it',
     );
   });
@@ -1416,8 +1417,8 @@ describe('restart and deploy report the connection they read', () => {
     expectSays(
       result.error,
       'Server "world" was saved to your overlay, but it isn\'t connected', 'it keeps retrying on its own',
-      'call mcpl-admin--mcpl_deploy with the right one', 'call mcpl-admin--mcpl_restart once it\'s fixed',
-      'mcpl-admin--mcpl_unload unloads it',
+      'call mcpl-admin--mcpl_deploy with each of its fields, the wrong one corrected', 'call mcpl-admin--mcpl_restart once ' +
+      'it\'s fixed', 'mcpl-admin--mcpl_unload unloads it',
     );
     expect(readAgentOverlay(overlayPath).world).toEqual({ url: 'wss://down/mcpl', transport: 'websocket' });
   });
@@ -1443,6 +1444,29 @@ describe('restart and deploy report the connection they read', () => {
 // reads afterwards, with the step that state allows.
 describe('a failed connect or restart says the state it left', () => {
   type Stub = Record<string, (...args: never[]) => unknown>;
+
+  // A deploy whose connect throws, and whose listing then throws too, can't
+  // read the state the server is left in, so it says that it's unknown.
+  test('a deploy whose state can\'t be read after a failed connect says it\'s unknown, with the listing', async () => {
+    const { stub } = makeStubFramework();
+    const list = (stub as unknown as Stub).listMcplServers as () => unknown[];
+    let broken = false;
+    (stub as unknown as Stub).listMcplServers = () => {
+      if (broken) throw new Error('the framework is stopping');
+      return list();
+    };
+    (stub as unknown as Stub).connectMcplServer = async () => {
+      broken = true;
+      throw new Error('the awareness ledger can\'t be read');
+    };
+    const mod = makeModule(stub);
+    expectSays(
+      String((await call(mod, 'mcpl_deploy', { id: 'tool', command: 'node' })).error),
+      'Server "tool" was saved to your overlay, but connecting it failed: the awareness ledger can\'t be read.',
+      'What state it\'s in now is unknown; mcpl-admin--mcpl_list shows it.',
+    );
+    expect(readAgentOverlay(overlayPath).tool).toEqual({ command: 'node' });
+  });
 
   test('a redeploy whose restart fails before it disconnects: the old configuration still runs', async () => {
     const { stub } = makeStubFramework();
@@ -1606,8 +1630,8 @@ describe('a failed connect or restart says the state it left', () => {
     expectSays(
       restarted.data, 'Restarted server "tool"', `Your overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR',
       '), so nothing is said here about your entry, and mcpl-admin--mcpl_deploy and an mcpl-admin--mcpl_unload that ' +
-      'persists are refused. The next host start will stop on the file while it can\'t be read. Ask your operator to make ' +
-      'the file readable.',
+      'persists are refused. The next host start will stop on the file while it can\'t be read. Ask your operator to fix ' +
+      'it.',
     );
   });
 
@@ -1623,7 +1647,7 @@ describe('a failed connect or restart says the state it left', () => {
       String((await call(mod, 'mcpl_restart', { id: 'tool' })).error),
       'The restart of "tool" didn\'t complete: handshake timed out.',
       'It isn\'t connected; it keeps retrying on its own, so it may still connect, which mcpl-admin--mcpl_list shows.',
-      'If its command, args or url is wrong, call mcpl-admin--mcpl_deploy with the right one',
+      'If its command, args or url is wrong, call mcpl-admin--mcpl_deploy with each of its fields, the wrong one corrected',
       'call mcpl-admin--mcpl_restart once it\'s fixed',
     );
   });
@@ -1851,8 +1875,9 @@ describe('a failed call says what changed and what to do', () => {
     expect((await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).success).toBe(true);
     const fileLine = (problem: string) =>
       `The operator's server file couldn't be read (${configPath} ${problem}), so this list can't show which servers it ` +
-      'defines. The next host start will stop on the file until it\'s fixed, before it loads any server. It\'s theirs to ' +
-      'fix, so ask your operator. Of these tools, only this listing reads it.';
+      'defines. The next host start will stop on the file until it\'s fixed, before it loads any server, so what this ' +
+      'list says a start loads holds once a start gets past the file. It\'s theirs to fix, so ask your operator. Of these ' +
+      'tools, only this listing reads it.';
     const listed = String((await call(mod, 'mcpl_list')).data);
     expectSays(
       listed, 'MCPL servers (2):\n', 'source=unknown, node', 'prefix=mcpl--mytool, source=agent-overlay, node',
@@ -1879,12 +1904,13 @@ describe('a failed call says what changed and what to do', () => {
       String((await call(mod, 'mcpl_list')).data),
       `\nThe operator's server file, ${configPath}, couldn't be read (EISDIR`,
       '), so this list can\'t show which servers it defines. The next host start will stop on the file while it can\'t be ' +
-      'read, before it loads any server.',
+      'read, before it loads any server, so what this list says a start loads holds once a start gets past the file. Ask ' +
+      'your operator to fix it. Of these tools, only this listing reads it.',
     );
   });
 
   // The boot stops on the operator's file before it loads any server, so
-  // its line says so beside the overlay's own lines, which say what a start
+  // its line says so, and that the overlay's own lines say what a start
   // loads once it gets past the file.
   test("an operator's file that can't be read stops the start before any server, said beside an entry's next-start line", async () => {
     const { stub } = makeStubFramework();
@@ -1896,14 +1922,15 @@ describe('a failed call says what changed and what to do', () => {
       'MCPL servers (1):\n  idle: NOT LOADED (in your overlay but not connected: the next host start loads it, and ' +
       'mcpl-admin--mcpl_deploy with each of its fields loads it now, since a deploy replaces the entry whole)\n' +
       `The operator's server file couldn't be read (${configPath} isn't valid JSON), so this list can't show which servers ` +
-      'it defines. The next host start will stop on the file until it\'s fixed, before it loads any server. It\'s theirs ' +
-      'to fix, so ask your operator. Of these tools, only this listing reads it.',
+      'it defines. The next host start will stop on the file until it\'s fixed, before it loads any server, so what this ' +
+      'list says a start loads holds once a start gets past the file. It\'s theirs to fix, so ask your operator. Of these ' +
+      'tools, only this listing reads it.',
     );
   });
 
   // A file the module can't open or read stops the next start like one that
-  // isn't JSON, and making it readable is the operator's.
-  test('an overlay that can\'t be read at all is the operator\'s to make readable, for each tool', async () => {
+  // isn't JSON, and fixing it is the operator's.
+  test('an overlay that can\'t be read at all is the operator\'s to fix, for each tool', async () => {
     const { stub, calls } = makeStubFramework();
     await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
       .connectMcplServer({ id: 'shell', command: 'node' });
@@ -1911,7 +1938,7 @@ describe('a failed call says what changed and what to do', () => {
     mkdirSync(overlayPath);
     // The file is named, since a file-system error need not name it.
     const unreadable = (so: string) => [`our overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR', `), so ${so}. The next host start will ` +
-      'stop on the file while it can\'t be read. Ask your operator to make the file readable'];
+      'stop on the file while it can\'t be read. Ask your operator to fix it'];
     expectSays(
       (await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).error, 'Nothing was deployed or saved: your overlay',
       ...unreadable('your entry can\'t be saved in it'), ', then call mcpl-admin--mcpl_deploy again.',
@@ -1921,13 +1948,62 @@ describe('a failed call says what changed and what to do', () => {
       listed, 'shell: CONNECTED', 'source=unknown', '\nYour overlay file',
       ...unreadable('this list can\'t show your overlay\'s own entries, or which servers they define'),
     );
-    expect(listed).toEndWith('Ask your operator to make the file readable.');
+    expect(listed).toEndWith('Ask your operator to fix it.');
     expectSays(
       (await call(mod, 'mcpl_unload', { id: 'shell' })).error, 'Nothing was unloaded: your overlay',
       ...unreadable('the unload can\'t be recorded in it'), ', then call mcpl-admin--mcpl_unload again.',
       'To stop "shell" for this session in the meantime, call mcpl-admin--mcpl_unload with `persist: false`.',
     );
     expect(calls).toEqual(['connect:shell']);
+  });
+
+  // Too many files open, in this process (EMFILE) or the system (ENFILE), is
+  // the host's own failure, not the file's: nothing about the file needs
+  // fixing, and it can pass, so the repair is a call again shortly, then the
+  // operator.
+  test('a file the host has too many files open to read is said as its own failure, for the overlay and the operator\'s file', async () => {
+    const { stub } = makeStubFramework();
+    await (stub as unknown as { connectMcplServer: (c: { id: string; command: string }) => Promise<void> })
+      .connectMcplServer({ id: 'shell', command: 'node' });
+    const mod = makeModule(stub);
+    const configPath = join(dir, 'mcpl-servers.json');
+    writeFileSync(configPath, JSON.stringify({ mcplServers: {} }));
+    const read = spyOn(mcplConfig, 'readAgentOverlay').mockImplementation((path: string) => {
+      throw Object.assign(new Error(`EMFILE: too many open files, open '${path}'`), { code: 'EMFILE' });
+    });
+    let deployed: string;
+    let listed: string;
+    try {
+      deployed = String((await call(mod, 'mcpl_deploy', { id: 'mytool', command: 'node' })).error);
+      listed = String((await call(mod, 'mcpl_list')).data);
+    } finally {
+      read.mockRestore();
+    }
+    expectSays(
+      deployed, `Nothing was deployed or saved: your overlay file, ${overlayPath}, couldn't be read (EMFILE: too many open files`,
+      'The next host start will stop on the file while it can\'t be read. This host has too many files open, which can ' +
+        'pass: call mcpl-admin--mcpl_deploy again shortly, and if it fails the same way, ask your operator.',
+    );
+    expect(deployed).not.toContain('fix it');
+    expect(listed).toEndWith(
+      'This host has too many files open, which can pass: mcpl-admin--mcpl_list may read it shortly, and if it keeps ' +
+        'failing, ask your operator.',
+    );
+    const file = spyOn(mcplConfig, 'readMcplServersFile').mockImplementation((path: string) => {
+      throw Object.assign(new Error(`ENFILE: file table overflow, open '${path}'`), { code: 'ENFILE' });
+    });
+    try {
+      listed = String((await call(mod, 'mcpl_list')).data);
+    } finally {
+      file.mockRestore();
+    }
+    expectSays(
+      listed, `\nThe operator's server file, ${configPath}, couldn't be read (ENFILE: file table overflow`,
+      'before it loads any server, so what this list says a start loads holds once a start gets past the file. This host ' +
+        'has too many files open, which can pass: mcpl-admin--mcpl_list may read it shortly, and if it keeps failing, ask ' +
+        'your operator. Of these tools, only this listing reads it.',
+    );
+    expect(listed).not.toContain('theirs to fix');
   });
 
   test('a restart or an unload with no id says so, and an unload refuses a key it doesn\'t take', async () => {
@@ -1974,11 +2050,11 @@ describe('a failed call says what changed and what to do', () => {
     await call(mod, 'mcpl_deploy', { id: 'shell', command: 'node' });
     expect((await call(mod, 'mcpl_restart', { id: 'shell', command: 'bun', args: ['serve'] })).error).toBe(
       'Nothing was restarted: "command", "args" aren\'t fields of mcpl-admin--mcpl_restart, which takes id. ' +
-      'mcpl-admin--mcpl_deploy takes command, args: deploy the server again to change them.',
+      'mcpl-admin--mcpl_deploy takes command, args: deploy the server again, with each of its fields, to change them.',
     );
     expect((await call(mod, 'mcpl_restart', { id: 'shell', url: 'wss://example.test/' })).error).toBe(
       'Nothing was restarted: "url" isn\'t a field of mcpl-admin--mcpl_restart, which takes id. ' +
-      'mcpl-admin--mcpl_deploy takes url: deploy the server again to change it.',
+      'mcpl-admin--mcpl_deploy takes url: deploy the server again, with each of its fields, to change it.',
     );
     expect((await call(mod, 'mcpl_restart', { id: 'shell', reason: 'rebuilt' })).error).toBe(
       'Nothing was restarted: "reason" isn\'t a field of mcpl-admin--mcpl_restart, which takes id.',

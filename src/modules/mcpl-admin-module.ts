@@ -119,6 +119,26 @@ function overlayRepair(name?: string): string {
   return `${capital(REPAIR)}${name ? `, then call ${name} again` : ''}. ${NOT_ASIDE}`;
 }
 
+/** File-system failures that are this host's own rather than the file's:
+ *  too many files open, in this process (EMFILE) or the system (ENFILE).
+ *  Nothing about the file needs fixing, and the failure can pass. */
+const OWN_FAILURES = new Set(['EMFILE', 'ENFILE']);
+
+/** The repair for a file this host couldn't open or read: by whose failure
+ *  it is, its own (OWN_FAILURES), which a call again shortly can get past,
+ *  or the file's, which the operator fixes. After a call `name` it stopped,
+ *  that call is the one to make again; otherwise the listing reads the
+ *  file. */
+function readRepair(error: unknown, name?: string): string {
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && OWN_FAILURES.has(code)) {
+    return 'This host has too many files open, which can pass: ' + (name
+      ? `call ${name} again shortly, and if it fails the same way, ask your operator.`
+      : `${LIST} may read it shortly, and if it keeps failing, ask your operator.`);
+  }
+  return `Ask your operator to fix it${name ? `, then call ${name} again` : ''}.`;
+}
+
 /** The failures a save of the overlay meets before anything is written: at
  *  the open, or in the read before it (saveAgentOverlay keeps the root's
  *  other keys). The overlay is written in place (saveAgentOverlay says why),
@@ -154,9 +174,11 @@ const UNLOAD_REMEDY = `${UNLOAD} unloads it.`;
  *  configuration agent-framework stored at the server's last connect,
  *  whether that connect succeeded or not, so a wrong command, args or url is
  *  corrected only by deploying again, while a server rebuilt in place is
- *  picked up by a restart. */
-const CONNECT_REMEDY = `If its command, args or url is wrong, call ${DEPLOY} with the right one; if the server ` +
-  `itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
+ *  picked up by a restart. A deploy replaces the entry whole, so it takes
+ *  each of the server's fields, not the corrected one alone. */
+const CONNECT_REMEDY = `If its command, args or url is wrong, call ${DEPLOY} with each of its fields, the wrong one ` +
+  `corrected, since a deploy replaces the entry whole; if the server itself needs fixing (its build, say), call ` +
+  `${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
 
 /** What a call has changed so far, for the catch-all. `changed` is set
  *  before the first step that changes the overlay file or a server's
@@ -511,13 +533,16 @@ export class McplAdminModule implements Module {
       // server's source. Its parse errors name it; a file-system error, such
       // as a directory in its place, needn't. A file-system error can be
       // this process's alone (EMFILE, say), so the start is said to stop
-      // while the file can't be read, not until it's fixed.
+      // while the file can't be read, not until it's fixed, and the repair
+      // goes by whose failure it is (readRepair). Said once here, so no
+      // reader has to reconcile it with the overlay's lines above.
       const system = typeof (error as { code?: unknown } | null)?.code === 'string';
       notes.push(
         `The operator's server file${system ? `, ${this.configPath},` : ''} couldn't be read (${reasonText(error)}), so ` +
         'this list can\'t show which servers it defines. The next host start will stop on the file ' +
-        `${system ? 'while it can\'t be read' : 'until it\'s fixed'}, before it loads any server. It's theirs to fix, so ` +
-        'ask your operator. Of these tools, only this listing reads it.',
+        `${system ? 'while it can\'t be read' : 'until it\'s fixed'}, before it loads any server, so what this list says ` +
+        `a start loads holds once a start gets past the file. ${system ? readRepair(error) : 'It\'s theirs to fix, so ' +
+        'ask your operator.'} Of these tools, only this listing reads it.`,
       );
     }
 
@@ -862,15 +887,17 @@ export class McplAdminModule implements Module {
     if (undeclared) {
       const forDeploy = undeclared.keys.filter((k) => this.declared('mcpl_deploy').includes(k));
       problems.push(undeclared.text + (forDeploy.length === 0 ? '' :
-        ` ${DEPLOY} takes ${forDeploy.join(', ')}: deploy the server again to change ${forDeploy.length === 1 ? 'it' : 'them'}.`));
+        ` ${DEPLOY} takes ${forDeploy.join(', ')}: deploy the server again, with each of its fields, to change ` +
+        `${forDeploy.length === 1 ? 'it' : 'them'}.`));
     }
     if (problems.length > 0) return fail(`Nothing was restarted: ${problems.join(' ')}`);
 
     // The overlay is read before the restart, so a restart that throws still
     // carries what it says, and an overlay file that can't be read costs only
     // that: the restart's own outcome is what the receipt reports. Neither
-    // error readAgentOverlay throws quotes the file. The connect remedy names
-    // a deploy and an unload, so the note says which of them the file stops.
+    // error readAgentOverlay throws quotes the file's content. The connect
+    // remedy names a deploy and an unload, so the note says which of them the
+    // file stops.
     let overlay: Record<string, AgentOverlayEntry> | null = null;
     let unreadable = '';
     try {
@@ -1033,15 +1060,16 @@ export class McplAdminModule implements Module {
    *  only where the boot does too; and the repair, then, after a call
    *  `again` it stopped, to call it again. A file that isn't JSON or holds
    *  null stops each start until it's fixed, and is the agent's to fix if it
-   *  can edit it. One that can't be opened or read is the operator's, and
-   *  stops a start only while it can't be read, since the failure can be
-   *  this process's alone (EMFILE, say). Starts in lower case. */
+   *  can edit it. One that can't be opened or read stops a start only while
+   *  it can't be read, since the failure can be this process's alone
+   *  (EMFILE, say), and its repair goes by whose failure it is
+   *  (readRepair). Starts in lower case. */
   private unusableOverlay(error: unknown, so?: string, again?: string): string {
     const unreadable = error instanceof OverlayUnreadableError;
     return `${unreadable ? reasonText(error) : `your overlay file, ${this.overlayPath}, couldn't be read (${reasonText(error)})`}` +
       `${so ? `, so ${so}` : ''}. The next host start will stop on the file ` +
       `${unreadable ? 'until it\'s fixed' : 'while it can\'t be read'}. ` +
-      (unreadable ? overlayRepair(again) : `Ask your operator to make the file readable${again ? `, then call ${again} again` : ''}.`);
+      (unreadable ? overlayRepair(again) : readRepair(error, again));
   }
 
   /** What the next host start loads for `id`, read from `overlay` as this

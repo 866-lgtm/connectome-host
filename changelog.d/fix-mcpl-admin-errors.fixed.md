@@ -5,24 +5,28 @@
   - A call that fails says whether it changed anything: nothing, or that it
     stopped partway, from the call's own record of its changes.
   - An agent overlay that can't be read stops only the calls that need it.
-    Before, it stopped every call but a restart, `mcpl_list` and a
-    session-only `mcpl_unload` included. A deploy and an unload that would
-    record itself are refused, and the unload's refusal points a loaded
-    server to `persist: false`. `mcpl_list` lists the servers, with the
-    sources the overlay decides as unknown, and an unload for this session
-    of a server that's loaded, or the operator's, goes on. A restart goes
-    on too, and its note says that a deploy, and an unload that persists,
-    are refused meanwhile. Each tool says it in one wording, an unload
-    that can't read the file when it reads it again after the disconnect
-    included: why the file can't be read, that the next host start will
-    stop on it, and the repair. For a file that isn't valid JSON or holds
-    `null`, the start stops until it's fixed, and the repair is to fix it
-    (or have the operator fix it), with why not to move it aside. For one
-    that can't be opened or read, such as a directory in its place, the
-    start stops while it can't be read, and the repair is to ask the
-    operator to make it readable. Before, a deploy passed the file-system
-    error on with no step. The boot, which stops on such a file, keeps its
-    operator message.
+    Before, it stopped `mcpl_list`, a session-only `mcpl_unload` and every
+    other call but a restart. A deploy and an unload that would record
+    itself are refused, and the unload's refusal points a loaded server to
+    `persist: false`. `mcpl_list` lists the servers, with the sources the
+    overlay decides as unknown, and an unload for this session of a server
+    that's loaded, or the operator's, goes on. A restart goes on too, and
+    its note says that a deploy, and an unload that persists, are refused
+    meanwhile. Each tool says it in one wording, an unload that can't read
+    the file when it reads it again after the disconnect included: why the
+    file can't be read, that the next host start will stop on it, and the
+    repair. For a file that isn't valid JSON or holds `null`, the start
+    stops until it's fixed, and the repair is to fix it (or have the
+    operator fix it), with why not to move it aside. For one that can't be
+    opened or read, such as a directory in its place, the start stops while
+    it can't be read, and the repair goes by whose failure it is: too many
+    files open (`EMFILE`, `ENFILE`) is the host's own and can pass, so the
+    call is made again shortly, then the operator asked; any other code is
+    the file's, for the operator to fix. The listing's line for an
+    operator's `mcpl-servers.json` it can't read gives the same repair, and
+    says once that what the list says a start loads holds once a start gets
+    past that file. Before, a deploy passed the file-system error on with no
+    step. The boot, which stops on such a file, keeps its operator message.
   - `mcpl_deploy` names every problem with its arguments in one refusal,
     where it named only the first, so an agent fixes them in one call: an
     argument the tool doesn't take, the id, the command or url, an `access`
@@ -71,11 +75,12 @@
     that a restart of an unloaded id gives, by what defines it; a deploy
     that does says its entry is saved and loads at the next host start. A
     server a restart leaves down is pointed to a deploy for a wrong command,
-    args or url, and to a restart only once the server itself is fixed,
-    since a restart reconnects with the configuration of its last connect,
-    whether that connect succeeded or not. One that a deploy's failed
-    connect or restart leaves down is pointed to a deploy again, which
-    applies the saved entry whichever configuration the framework holds.
+    args or url, with each of its fields, since a deploy replaces the entry
+    whole, and to a restart only once the server itself is fixed, since a
+    restart reconnects with the configuration of its last connect, whether
+    that connect succeeded or not. One that a deploy's failed connect or
+    restart leaves down is pointed to a deploy again, which applies the
+    saved entry whichever configuration the framework holds.
   - `mcpl_restart` of an id that isn't loaded is refused before
     agent-framework is asked, naming the loaded servers and the next step by
     what defines the id: the agent's overlay, the operator, or nothing. It
