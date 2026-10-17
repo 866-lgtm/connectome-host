@@ -161,8 +161,8 @@ function partway(error: unknown): boolean {
  *  come from the read before the write, and a failure at close after the
  *  whole content went out, so no single guess about the file is true. */
 const PARTWAY_TEXT = ' What your overlay file holds now isn\'t known: its old content, the new content whole, or ' +
-  `the new content cut short. ${LIST} shows which. If it says the file isn't valid JSON, the next host start will stop on ` +
-  `it until it's fixed: ${REPAIR}. ${NOT_ASIDE}`;
+  `the new content cut short. ${LIST} shows the entries it holds, or why it can't be read. If it says the file ` +
+  `isn't valid JSON, the next host start will stop on it until it's fixed: ${REPAIR}. ${NOT_ASIDE}`;
 
 /** What takes a server out. An unload removes the agent's own entry, or
  *  tombstones an operator's server, and its receipt says what the next host
@@ -170,12 +170,14 @@ const PARTWAY_TEXT = ' What your overlay file holds now isn\'t known: its old co
  *  back then, so no more is promised here. */
 const UNLOAD_REMEDY = `${UNLOAD} unloads it.`;
 
-/** What fixes a server that won't connect. A restart reconnects with the
- *  configuration agent-framework stored at the server's last connect,
- *  whether that connect succeeded or not, so a wrong command, args or url is
- *  corrected only by deploying again, while a server rebuilt in place is
- *  picked up by a restart. A deploy replaces the entry whole, so it takes
- *  each of the server's fields, not the corrected one alone. */
+/** What fixes a server of the agent's own that won't connect, after a deploy
+ *  or a restart. A restart reconnects with the configuration agent-framework
+ *  stored at the server's last connect, whether that connect succeeded or
+ *  not, so a wrong command, args or url is corrected only by deploying
+ *  again, while a server rebuilt in place is picked up by a restart. A
+ *  deploy replaces the entry whole, so it takes each of the server's fields,
+ *  not the corrected one alone. A restart of another's server takes
+ *  restartRemedy's instead. */
 const CONNECT_REMEDY = `If its command, args or url is wrong, call ${DEPLOY} with each of its fields, the wrong one ` +
   `corrected, since a deploy replaces the entry whole; if the server itself needs fixing (its build, say), call ` +
   `${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
@@ -349,7 +351,9 @@ export class McplAdminModule implements Module {
           'Deploy an MCPL server: persist it to your agent overlay (survives host ' +
           'restarts) and hot-connect it now — its tools become available immediately. ' +
           'If a server with this id is already running it is restarted with the new ' +
-          'config. Provide either `command` (stdio, spawned as the host user) or `url` ' +
+          'config. A deploy replaces the server\'s entry whole, so give each of its fields ' +
+          'every time, not only the one you change. Provide either `command` (stdio, ' +
+          'spawned as the host user) or `url` ' +
           '(WebSocket). Relative ./ args resolve against the host working directory. ' +
           'Sensible defaults: omit (or pass empty) the list fields and every feature ' +
           'set and tool the server offers is available; an empty array means ' +
@@ -529,8 +533,10 @@ export class McplAdminModule implements Module {
       // The operator's file, which the boot read at its start, and stops on
       // as it does on the overlay, before it loads any server, so the
       // overlay's lines above say what a start loads once it gets past the
-      // file. Of these tools, only this listing reads it again, for each
-      // server's source. Its parse errors name it; a file-system error, such
+      // file, by the operator's definitions as this host's start read them
+      // (operatorServers), which an edit since may have changed. Of these
+      // tools, only this listing reads it again, for each server's source.
+      // Its parse errors name it; a file-system error, such
       // as a directory in its place, needn't. A file-system error can be
       // this process's alone (EMFILE, say), so the start is said to stop
       // while the file can't be read, not until it's fixed, and the repair
@@ -541,7 +547,8 @@ export class McplAdminModule implements Module {
         `The operator's server file${system ? `, ${this.configPath},` : ''} couldn't be read (${reasonText(error)}), so ` +
         'this list can\'t show which servers it defines. The next host start will stop on the file ' +
         `${system ? 'while it can\'t be read' : 'until it\'s fixed'}, before it loads any server, so what this list says ` +
-        `a start loads holds once a start gets past the file. ${system ? readRepair(error) : 'It\'s theirs to fix, so ' +
+        'a start loads holds once a start gets past the file, if the file still defines what it did at this host\'s ' +
+        `start. ${system ? readRepair(error) : 'It\'s theirs to fix, so ' +
         'ask your operator.'} Of these tools, only this listing reads it.`,
       );
     }
@@ -817,14 +824,16 @@ export class McplAdminModule implements Module {
     } catch (error) {
       // A save that may have stopped partway may have written the new entry
       // whole, which the next host start loads, so only a save that wrote
-      // nothing says nothing was deployed. Bun's errors from the write
-      // itself (ENOSPC, say) name no file, so the text names it.
+      // nothing says nothing was deployed, with the repair by whose failure
+      // it is (readRepair), as for a read. Bun's errors from the write itself
+      // (ENOSPC, say) name no file, so the text names it.
       const cut = partway(error);
       return fail(
         `${cut ? 'Saving' : 'Nothing was deployed: saving'} your overlay file, ${this.overlayPath}, failed ` +
-        `(${reasonText(error)}), so no server ` +
-        `was connected or restarted. Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your ` +
-        `operator.${cut ? PARTWAY_TEXT : ''}`,
+        `(${reasonText(error)}), so no server was connected or restarted. ` +
+        (cut
+          ? `Once that's fixed, call ${DEPLOY} again; if you can't fix it, ask your operator.${PARTWAY_TEXT}`
+          : readRepair(error, DEPLOY)),
       );
     }
 
@@ -946,7 +955,7 @@ export class McplAdminModule implements Module {
       return fail(
         `Restarted server "${id}", but it isn't connected` +
         `${status?.retrying ? `; it keeps retrying on its own, so it may still connect, which ${LIST} shows` : ''}. ` +
-        `${CONNECT_REMEDY}${note}`,
+        `${this.restartRemedy(id, overlay)}${note}`,
       );
     }
     return ok(`Restarted server "${id}" — connected, ${status.toolCount} tools.${note}`);
@@ -975,7 +984,8 @@ export class McplAdminModule implements Module {
     try {
       status = framework.listMcplServers().find((s) => s.id === id);
     } catch {
-      return `What state it's in now is unknown; ${LIST} shows it.`;
+      // The listing reads the state the same way, so it can fail too.
+      return `What state it's in now couldn't be read: ${LIST} shows it, and if that fails too, ask your operator.`;
     }
     if (status?.connected) {
       return restart
@@ -988,19 +998,27 @@ export class McplAdminModule implements Module {
       // loaded, by what defines it. A deploy reads the overlay before it
       // saves, so with the file unreadable it can't load the server yet.
       if (restart) {
-        // The restart appends its own overlay note, so the advice leaves it out.
+        // The restart appends its own overlay note, so the advice leaves it
+        // out. With the overlay unreadable, whether the agent's own entry
+        // replaces an operator's definition isn't known, so for an id the
+        // operator defines, the step for each, as notLoadedAdvice gives it.
         return `It isn't loaded in this session any more, so ${RESTART} can't reach it.` +
           (restartOf
             ? this.notLoadedAdvice(id, restartOf, false)
-            : ` ${DEPLOY} with each of its fields can load it again once your overlay file is fixed, since a deploy ` +
-              'replaces the entry whole.');
+            : this.operatorServers.has(id)
+              ? ` Which defines it isn't known while your overlay file can't be read. Once it can, ${LIST} shows ` +
+                `your own entry for it, if there is one, which ${DEPLOY} with each of its fields loads again; ` +
+                'otherwise your operator\'s definition loads again at the next host start, and ' +
+                `${DEPLOY} would load your own entry in its place.`
+              : ` ${DEPLOY} with each of its fields can load it again once your overlay file can be read, since a ` +
+                'deploy replaces the entry whole.');
       }
       return `It isn't loaded in this session, so ${RESTART} can't reach it. Your entry is saved, so the next host ` +
         `start loads it; once the cause is fixed, call ${DEPLOY} again to load it now. ${UNLOAD} removes the saved ` +
         'entry.';
     }
     const retrying = status.retrying ? `; it keeps retrying on its own, so it may still connect, which ${LIST} shows` : '';
-    if (restart) return `It isn't connected${retrying}. ${CONNECT_REMEDY}`;
+    if (restart) return `It isn't connected${retrying}. ${this.restartRemedy(id, restartOf ?? null)}`;
     // A down server after a deploy that threw holds the new entry if a
     // redeploy's restart got past its disconnect, as a handshake failure
     // does, but the previous configuration if it stopped before, at its
@@ -1032,6 +1050,34 @@ export class McplAdminModule implements Module {
     const nextStart = composeOverlay(this.operatorDefinitions, others, this.overlayPath);
     const other = [...nextStart, ...framework.listMcplServers()].find((s) => s.id !== id && prefixOf(s) === prefix);
     return other ? `held by server "${other.id}"` : null;
+  }
+
+  /**
+   * What fixes a server a restart left down, by what defines it. The agent's
+   * own entry takes the connect remedy, since the agent wrote its fields. A
+   * server the operator defines, which the overlay doesn't replace, is
+   * theirs to correct: its args and env never reach the agent, so a deploy
+   * of it would replace their definition with less. With the overlay
+   * unreadable, a deploy waits until the file can be read, and whether the
+   * agent's own entry replaces an operator's definition isn't known, so for
+   * an id the operator defines, the step for each.
+   */
+  private restartRemedy(id: string, overlay: Record<string, AgentOverlayEntry> | null): string {
+    const rebuilt = `if the server itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
+    const unseen = `its args and env aren't shown to you, and ${DEPLOY} would replace it whole with your own entry`;
+    if (overlay === null) {
+      return this.operatorServers.has(id)
+        ? `If its command, args or url is wrong, what corrects it depends on which defines it, which ${LIST} shows ` +
+          `once your overlay file can be read: your own entry takes ${DEPLOY} with each of its fields; your ` +
+          `operator's definition is theirs to correct, so ask them, since ${unseen}. ${capital(rebuilt)}`
+        : `If its command, args or url is wrong, ${DEPLOY} with each of its fields corrects it once your overlay ` +
+          `file can be read; ${rebuilt}`;
+    }
+    if (!overlayEntryReplaces(entryOf(overlay, id)) && this.operatorServers.has(id)) {
+      return `If its command, args or url is wrong, that's your operator's definition to correct, so ask them: ${unseen}; ` +
+        rebuilt;
+    }
+    return CONNECT_REMEDY;
   }
 
   /** The next step for an id a restart found unloaded, by what defines it.
@@ -1214,8 +1260,7 @@ export class McplAdminModule implements Module {
           ? `But saving your overlay file, ${this.overlayPath}, failed (${reasonText(error)}).${PARTWAY_TEXT} If the ` +
             `file doesn't hold the unload, ${UNLOAD} "${id}" again records it once the file can be read and written.`
           : `But your overlay file, ${this.overlayPath}, couldn't be updated (${reasonText(error)}), so the unload isn't ` +
-            `recorded: ${this.nextStart(id, held)} ${UNLOAD} "${id}" again records it once the file can be read and ` +
-            'written.'}`,
+            `recorded: ${this.nextStart(id, held)} ${readRepair(error, `${UNLOAD} "${id}"`)}`}`,
       );
     }
   }
