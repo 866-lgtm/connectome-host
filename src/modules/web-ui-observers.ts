@@ -552,34 +552,22 @@ export class ObserverSessions {
     return token;
   }
 
-  /** The session for `token`. An observer session is checked against its
-   *  grant each time (`liveScopes`, the registry's): it ends when the grant
-   *  is revoked, expires, its file is removed or it keeps none of the
-   *  session's scopes, and otherwise keeps only the scopes the grant still
-   *  has. narrowToGrants does the same at each check of the file, so what a
-   *  session keeps doesn't depend on whether it was used meanwhile. */
-  lookup(
-    token: string | null | undefined,
-    liveScopes: (key: string) => Set<ObserverScope> | null,
-  ): ObserverSession | null {
+  lookup(token: string | null | undefined): ObserverSession | null {
     if (!token) return null;
     const s = this.sessions.get(token);
     if (!s || s.expiresAt < Date.now()) return null;
-    if (s.key === undefined) return { scopes: s.scopes, full: s.full };
-    if (!narrow(s, liveScopes(s.key))) {
-      this.sessions.delete(token);
-      return null;
-    }
-    return { scopes: new Set(s.scopes), full: s.full };
+    return { scopes: s.scopes, full: s.full };
   }
 
   /** Narrow every observer session to the scopes its grant still has, and
    *  end those whose grant is gone, expired or keeps none of their scopes;
-   *  run after each check of the grants file. A session's scopes only ever
-   *  shrink: a grant widened or given again later is a new decision, which
-   *  the observer's next hello takes up in a new session. Returns how many
-   *  it ended. A session already past its 12 hours ended on its own, so
-   *  it's left alone and not counted: lookup refuses it, and mint sweeps it. */
+   *  run after each check of the grants file, which is when the registry
+   *  learns of a revoke, a narrowing or the file's removal. A lookup reads
+   *  what the last check left. A session's scopes only ever shrink: a grant
+   *  widened or given again later is a new decision, which the observer's
+   *  next hello takes up in a new session. Returns how many it ended. A
+   *  session already past its 12 hours ended on its own, so it's left alone
+   *  and not counted: lookup refuses it, and mint sweeps it. */
   narrowToGrants(liveScopes: (key: string) => Set<ObserverScope> | null): number {
     const now = Date.now();
     let ended = 0;
@@ -715,15 +703,12 @@ export interface ObserverConnection {
  *  the web client takes as final, as it does a refused hello. A narrowed
  *  grant closes with 4403 rather than narrowing the connection, since its
  *  open subscriptions were checked against the old scopes, and the client
- *  connects again with the new ones. Returns how many it closed, and the
- *  connections whose close threw, which the caller drops as a close would,
- *  once the sweep is done. */
-export function closeConnectionsWithoutGrant<C extends ObserverConnection>(
-  connections: Iterable<C>,
+ *  connects again with the new ones. Returns how many it closed. */
+export function closeConnectionsWithoutGrant(
+  connections: Iterable<ObserverConnection>,
   registry: Pick<ObserverRegistry, 'liveScopes'>,
-): { closed: number; unclosed: C[] } {
+): number {
   let closed = 0;
-  const unclosed: C[] = [];
   for (const c of connections) {
     if (c.auth !== 'observer') continue;
     const live = c.observerKey === undefined ? null : registry.liveScopes(c.observerKey);
@@ -734,9 +719,8 @@ export function closeConnectionsWithoutGrant<C extends ObserverConnection>(
       closed++;
     } catch (err) {
       // One socket's failure doesn't keep the sweep from the rest.
-      unclosed.push(c);
-      console.error(`[webui-observers] observer connection couldn't be closed: ${c.label ?? 'no grant'} (${errorText(err)}); it gets nothing more`);
+      console.error(`[webui-observers] observer connection couldn't be closed: ${c.label ?? 'no grant'} (${errorText(err)}); each check tries again while its grant is gone, expired or narrowed`);
     }
   }
-  return { closed, unclosed };
+  return closed;
 }

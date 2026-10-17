@@ -201,8 +201,6 @@ interface ClientState {
   ws: ServerWebSocket<WsData>;
   /** True after we've sent the welcome message. */
   welcomed: boolean;
-  /** True once the server has dropped it (dropClient): it gets nothing more. */
-  dropped?: boolean;
   /**
    * Authorization state. 'full' = basic-auth (or open loopback) — behavior
    * identical to pre-observer builds, scopes null. 'pending' = upgraded
@@ -475,17 +473,13 @@ export class WebUiModule implements Module {
       fleetEventDetacher: null,
       messageListenerDetacher: null,
     };
-    // Each check also closes the open connections of grants that are gone,
-    // expired or narrowed, ends the sessions of grants that are gone or
-    // expired, and narrows the rest; a session is checked at each request
-    // too (liveScopes).
+    // Each check also ends the sessions of grants that are gone or expired,
+    // narrows the rest, and closes the open connections of grants that are
+    // gone, expired or narrowed.
     const observers = state.observers;
     observers?.start(() => {
-      const { closed, unclosed } = closeConnectionsWithoutGrant(state.clients.values(), observers);
-      // A socket that couldn't be closed is dropped as its close would drop
-      // it, so send() sends it nothing more.
-      for (const client of unclosed) this.dropClient(client.id);
       const ended = state.observerSessions.narrowToGrants((key) => observers.liveScopes(key));
+      const closed = closeConnectionsWithoutGrant(state.clients.values(), observers);
       if (closed > 0 || ended > 0) {
         console.error(`[webui-observers] closed ${closed} observer connection(s) whose grant is gone, expired or narrowed, and ended ${ended} observer session(s) whose grant is gone, expired or keeps none of their scopes`);
       }
@@ -1035,7 +1029,7 @@ export class WebUiModule implements Module {
       // cookies on WS upgrades but Chrome does NOT send cached basic-auth
       // credentials — without it, password sign-in bounced back to the
       // observer gate in a loop.
-      const wsSession = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req), liveScopesOf(sharedServer!));
+      const wsSession = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req));
       const basicOk = this.checkAuth(req) || (wsSession?.full ?? false);
       // Without full auth the upgrade is allowed only when observer grants
       // exist — and then NOTHING is sent until a signed observer-hello
@@ -1055,7 +1049,7 @@ export class WebUiModule implements Module {
     // when observers are active the static app shell is public — it carries
     // no data, and key-only devices must be able to load the SPA to
     // authenticate at all.
-    const session = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req), liveScopesOf(sharedServer!));
+    const session = sharedServer!.observerSessions.lookup(sessionTokenFromRequest(req));
     const basicOk = this.checkAuth(req) || (session?.full ?? false);
     const operatorAuthenticated = this.config.basicAuth !== undefined && basicOk;
     const sessionScopes = basicOk ? null : session?.scopes ?? null;
@@ -2808,17 +2802,9 @@ export class WebUiModule implements Module {
   }
 
   private onWsClose(ws: ServerWebSocket<WsData>): void {
-    this.dropClient(ws.data.id);
-  }
-
-  /** Forget a client as its socket's close does: its auth timer, its peek
-   *  subscriptions and its place among the server's clients. It's marked
-   *  dropped, so send() sends it nothing more. The grant sweep drops an
-   *  observer whose socket couldn't be closed the same way. */
-  private dropClient(id: number): void {
+    const id = ws.data.id;
     const client = sharedServer?.clients.get(id);
     if (client) {
-      client.dropped = true;
       if (client.authTimer) clearTimeout(client.authTimer);
       for (const detach of client.peeks.values()) {
         try { detach(); } catch { /* ignore */ }
@@ -3300,9 +3286,6 @@ export class WebUiModule implements Module {
   }
 
   private send(client: ClientState, msg: WebUiServerMessage): void {
-    // A client the server has dropped gets nothing, whatever was in flight
-    // for it: a welcome past its await, a reply.
-    if (client.dropped) return;
     try {
       client.ws.send(JSON.stringify(msg));
     } catch {
@@ -3806,11 +3789,6 @@ function mimeFor(path: string): string {
 // running across session switches. These helpers exist solely for tests; they
 // are not part of the public module API.
 
-/** The shared server's clients, for tests that place a client among them. */
-export function __getSharedServerClientsForTests(): Map<number, unknown> | null {
-  return sharedServer?.clients ?? null;
-}
-
 /** Return the bound listener port, or null if the singleton hasn't started. */
 export function __getSharedServerPortForTests(): number | null {
   return sharedServer?.port ?? null;
@@ -3827,10 +3805,4 @@ export async function __resetSharedServerForTests(): Promise<void> {
   sharedServer.fleetEventDetacher?.();
   sharedServer.treeAggregator?.dispose();
   sharedServer = null;
-}
-
-/** The registry's check of an observer session's grant, for session lookups.
- *  With no grants file configured, no observer session is honoured. */
-function liveScopesOf(state: SharedServerState): (key: string) => Set<ObserverScope> | null {
-  return (key) => state.observers?.liveScopes(key) ?? null;
 }

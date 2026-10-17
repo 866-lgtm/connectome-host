@@ -18,7 +18,6 @@ import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
 import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
-  __getSharedServerClientsForTests,
   __getSharedServerPortForTests,
   __resetSharedServerForTests,
 } from '../src/modules/web-ui-module.js';
@@ -323,123 +322,59 @@ async function waitUntil(done: () => boolean, ms = 10_000): Promise<void> {
 describe('observer sessions and connections end with their grant', () => {
   const K = `ed25519:${'K'.repeat(42)}A`; // canonical: its last character carries no stray bits
 
-  test('a session keeps only what its grant still holds, and ends when the grant is revoked, expires or its file goes', () => {
+  test('at each check, a session keeps only what its grant still holds, and ends for good when the grant is revoked, expires, keeps none of its scopes or its file goes', () => {
     const tmp = mkdtempSync(join(tmpdir(), 'observers-sessions-'));
     const path = join(tmp, 'observers.json');
-    const write = (observers: ObserversFile['observers']) => { saveObserversFile(path, { observers }); check(registry); };
     saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health', 'ops'] }] });
     const registry = new ObserverRegistry(path, 60_000); // checks driven by hand
     const sessions = new ObserverSessions();
     let now = Date.now();
-    const live = (key: string) => registry.liveScopes(key, now);
+    // One check of the file, then of the sessions, as the web UI's hook runs
+    // after each; it returns how many sessions the check ended.
+    const checked = () => { check(registry); return sessions.narrowToGrants((key) => registry.liveScopes(key, now)); };
+    const write = (observers: ObserversFile['observers']) => { saveObserversFile(path, { observers }); return checked(); };
     const spy = spyOn(console, 'error').mockImplementation(() => {});
     try {
       registry.start();
       const token = sessions.mint(new Set(['health', 'ops'] as ObserverScope[]), { key: K });
-      expect([...sessions.lookup(token, live)!.scopes].sort()).toEqual(['health', 'ops']);
+      expect([...sessions.lookup(token)!.scopes].sort()).toEqual(['health', 'ops']);
 
-      write([{ key: K, label: 'phone', scopes: ['health'] }]);
-      expect([...sessions.lookup(token, live)!.scopes]).toEqual(['health']);
+      expect(write([{ key: K, label: 'phone', scopes: ['health'] }])).toBe(0);
+      expect([...sessions.lookup(token)!.scopes]).toEqual(['health']);
       // Widened again: the narrowing stays, and the next hello takes up the wider grant.
-      write([{ key: K, label: 'phone', scopes: ['health', 'ops'] }]);
-      expect([...sessions.lookup(token, live)!.scopes]).toEqual(['health']);
+      expect(write([{ key: K, label: 'phone', scopes: ['health', 'ops'] }])).toBe(0);
+      expect([...sessions.lookup(token)!.scopes]).toEqual(['health']);
 
-      write([]);
-      expect(sessions.lookup(token, live)).toBeNull();
+      expect(write([])).toBe(1);
+      expect(sessions.lookup(token)).toBeNull();
+      // Granting the key again doesn't bring it back: that takes a new hello.
+      expect(write([{ key: K, label: 'phone', scopes: ['health', 'ops'] }])).toBe(0);
+      expect(sessions.lookup(token)).toBeNull();
 
-      // A grant that keeps none of the session's scopes ends it, at a lookup
-      // and at a check alike.
-      write([{ key: K, label: 'phone', scopes: ['ops'] }]);
+      // A grant that keeps none of the session's scopes ends it.
       const opsLess = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
-      const unused = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
-      expect(sessions.lookup(opsLess, live)).toBeNull();
-      expect(sessions.narrowToGrants(live)).toBe(1);
-      expect(sessions.lookup(unused, live)).toBeNull();
+      expect(write([{ key: K, label: 'phone', scopes: ['ops'] }])).toBe(1);
+      expect(sessions.lookup(opsLess)).toBeNull();
 
-      write([{ key: K, label: 'phone', scopes: ['health'], expires: new Date(now + 60_000).toISOString() }]);
+      expect(write([{ key: K, label: 'phone', scopes: ['health'], expires: new Date(now + 60_000).toISOString() }])).toBe(0);
       const expiring = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
-      expect(sessions.lookup(expiring, live)).not.toBeNull();
+      expect(checked()).toBe(0);
       now += 120_000;
-      expect(sessions.lookup(expiring, live)).toBeNull();
-      // The lookup ended it, so the next check has nothing left to count.
-      expect(sessions.narrowToGrants(live)).toBe(0);
+      expect(checked()).toBe(1);
+      expect(sessions.lookup(expiring)).toBeNull();
       now = Date.now();
 
-      write([{ key: K, label: 'phone', scopes: ['health'] }]);
+      expect(write([{ key: K, label: 'phone', scopes: ['health'] }])).toBe(0);
       const removed = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
-      expect(sessions.lookup(removed, live)).not.toBeNull();
       rmSync(path);
-      check(registry);
-      check(registry); // a removal counts at the second check that misses the file
-      expect(sessions.lookup(removed, live)).toBeNull();
+      expect(checked()).toBe(0); // a removal counts at the second check that misses the file
+      expect(checked()).toBe(1);
+      expect(sessions.lookup(removed)).toBeNull();
 
       // A password session has no grant to end with.
-      expect(sessions.lookup(sessions.mint(new Set(), { full: true }), live)?.full).toBe(true);
-    } finally {
-      registry.stop();
-      spy.mockRestore();
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
-  test('a session ends at the check that finds its grant gone, used or not, and granting the key again doesn\'t bring it back', () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'observers-session-drop-'));
-    const path = join(tmp, 'observers.json');
-    saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health'] }] });
-    const registry = new ObserverRegistry(path, 60_000);
-    const sessions = new ObserverSessions();
-    const live = (key: string) => registry.liveScopes(key);
-    const spy = spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      registry.start();
-      const used = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
-      const unused = sessions.mint(new Set(['health'] as ObserverScope[]), { key: K });
       const password = sessions.mint(new Set(), { full: true });
-      expect(sessions.lookup(used, live)).not.toBeNull();
-      expect(sessions.narrowToGrants(live)).toBe(0);
-
-      saveObserversFile(path, { observers: [] });
-      check(registry);
-      expect(sessions.narrowToGrants(live)).toBe(2); // the check ends both, whether used or not
-
-      saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health'] }] });
-      check(registry);
-      expect(sessions.lookup(used, live)).toBeNull();
-      expect(sessions.lookup(unused, live)).toBeNull();
-      expect(sessions.lookup(password, live)?.full).toBe(true);
-    } finally {
-      registry.stop();
-      spy.mockRestore();
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
-  test('at each check, an unused session narrows with its grant and ends when the grant expires', () => {
-    const tmp = mkdtempSync(join(tmpdir(), 'observers-session-check-'));
-    const path = join(tmp, 'observers.json');
-    const at = Date.now();
-    saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health', 'ops'], expires: new Date(at + 60_000).toISOString() }] });
-    const registry = new ObserverRegistry(path, 60_000);
-    const sessions = new ObserverSessions();
-    let now = at;
-    const live = (key: string) => registry.liveScopes(key, now);
-    const spy = spyOn(console, 'error').mockImplementation(() => {});
-    try {
-      registry.start();
-      const token = sessions.mint(new Set(['health', 'ops'] as ObserverScope[]), { key: K });
-      // Narrowed and widened again between lookups: the check stored the narrowing.
-      saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health'], expires: new Date(at + 60_000).toISOString() }] });
-      check(registry);
-      expect(sessions.narrowToGrants(live)).toBe(0);
-      saveObserversFile(path, { observers: [{ key: K, label: 'phone', scopes: ['health', 'ops'], expires: new Date(at + 60_000).toISOString() }] });
-      check(registry);
-      expect(sessions.narrowToGrants(live)).toBe(0);
-      expect([...sessions.lookup(token, live)!.scopes]).toEqual(['health']);
-      // The grant expires: the check ends the session, unused.
-      now = at + 120_000;
-      expect(sessions.narrowToGrants(live)).toBe(1);
-      now = at;
-      expect(sessions.lookup(token, live)).toBeNull();
+      expect(checked()).toBe(0);
+      expect(sessions.lookup(password)?.full).toBe(true);
     } finally {
       registry.stop();
       spy.mockRestore();
@@ -463,7 +398,7 @@ describe('observer sessions and connections end with their grant', () => {
       check(registry);
       expect(registry.liveScopes(K)).toBeNull();
       expect(sessions.narrowToGrants(live)).toBe(1);
-      expect(sessions.lookup(token, live)).toBeNull();
+      expect(sessions.lookup(token)).toBeNull();
     } finally {
       registry.stop();
       spy.mockRestore();
@@ -478,7 +413,7 @@ describe('observer sessions and connections end with their grant', () => {
     const held = (sessions as unknown as { sessions: Map<string, { expiresAt: number }> }).sessions;
     held.get(token)!.expiresAt = Date.now() - 1;
     expect(sessions.narrowToGrants(() => null)).toBe(0);
-    expect(sessions.lookup(token, () => new Set(['health'] as ObserverScope[]))).toBeNull();
+    expect(sessions.lookup(token)).toBeNull();
     // It's left for the next mint to sweep.
     expect(held.has(token)).toBe(true);
     sessions.mint(new Set(), { full: true });
@@ -523,7 +458,7 @@ describe('observer sessions and connections end with their grant', () => {
     }
   });
 
-  test('the sweep closes a connection whose grant is gone (4401) or narrowed (4403), and leaves the rest', () => {
+  test('the sweep closes a connection whose grant is gone (4401) or narrowed (4403), leaves the rest, and goes on past a close that throws', () => {
     const closed: string[] = [];
     const conn = (name: string, auth: string, observerKey: string | undefined, scopes: ObserverScope[] | null, throws = false) => ({
       auth,
@@ -536,12 +471,11 @@ describe('observer sessions and connections end with their grant', () => {
     const lines: string[] = [];
     const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
     try {
-      const throws = conn('throws', 'observer', 'C', ['health'], true);
       const connections = [
         conn('same', 'observer', 'A', ['health', 'ops']),
         conn('widened', 'observer', 'W', ['health']),
         conn('narrowed', 'observer', 'B', ['health', 'ops']),
-        throws,
+        conn('throws', 'observer', 'C', ['health'], true),
         conn('gone', 'observer', 'C', ['health']),
         conn('keyless', 'observer', undefined, ['health']),
         conn('password', 'full', undefined, null),
@@ -554,11 +488,9 @@ describe('observer sessions and connections end with their grant', () => {
         'gone:4401:observer grant gone or expired',
         'keyless:4401:observer grant gone or expired',
       ]);
-      // The socket whose close threw isn't counted: it's handed back for the
-      // caller to drop, and named.
-      expect(swept.closed).toBe(3);
-      expect(swept.unclosed).toEqual([throws]);
-      expect(lines).toEqual(["[webui-observers] observer connection couldn't be closed: throws (socket); it gets nothing more"]);
+      // The socket whose close threw isn't counted, and it's named.
+      expect(swept).toBe(3);
+      expect(lines).toEqual(["[webui-observers] observer connection couldn't be closed: throws (socket); each check tries again while its grant is gone, expired or narrowed"]);
     } finally { spy.mockRestore(); }
   });
 
@@ -578,7 +510,7 @@ describe('observer sessions and connections end with their grant', () => {
         [{ auth: 'observer', observerKey: K, scopes: new Set(['health'] as ObserverScope[]), ws: { close: (code?: number) => { closed.push(code!); } } }],
         registry,
       );
-      expect(swept).toEqual({ closed: 1, unclosed: [] });
+      expect(swept).toBe(1);
       expect(closed).toEqual([4401]);
     } finally {
       registry.stop();
@@ -602,7 +534,7 @@ describe('observer sessions and connections end with their grant', () => {
     try {
       registry.start(() => {
         if (checksSinceWrite >= 0) checksSinceWrite++;
-        if (closeConnectionsWithoutGrant([connection], registry).closed > 0) closedAt = checksSinceWrite;
+        if (closeConnectionsWithoutGrant([connection], registry) > 0) closedAt = checksSinceWrite;
       });
       expect(registry.liveScopes(K)).not.toBeNull();
       writeFileSync(path, JSON.stringify({ observers: null }));
@@ -775,22 +707,22 @@ describe('ObserverSessions', () => {
   test('mint/lookup round-trip; bad token null; full flag carried', () => {
     const s = new ObserverSessions();
     const scopes = new Set<ObserverScope>(['health']);
-    const live = () => new Set<ObserverScope>(['health', 'ops']);
     const token = s.mint(scopes, { key: 'k' });
     expect(token).toMatch(/^[a-f0-9]{64}$/);
-    expect([...s.lookup(token, live)!.scopes]).toEqual(['health']);
-    expect(s.lookup(token, live)!.full).toBe(false);
-    expect(s.lookup('0'.repeat(64), live)).toBeNull();
-    expect(s.lookup(null, live)).toBeNull();
-    // Narrowing a session leaves the set it was minted with alone, which the hello's connection holds too.
+    expect(s.lookup(token)!.scopes).toBe(scopes);
+    expect(s.lookup(token)!.full).toBe(false);
+    expect(s.lookup('0'.repeat(64))).toBeNull();
+    expect(s.lookup(null)).toBeNull();
+    // Narrowing a session at a check leaves the set it was minted with alone, which the hello's connection holds too.
     const wide = new Set<ObserverScope>(['health', 'ops']);
     const wideToken = s.mint(wide, { key: 'k' });
-    expect([...s.lookup(wideToken, () => new Set<ObserverScope>(['health']))!.scopes]).toEqual(['health']);
+    expect(s.narrowToGrants(() => new Set<ObserverScope>(['health']))).toBe(0);
+    expect([...s.lookup(wideToken)!.scopes]).toEqual(['health']);
     expect([...wide].sort()).toEqual(['health', 'ops']);
 
     // Full sessions (password sign-in path) carry operator authority.
     const fullToken = s.mint(new Set(), { full: true });
-    expect(s.lookup(fullToken, live)!.full).toBe(true);
+    expect(s.lookup(fullToken)!.full).toBe(true);
   });
 });
 
@@ -970,17 +902,25 @@ describe('WebUiModule observer flow (e2e)', () => {
     expect(await shellStatusBecomes(401)).toBe(401);
   }, 20_000);
 
-  test("an observer whose socket can't be closed is dropped as a close drops it: its peek, its place among the clients, and anything more sent", async () => {
+  test("an observer whose socket's close throws is named, and closed at a later check while its grant stays gone", async () => {
     const kp4 = makeKeypair();
     const host = `127.0.0.1:${port}`;
     const id = 900_001;
     const sent: string[] = [];
+    const closes: number[] = [];
+    let throws = 1;
+    const m = mod as unknown as { onWsOpen(ws: unknown): void; onWsMessage(ws: unknown, msg: string): void; onWsClose(ws: unknown): void };
     const fakeWs = {
       data: { id, authed: false, host },
       send: (s: string) => { sent.push(s); return s.length; },
-      close: () => { throw new Error('socket'); },
+      // A close that succeeds runs the server's close handler inside it, as
+      // Bun's does (receipt ws-close-timing-bun-1.4.3-and-1.3.14.txt).
+      close: (code?: number) => {
+        if (throws-- > 0) throw new Error('socket');
+        closes.push(code!);
+        m.onWsClose(fakeWs);
+      },
     };
-    const m = mod as unknown as { onWsOpen(ws: unknown): void; onWsMessage(ws: unknown, msg: string): void; send(client: unknown, msg: unknown): void };
     const lines: string[] = [];
     const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
     try {
@@ -989,27 +929,14 @@ describe('WebUiModule observer flow (e2e)', () => {
       m.onWsOpen(fakeWs);
       m.onWsMessage(fakeWs, JSON.stringify({ type: 'observer-hello', identity: helloFor(kp4, host) }));
       await waitUntil(() => sent.some((s) => (JSON.parse(s) as { type: string }).type === 'observer-ack'), 5000);
-      const clients = __getSharedServerClientsForTests()!;
-      const client = clients.get(id) as { auth: string; peeks: Map<string, () => void> };
-      expect(client.auth).toBe('observer');
-      let detached = false;
-      client.peeks.set('scout', () => { detached = true; });
-      const before = sent.length;
 
       saveObserversFile(observersPath, { observers: [] });
-      await waitUntil(() => !clients.has(id), 8000);
-      expect(clients.has(id)).toBe(false);
-      expect(detached).toBe(true);
-      expect(lines).toContain("[webui-observers] observer connection couldn't be closed: unclosable (socket); it gets nothing more");
-      // Whatever was in flight for it, such as a welcome past its await or a
-      // reply, goes through send(), which now sends it nothing.
-      m.send(client, { type: 'error', message: 'late' });
-      expect(sent.length).toBe(before);
-      // What it sends finds no client, so nothing answers it: a hello here
-      // would otherwise be refused with an error, since no grant is left.
-      m.onWsMessage(fakeWs, JSON.stringify({ type: 'observer-hello', identity: helloFor(kp4, host) }));
-      await new Promise((r) => setTimeout(r, 50));
-      expect(sent.length).toBe(before);
+      await waitUntil(() => closes.length > 0, 15_000);
+      // The revoke's check named it, and a later check closed it.
+      expect(closes).toEqual([4401]);
+      expect(lines.filter((l) => l.startsWith('[webui-observers] observer connection'))).toEqual([
+        "[webui-observers] observer connection couldn't be closed: unclosable (socket); each check tries again while its grant is gone, expired or narrowed",
+      ]);
     } finally {
       spy.mockRestore();
       saveObserversFile(observersPath, { observers: [] });
