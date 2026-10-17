@@ -114,6 +114,7 @@ import { loadRecipe } from '../recipe.js';
 import {
   ObserverRegistry,
   ObserverSessions,
+  closeConnectionsWithoutGrant,
   sessionTokenFromRequest,
   traceRequiredScope,
   filterEntryForScopes,
@@ -213,6 +214,10 @@ interface ClientState {
   /** Observer grant label (key-authenticated clients) — the requester name
    *  recorded in the operator log for any action this client takes. */
   label?: string;
+  /** The grant a key-authenticated client connected with; each check of the
+   *  grants file closes the connection once that grant is gone, expired or
+   *  narrowed. */
+  observerKey?: string;
   /** Kills pending connections that never complete the hello. */
   authTimer?: ReturnType<typeof setTimeout>;
   /** Open peek subscriptions for this client, keyed by scope. Each entry
@@ -470,7 +475,17 @@ export class WebUiModule implements Module {
       fleetEventDetacher: null,
       messageListenerDetacher: null,
     };
-    state.observers?.start();
+    // Each check also ends the sessions of grants that are gone or expired,
+    // narrows the rest, and closes the open connections of grants that are
+    // gone, expired or narrowed.
+    const observers = state.observers;
+    observers?.start(() => {
+      const ended = state.observerSessions.narrowToGrants((key) => observers.liveScopes(key));
+      const closed = closeConnectionsWithoutGrant(state.clients.values(), observers);
+      if (closed > 0 || ended > 0) {
+        console.error(`[webui-observers] closed ${closed} observer connection(s) whose grant is gone, expired or narrowed, and ended ${ended} observer session(s) whose grant is gone, expired or keeps none of their scopes`);
+      }
+    });
     state.server = Bun.serve({
       port,
       hostname: host,
@@ -1532,10 +1547,11 @@ export class WebUiModule implements Module {
     client.auth = 'observer';
     client.scopes = result.scopes;
     client.label = result.grant.label;
+    client.observerKey = result.grant.key;
     this.send(client, {
       type: 'observer-ack',
       scopes: [...result.scopes],
-      sessionToken: sharedServer!.observerSessions.mint(result.scopes),
+      sessionToken: sharedServer!.observerSessions.mint(result.scopes, { key: result.grant.key }),
       label: result.grant.label,
     });
     console.error(`[webui-observers] observer connected: ${result.grant.label} scopes=[${[...result.scopes].join(',')}]`);
@@ -3798,6 +3814,8 @@ export function __getSharedServerPortForTests(): number | null {
 export async function __resetSharedServerForTests(): Promise<void> {
   if (!sharedServer) return;
   try { sharedServer.server.stop(true); } catch { /* ignore */ }
+  // The grants file's checks, and the sweep that runs after each, end too.
+  sharedServer.observers?.stop();
   // Detach any fleet listener / aggregator so the next start runs clean.
   sharedServer.fleetEventDetacher?.();
   sharedServer.treeAggregator?.dispose();
