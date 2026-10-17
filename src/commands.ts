@@ -827,19 +827,24 @@ function handleLessons(framework: AgentFramework): CommandResult {
 /** Export lessons to ./output/ as JSON and markdown. Called by /export and on quit. */
 export function handleExport(app: AppContext): CommandResult {
   const modules = app.framework.getAllModules();
+  type Readable = { id: string; content: string; confidence: number; tags: string[]; evidence: string[]; created: number; updated: number; deprecated: boolean; deprecationReason?: string };
   const lessonsModule = modules.find(m => m.name === 'lessons') as
-    { getLessons(): Array<{ id: string; content: string; confidence: number; tags: string[]; evidence: string[]; created: number; updated: number; deprecated: boolean; deprecationReason?: string }> } | undefined;
+    { getLessonRecords(): Array<{ stored: unknown; lesson: Readable; needsFix?: string }> } | undefined;
 
   if (!lessonsModule) {
     return { lines: [{ text: 'Lessons module not loaded — nothing to export.', style: 'system' }] };
   }
 
-  const lessons = lessonsModule.getLessons();
-  if (lessons.length === 0) {
+  const records = lessonsModule.getLessonRecords();
+  if (records.length === 0) {
     return { lines: [{ text: 'No lessons to export.', style: 'system' }] };
   }
 
-  const active = lessons.filter(l => !l.deprecated);
+  // The JSON is data, read back or kept, so it holds the lessons as stored.
+  // The markdown is for reading: each lesson as it's ranked, with the mark
+  // the agent's list gives one that needs fixing.
+  const lessons = records.map(r => r.stored);
+  const active = records.filter(r => !r.lesson.deprecated);
   const outDir = resolve('./output');
   mkdirSync(outDir, { recursive: true });
 
@@ -857,10 +862,10 @@ export function handleExport(app: AppContext): CommandResult {
 
   // Markdown summary grouped by tag
   const tagMap = new Map<string, typeof active>();
-  for (const l of active) {
-    for (const tag of l.tags.length ? l.tags : ['untagged']) {
+  for (const r of active) {
+    for (const tag of r.lesson.tags.length ? r.lesson.tags : ['untagged']) {
       if (!tagMap.has(tag)) tagMap.set(tag, []);
-      tagMap.get(tag)!.push(l);
+      tagMap.get(tag)!.push(r);
     }
   }
 
@@ -871,10 +876,11 @@ export function handleExport(app: AppContext): CommandResult {
 
   for (const [tag, tagLessons] of [...tagMap.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     md += `## ${tag}\n\n`;
-    for (const l of tagLessons.sort((a, b) => b.confidence - a.confidence)) {
+    for (const { lesson: l, needsFix } of tagLessons.sort((a, b) => b.lesson.confidence - a.lesson.confidence)) {
       const conf = (l.confidence * 100).toFixed(0);
       md += `- **[${conf}%]** ${l.content}`;
       if (l.evidence.length) md += `  \n  _Sources: ${l.evidence.join(', ')}_`;
+      if (needsFix) md += `  \n  _${needsFix}_`;
       md += '\n';
     }
     md += '\n';
