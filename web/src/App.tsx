@@ -21,6 +21,7 @@ import {
   type OpsAlert, type HealthSnapshot, type CredentialInfo, type CredentialAction,
 } from './Health';
 import { BranchPanel } from './Branches';
+import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
 import {
   WEB_PROTOCOL_VERSION,
@@ -312,7 +313,7 @@ export function App() {
       if ((q.count ?? 0) > 0) {
         if (!opsAlerts().has(key)) {
           upsertOpsAlert('compression-quarantine', agent,
-            `${q.count} chunk(s) in compression quarantine — spans stay raw and will eventually exhaust the context budget.`,
+            `${quarantineHeld(q)} — spans stay raw and will eventually exhaust the context budget.`,
             false);
         }
       } else {

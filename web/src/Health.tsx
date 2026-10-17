@@ -19,6 +19,7 @@
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
 import { healthEntry } from '@conhost/web/health-lookup';
+import { quarantineHeld } from '@conhost/web/quarantine-alert';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -111,7 +112,9 @@ export interface HealthSnapshot {
       lastCategory?: string;
     } | null;
   }>;
-  compressionQuarantine?: Record<string, { count?: number; keys?: string[] }>;
+  /** Each agent's quarantine status: records (`count`) and their keys, and the
+   *  quarantined spans (`spans`) when context-manager lists them. */
+  compressionQuarantine?: Record<string, { count?: number; keys?: string[]; spans?: unknown[] }>;
 
   /** cm's single-authority debt reduction (getCompressionDebt) — the QUEUE
 
@@ -553,7 +556,7 @@ export function HealthPanel(props: {
 
             <Show when={quarantine(a.name) && (quarantine(a.name)!.count ?? 0) > 0}>
               <div class="text-rose-300 bg-rose-950/30 border border-rose-900/50 rounded px-2 py-1">
-                ⚠ {quarantine(a.name)!.count} chunk(s) in compression quarantine — raw spans
+                ⚠ {quarantineHeld(quarantine(a.name)!)} — raw spans
                 accumulate until the window can't fit. Inspect, then branch, pin, or clear.
                 <Show when={(quarantine(a.name)!.keys?.length ?? 0) > 0}>
                   <div class="text-rose-400/70 truncate" title={quarantine(a.name)!.keys!.join(', ')}>
