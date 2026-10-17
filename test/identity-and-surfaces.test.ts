@@ -19,6 +19,18 @@ import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
 import { ObserversModule } from '../src/modules/observers-module.ts';
 
 const REQUEST_BODY_MAX_FOR_TEST = 256 * 1024;
+
+// Temporary directories and stores a test makes are removed after it, passed
+// or failed, so a run leaves none behind.
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0).reverse()) cleanup();
+});
+function tempDir(prefix: string): string {
+  const dir = mkdtempSync(join(tmpdir(), prefix));
+  cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+  return dir;
+}
 const call = (name: string, input: unknown) => ({ id: 't1', name, input });
 
 function fakeHome(routes: Record<string, (body: any) => { status: number; json: unknown }>): typeof fetch {
@@ -34,7 +46,7 @@ function fakeHome(routes: Record<string, (body: any) => { status: number; json: 
 
 describe('identity module', () => {
   it('is utilities-only, and the agent surface never mentions or returns credentials', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     const mod = new IdentityModule({ keyPath: join(dir, 'identity-key.pem'), home: 'id.test' });
     expect(mod.getTools()).toEqual([]);
     expect(mod.getUtilities().map((u) => u.name)).toEqual(['status', 'request', 'accept_invite']);
@@ -54,7 +66,7 @@ describe('identity module', () => {
   });
 
   it('accept_invite registers, echoes NO credential, and is one-time', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     let seen: any = null;
     const mod = new IdentityModule({
       keyPath: join(dir, 'k.pem'),
@@ -91,7 +103,7 @@ describe('identity module', () => {
 
 
   it('request: allowlisted service, host-attached access, no credential in result', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     let authSeen = '';
     const mod = new IdentityModule({
       keyPath: join(dir, 'k.pem'),
@@ -129,7 +141,7 @@ describe('identity module', () => {
   });
 
   it('request: services come from the home node directory, and a newly-listed one works without a restart', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     // The archipelago's service list lives at the home node, not in this host.
     // It changes underneath us mid-run: `music` is added after the module has
     // already fetched and cached a directory without it.
@@ -174,7 +186,7 @@ describe('identity module', () => {
   });
 
   it('request: a home node that cannot be reached degrades to the built-in map, never to an outage', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     const mod = new IdentityModule({
       keyPath: join(dir, 'k.pem'),
       home: 'id.test',
@@ -194,7 +206,7 @@ describe('identity module', () => {
   });
 
   it('request: fromFile uploads a workspace file byte-exactly, without the bytes touching context', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     // A file far larger than the JSON body cap — the case that made this exist.
     const audio = Buffer.alloc(REQUEST_BODY_MAX_FOR_TEST + 4096, 0);
     audio.write('ID3', 0);
@@ -259,7 +271,7 @@ describe('identity module', () => {
   });
 
   it('request: every writing method carries a JSON body or a workspace file; GET carries neither', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
     const sent: Array<{ url: string; method: string; type: string; auth: string; body: unknown }> = [];
     const workspace = {
@@ -375,7 +387,7 @@ describe('identity module', () => {
   });
 
   it('request: binary responses are described safely or saved byte-exactly to workspace', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00, 0x7f]);
     let saved: { path: string; data: Buffer; mime: string } | null = null;
     const mod = new IdentityModule({
@@ -419,7 +431,7 @@ describe('identity module', () => {
   });
 
   it('host-facing accessFor: requires registration, then exchanges per call', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     let mints = 0;
     const mod = new IdentityModule({
       keyPath: join(dir, 'k.pem'),
@@ -495,7 +507,7 @@ function registeredModule(opts: {
   workspace?: unknown;
   register?: boolean;
 } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+  const dir = tempDir('ident-');
   const seen = { orrery: 0, bodies: [] as Buffer[] };
   const mod = new IdentityModule({
     keyPath: join(dir, 'k.pem'),
@@ -785,7 +797,7 @@ describe('identity: what the agent reads when a call fails', () => {
   // written straight through the workspace's write, so the two verdicts are
   // compared form by form.
   it("sends every saveAs the workspace's write accepts, and nothing it would refuse", async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-saveas-'));
+    const dir = tempDir('ident-saveas-');
     mkdirSync(join(dir, 'files'));
     mkdirSync(join(dir, 'docs'));
     const workspace = new WorkspaceModule({
@@ -794,7 +806,9 @@ describe('identity: what the agent reads when a call fails', () => {
         { name: 'docs', path: join(dir, 'docs'), mode: 'read-only', watch: 'never' },
       ],
     });
-    workspace.initStore(JsStore.openOrCreate({ path: join(dir, 'store') }));
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    cleanups.push(() => store.close?.());
+    workspace.initStore(store);
     const { mod, ready, seen } = registeredModule({ workspace });
     await ready;
     // Each form names a file no other form does, so no form's save decides another's.
@@ -1209,7 +1223,7 @@ describe('identity: what the agent reads when a call fails', () => {
       return real(20);
     });
     try {
-      const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+      const dir = tempDir('ident-');
       const mod = new IdentityModule({
         keyPath: join(dir, 'k.pem'),
         home: 'id.test',
@@ -1350,7 +1364,7 @@ describe('identity: what the agent reads when a call fails', () => {
   // A key file that can't be read is the host's to fix; the log has why, and
   // the agent gets neither its words nor its code, since it can't act on them.
   it("says a failure before anything is sent is the host's, without its paths", async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-'));
+    const dir = tempDir('ident-');
     writeFileSync(join(dir, 'k.pem'), 'not a key at all');
     const mod = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
     const res = await mod.handleToolCall(call('status', {}));
@@ -1369,7 +1383,7 @@ describe('identity: what the agent reads when a call fails', () => {
 
 describe('mcpl-admin access grants', () => {
   it('deploy with `access` requires identity wiring, and stores the NAME not a credential', async () => {
-    const dir = mkdtempSync(join(tmpdir(), 'mcpl-'));
+    const dir = tempDir('mcpl-');
     const mod = new McplAdminModule({ overlayPath: join(dir, 'overlay.json') });
     // stub framework so the deploy reaches the access check
     mod.setFramework({
@@ -1402,7 +1416,7 @@ describe('mcpl-admin access grants', () => {
 
 describe('observers surface flag', () => {
   it('same definitions on either surface', () => {
-    const dir = mkdtempSync(join(tmpdir(), 'obs-'));
+    const dir = tempDir('obs-');
     const asTools = new ObserversModule({ path: join(dir, 'observers.json') });
     const asUtils = new ObserversModule({ path: join(dir, 'observers.json'), surface: 'utilities' });
     expect(asTools.getTools().map((t) => t.name)).toEqual(asUtils.getUtilities().map((u) => u.name));
@@ -1422,23 +1436,15 @@ describe('observers surface flag', () => {
 describe('identity request: fromFile reads only what the mount allows', () => {
   const CAP = 64 * 1024 * 1024;
 
-  // Each fixture's teardown, registered as it makes its tree and store, and
-  // run after every test, passed or failed: the store closed, the tree removed.
-  const teardowns: Array<() => void> = [];
-  afterEach(() => {
-    for (const teardown of teardowns.splice(0).reverse()) teardown();
-  });
-
   async function mounted(opts: { followSymlinks?: boolean } = {}) {
-    const dir = mkdtempSync(join(tmpdir(), 'ident-mount-'));
-    teardowns.push(() => rmSync(dir, { recursive: true, force: true }));
+    const dir = tempDir('ident-mount-');
     const mountDir = join(dir, 'files');
     const outside = join(dir, 'outside');
     mkdirSync(mountDir);
     mkdirSync(outside);
     writeFileSync(join(outside, 'host-secret.txt'), 'the host\'s own file');
     const store = JsStore.openOrCreate({ path: join(dir, 'store') });
-    teardowns.push(() => store.close?.());
+    cleanups.push(() => store.close?.());
     const workspace = new WorkspaceModule({
       mounts: [{ name: 'files', path: mountDir, mode: 'read-write', watch: 'never', ...(opts.followSymlinks ? { followSymlinks: true } : {}) }],
     });
