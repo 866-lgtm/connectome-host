@@ -260,7 +260,18 @@ export class CallLedger {
         }
       }
     }
-    calls.sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+    // A call whose time can't be read sorts first, the rest in time order:
+    // a comparator that answered NaN for it would leave the calls around it
+    // out of order, and a lineage's clock could then step backwards.
+    const at = (call: ProviderCallRecord): number => {
+      const time = Date.parse(call.timestamp);
+      return Number.isFinite(time) ? time : -Infinity;
+    };
+    calls.sort((a, b) => {
+      const x = at(a);
+      const y = at(b);
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
     // The rows kept are the newest, but every call read is its lineage's
     // cache activity, as it was for the process that logged it.
     const kept = Math.max(0, calls.length - this.maxRows);

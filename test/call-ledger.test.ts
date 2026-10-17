@@ -207,6 +207,29 @@ describe('CallLedger cache gaps by lineage', () => {
     }
   });
 
+  test("a reload keeps its calls in time order around a call whose time can't be read", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'call-ledger-order-'));
+    try {
+      const row = (timestamp: string, usage: Record<string, number>) => JSON.stringify({
+        type: 'call', kind: 'stream', timestamp, durationMs: 1000,
+        requestSummary: { model: 'claude-fable-5', messages: 10, cacheBreakpoints: 4, cacheTtls: ['1h', '1h', '1h', '1h'], lineage: 'a' },
+        rawResponse: { stop_reason: 'end_turn', usage: { input_tokens: 2, output_tokens: 100, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ...usage } },
+      });
+      // In file order, a read at 3500 s, a row whose time can't be read, a
+      // write at 0 and a write at 3800: the last is measured from the read.
+      writeFileSync(join(dir, 'llm-calls.test.jsonl'), [
+        row(at(3500), { cache_read_input_tokens: 80_000 }),
+        row('not a time', { cache_read_input_tokens: 80_000 }),
+        row(at(0), { cache_creation_input_tokens: 100_000 }),
+        row(at(3800), { cache_creation_input_tokens: 100_000 }),
+      ].join('\n') + '\n');
+      const rows = new CallLedger({ dataDir: dir, defaultTtl: '1h' }).snapshot().rows;
+      expect(rows.at(-1)).toMatchObject({ verdict: 'rewrite:unexplained', cause: 'cache miss inside ttl (300s <= 3600s); prefix changed or was truncated' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   test('a call whose time can\'t be read leaves the clocks where they were', () => {
     const ledger = new CallLedger({ hydrate: false, defaultTtl: '1h' });
     ledger.record(call({ timestamp: at(0), lineage: 'a', cacheWriteTokens: 100_000 }));
