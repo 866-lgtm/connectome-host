@@ -159,6 +159,13 @@ function watchWaits(sub: SubagentModule): Array<{ ms: number; endedBy?: 'cancel'
   };
   return waits;
 }
+/** The reasons of the promise rejections nothing handled while it watched. */
+function watchUnhandled(): { reasons: unknown[]; stop(): void } {
+  const reasons: unknown[] = [];
+  const record = (reason: unknown) => { reasons.push(reason); };
+  process.on('unhandledRejection', record);
+  return { reasons, stop: () => { process.off('unhandledRejection', record); } };
+}
 /** The settled outcome of an async subagent, from its handle. */
 async function outcome(h: Harness, name: string): Promise<{ ok: boolean; text: string }> {
   const handle = internal(h.subagent).asyncHandles.get(name);
@@ -911,34 +918,41 @@ describe('a cancel reaches the whole run', () => {
     } finally { await h.cleanup(); }
   }, 20_000);
 
-  test('cancelling a subagent that has retried reaches the children its earlier attempt spawned', async () => {
-    let leadAttempts = 0;
-    let h!: Harness;
-    h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
-      if (agent.name.startsWith('spawn-lead-')) {
-        if (++leadAttempts === 1) {
-          await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
-          throw new Error('503 overloaded');
+  for (const call of [spawn, fork]) {
+    test(`cancelling a ${call.name} that has retried reaches the children its earlier attempt spawned`, async () => {
+      const isLead = (agentName: string) => agentName.startsWith(call === spawn ? 'spawn-lead-' : 'lead-d');
+      let leadAttempts = 0;
+      let h!: Harness;
+      h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
+        if (isLead(agent.name)) {
+          if (++leadAttempts === 1) {
+            await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
+            throw new Error('503 overloaded');
+          }
+          return new Promise(() => { /* the retry runs until cancelled */ });
         }
-        return new Promise(() => { /* the retry runs until cancelled */ });
-      }
-      return new Promise(() => { /* the child runs until cancelled */ });
-    });
-    internal(h.subagent).waitOrStop = async () => null; // retry at once
-    try {
-      await h.subagent.handleToolCall(spawn('lead'));
-      await until(() => leadAttempts === 2 && h.running('child'));
-      let childText: string | undefined;
-      void outcome(h, 'child').then((o) => { childText = o.text; });
-      const lead = outcome(h, 'lead');
-      expect(h.subagent.cancelSubagent('lead')).toBe(true);
-      await until(() => childText !== undefined);
-      expect(childText).toStartWith('[Stopped by user]');
-      expect((await lead).text).toStartWith('[Stopped by user]');
-    } finally { await h.cleanup(); }
-  }, 20_000);
+        return new Promise(() => { /* the child runs until cancelled */ });
+      });
+      internal(h.subagent).waitOrStop = async () => null; // retry at once
+      try {
+        await h.subagent.handleToolCall(call('lead'));
+        await until(() => leadAttempts === 2 && h.running('child'));
+        let childText: string | undefined;
+        void outcome(h, 'child').then((o) => { childText = o.text; });
+        const lead = outcome(h, 'lead');
+        expect(h.subagent.cancelSubagent('lead')).toBe(true);
+        await until(() => childText !== undefined);
+        expect(childText).toStartWith('[Stopped by user]');
+        expect((await lead).text).toStartWith('[Stopped by user]');
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
 
   test('cancelling a subagent in its back-off reaches the children its earlier attempt spawned', async () => {
+    // The earlier attempt is still live in its back-off (its catch waits
+    // before its finally unregisters it), so a lookup through live attempts
+    // reached this child too; the next test's window is the one only the
+    // index of every attempt covers.
     let leadAttempts = 0;
     let h!: Harness;
     h = await harness({ maxConcurrent: 3, maxRetries: 1 }, async (agent) => {
@@ -960,6 +974,7 @@ describe('a cancel reaches the whole run', () => {
       await until(() => childText !== undefined);
       expect(childText).toStartWith('[Stopped by user]');
       expect((await lead).text).toStartWith('[Stopped by user]');
+      expect(waits).toEqual([{ ms: 5000, endedBy: 'cancel' }]);
       expect(leadAttempts).toBe(1);
     } finally { await h.cleanup(); }
   }, 20_000);
@@ -1003,21 +1018,24 @@ describe('a cancel reaches the whole run', () => {
     } finally { await h.cleanup(); }
   }, 20_000);
 
-  test('a child whose wait for a slot times out leaves no parent link', async () => {
-    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
-    const sub = internal(h.subagent);
-    const acquire = sub.acquireSlot.bind(h.subagent);
-    sub.acquireSlot = (_slotTimeoutMs?: number, cancelled?: Promise<never>) => acquire(50, cancelled);
-    try {
-      await h.subagent.handleToolCall(spawn('lead'));
-      await until(() => h.running('lead'));
-      const lead = sub.liveSubagents.get('lead')!.frameworkAgentName;
-      await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: lead });
-      const child = await outcome(h, 'child');
-      expect(child.text).toContain('Timed out waiting for a concurrency slot');
-      expect(sub.parentMap.has('child')).toBe(false);
-    } finally { await h.cleanup(); }
-  }, 20_000);
+  for (const call of [spawn, fork]) {
+    test(`a child ${call.name} whose wait for a slot times out leaves no parent link`, async () => {
+      const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+      const sub = internal(h.subagent);
+      const acquire = sub.acquireSlot.bind(h.subagent);
+      sub.acquireSlot = (_slotTimeoutMs?: number, cancelled?: Promise<never>) => acquire(50, cancelled);
+      try {
+        await h.subagent.handleToolCall(spawn('lead'));
+        await until(() => h.running('lead'));
+        const lead = sub.liveSubagents.get('lead')!.frameworkAgentName;
+        await h.subagent.handleToolCall({ ...call('child'), callerAgentName: lead });
+        expect(sub.parentMap.get('child')).toBe(lead); // taken as it queued
+        const child = await outcome(h, 'child');
+        expect(child.text).toContain('Timed out waiting for a concurrency slot');
+        expect(sub.parentMap.has('child')).toBe(false);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
 
   test('a run leaves no cancel behind, so a second cancel finds nothing', async () => {
     const h = await harness({ maxRetries: 0 }, (agent) => (agent.name.startsWith('spawn-quick-')
@@ -1174,24 +1192,26 @@ describe('a name means one subagent until its result has come back', () => {
     } finally { await h.cleanup(); }
   }, 20_000);
 
-  test("a retry doesn't report a result an earlier attempt returned before it failed", async () => {
-    let attempts = 0;
-    let h!: Harness;
-    h = await harness({ maxRetries: 1 }, async () => {
-      if (++attempts === 1) {
-        internal(h.subagent).callIdIndex.set('ret-1', 'scout');
-        await h.subagent.handleToolCall({ id: 'ret-1', name: 'return', input: { result: 'stale' } });
-        throw new Error('503 overloaded');
-      }
-      return ran('fresh');
-    });
-    internal(h.subagent).waitOrStop = async () => null; // retry at once
-    try {
-      await h.subagent.handleToolCall(spawn('scout'));
-      expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'fresh' });
-      expect(attempts).toBe(2);
-    } finally { await h.cleanup(); }
-  }, 20_000);
+  for (const call of [spawn, fork]) {
+    test(`a ${call.name}'s retry doesn't report a result an earlier attempt returned before it failed`, async () => {
+      let attempts = 0;
+      let h!: Harness;
+      h = await harness({ maxRetries: 1 }, async () => {
+        if (++attempts === 1) {
+          internal(h.subagent).callIdIndex.set('ret-1', 'scout');
+          await h.subagent.handleToolCall({ id: 'ret-1', name: 'return', input: { result: 'stale' } });
+          throw new Error('503 overloaded');
+        }
+        return ran('fresh');
+      });
+      internal(h.subagent).waitOrStop = async () => null; // retry at once
+      try {
+        await h.subagent.handleToolCall(call('scout'));
+        expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'fresh' });
+        expect(attempts).toBe(2);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
 
   test('a new run under a name starts with none of the last run\'s leftovers', async () => {
     const h = await harness({ maxRetries: 0 }, async () => ran('done'));
@@ -1207,6 +1227,37 @@ describe('a name means one subagent until its result has come back', () => {
       expect(sub.lastInputTokens.has('scout')).toBe(false);
     } finally { await h.cleanup(); }
   }, 20_000);
+
+  for (const call of [spawn, fork]) {
+    test(`a cancel of a new ${call.name} under a name doesn't reach a child the name's last run left running`, async () => {
+      const isLead = (agentName: string) => agentName.startsWith(call === spawn ? 'spawn-lead-' : 'lead-d');
+      let leadRuns = 0;
+      let h!: Harness;
+      h = await harness({ maxConcurrent: 3, maxRetries: 0 }, async (agent) => {
+        if (isLead(agent.name)) {
+          if (++leadRuns === 1) {
+            await h.subagent.handleToolCall({ ...spawn('child'), callerAgentName: agent.name });
+            return ran('done');
+          }
+          return new Promise(() => { /* the second run under the name runs until cancelled */ });
+        }
+        return new Promise(() => { /* the child runs until cancelled */ });
+      });
+      const sub = internal(h.subagent);
+      try {
+        await h.subagent.handleToolCall(call('lead'));
+        await until(() => h.running('child') && !sub.asyncHandles.has('lead')); // the first run's result has come back
+        expect((await h.subagent.handleToolCall(call('lead'))).success).toBe(true);
+        await until(() => leadRuns === 2);
+        const lead = outcome(h, 'lead');
+        expect(h.subagent.cancelSubagent('lead')).toBe(true);
+        expect((await lead).text).toStartWith('[Stopped by user]');
+        // The child is the last run's, so this run's cancel left it, and its
+        // own cancel still finds it.
+        expect(h.subagent.cancelSubagent('child')).toBe(true);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
 
   for (const stuck of ['creating its agent', 'compiling its prompt'] as const) {
     test(`a cancel ends a run whose setup never finishes ${stuck}, and frees its name`, async () => {
@@ -1258,6 +1309,55 @@ describe('a name means one subagent until its result has come back', () => {
       } finally { await h.cleanup(); }
     }, 20_000);
   }
+
+  test('a creation that fails after its run was cancelled leaves nothing to give back, and raises nothing', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+    const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<unknown> };
+    let fail!: () => void;
+    fw.createEphemeralAgent = () => new Promise((_resolve, reject) => {
+      // Creation fails only when the test says, after the cancel.
+      fail = () => reject(new Error('creation failed late'));
+    });
+    const delivered = deliveries(h);
+    const unhandled = watchUnhandled();
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => fail !== undefined);
+      expect(h.subagent.cancelSubagent('scout')).toBe(true);
+      await until(() => delivered.requests.length === 1);
+      expect(delivered.messages.at(-1)).toStartWith("[Subagent 'scout' returned]\n\n[Stopped by user]");
+      fail();
+      await sleep(20); // an unhandled rejection is reported once the turn it happens in has ended
+      expect(unhandled.reasons).toEqual([]);
+      expect(delivered.requests.length).toBe(1);
+    } finally { unhandled.stop(); await h.cleanup(); }
+  }, 20_000);
+
+  test('a cleanup that throws as an agent is given back is logged, naming the run, and raises nothing', async () => {
+    const h = await harness({ maxRetries: 0 }, async () => ran('ran'));
+    const fw = h.framework as unknown as { createEphemeralAgent: (c: unknown) => Promise<{ cleanup: () => void }> };
+    const create = fw.createEphemeralAgent.bind(fw);
+    let finish!: () => void;
+    let cleanups = 0;
+    fw.createEphemeralAgent = (c) => new Promise((resolve, reject) => {
+      finish = () => create(c).then((created) => resolve({ ...created, cleanup: () => { cleanups++; throw new Error('the store refused'); } }), reject);
+    });
+    const delivered = deliveries(h);
+    const unhandled = watchUnhandled();
+    const lines: string[] = [];
+    const spy = spyOn(console, 'error').mockImplementation((...args: unknown[]) => { lines.push(args.join(' ')); });
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      await until(() => finish !== undefined);
+      expect(h.subagent.cancelSubagent('scout')).toBe(true);
+      await until(() => delivered.requests.length === 1);
+      finish();
+      await until(() => cleanups === 1);
+      await sleep(20); // an unhandled rejection is reported once the turn it happens in has ended
+      expect(lines.filter((l) => l.includes('giving back'))).toEqual(['[subagent] scout: giving back an agent created after its run was stopped failed: the store refused']);
+      expect(unhandled.reasons).toEqual([]);
+    } finally { spy.mockRestore(); unhandled.stop(); await h.cleanup(); }
+  }, 20_000);
 
   test('a reclaim ends a run whose setup never finishes compiling its prompt, and frees its name', async () => {
     const h = await harness({ maxRetries: 0 }, async () => ran('ran'));

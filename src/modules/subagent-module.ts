@@ -1440,8 +1440,9 @@ export class SubagentModule implements Module {
   }
 
   /** The direct children of the run named: the parentMap entries whose
-   *  parent is its framework agent, queued children included, since a run
-   *  takes its parent link when it queues. */
+   *  parent is the framework agent of any of its attempts (runOfAttempt),
+   *  queued children included, since a run takes its parent link when it
+   *  queues. */
   private childrenOf(displayName: string): string[] {
     const children: string[] = [];
     for (const [childName, parentFrameworkName] of this.parentMap) {
