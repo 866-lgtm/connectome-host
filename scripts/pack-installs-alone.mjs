@@ -8,9 +8,9 @@
 // is, and no dependency in package-lock.json has one. Build the Web UI
 // first (`npm run build:web:ci`). It checks:
 //   1. the package carries the Web UI, dist/web/index.html and every local
-//      file its src and href attributes name, and tsconfig.json, with which
-//      a consumer typechecks the TypeScript source the package ships, as
-//      connectome-smoke's published lane does;
+//      file its quoted src and href attributes name, as vite writes them,
+//      and tsconfig.json, with which a consumer typechecks the TypeScript
+//      source the package ships, as connectome-smoke's published lane does;
 //   2. `bun build` resolves src/index.ts's static imports, and its dynamic
 //      ones with a literal specifier, in the installed tree, on paths a run
 //      doesn't reach too (a recipe extension, loaded by a computed path, isn't
@@ -91,9 +91,9 @@ function packedButIgnored(paths) {
   return result.stdout.split("\0").filter((path) => path !== "" && !path.startsWith(`${dirname(WEB_UI)}/`));
 }
 
-/** The local files a built index.html names in its src and href
- *  attributes, as paths under its own directory: URLs with a scheme or a
- *  host, and anchors, aside. */
+/** The local files a built index.html names in its quoted src and href
+ *  attributes, as vite writes them, as paths under its own directory:
+ *  URLs with a scheme or a host, and anchors, aside. */
 function webAssets(html) {
   const refs = [...html.matchAll(/\b(?:src|href)\s*=\s*["']([^"'#?]*)/gi)].map((match) => match[1]);
   return [...new Set(refs.filter((ref) => ref !== "" && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(ref)).map((ref) => ref.replace(/^\.?\//, "")))];

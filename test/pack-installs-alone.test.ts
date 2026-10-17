@@ -49,7 +49,7 @@ function standIn(pkg: Record<string, unknown>, index = HOST, extra: Record<strin
     "src/index.ts": index,
     "src/helper.ts": "export const helper = (line: string): string => line;\n",
     "recipes/mock-test.json": JSON.stringify({ name: "Mock", agent: { name: "zz-agent" }, modules: { wake: false, webui: { host: "127.0.0.1" } } }),
-    "dist/web/index.html": '<!doctype html>\n<link rel="stylesheet" href="/assets/app.css">\n<script type="module" src="./assets/app.js"></script>\n<a href="https://example.invalid/">x</a><a href="#top">top</a>\n',
+    "dist/web/index.html": '<!doctype html>\n<link rel="stylesheet" href="/assets/app.css">\n<script type="module" src="./assets/app.js"></script>\n<script src="//cdn.example.invalid/x.js"></script>\n<a href="https://example.invalid/">x</a><a href="#top">top</a>\n',
     "dist/web/assets/app.css": "body {}\n",
     "dist/web/assets/app.js": "export {};\n",
     ...extra,
@@ -325,10 +325,12 @@ test("an install that fails once and then succeeds passes on its second attempt"
 test("an install that runs out of time, even one that ignores SIGTERM, fails at once, saying so, without another attempt", async () => {
   const slow = npmShim(`if (args[0] === "install") { process.on("SIGTERM", () => {}); setTimeout(() => {}, 90_000); }\nelse pass();`);
   const start = Date.now();
-  const result = await check(standIn({}), { ...withPath(slow), PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "2000" });
+  // The real npm pack runs under this limit too, so it leaves pack room on a
+  // loaded runner.
+  const result = await check(standIn({}), { ...withPath(slow), PACK_INSTALLS_ALONE_INSTALL_TIMEOUT_MS: "10000" });
   assert.ok(Date.now() - start < 60_000, `took ${Date.now() - start} ms`);
   assert.equal(result.code, 1);
-  assert.match(result.stderr, /pack-installs-alone: the install of zz-host-1\.0\.0\.tgz didn't finish within 2 s\.\n$/);
+  assert.match(result.stderr, /pack-installs-alone: the install of zz-host-1\.0\.0\.tgz didn't finish within 10 s\.\n$/);
   assert.doesNotMatch(result.stderr, /attempt 1 of 3/);
 }, TIMEOUT_MS * 2);
 
