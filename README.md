@@ -34,7 +34,7 @@ the host is put together is in [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Quick start
 
 ```bash
-# Prerequisites: Bun and Node.js 20+ (Node builds the web UI), plus credentials
+# Prerequisites: Bun 1.4.3+ and Node.js 22.12+ (Node builds the web UI), plus credentials
 export ANTHROPIC_API_KEY=sk-ant-...     # or ANTHROPIC_AUTH_TOKEN (Claude subscription)
 
 bun install                                   # also builds the web UI bundle
@@ -561,7 +561,7 @@ are one free-form curated document, always present verbatim.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) runs the host; [Node.js](https://nodejs.org/) 20+ and npm build the web UI
+- [Bun](https://bun.sh/) 1.4.3+ runs the host; [Node.js](https://nodejs.org/) 22.12+ and npm build the web UI
 - No Rust toolchain: `@animalabs/chronicle` ships prebuilt native binaries
 - Credentials for one provider: an Anthropic API key, a Claude subscription
   OAuth token (`claude setup-token`), an OpenAI or OpenRouter key, AWS

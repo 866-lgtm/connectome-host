@@ -18,7 +18,7 @@
  * - A run not started by its deadline is dropped by the framework and
  *   reported as the time limit; one whose setup outlasts it isn't started.
  */
-import { describe, test, expect, spyOn } from 'bun:test';
+import { describe, test, expect, spyOn, afterEach } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -128,11 +128,12 @@ function fork(name: string, extra: Record<string, unknown> = {}): ToolCall {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Wait for what a step brings about rather than for a set time, and fail
- *  if it doesn't come. */
+ *  if it doesn't come. Timed by performance.now(), which a test that holds
+ *  Date.now doesn't stop. */
 async function until(done: () => boolean, ms = 10_000): Promise<void> {
-  const end = Date.now() + ms;
+  const end = performance.now() + ms;
   while (!done()) {
-    if (Date.now() >= end) throw new Error(`not brought about within ${ms} ms`);
+    if (performance.now() >= end) throw new Error(`not brought about within ${ms} ms`);
     await sleep(10);
   }
 }
@@ -1446,4 +1447,94 @@ describe('a name means one subagent until its result has come back', () => {
       expect((await h.subagent.handleToolCall(spawn('scout'))).success).toBe(true);
     } finally { await h.cleanup(); }
   }, 20_000);
+});
+
+describe('with the clock held, agent names stay new to agent-framework, and until() still gives up', () => {
+  // agent-framework refuses to create an agent under a name it has seen in
+  // the framework's life. These cases hold the clock, so every attempt in
+  // them starts in the same millisecond, and the clock is given back after
+  // each case, one that times out included.
+  const realNow = Date.now;
+  const holdClock = (now = realNow()) => { Date.now = () => now; };
+  afterEach(() => { Date.now = realNow; });
+  const ran = (speech: string) => ({ speech, toolCallsCount: 0 });
+  /** The number an agent name ends in. */
+  const stampOf = (agentName: string) => Number(/-(\d+)$/.exec(agentName)?.[1]);
+
+  test('until() still gives up while the clock is held', async () => {
+    holdClock();
+    let error: unknown;
+    try { await until(() => false, 50); } catch (err) { error = err; }
+    expect(String(error)).toContain('not brought about within 50 ms');
+  }, 2_000);
+
+  test('a name\'s number is the time when no earlier name has reached it', async () => {
+    // A minute past any number given so far, so the time is what decides.
+    const now = realNow() + 60_000;
+    holdClock(now);
+    const names: string[] = [];
+    const h = await harness({ maxRetries: 0 }, async (agent) => { names.push(agent.name); return ran('done'); });
+    try {
+      await h.subagent.handleToolCall(spawn('scout'));
+      expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'done' });
+      expect(names).toEqual([`spawn-scout-${now}`]);
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  for (const call of [spawn, fork]) {
+    const shapes = call === spawn
+      ? [/^spawn-scout-\d+$/, /^spawn-scout-\d+$/]
+      : [/^scout-d1-\d+$/, /^scout-d1-retry1-\d+$/];
+
+    test(`a ${call.name}'s retry starts in the same millisecond as the attempt before it`, async () => {
+      holdClock();
+      const names: string[] = [];
+      const h = await harness({ maxRetries: 1 }, async (agent) => {
+        names.push(agent.name);
+        if (names.length === 1) throw new Error('503 overloaded');
+        return ran('second');
+      });
+      internal(h.subagent).waitOrStop = async () => null; // retry at once
+      try {
+        await h.subagent.handleToolCall(call('scout'));
+        expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'second' });
+        expect(names).toHaveLength(2);
+        expect(names[0]).toMatch(shapes[0]);
+        expect(names[1]).toMatch(shapes[1]);
+        expect(stampOf(names[1])).toBeGreaterThan(stampOf(names[0]));
+      } finally { await h.cleanup(); }
+    }, 20_000);
+
+    test(`a new ${call.name} run under a name, and its retry, start in the same millisecond as the last run's`, async () => {
+      holdClock();
+      const names: string[] = [];
+      // Each run's first attempt fails and its retry gives the result.
+      const h = await harness({ maxRetries: 1 }, async (agent) => {
+        names.push(agent.name);
+        if (names.length % 2 === 1) throw new Error('503 overloaded');
+        return ran(`run ${names.length / 2}`);
+      });
+      const sub = internal(h.subagent);
+      sub.waitOrStop = async () => null; // retry at once
+      try {
+        await h.subagent.handleToolCall(call('scout'));
+        expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'run 1' });
+        await until(() => !sub.asyncHandles.has('scout')); // its result has come back
+        await h.subagent.handleToolCall(call('scout'));
+        expect(await outcome(h, 'scout')).toEqual({ ok: true, text: 'run 2' });
+        expect(names).toHaveLength(4);
+        expect(names[2]).toMatch(shapes[0]);
+        expect(names[3]).toMatch(shapes[1]);
+        const stamps = names.map(stampOf);
+        expect(stamps).toEqual([...stamps].sort((a, b) => a - b));
+        expect(new Set(stamps).size).toBe(4);
+      } finally { await h.cleanup(); }
+    }, 20_000);
+  }
+
+  // Last in the file, so what runs after it in the same process has the
+  // real clock.
+  test('the clock is the real one again after the cases that held it', () => {
+    expect(Date.now).toBe(realNow);
+  });
 });

@@ -134,9 +134,10 @@ export function resolveQuitConfirm(raw: string): QuitConfirmAction {
  * here used to cross-wire agents whose names were substrings of each other
  * (e.g. `web` / `websearch`).
  *
- * Naming schemes (see subagent-module.ts spawn/fork paths):
- *   spawn: `spawn-{name}-{ts}`
- *   fork:  `{name}-d{depth}-{ts}` / `{name}-d{depth}-retry{n}-{ts}` — no
+ * Naming schemes (see subagent-module.ts spawn/fork paths; {stamp} is
+ * nameStamp()'s number, the time in ms or one past the last name's):
+ *   spawn: `spawn-{name}-{stamp}`
+ *   fork:  `{name}-d{depth}-{stamp}` / `{name}-d{depth}-retry{n}-{stamp}` — no
  *          fork- prefix at all; the -d{depth} suffix must be stripped too,
  *          or every fork resolves to e.g. `web-d1` and matches nothing.
  */
