@@ -2,20 +2,20 @@ name: Greptile label
 
 # Greptile reviews only pull requests labelled `greptile` (.greptile/config.json).
 # Every 30 minutes this job adds the label to each open, non-draft pull
-# request with more than 250 additions plus deletions that carries neither
+# request with more than 400 additions plus deletions that carries neither
 # `greptile` nor `no-greptile`, so a smaller one gets a Greptile review only
 # if someone adds the label by hand. Greptile's reference lists a pull
 # request being given a trigger label among the openings it reviews, and a
 # label added after a pull request opened starts its review then: within
-# about half an hour of a pull request opening, passing 250 lines or being
+# about half an hour of a pull request opening, passing 400 lines or being
 # marked ready, and later when GitHub's scheduler is busy.
 #
 # Each run lists every open pull request, up to the list call's 500, so the
-# next run catches up on one that was missed or delayed. A draft is labelled
-# once it's marked ready. The label is only ever added: a pull request that
-# later shrinks keeps it, and removing it from one past the line doesn't skip
-# the review, since the next run adds it back. `no-greptile` is the way to
-# skip a review.
+# next run catches up on one that was missed or delayed. A draft past the
+# line is labelled once it's marked ready. The label is only ever added: a
+# pull request that later shrinks keeps it, and removing it from one past the
+# line doesn't skip the review, since the next run adds it back.
+# `no-greptile` is the way to skip a review.
 #
 # A schedule rather than pull_request_target, which GitHub's default event
 # policy for public repositories blocks once it's enforced, from November 2,
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Label open pull requests of more than 250 changed lines
+      - name: Label open pull requests of more than 400 changed lines
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -62,7 +62,7 @@ jobs:
             | "#\(.number)"] | join(" ")' <<< "$candidates")
           todo=$(jq -r '.[]
             | select((.additions | type) == "number" and (.deletions | type) == "number")
-            | select(.additions + .deletions > 250)
+            | select(.additions + .deletions > 400)
             | "\(.number) \(.additions + .deletions)"' <<< "$candidates")
           labelled=0
           failed=""
