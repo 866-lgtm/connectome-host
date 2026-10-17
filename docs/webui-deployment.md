@@ -88,15 +88,27 @@ The module accepts three credentials:
   written in either base64 alphabet, padded or not, and is the same key either
   way. Once the file holds at least one usable grant, the static app shell is
   served without auth and `/ws` accepts upgrades that must then present a
-  signed observer hello. Removing the file takes every grant in it away
-  within about 6 s, once two checks in a row, 3 s apart, find it gone, and
-  the log says so then: no hello is admitted from it, and a visitor without
-  a session needs the password for the shell again. A session an observer
-  already holds keeps its routes until it expires, up to 12 hours, and a
-  connection already open keeps its scopes until it closes. A file back by
-  the second check, as after an editor's save that removes it before
-  writing it again, changes nothing. To stop admitting anyone new, remove
-  the file: one that doesn't parse keeps the grants. Each
+  signed observer hello. Removing the file takes every grant in it away within
+  about 6 s, once two checks in a row, 3 s apart, find it gone, and the log
+  says so then: no hello is admitted from it, and the shell needs the password
+  again. Revoking or expiring a grant ends the sessions and open connections
+  it gave within about 3 s, and removing the file ends them when it takes the
+  grants away. An entry the viewer can't use counts as no grant. Narrowing a
+  grant in place narrows its sessions for good, ending one it leaves with
+  none of its scopes, and closes its connections, which connect again with
+  the narrower scopes: a grant widened or given again applies from the
+  observer's next hello. A file back by the second check, as after an editor's
+  save that removes it before writing it again, changes nothing, and a read of
+  the file that fails counts as a check that didn't find it, so a read error
+  that passes changes nothing either. One that lasts two checks ends every
+  observer's sessions and connections, since the viewer can't tell who is
+  granted, and viewers stay off until someone reloads them, even once the file
+  reads again. A file that parses but isn't a grants file, such as one whose
+  `observers` isn't a list, holds no grant the viewer can use: at the check
+  that reads it, every observer's sessions end and their connections close as
+  final, so viewers need reloading once the file is fixed. To cut every
+  observer off, remove the file. A file that doesn't parse at all leaves the
+  grants as they were, since an editor's save can be read half-written. Each
   observer sees only its grant's scopes — `health`, `ops`, `messages`,
   `tools`, `thinking`, `debug` — and gets a session cookie for the matching
   HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
