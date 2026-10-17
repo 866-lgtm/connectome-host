@@ -117,13 +117,11 @@ describe('a lesson stored without usable content or tags', () => {
     const h = await loaded([...lessons, stored('blank', { content: '  ', tags: 'process' }), stored('gone', { deprecated: true })]);
     try {
       expect(h.warnings).toEqual([
-        '[lessons] lesson "notags" is stored without usable tags. Queries and retrieval read its tags as empty ' +
-          'until the lesson is updated with its tags or deprecated.',
-        '[lessons] lesson "nocontent" is stored without usable content. Queries find no words in its content, and ' +
-          'retrieval leaves it out, until the lesson is updated with its content or deprecated.',
-        '[lessons] lesson "blank" is stored without usable content or tags. Queries find no words in its content and ' +
-          'read its tags as empty, and retrieval leaves it out, until the lesson is updated with its content and tags ' +
-          'or deprecated.',
+        '[lessons] lesson "notags": Stored without usable tags: give its tags with lessons--update, or deprecate this lesson.',
+        '[lessons] lesson "nocontent": Stored without usable content: give its content with lessons--update, ' +
+          'or deprecate this lesson.',
+        '[lessons] lesson "blank": Stored without usable content or tags: give its content and tags with ' +
+          'lessons--update, or deprecate this lesson.',
       ]);
     } finally { h.cleanup(); }
   });
@@ -167,7 +165,7 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
       );
       expect(listed.percent).toMatchObject({
         confidence: 85,
-        needsFix: 'Stored with confidence 85, outside 0 to 1: give a confidence from 0 to 1, such as 0.85, with lessons--update.',
+        needsFix: 'Stored with confidence 85, outside 0 to 1: give a confidence from 0 to 1 with lessons--update.',
       });
       expect(listed.nan).toMatchObject({
         confidence: null,
@@ -179,7 +177,7 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
       // Ranked clamped: 85 counts as 1, no more, and one that isn't a number as 0.
       const ranked = (await h.m.handleToolCall(call('query', { tags: ['process'] }))).data as { lessons: AnyObj[] };
       expect(ranked.lessons.map(l => l.id)).toEqual(['percent', 'whole', 'nan', 'negative']);
-      expect(ranked.lessons[0]).toMatchObject({ confidence: 85, needsFix: expect.stringContaining('such as 0.85') });
+      expect(ranked.lessons[0]).toMatchObject({ confidence: 85, needsFix: expect.stringContaining('confidence 85, outside 0 to 1') });
       const sure = (await h.m.handleToolCall(call('query', { minConfidence: 0.9 }))).data as { lessons: AnyObj[] };
       expect(sure.lessons.map(l => l.id).sort()).toEqual(['percent', 'whole']);
       // At 0, every lesson's ranked value passes, -0.5 and null included,
@@ -197,16 +195,13 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
     } finally { h.cleanup(); }
   });
 
-  test('the operator log names each one once per load, with what it is ranked as', async () => {
+  test('the operator log names each one once per load, with the mark the agent\'s list gives it', async () => {
     const h = await loaded(lessons);
     try {
       expect(h.warnings).toEqual([
-        '[lessons] lesson "percent" is stored with confidence 85, outside 0 to 1. Queries and retrieval rank it as 1 ' +
-          'until the lesson is updated with a confidence from 0 to 1, such as 0.85.',
-        '[lessons] lesson "nan" is stored with a confidence that isn\'t a number. Queries and retrieval rank it as 0 ' +
-          'until the lesson is updated with a confidence from 0 to 1.',
-        '[lessons] lesson "negative" is stored with confidence -0.5, outside 0 to 1. Queries and retrieval rank it as 0 ' +
-          'until the lesson is updated with a confidence from 0 to 1.',
+        '[lessons] lesson "percent": Stored with confidence 85, outside 0 to 1: give a confidence from 0 to 1 with lessons--update.',
+        '[lessons] lesson "nan": Stored with a confidence that isn\'t a number: give a confidence from 0 to 1 with lessons--update.',
+        '[lessons] lesson "negative": Stored with confidence -0.5, outside 0 to 1: give a confidence from 0 to 1 with lessons--update.',
       ]);
     } finally { h.cleanup(); }
   });
@@ -215,15 +210,10 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
     const h = await loaded([stored('both', { content: 'epsilon', confidence: 60 })]);
     try {
       const listed = ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons[0]!;
-      expect(listed.needsFix).toBe(
-        'Stored without usable tags, and with confidence 60, outside 0 to 1: give its tags, and a confidence from 0 to 1, ' +
-        'such as 0.6, with lessons--update, or deprecate this lesson.',
-      );
-      expect(h.warnings).toEqual([
-        '[lessons] lesson "both" is stored without usable tags, and with confidence 60, outside 0 to 1. Queries and ' +
-          'retrieval read its tags as empty and rank it as 1 until the lesson is updated with its tags, and a confidence ' +
-          'from 0 to 1, such as 0.6, or deprecated.',
-      ]);
+      const mark = 'Stored without usable tags, and with confidence 60, outside 0 to 1: give its tags, and a confidence ' +
+        'from 0 to 1 with lessons--update, or deprecate this lesson.';
+      expect(listed.needsFix).toBe(mark);
+      expect(h.warnings).toEqual([`[lessons] lesson "both": ${mark}`]);
     } finally { h.cleanup(); }
   });
 
@@ -236,7 +226,7 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
       expect(boosted).toMatchObject({ success: false, isError: true });
       expect(boosted.error).toBe(
         'Nothing was boosted: lesson "percent" is stored with confidence 85, outside 0 to 1, so it has no confidence ' +
-        'to boost from. Give it one from 0 to 1, such as 0.85, with lessons--update, then boost it.',
+        'to boost from. Give it one from 0 to 1 with lessons--update, then boost it.',
       );
       expect((await h.m.handleToolCall(call('boost', { id: 'word' }))).error).toBe(
         'Nothing was boosted: lesson "word" is stored with a confidence that isn\'t a number, so it has no confidence ' +
@@ -258,7 +248,7 @@ describe('a lesson stored with a confidence outside 0 to 1, or one that isn\'t a
   });
 });
 
-describe('a confidence stored as text, or out of range but not a percentage', () => {
+describe('a confidence stored as text, or out of range', () => {
   const lessons = [
     stored('text', { content: 'alpha', tags: ['process'], confidence: '0.9' }),
     stored('textpercent', { content: 'beta', tags: ['process'], confidence: '85' }),
@@ -266,7 +256,7 @@ describe('a confidence stored as text, or out of range but not a percentage', ()
     stored('onehalf', { content: 'epsilon', tags: ['process'], confidence: 1.5 }),
   ];
 
-  test('text that holds a number reads as that number, and only a whole percentage gets an example', async () => {
+  test('text that holds a number reads as that number, and the mark says how it\'s stored', async () => {
     const h = await loaded(lessons);
     try {
       expect(Object.fromEntries(h.m.getLessons().map(l => [l.id, l.confidence]))).toEqual({
@@ -276,16 +266,15 @@ describe('a confidence stored as text, or out of range but not a percentage', ()
         ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons.map(l => [l.id, [l.confidence, l.needsFix]]),
       );
       expect(listed).toEqual({
-        text: ['0.9', 'Stored with confidence "0.9", stored as text: give a confidence from 0 to 1, such as 0.9, with lessons--update.'],
-        textpercent: ['85', 'Stored with confidence "85", stored as text, outside 0 to 1: give a confidence from 0 to 1, such as 0.85, with lessons--update.'],
+        text: ['0.9', 'Stored with confidence "0.9", stored as text: give a confidence from 0 to 1 with lessons--update.'],
+        textpercent: ['85', 'Stored with confidence "85", stored as text, outside 0 to 1: give a confidence from 0 to 1 with lessons--update.'],
         blanktext: [' ', "Stored with a confidence that isn't a number: give a confidence from 0 to 1 with lessons--update."],
         onehalf: [1.5, 'Stored with confidence 1.5, outside 0 to 1: give a confidence from 0 to 1 with lessons--update.'],
       });
       const sure = (await h.m.handleToolCall(call('query', { minConfidence: 0.9 }))).data as { lessons: AnyObj[] };
       expect(sure.lessons.map(l => l.id).sort()).toEqual(['onehalf', 'text', 'textpercent']);
       expect(h.warnings[0]).toBe(
-        '[lessons] lesson "text" is stored with confidence "0.9", stored as text. Queries and retrieval rank it as 0.9 ' +
-        'until the lesson is updated with a confidence from 0 to 1, such as 0.9.',
+        '[lessons] lesson "text": Stored with confidence "0.9", stored as text: give a confidence from 0 to 1 with lessons--update.',
       );
     } finally { h.cleanup(); }
   });
@@ -320,12 +309,7 @@ describe('a confidence stored as text, or out of range but not a percentage', ()
       const mark = "Stored with a confidence that isn't a number: give a confidence from 0 to 1 with lessons--update.";
       expect(listed.huge).toEqual([null, mark]);
       expect(listed.tiny).toEqual([null, mark]);
-      expect(h.warnings).toEqual([
-        '[lessons] lesson "huge" is stored with a confidence that isn\'t a number. Queries and retrieval rank it as 0 ' +
-          'until the lesson is updated with a confidence from 0 to 1.',
-        '[lessons] lesson "tiny" is stored with a confidence that isn\'t a number. Queries and retrieval rank it as 0 ' +
-          'until the lesson is updated with a confidence from 0 to 1.',
-      ]);
+      expect(h.warnings).toEqual([`[lessons] lesson "huge": ${mark}`, `[lessons] lesson "tiny": ${mark}`]);
       // The file keeps 1e999 until a save writes the lessons as the module holds them.
       expect(h.fileText()).toContain('1e999');
       await h.m.handleToolCall(call('boost', { id: 'local' }));
@@ -335,21 +319,17 @@ describe('a confidence stored as text, or out of range but not a percentage', ()
 });
 
 describe('a tags list with entries that aren\'t text', () => {
-  test('is read by its text entries: a query by tag finds it, and the mark and the log say so', async () => {
+  test('is read by its text entries: a query by tag finds it, and the mark and the log name its tags', async () => {
     const h = await loaded([stored('mixed', { content: 'memory notes', tags: ['memory', 5, null] })]);
     try {
       const byTag = await h.m.handleToolCall(call('query', { tags: ['memory'] }));
       expect(byTag.success).toBe(true);
       expect(ids(byTag)).toEqual(['mixed']);
       expect(h.m.getLessons()[0]!.tags).toEqual(['memory']);
-      expect(((byTag.data as { lessons: AnyObj[] }).lessons[0]!).needsFix).toBe(
-        "Stored with tags that aren't all text, read by the ones that are: give its tags with lessons--update, " +
-        'or deprecate this lesson.',
-      );
-      expect(h.warnings).toEqual([
-        '[lessons] lesson "mixed" is stored with tags that aren\'t all text, read by the ones that are. Queries and ' +
-          'retrieval read only its text tags until the lesson is updated with its tags or deprecated.',
-      ]);
+      const mark = "Stored with tags that aren't all text: give its tags with " +
+        'lessons--update, or deprecate this lesson.';
+      expect(((byTag.data as { lessons: AnyObj[] }).lessons[0]!).needsFix).toBe(mark);
+      expect(h.warnings).toEqual([`[lessons] lesson "mixed": ${mark}`]);
       expect(h.stored()[0]!.tags).toEqual(['memory', 5, null]);
     } finally { h.cleanup(); }
   });
@@ -411,7 +391,7 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     } finally { h.cleanup(); }
   });
 
-  test('a bare value already in the module\'s own state is listed as a lesson with nothing usable, marked and logged', async () => {
+  test('a bare value already in the module\'s own state is listed, marked and logged as a lesson no call can name', async () => {
     // main's merge could have saved any value but null from the shared file
     // into the state: it threw reading a null entry's id before saving it.
     // Such a value is left there, and read rather than thrown on.
@@ -426,20 +406,12 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
           confidence: undefined,
           tags: [],
           deprecated: undefined,
-          needsFix: "Stored without usable content or tags, and with a confidence that isn't a number, and without an id. " +
-            'Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval leaves it ' +
-            "out. Lesson tools find a lesson by an id that's non-empty text, so none can reach this one, and there's " +
-            'nothing to do about it.',
+          needsFix: 'Stored without an id, so no lesson tool can name it.',
         }]);
         expect((await h.m.handleToolCall(call('query', { tags: ['x'], text: 'y' }))).success).toBe(true);
         // Readers get its read fields alone: no index keys from text or a list.
         expect(h.m.getLessons()).toEqual([{ content: '', tags: [], evidence: [], confidence: 0 }]);
-        expect(h.warnings).toEqual([
-          "[lessons] a lesson without an id is stored without usable content or tags, and with a confidence that isn't " +
-            'a number. Queries find no words in its content and read its tags as empty and rank it as 0, and retrieval ' +
-            "leaves it out. Lesson tools find a lesson by an id that's non-empty text, so none can reach it, and " +
-            "there's nothing to do about it.",
-        ]);
+        expect(h.warnings).toEqual(['[lessons] a lesson: Stored without an id, so no lesson tool can name it.']);
         expect(h.stored()).toEqual([value]);
       } finally { h.cleanup(); }
     }
@@ -465,7 +437,7 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
       // The skipped entry's line, then the state's 5's own, each once.
       expect(h.warnings).toHaveLength(2);
       expect(h.warnings[0]).toMatch(/has 1 entry that isn't a lesson \(not an object\)\. It's left out of what this host loads, and the next save writes the file with the lessons this host holds\.$/);
-      expect(h.warnings[1]).toStartWith('[lessons] a lesson without an id is stored without usable content or tags');
+      expect(h.warnings[1]).toBe('[lessons] a lesson: Stored without an id, so no lesson tool can name it.');
       await h.m.handleToolCall(call('boost', { id: 'local' }));
       expect(h.file().lessons.map(l => (l as AnyObj | number) === 5 ? 5 : l.id)).toEqual([5, 'local', 'shared']);
     } finally { h.cleanup(); }
@@ -475,23 +447,17 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     const noId = stored('x', { content: 'alpha' });
     delete noId.id;
     const h = await loaded([noId, stored('', { content: 'beta' }), stored(5 as unknown as string, { content: 'gamma' }), stored('withid', { content: 'delta' })]);
-    const tail = (it: string) => `Queries and retrieval read its tags as empty. Lesson tools find a lesson by an id that's non-empty text, so none can reach ${it}, and there's nothing to do about it.`;
+    const marks = [
+      'Stored without an id, so no lesson tool can name it.',
+      'Stored with an empty id, so no lesson tool can name it.',
+      "Stored with an id that isn't text (5), so no lesson tool can name it.",
+    ];
+    const withId = 'Stored without usable tags: give its tags with lessons--update, or deprecate this lesson.';
     try {
       const listed = ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons;
-      expect(listed.map(l => [l.id, l.needsFix])).toEqual([
-        [undefined, `Stored without usable tags, and without an id. ${tail('this one')}`],
-        ['', `Stored without usable tags, and with an empty id. ${tail('this one')}`],
-        [5, `Stored without usable tags, and with an id that isn't text (5). ${tail('this one')}`],
-        ['withid', 'Stored without usable tags: give its tags with lessons--update, or deprecate this lesson.'],
-      ]);
+      expect(listed.map(l => [l.id, l.needsFix])).toEqual([[undefined, marks[0]], ['', marks[1]], [5, marks[2]], ['withid', withId]]);
       // Three unnamed lines, then the named lesson's own, each once.
-      expect(h.warnings).toHaveLength(4);
-      expect(h.warnings.slice(0, 3)).toEqual([
-        `[lessons] a lesson without an id is stored without usable tags. ${tail('it')}`,
-        `[lessons] a lesson with an empty id is stored without usable tags. ${tail('it')}`,
-        `[lessons] a lesson with an id that isn't text (5) is stored without usable tags. ${tail('it')}`,
-      ]);
-      expect(h.warnings[3]).toStartWith('[lessons] lesson "withid" is stored without usable tags.');
+      expect(h.warnings).toEqual([...marks.map(m => `[lessons] a lesson: ${m}`), `[lessons] lesson "withid": ${withId}`]);
     } finally { h.cleanup(); }
   });
 
@@ -499,19 +465,15 @@ describe('evidence, and entries in the shared file that aren\'t lessons', () => 
     const noId = stored('x', { content: 'alpha', tags: ['t'] });
     delete noId.id;
     const h = await loaded([noId, stored('', { content: 'beta', tags: ['t'] }), stored(5 as unknown as string, { content: 'gamma', tags: ['t'] })]);
-    const tail = (it: string) => `Lesson tools find a lesson by an id that's non-empty text, so none can reach ${it}, and there's nothing to do about it.`;
+    const marks = [
+      'Stored without an id, so no lesson tool can name it.',
+      'Stored with an empty id, so no lesson tool can name it.',
+      "Stored with an id that isn't text (5), so no lesson tool can name it.",
+    ];
     try {
       const listed = ((await h.m.handleToolCall(call('list'))).data as { lessons: AnyObj[] }).lessons;
-      expect(listed.map(l => [l.id, l.needsFix])).toEqual([
-        [undefined, `Stored without an id. ${tail('this one')}`],
-        ['', `Stored with an empty id. ${tail('this one')}`],
-        [5, `Stored with an id that isn't text (5). ${tail('this one')}`],
-      ]);
-      expect(h.warnings).toEqual([
-        `[lessons] a lesson is stored without an id. ${tail('it')}`,
-        `[lessons] a lesson is stored with an empty id. ${tail('it')}`,
-        `[lessons] a lesson is stored with an id that isn't text (5). ${tail('it')}`,
-      ]);
+      expect(listed.map(l => [l.id, l.needsFix])).toEqual([[undefined, marks[0]], ['', marks[1]], [5, marks[2]]]);
+      expect(h.warnings).toEqual(marks.map(m => `[lessons] a lesson: ${m}`));
     } finally { h.cleanup(); }
   });
 
@@ -587,7 +549,7 @@ describe('/export', () => {
       const md = readFileSync(join(dir, 'output', 'lessons-export.md'), 'utf-8');
       expect(md).toContain(
         '- **[100%]** alpha  \n  _Sources: s:1_  \n  _Stored with confidence 85, outside 0 to 1: give a ' +
-        'confidence from 0 to 1, such as 0.85, with lessons--update._\n',
+        'confidence from 0 to 1 with lessons--update._\n',
       );
       expect(md).toContain('- **[60%]** beta\n');
     } finally {

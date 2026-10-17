@@ -119,8 +119,8 @@ export class LessonsModule implements Module {
       this.mergeFromGlobal();
     }
     // Each lesson stored with a fault is named once per load for whoever
-    // runs the host, with every fault in one line; see readable() for how
-    // readers take it.
+    // runs the host, with the mark the agent's list gives it; see readable()
+    // for how readers take it.
     for (const l of this.state.lessons) {
       if (l.deprecated) continue;
       const line = loadLine(l);
@@ -285,8 +285,8 @@ export class LessonsModule implements Module {
   // =========================================================================
 
   private handleCreate(input: CreateInput): ToolResult {
-    // A lesson stored without its content or tags makes every later query by
-    // text or by tags fail, and retrieval reads every field as given.
+    // A lesson stored without its content or tags reads as having none, and
+    // stays marked until it's fixed, so a call that would store one is refused.
     const problems = inputProblems(input, true);
     if (problems.length > 0) {
       return { success: false, isError: true, error: `Nothing was created: ${problems.join('; ')}.` };
@@ -553,16 +553,9 @@ interface Faults {
   /** Tags that aren't a list ('missing'), read as none, or a list with
    *  entries that aren't text ('mixed'), read by the ones that are. */
   tags?: 'missing' | 'mixed';
-  confidence?: ConfidenceFault;
-}
-
-interface ConfidenceFault {
-  /** What's stored, as a phrase after "with". */
-  stored: string;
-  /** What queries, lists and retrieval rank and filter it by. */
-  ranked: number;
-  /** A value from 0 to 1 the stored one most likely meant, if it has one. */
-  example?: number;
+  /** A confidence stored outside 0 to 1, as text, or as no number at all:
+   *  what's stored, as a phrase after "with". */
+  confidence?: string;
 }
 
 function faultsOf(l: StoredLesson): Faults | undefined {
@@ -589,18 +582,15 @@ function rankedConfidence(c: unknown): number {
   return Number.isNaN(v) ? 0 : Math.min(1, Math.max(0, v));
 }
 
-function confidenceFault(c: unknown): ConfidenceFault | undefined {
+/** What's wrong with a stored confidence, as a phrase after "with", or
+ *  nothing when it's a number from 0 to 1. */
+function confidenceFault(c: unknown): string | undefined {
   const v = confidenceValue(c);
   const inRange = v >= 0 && v <= 1;
   if (typeof c === 'number' && inRange) return undefined;
-  const ranked = rankedConfidence(c);
-  if (Number.isNaN(v)) return { stored: "a confidence that isn't a number", ranked };
+  if (Number.isNaN(v)) return "a confidence that isn't a number";
   const asStored = typeof c === 'string' ? `confidence ${JSON.stringify(c)}, stored as text` : `confidence ${v}`;
-  if (inRange) return { stored: asStored, ranked, example: v };
-  // A whole number from 2 to 100 reads as a percentage, as 85 for 85%.
-  // Any other value outside the range gets no guess.
-  const percent = Number.isInteger(v) && v >= 2 && v <= 100;
-  return { stored: `${asStored}, outside 0 to 1`, ranked, ...(percent ? { example: v / 100 } : {}) };
+  return inRange ? asStored : `${asStored}, outside 0 to 1`;
 }
 
 /** What a lesson is stored with, as a phrase after "stored". */
@@ -608,17 +598,15 @@ function storedPhrase(f: Faults): string {
   const missing = [...(f.content ? ['content'] : []), ...(f.tags === 'missing' ? ['tags'] : [])];
   return [
     ...(missing.length > 0 ? [`without usable ${missing.join(' or ')}`] : []),
-    ...(f.tags === 'mixed' ? ["with tags that aren't all text, read by the ones that are"] : []),
-    ...(f.confidence ? [`with ${f.confidence.stored}`] : []),
+    ...(f.tags === 'mixed' ? ["with tags that aren't all text"] : []),
+    ...(f.confidence ? [`with ${f.confidence}`] : []),
   ].join(', and ');
 }
 
 /** What an update gives to fix it, and whether deprecating would do too. */
 function fixPhrase(f: Faults): { give: string; orDeprecate: boolean } {
   const fields = f.content && f.tags ? ['its content and tags'] : f.content ? ['its content'] : f.tags ? ['its tags'] : [];
-  const confidence = f.confidence
-    ? [`a confidence from 0 to 1${f.confidence.example !== undefined ? `, such as ${f.confidence.example},` : ''}`]
-    : [];
+  const confidence = f.confidence ? ['a confidence from 0 to 1'] : [];
   return { give: [...fields, ...confidence].join(', and '), orDeprecate: fields.length > 0 };
 }
 
@@ -637,7 +625,7 @@ function idProblem(id: unknown): string | undefined {
   return undefined;
 }
 
-/** Why no call can name a stored lesson, as a phrase after "and", if none
+/** Why no call can name a stored lesson, as a phrase after "stored", if none
  *  can: lesson tools find a lesson by an id that's non-empty text. */
 function idFault(l: StoredLesson): string | undefined {
   if (l.id === undefined) return 'without an id';
@@ -646,48 +634,25 @@ function idFault(l: StoredLesson): string | undefined {
   return undefined;
 }
 
-/** What the agent's list and query say a stored lesson needs, if anything. */
+/** What the agent's list and query say a stored lesson needs, if anything.
+ *  A lesson no call can name gets only that, since no lesson tool can act on
+ *  its other faults. */
 function needsFix(l: StoredLesson): string | undefined {
-  const f = faultsOf(l);
   const unnamed = idFault(l);
-  if (unnamed) {
-    const what = f ? `Stored ${storedPhrase(f)}, and ${unnamed}. ${readsPhrase(f)}.` : `Stored ${unnamed}.`;
-    return `${what} Lesson tools find a lesson by an id that's non-empty text, so none can reach this one, ` +
-      "and there's nothing to do about it.";
-  }
+  if (unnamed) return `Stored ${unnamed}, so no lesson tool can name it.`;
+  const f = faultsOf(l);
   if (!f) return undefined;
   const { give, orDeprecate } = fixPhrase(f);
   return `Stored ${storedPhrase(f)}: give ${give} with lessons--update${orDeprecate ? ', or deprecate this lesson' : ''}.`;
 }
 
-/** The line that names a stored lesson's faults for whoever runs the host,
- *  once per load, with what readers make of them and what fixes them. */
+/** The line that gives a stored lesson's mark to whoever runs the host,
+ *  once per load: the agent's words, naming the lesson by its id, or as "a
+ *  lesson" when no call can name it. */
 function loadLine(l: StoredLesson): string | undefined {
-  const f = faultsOf(l);
-  const unnamed = idFault(l);
-  if (unnamed) {
-    const what = f ? `a lesson ${unnamed} is stored ${storedPhrase(f)}. ${readsPhrase(f)}.` : `a lesson is stored ${unnamed}.`;
-    return `[lessons] ${what} Lesson tools find a lesson by an id that's non-empty text, so none can reach it, ` +
-      "and there's nothing to do about it.";
-  }
-  if (!f) return undefined;
-  const { give, orDeprecate } = fixPhrase(f);
-  return `[lessons] lesson ${JSON.stringify(l.id)} is stored ${storedPhrase(f)}. ` +
-    `${readsPhrase(f)}${f.content ? ',' : ''} until the lesson is updated with ` +
-    `${orDeprecate ? `${give} or deprecated` : give.replace(/,$/, '')}.`;
-}
-
-/** What queries and retrieval make of a stored lesson's faults. */
-function readsPhrase(f: Faults): string {
-  const reads = [
-    ...(f.tags === 'missing' && !f.content ? ['read its tags as empty'] : []),
-    ...(f.tags === 'mixed' ? ['read only its text tags'] : []),
-    ...(f.confidence ? [`rank it as ${f.confidence.ranked}`] : []),
-  ];
-  return f.content
-    ? `Queries find no words in its content${f.tags === 'missing' ? ' and read its tags as empty' : ''}` +
-      `${reads.length > 0 ? ` and ${reads.join(' and ')}` : ''}, and retrieval leaves it out`
-    : `Queries and retrieval ${reads.join(' and ')}`;
+  const mark = needsFix(l);
+  if (!mark) return undefined;
+  return `[lessons] ${idFault(l) ? 'a lesson' : `lesson ${JSON.stringify(l.id)}`}: ${mark}`;
 }
 
 /** Why boost or demote leaves a lesson as it is: one whose stored confidence
@@ -697,10 +662,9 @@ function adjustRefusal(l: StoredLesson, verb: 'boost' | 'demote'): string | unde
   const fault = confidenceFault(l.confidence);
   const v = confidenceValue(l.confidence);
   if (!fault || (v >= 0 && v <= 1)) return undefined;
-  const example = fault.example !== undefined ? `, such as ${fault.example},` : '';
   const done = verb === 'boost' ? 'boosted' : 'demoted';
-  return `Nothing was ${done}: lesson ${JSON.stringify(l.id)} is stored with ${fault.stored}, so it has no ` +
-    `confidence to ${verb} from. Give it one from 0 to 1${example} with lessons--update, then ${verb} it.`;
+  return `Nothing was ${done}: lesson ${JSON.stringify(l.id)} is stored with ${fault}, so it has no ` +
+    `confidence to ${verb} from. Give it one from 0 to 1 with lessons--update, then ${verb} it.`;
 }
 
 /** A stored lesson as every reader sees it: content it lacks reads as empty,
