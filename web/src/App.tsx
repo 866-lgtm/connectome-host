@@ -299,7 +299,7 @@ export function App() {
   };
 
   /** /healthz snapshot — feeds the Health tab and reconciles durable-state
-   *  alerts (quarantine, hard-down) so a page opened mid-incident alarms
+   *  alerts (quarantine, inference-exhausted) so a page opened mid-incident alarms
    *  without waiting for the next klaxon re-fire. */
   const [health, setHealth] = createSignal<HealthSnapshot | null>(null);
   const [healthErr, setHealthErr] = createSignal<string | null>(null);
@@ -310,7 +310,8 @@ export function App() {
     const plan = planHealthAlerts(h, opsAlerts());
     for (const key of plan.remove) removeOpsAlert(key);
     for (const u of plan.upsert) {
-      upsertOpsAlert(u.kind, u.agent, u.message, false);    }
+      upsertOpsAlert(u.kind, u.agent, u.message, false);
+    }
   };
 
   /** `force` retries past a remembered 401/403 — the operator's grant may
@@ -353,7 +354,7 @@ export function App() {
   };
 
   /** Local-alert reconciliation when the panel scope is parked on a child:
-   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  the strip's durable-state alerts (quarantine, inference-exhausted) are host-level
    *  and must keep reconciling regardless of what the Health tab inspects. */
   const reconcileLocalAlerts = async (): Promise<void> => {
     if (healthDenied) return;
@@ -1276,7 +1277,7 @@ export function App() {
       wire.close();
     });
 
-    // Health poll: durable-state alerts (quarantine, hard-down) must not
+    // Health poll: durable-state alerts (quarantine, inference-exhausted) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
     // honest without meaningful load (counts-only JSON). With the scope on a
     // fleet child, loadHealth feeds the Health tab from that child and a

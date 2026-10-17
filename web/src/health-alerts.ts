@@ -1,10 +1,15 @@
 /**
- * /healthz reconciliation of the alert strip's durable-state rows
- * (compression quarantine, inference hard-down), worked out as a plan the
- * page applies. Kept free of Solid and the DOM so it can be tested alone.
+ * /healthz reconciliation of the alert strip's condition rows (compression
+ * quarantine and inference-exhausted), worked out as a plan the page applies.
+ * Kept free of Solid and the DOM so it can be tested alone.
  *
- * A current row of either kind whose agent is missing from the snapshot's
- * `agents` list is removed: the agent was torn down (an ephemeral subagent).
+ * A row of either kind whose agent is missing from the snapshot's `agents`
+ * list is removed, whatever raised it: the agent was torn down (an ephemeral
+ * subagent), and no later snapshot would clear the row. Rows of other kinds
+ * keep their own lifecycle: a `<kind>-clear` trace where their producer sends
+ * one, else the operator's dismissal. agent-framework 0.22.1 sends no
+ * `hard-down-clear`, so a hard-down row leaves only by a dismissal, for a
+ * present agent and a departed one alike.
  */
 
 import type { HealthSnapshot } from './Health';
