@@ -2134,8 +2134,8 @@ describe('a failed call says what changed and what to do', () => {
     expect(deployed).not.toContain('fix it');
     expect(deployed).not.toContain('Fix the file');
     expect(listed).toEndWith(
-      'This host has too many files open, which can pass: mcpl-admin--mcpl_list may read it shortly, and if it keeps ' +
-        'failing, ask your operator.',
+      'This host has too many files open, which can pass: call mcpl-admin--mcpl_list shortly to read it, and if it ' +
+        'still can\'t, ask your operator.',
     );
     const file = spyOn(mcplConfig, 'readMcplServersFile').mockImplementation((path: string) => {
       throw Object.assign(new Error(`ENFILE: file table overflow, open '${path}'`), { code: 'ENFILE' });
@@ -2149,8 +2149,8 @@ describe('a failed call says what changed and what to do', () => {
       listed, `\nThe operator's server file, ${configPath}, couldn't be read (ENFILE: file table overflow`,
       'before it loads any server, so what this list says a start loads holds once a start gets past the file, if the file ' +
         'still defines what it did at this host\'s start. This host has too many files open, which can pass: ' +
-        'mcpl-admin--mcpl_list may read it shortly, and if it keeps failing, ask your operator. Of these tools, only this ' +
-        'listing reads it.',
+        'call mcpl-admin--mcpl_list shortly to read it, and if it still can\'t, ask your operator. Of these tools, only ' +
+        'this listing reads it.',
     );
     expect(listed).not.toContain('theirs to fix');
   });
@@ -2184,8 +2184,8 @@ describe('a failed call says what changed and what to do', () => {
     }
     expectSays(
       restarted, 'mcpl-admin--mcpl_deploy with each of its fields can load it again once your overlay file can be read',
-      'This host has too many files open, which can pass: mcpl-admin--mcpl_list may read it shortly, and if it keeps ' +
-        'failing, ask your operator.',
+      'This host has too many files open, which can pass: call mcpl-admin--mcpl_list shortly to read it, and if it ' +
+        'still can\'t, ask your operator.',
     );
     expect(restarted).not.toContain('is fixed');
     expect(restarted).not.toContain('Fix the file');

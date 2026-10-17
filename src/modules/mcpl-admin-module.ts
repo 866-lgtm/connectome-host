@@ -134,7 +134,7 @@ function readRepair(error: unknown, name?: string): string {
   if (typeof code === 'string' && OWN_FAILURES.has(code)) {
     return 'This host has too many files open, which can pass: ' + (name
       ? `call ${name} again shortly, and if it fails the same way, ask your operator.`
-      : `${LIST} may read it shortly, and if it keeps failing, ask your operator.`);
+      : `call ${LIST} shortly to read it, and if it still can't, ask your operator.`);
   }
   return `Ask your operator to fix it${name ? `, then call ${name} again` : ''}.`;
 }
