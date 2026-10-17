@@ -7,9 +7,10 @@
 // package's own postinstall builds the Web UI only in a checkout, where web/
 // is, and no dependency in package-lock.json has one. Build the Web UI
 // first (`npm run build:web:ci`). It checks:
-//   1. the package carries the Web UI, dist/web/index.html, and
-//      tsconfig.json, with which a consumer typechecks the TypeScript
-//      source the package ships, as connectome-smoke's published lane does;
+//   1. the package carries the Web UI, dist/web/index.html and every local
+//      file its src and href attributes name, and tsconfig.json, with which
+//      a consumer typechecks the TypeScript source the package ships, as
+//      connectome-smoke's published lane does;
 //   2. `bun build` resolves src/index.ts's static imports, and its dynamic
 //      ones with a literal specifier, in the installed tree, on paths a run
 //      doesn't reach too (a recipe extension, loaded by a computed path, isn't
@@ -85,6 +86,14 @@ function packedButIgnored(paths) {
   // 1: none of them is ignored; 128: not a git checkout.
   if (result.status !== 0) return [];
   return result.stdout.split("\0").filter((path) => path !== "" && !path.startsWith(`${dirname(WEB_UI)}/`));
+}
+
+/** The local files a built index.html names in its src and href
+ *  attributes, as paths under its own directory: URLs with a scheme or a
+ *  host, and anchors, aside. */
+function webAssets(html) {
+  const refs = [...html.matchAll(/\b(?:src|href)\s*=\s*["']([^"'#?]*)/gi)].map((match) => match[1]);
+  return [...new Set(refs.filter((ref) => ref !== "" && !/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(ref)).map((ref) => ref.replace(/^\.?\//, "")))];
 }
 
 /** Up to five paths, for a message. */
@@ -201,6 +210,15 @@ function main() {
       throw new CheckError(
         `the installed ${packed.filename} has no ${WEB_UI}, though this tree has it: package.json's files must list ` +
           `${dirname(WEB_UI)}, so that npm 12 and bun installs, which run no install scripts, get the Web UI.`,
+      );
+    }
+    const unshipped = webAssets(readFileSync(join(installed, WEB_UI), "utf8")).filter(
+      (asset) => !existsSync(join(installed, dirname(WEB_UI), asset)),
+    );
+    if (unshipped.length > 0) {
+      throw new CheckError(
+        `the installed ${packed.filename}'s ${WEB_UI} names ${some(unshipped)}, which ${unshipped.length === 1 ? "isn't" : "aren't"} ` +
+          `in the package: package.json's files must list all of ${dirname(WEB_UI)}, or the Web UI is a blank page.`,
       );
     }
     if (!existsSync(join(installed, "tsconfig.json"))) {

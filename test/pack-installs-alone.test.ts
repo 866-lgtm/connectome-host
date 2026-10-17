@@ -49,7 +49,9 @@ function standIn(pkg: Record<string, unknown>, index = HOST, extra: Record<strin
     "src/index.ts": index,
     "src/helper.ts": "export const helper = (line: string): string => line;\n",
     "recipes/mock-test.json": JSON.stringify({ name: "Mock", agent: { name: "zz-agent" }, modules: { wake: false, webui: { host: "127.0.0.1" } } }),
-    "dist/web/index.html": "<!doctype html>\n",
+    "dist/web/index.html": '<!doctype html>\n<link rel="stylesheet" href="/assets/app.css">\n<script type="module" src="./assets/app.js"></script>\n<a href="https://example.invalid/">x</a><a href="#top">top</a>\n',
+    "dist/web/assets/app.css": "body {}\n",
+    "dist/web/assets/app.js": "export {};\n",
     ...extra,
   };
   for (const [path, text] of Object.entries(files)) {
@@ -151,6 +153,15 @@ test("a package whose files leave the Web UI out fails: npm 12 and bun installs 
     );
   }
 }, TIMEOUT_MS * 2);
+
+test("a package that carries the Web UI's index.html without the files it names fails, naming them", async () => {
+  const result = await check(standIn({ files: ["src", "recipes", "dist/web/index.html", "tsconfig.json"] }));
+  assert.equal(result.code, 1);
+  assert.match(
+    result.stderr,
+    /pack-installs-alone: the installed zz-host-1\.0\.0\.tgz's dist\/web\/index\.html names assets\/app\.css, assets\/app\.js, which aren't in the package: package\.json's files must list all of dist\/web, or the Web UI is a blank page\.\n$/,
+  );
+}, TIMEOUT_MS);
 
 test("a package whose files leave tsconfig.json out fails: a consumer typechecks the source with it", async () => {
   const result = await check(standIn({ files: ["src", "recipes", "dist/web"] }));
