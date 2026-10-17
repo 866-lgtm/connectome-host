@@ -239,7 +239,7 @@ export class IdentityModule implements Module {
 
   /** A registration this session holds in memory, since it couldn't be recorded. */
   private held: HeldRegistration | null = null;
-  /** Whether a registration is under way: another waits for it to finish. */
+  /** Whether a registration is under way: a second one is refused until it ends. */
   private enrolling = false;
 
   constructor(private readonly config: IdentityModuleConfig) {
