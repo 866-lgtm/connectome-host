@@ -4,10 +4,11 @@
  * Interiority access (thinking, tool payloads, conversation stream via the
  * webui) is a consent question before it is an ACL question — see connectome
  * docs/observability.md §4. These tools let the agent read and edit its own
- * data/observers.json grant file. The webui's ObserverRegistry hot-reloads
- * the file on mtime (~3s), so grants and revocations apply to new
- * connections without a restart. Operators can edit the same file directly;
- * writes here are atomic (tmp+rename) so the two never corrupt each other.
+ * data/observers.json grant file. The webui's ObserverRegistry checks the
+ * file every ~3s, so without a restart a grant applies to the next hello, and
+ * a revocation ends the grant's sessions and open connections. Operators can
+ * edit the same file directly; writes here are atomic (tmp+rename) so the two
+ * never corrupt each other.
  * A file these tools can't read, or that isn't a grants file, is never
  * written over. In one they can read, a change touches only the entries it
  * matches: every other entry, an unusable one included, and every other
@@ -105,8 +106,8 @@ export class ObserversModule implements Module {
         name: 'revoke',
         description:
           'Remove an observer grant by key or by label. Protected (operator-baseline) grants ' +
-          'cannot be revoked here. Existing connections are not killed, but new connections and ' +
-          'HTTP sessions stop authenticating within ~3 seconds.',
+          'cannot be revoked here. Within about 3 seconds, new connections are refused, and the ' +
+          "grant's HTTP sessions and open connections end.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -198,7 +199,7 @@ export class ObserversModule implements Module {
           }
           read.doc.observers = read.doc.observers.filter((g) => !matches.includes(g as ObserverGrant));
           const revoked = matches.map((g) => (typeof g.label === 'string' ? g.label : g.key));
-          return this.saved(read.doc, `Revoked: ${revoked.join(', ')}. New connections stop within ~3s.`);
+          return this.saved(read.doc, `Revoked: ${revoked.join(', ')}. Within about 3 s, new connections are refused, and its sessions and open connections end.`);
         }
 
         default:
