@@ -1045,12 +1045,22 @@ describe('identity: what the agent reads when a call fails', () => {
     // The log says where the record goes and what to write in it.
     expect(lines.some((line) => line.includes('EISDIR') && line.includes('only until it restarts') &&
       line.includes(`to ${join(dir, 'k.json')}`) && line.includes('"sub":"agent:a@guest","name":"A","home":"id.test"'))).toBe(true);
-    // Held for this session: status shows it, access works, and registering again is refused here.
+    // Held until the host restarts: status shows it, access works, and registering again is refused here.
     const status = await mod.handleToolCall(call('status', {}));
     expect(status.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
     expectSays((status.data as any).note, 'only until it restarts', 'ask them to');
     expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
     expectSays((await join_('B')).error, 'Nothing changed: this host is already registered as "A"', 'only until it restarts', 'ask them to');
+    // A session switch builds a new module for the same key, which holds it
+    // too, however the key's path is spelled.
+    const switched = new IdentityModule({ keyPath: `${dir}/./k.pem`, home: 'id.test' });
+    const switchedStatus = await switched.handleToolCall(call('status', {}));
+    expect(switchedStatus.data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+    expectSays((switchedStatus.data as any).note, 'only until it restarts');
+    expectSays(
+      (await switched.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
+      'Nothing changed: this host is already registered as "A"', 'only until it restarts',
+    );
   });
 
   // After an unknown outcome, the log's last word was to record the
@@ -1274,14 +1284,17 @@ describe('identity: what the agent reads when a call fails', () => {
     expect((await mod.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: null });
     expect(await mod.accessFor('orrery')).toBe('aid1.fresh.secret');
     // A copy of that record made as written, without the id, reads as holding
-    // no registration once the host restarts: it fails closed.
-    writeFileSync(join(dir, 'k.json'), byHand!.match(/write (\{.*?\}) to /)![1]);
-    const restarted = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
+    // no registration on a host that doesn't hold it in memory, as once it
+    // restarts: it fails closed. The hold is the process's, so the copy and
+    // the key go where no module of this process has held anything.
+    const restartedDir = tempDir('ident-');
+    writeFileSync(join(restartedDir, 'k.json'), byHand!.match(/write (\{.*?\}) to /)![1]);
+    writeFileSync(join(restartedDir, 'k.pem'), readFileSync(join(dir, 'k.pem')));
+    const restarted = new IdentityModule({ keyPath: join(restartedDir, 'k.pem'), home: 'id.test' });
     expectSays(
       (await restarted.handleToolCall(call('status', {}))).error,
       'identity--status failed: this host\'s registration record couldn\'t be read, so whether this host is registered is unknown',
     );
-    rmSync(join(dir, 'k.json'));
     // The key gone while the registration is held: refused, no new key made,
     // and the log's way to rotate fits a registration held in memory.
     rmSync(join(dir, 'k.pem'));
@@ -1328,15 +1341,62 @@ describe('identity: what the agent reads when a call fails', () => {
 
   it('refuses a second registration while one is under way', async () => {
     let answer!: (res: Response) => void;
-    const { mod } = registeredModule({ register: false, enroll: () => new Promise<Response>((resolve) => { answer = resolve; }) });
+    const { mod, dir } = registeredModule({ register: false, enroll: () => new Promise<Response>((resolve) => { answer = resolve; }) });
     const first = mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
     expectSays(
       (await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
       'Nothing was sent: a registration is already under way on this host', 'its own answer will say how it went',
     );
+    // A session switch builds a new module for the same key, which refuses it too.
+    const switched = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
+    expectSays(
+      (await switched.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
+      'Nothing was sent: a registration is already under way on this host',
+    );
     answer(new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 }));
     expect((await first).success).toBe(true);
     expectSays((await mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error, 'already registered as "A"');
+  });
+
+  // A session switch stops the module whose registration is under way and
+  // builds another for the same key. The registration goes on, and its end
+  // is the new module's to act on: recorded, or, with no reply, the guard
+  // released so the new module may register.
+  it('ends a registration under way across a session switch in a state the new module acts on', async () => {
+    let answer!: (res: Response) => void;
+    const { mod, dir } = registeredModule({ register: false, enroll: () => new Promise<Response>((resolve) => { answer = resolve; }) });
+    const first = mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    await mod.stop();
+    const switched = new IdentityModule({ keyPath: join(dir, 'k.pem'), home: 'id.test' });
+    expectSays(
+      (await switched.handleToolCall(call('accept_invite', { invite: 'inv', name: 'B' }))).error,
+      'Nothing was sent: a registration is already under way on this host',
+    );
+    answer(new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 }));
+    expect((await first).success).toBe(true);
+    expect((await switched.handleToolCall(call('status', {}))).data).toMatchObject({ registeredAs: 'A', id: 'agent:a@guest' });
+
+    let drop!: (err: Error) => void;
+    const lost = registeredModule({ register: false, enroll: () => new Promise<Response>((_answer, reject) => { drop = reject; }) });
+    const unanswered = lost.mod.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }));
+    await lost.mod.stop();
+    let enrolls = 0;
+    const next = new IdentityModule({
+      keyPath: join(lost.dir, 'k.pem'),
+      home: 'id.test',
+      fetchImpl: (async (url: any) => {
+        if (String(url).includes('/enroll')) enrolls++;
+        return new Response(JSON.stringify({ sub: 'agent:a@guest' }), { status: 200 });
+      }) as typeof fetch,
+    });
+    drop(new Error('connection reset'));
+    let noReply = '';
+    await logged(async () => { noReply = String((await unanswered).error); });
+    expectSays(noReply, 'gave no reply (connection reset)');
+    let registered = false;
+    await logged(async () => { registered = (await next.handleToolCall(call('accept_invite', { invite: 'inv', name: 'A' }))).success; });
+    expect(registered).toBe(true);
+    expect(enrolls).toBe(1);
   });
 
   it('names what a call lacks: the service, the path as given, both of invite and name', async () => {

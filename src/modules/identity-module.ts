@@ -27,7 +27,7 @@
  * src/statements.ts is the source of truth — re-copy, don't fork).
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync, renameSync } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, resolve } from 'node:path';
 import {
   createPrivateKey,
   createPublicKey,
@@ -182,6 +182,19 @@ interface IdentityRecord {
  *  no id could be read from the reply, when `sub` is null. */
 type HeldRegistration = Omit<IdentityRecord, 'sub'> & { sub: string | null };
 
+/**
+ * What this process knows of a registration beyond its record: one held in
+ * memory because it couldn't be recorded, and whether one is under way. It
+ * is kept per record file rather than per module, since the host builds a
+ * new IdentityModule at each session switch while a registration belongs to
+ * the deployment: a session switch keeps both, and a restart ends them.
+ */
+interface RegistrationState {
+  held: HeldRegistration | null;
+  enrolling: boolean;
+}
+const registrationStates = new Map<string, RegistrationState>();
+
 function ok(data: unknown): ToolResult {
   return { success: true, data };
 }
@@ -237,13 +250,18 @@ export class IdentityModule implements Module {
   private servicesFetchedAt = 0;
   private servicesInflight: Promise<void> | null = null;
 
-  /** A registration this session holds in memory, since it couldn't be recorded. */
-  private held: HeldRegistration | null = null;
-  /** Whether a registration is under way: a second one is refused until it ends. */
-  private enrolling = false;
+  /** This deployment's registration state in this process: a registration
+   *  held in memory, and whether one is under way, so that a second one is
+   *  refused until it ends. Shared by every module made for the same record
+   *  file (see RegistrationState). */
+  private readonly state: RegistrationState;
 
   constructor(private readonly config: IdentityModuleConfig) {
     this.recordPath = config.keyPath.replace(/\.pem$/, '') + '.json';
+    const key = resolve(this.recordPath);
+    let state = registrationStates.get(key);
+    if (!state) registrationStates.set(key, (state = { held: null, enrolling: false }));
+    this.state = state;
   }
 
   private ctx: ModuleContext | null = null;
@@ -442,12 +460,12 @@ export class IdentityModule implements Module {
       if (rec) {
         // A registration held in memory has no record file to remove: the
         // host forgets it when it restarts.
-        const rotate = this.held
+        const rotate = this.state.held
           ? 'restart the host, which forgets the registration it holds in memory, and register it again'
           : 'remove the record as well and register this host again';
         throw new IdentityError(
           `this host's registration as "${rec.name}" with ${rec.home} is ` +
-            `${this.held ? 'held in memory' : `recorded at ${this.recordPath}`}, but its identity key at ` +
+            `${this.state.held ? 'held in memory' : `recorded at ${this.recordPath}`}, but its identity key at ` +
             `${this.config.keyPath} is missing, so no new key was made: the service holds the registration under the ` +
             `old key and would refuse every access signed with a new one. Restore the key file. To rotate the key on ` +
             `purpose, ${rotate} with an invitation code; the service keeps the old registration, so the new one needs ` +
@@ -500,7 +518,7 @@ export class IdentityModule implements Module {
   }
 
   /**
-   * This host's registration: one this session holds in memory, since it
+   * This host's registration: one this process holds in memory, since it
    * couldn't be recorded, or else the record file's. Null only when there is
    * no record file. A record file that can't be read, or holds no
    * registration, throws an IdentityError: whether this host is registered
@@ -508,7 +526,7 @@ export class IdentityModule implements Module {
    * would be refused if it is.
    */
   private record(): IdentityRecord | HeldRegistration | null {
-    if (this.held) return this.held;
+    if (this.state.held) return this.state.held;
     let text: string;
     try {
       text = readFileSync(this.recordPath, 'utf8');
@@ -588,7 +606,7 @@ export class IdentityModule implements Module {
             id: rec.sub,
             recognizedBy: rec.home,
             since: rec.enrolledAt,
-            note: this.held
+            note: this.state.held
               ? HELD_NOTE
               : 'Access to services is handled by the host automatically (e.g. mcpl-admin--mcpl_deploy with an `access` name).',
           }
@@ -1028,21 +1046,21 @@ export class IdentityModule implements Module {
     }
     // One registration at a time: a second call while one is under way
     // would be refused by the service, or register this host twice.
-    if (this.enrolling) {
+    if (this.state.enrolling) {
       return fail('Nothing was sent: a registration is already under way on this host, and its own answer will say how it went.');
     }
     const existing = this.record();
     if (existing) {
       return fail(
         `Nothing changed: this host is already registered as "${existing.name}"${existing.sub ? ` (${existing.sub})` : ''}, ` +
-        `and registration happens once. identity--status shows it.${this.held ? ` ${HELD_NOTE}` : ''}`,
+        `and registration happens once. identity--status shows it.${this.state.held ? ` ${HELD_NOTE}` : ''}`,
       );
     }
-    this.enrolling = true;
+    this.state.enrolling = true;
     try {
       return await this.enroll(input.invite, input.name);
     } finally {
-      this.enrolling = false;
+      this.state.enrolling = false;
     }
   }
 
@@ -1134,9 +1152,9 @@ export class IdentityModule implements Module {
    * Keep a registration the identity service answered 200 for. The service
    * holds it from then on, so registering again would be refused. When this
    * host can't record it (the record can't be saved, or no id could be read
-   * from the reply), it holds the registration in memory for this session,
-   * so status and access work until the host restarts, and the operator is
-   * asked to record it.
+   * from the reply), it holds the registration in memory until the host
+   * restarts, across session switches, so status and access work until
+   * then, and the operator is asked to record it.
    */
   private registered(name: string, sub: string | null, enrolledAt: string): ToolResult {
     const home = this.config.home;
@@ -1149,7 +1167,7 @@ export class IdentityModule implements Module {
           `reply, so it wasn't recorded. This host holds it in memory only until it restarts. ` +
           this.recordByHand(name, null, enrolledAt),
       );
-      this.held = { sub, name, home, enrolledAt };
+      this.state.held = { sub, name, home, enrolledAt };
       return fail(
         `The identity service at ${home} answered that it registered this host as "${name}" (200), but no id could ` +
         `be read from its reply, so this host couldn't record it. ${holding} Ask your operator to record this registration ` +
@@ -1167,7 +1185,7 @@ export class IdentityModule implements Module {
           `${sentence(errorText(err))} This host holds it in memory only until it restarts. ` +
           this.recordByHand(name, sub, enrolledAt),
       );
-      this.held = { sub, name, home, enrolledAt };
+      this.state.held = { sub, name, home, enrolledAt };
       return fail(
         `The identity service at ${home} registered this host as "${name}" (${sub}), but this host couldn't record ` +
         `that. ${holding} Ask your operator to fix what stopped the write, which the host's log names, and to record ` +
