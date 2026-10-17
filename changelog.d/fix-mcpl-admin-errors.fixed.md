@@ -66,12 +66,12 @@
     restarted, and, when the save failed before writing anything, that
     nothing was deployed, with the repair by whose failure it is, as for a
     read. For a save that may have stopped partway (a full disk, say, or any
-    failure not known to come before the write), it says what the file holds
-    isn't known (its old content, the new content whole, or the new content
-    cut short), that `mcpl_list` shows the entries it holds or why it can't
-    be read, and that the next host start stops on a file that isn't valid
-    JSON. Before, the raw file-system error came through. An unload whose
-    record fails that way says the same.
+    other system error that doesn't come before the write), it says what the
+    file holds isn't known (its old content, the new content whole, or the
+    new content cut short), that `mcpl_list` shows the entries it holds or
+    why it can't be read, and that the next host start stops on a file that
+    isn't valid JSON. Before, the raw file-system error came through. An
+    unload whose record fails that way says the same.
   - A failed connect or restart says the state agent-framework left the
     server in, read rather than guessed: still running its previous
     configuration, no longer loaded (so `mcpl_restart` can't reach it), or

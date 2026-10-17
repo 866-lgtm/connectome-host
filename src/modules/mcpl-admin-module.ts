@@ -1001,15 +1001,15 @@ export class McplAdminModule implements Module {
         // The restart appends its own overlay note, so the advice leaves it
         // out. With the overlay unreadable, whether the agent's own entry
         // replaces an operator's definition isn't known, so for an id the
-        // operator defines, the step for each, as notLoadedAdvice gives it.
+        // operator defines, the step for each definition.
         return `It isn't loaded in this session any more, so ${RESTART} can't reach it.` +
           (restartOf
             ? this.notLoadedAdvice(id, restartOf, false)
             : this.operatorServers.has(id)
               ? ` Which defines it isn't known while your overlay file can't be read. Once it can, ${LIST} shows ` +
                 `your own entry for it, if there is one, which ${DEPLOY} with each of its fields loads again; ` +
-                'otherwise your operator\'s definition loads again at the next host start, and ' +
-                `${DEPLOY} would load your own entry in its place.`
+                'otherwise your operator\'s definition loads again at the next host start, unless your overlay ' +
+                `unloads it, and ${DEPLOY} would load your own entry in its place.`
               : ` ${DEPLOY} with each of its fields can load it again once your overlay file can be read, since a ` +
                 'deploy replaces the entry whole.');
       }
@@ -1063,7 +1063,10 @@ export class McplAdminModule implements Module {
    * an id the operator defines, the step for each.
    */
   private restartRemedy(id: string, overlay: Record<string, AgentOverlayEntry> | null): string {
-    const rebuilt = `if the server itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${UNLOAD_REMEDY}`;
+    // With the overlay unreadable, an unload that persists is refused, so the
+    // unload step is for this session.
+    const unload = overlay === null ? `${UNLOAD} with \`persist: false\` unloads it for this session.` : UNLOAD_REMEDY;
+    const rebuilt = `if the server itself needs fixing (its build, say), call ${RESTART} once it's fixed. ${unload}`;
     const unseen = `its args and env aren't shown to you, and ${DEPLOY} would replace it whole with your own entry`;
     if (overlay === null) {
       return this.operatorServers.has(id)
@@ -1176,12 +1179,13 @@ export class McplAdminModule implements Module {
       if (!known && !operator) {
         return fail(
           `Nothing was unloaded: no server "${id}" is loaded or defined by your operator. ${loadedText} ` +
-          capital(this.unusableOverlay(read.error, `whether it names "${id}" isn't known`, UNLOAD)),
+          capital(this.unusableOverlay(read.error, `whether it names "${id}" isn't known`, `${UNLOAD} "${id}"`)),
         );
       }
       if (persist) {
         return fail(
-          `Nothing was unloaded: ${this.unusableOverlay(read.error, 'the unload can\'t be recorded in it', UNLOAD)}` +
+          'Nothing was unloaded: ' +
+          this.unusableOverlay(read.error, 'the unload can\'t be recorded in it', `${UNLOAD} "${id}"`) +
           (known ? ` To stop "${id}" for this session in the meantime, call ${UNLOAD} with \`persist: false\`.` : ''),
         );
       }
@@ -1200,7 +1204,7 @@ export class McplAdminModule implements Module {
         return fail(
           `Server "${id}" couldn't be disconnected: ${sentence(reasonText(error))} It may still be loaded in this ` +
           `session, and this unload changed nothing in your overlay. ${LIST} shows whether it's loaded; call ` +
-          `${UNLOAD} again to retry.`,
+          `${UNLOAD} "${id}" again to retry.`,
         );
       }
     }
@@ -1226,7 +1230,7 @@ export class McplAdminModule implements Module {
     try {
       held = known ? readAgentOverlay(this.overlayPath) : overlay;
     } catch (error) {
-      return fail(`${head} But ${this.unusableOverlay(error, 'the unload isn\'t recorded', UNLOAD)}`);
+      return fail(`${head} But ${this.unusableOverlay(error, 'the unload isn\'t recorded', `${UNLOAD} "${id}"`)}`);
     }
     // The change goes into a copy, so `held` stays what the file holds, for
     // the receipt of a save that fails.

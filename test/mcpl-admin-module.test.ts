@@ -643,7 +643,7 @@ describe('mcpl_unload', () => {
       result.error,
       `Nothing was unloaded: your overlay file, ${overlayPath}, isn't valid JSON, so the unload can't be recorded in it.`,
       'The next host start will stop on the file until it\'s fixed.',
-      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
+      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload "discord" again.',
       'Don\'t move it aside',
       'To stop "discord" for this session in the meantime, call mcpl-admin--mcpl_unload with `persist: false`.',
     );
@@ -678,7 +678,7 @@ describe('mcpl_unload', () => {
         (await unknownId(persist)).error,
         'Nothing was unloaded: no server "mine" is loaded or defined by your operator. Loaded: "discord".',
         `Your overlay file, ${overlayPath}, holds null, not an object with mcplServers, so whether it names "mine" isn't known.`,
-        'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
+        'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload "mine" again.',
       );
     }
     const persisting = String((await call(mod, 'mcpl_unload', { id: 'op' })).error);
@@ -708,7 +708,7 @@ describe('mcpl_unload', () => {
       async () => { throw new Error('stuck'); };
     const expectDisconnectFailed = (text: unknown, id: string, reason: string) => expectSays(
       text, `Server "${id}" couldn't be disconnected: ${reason}.`, 'It may still be loaded', 'changed nothing in your overlay',
-      'mcpl-admin--mcpl_list shows whether it\'s loaded', 'call mcpl-admin--mcpl_unload again',
+      'mcpl-admin--mcpl_list shows whether it\'s loaded', `call mcpl-admin--mcpl_unload "${id}" again`,
     );
     for (const id of ['discord', 'mytool']) {
       expectDisconnectFailed((await call(mod, 'mcpl_unload', { id })).error, id, 'stuck');
@@ -738,7 +738,7 @@ describe('mcpl_unload', () => {
       'Unloaded server "discord" — its tools are gone from your toolset.',
       `But your overlay file, ${overlayPath}, isn't valid JSON, so the unload isn't recorded.`,
       'The next host start will stop on the file until it\'s fixed.',
-      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload again.',
+      'Fix the file (or, if you can\'t edit it, ask your operator to), then call mcpl-admin--mcpl_unload "discord" again.',
       'Don\'t move it aside',
     );
     expect(servers.has('discord')).toBe(false);
@@ -774,7 +774,7 @@ describe('mcpl_unload', () => {
       'Unloaded server "discord" — its tools are gone from your toolset.',
       `But your overlay file, ${overlayPath}, couldn't be read (`, 'EISDIR',
       '), so the unload isn\'t recorded. The next host start will stop on the file while it can\'t be read. Ask your ' +
-      'operator to fix it, then call mcpl-admin--mcpl_unload again.',
+      'operator to fix it, then call mcpl-admin--mcpl_unload "discord" again.',
     );
     for (const said of ['couldn\'t be updated', 'aving your overlay', 'loads it again']) expect(failed).not.toContain(said);
     expect(servers.has('discord')).toBe(false);
@@ -1433,6 +1433,13 @@ describe('restart and deploy report the connection they read', () => {
       'The restart of "op" didn\'t complete: handshake timed out. It isn\'t connected.',
       'If its command, args or url is wrong, that\'s your operator\'s definition to correct, so ask them',
     );
+    // A malformed entry of the agent's replaces nothing: the boot skips it, so
+    // the operator's definition is what runs.
+    saveAgentOverlay(overlayPath, { op: { toolPrefix: 'y' } });
+    expectSays(
+      String((await call(mod, 'mcpl_restart', { id: 'op' })).error),
+      'If its command, args or url is wrong, that\'s your operator\'s definition to correct, so ask them',
+    );
     // Once the agent's own entry replaces it, that entry is the agent's to correct.
     saveAgentOverlay(overlayPath, { op: { command: 'mine' } });
     expectSays(
@@ -1459,8 +1466,22 @@ describe('restart and deploy report the connection they read', () => {
       'If its command, args or url is wrong, mcpl-admin--mcpl_deploy with each of its fields corrects it once your overlay ' +
       'file can be read; if the server itself needs fixing',
       'and mcpl-admin--mcpl_deploy and an mcpl-admin--mcpl_unload that persists are refused.',
+      // An unload that persists is refused then, so the step is for this session.
+      'mcpl-admin--mcpl_unload with `persist: false` unloads it for this session.',
     );
     expect(result).not.toContain('call mcpl-admin--mcpl_deploy with each of its fields');
+    expect(result).not.toContain('mcpl-admin--mcpl_unload unloads it.');
+    // A restart that throws and leaves it down, still listed, says the same.
+    (stub as unknown as { restartMcplServer: (id: string) => Promise<void> }).restartMcplServer = async (id) => {
+      Object.assign(servers.get(id)!, { connected: false });
+      throw new Error('handshake timed out');
+    };
+    expectSays(
+      String((await call(mod, 'mcpl_restart', { id: 'tool' })).error),
+      'The restart of "tool" didn\'t complete: handshake timed out. It isn\'t connected.',
+      'If its command, args or url is wrong, mcpl-admin--mcpl_deploy with each of its fields corrects it once your overlay ' +
+      'file can be read', 'mcpl-admin--mcpl_unload with `persist: false` unloads it for this session.',
+    );
   });
 
   // For a server the operator also defines, whether the agent's own entry
@@ -1485,7 +1506,8 @@ describe('restart and deploy report the connection they read', () => {
       'shows once your overlay file can be read: your own entry takes mcpl-admin--mcpl_deploy with each of its fields; ' +
       'your operator\'s definition is theirs to correct, so ask them, since its args and env aren\'t shown to you, and ' +
       'mcpl-admin--mcpl_deploy would replace it whole with your own entry. If the server itself needs fixing (its build, ' +
-      'say), call mcpl-admin--mcpl_restart once it\'s fixed. mcpl-admin--mcpl_unload unloads it.',
+      'say), call mcpl-admin--mcpl_restart once it\'s fixed. mcpl-admin--mcpl_unload with `persist: false` unloads it for ' +
+      'this session.',
     );
     expect(result).not.toContain('corrects it once your overlay file can be read');
   });
@@ -1731,8 +1753,8 @@ describe('a failed connect or restart says the state it left', () => {
       result, 'It isn\'t loaded in this session any more, so mcpl-admin--mcpl_restart can\'t reach it.',
       'Which defines it isn\'t known while your overlay file can\'t be read. Once it can, mcpl-admin--mcpl_list shows ' +
       'your own entry for it, if there is one, which mcpl-admin--mcpl_deploy with each of its fields loads again; ' +
-      'otherwise your operator\'s definition loads again at the next host start, and mcpl-admin--mcpl_deploy would load ' +
-      'your own entry in its place.',
+      'otherwise your operator\'s definition loads again at the next host start, unless your overlay unloads it, and ' +
+      'mcpl-admin--mcpl_deploy would load your own entry in its place.',
     );
     expect(result).not.toContain('can load it again once your overlay file can be read');
   });
@@ -2076,7 +2098,7 @@ describe('a failed call says what changed and what to do', () => {
     expect(listed).toEndWith('Ask your operator to fix it.');
     expectSays(
       (await call(mod, 'mcpl_unload', { id: 'shell' })).error, 'Nothing was unloaded: your overlay',
-      ...unreadable('the unload can\'t be recorded in it'), ', then call mcpl-admin--mcpl_unload again.',
+      ...unreadable('the unload can\'t be recorded in it'), ', then call mcpl-admin--mcpl_unload "shell" again.',
       'To stop "shell" for this session in the meantime, call mcpl-admin--mcpl_unload with `persist: false`.',
     );
     expect(calls).toEqual(['connect:shell']);
@@ -2145,7 +2167,7 @@ describe('a failed call says what changed and what to do', () => {
     const own = (code: 'EMFILE' | 'ENFILE', path: string): never => {
       throw Object.assign(new Error(`${code}: too many open files, open '${path}'`), { code });
     };
-    const later = 'This host has too many files open, which can pass: call mcpl-admin--mcpl_unload again shortly, and if ' +
+    const later = 'This host has too many files open, which can pass: call mcpl-admin--mcpl_unload "other" again shortly, and if ' +
       'it fails the same way, ask your operator.';
 
     // A restart that fails after its disconnect, with the overlay read refused.
