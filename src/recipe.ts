@@ -724,7 +724,7 @@ export interface RecipeModules {
    * the alternative when the file is maintained outside the agent (edits
    * then propagate to the injection but not to `workspace--read`, which
    * serves Chronicle). A missing FILE remains fail-open at runtime: no
-   * injection, warn once.
+   * injection, with a log line and an `instructions-unavailable` ops alert.
    *
    * Cache economics: with position 'system' the injected block sits in the
    * prompt-cache prefix of every agent, so each EDIT to the file is a

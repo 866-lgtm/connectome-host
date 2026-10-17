@@ -19,13 +19,15 @@
  * `instructions-unavailable-clear` stands it down, and a later loss alerts
  * afresh, whatever its reason.
  *
- * One read is in flight at a time. A turn that comes while it's pending
- * waits on it rather than starting another, until its budget, counted from
- * the read's start, runs out; a turn after that injects nothing at once. So
- * a read that never finishes (a FIFO at the path, which agent-framework
- * 0.22.1 opens and waits on) leaves agents without their instructions until
- * it finishes, the session is switched or the host restarts, and no further
- * read starts meanwhile.
+ * One read is in flight at a time in each session. A turn that comes while
+ * it's pending waits on it rather than starting another, until its budget,
+ * counted from the read's start, runs out; a turn after that injects nothing
+ * at once. So a read that never finishes (a FIFO at the path, which
+ * agent-framework 0.22.1 opens and waits on) leaves agents without their
+ * instructions until it finishes, the session is switched or the host
+ * restarts, and no further read starts in that session. A stop can't cancel
+ * the read, since readFileFromDisk takes no signal: the module lets go of
+ * it, and the next session's first turn starts a read of its own.
  *
  * The host keeps one instance across session switches, as it keeps the
  * notices module, so an alert raised in one session is stood down in the
@@ -35,15 +37,13 @@
  * workspace path ("<mountName>/<relativePath>"). validateRecipe enforces the
  * pairing. The file is read through WorkspaceModule.readFileFromDisk, which
  * refuses a file that is itself a link unless its mount follows links (a
- * recipe's mounts don't), reads a file only if its canonical path lies
- * inside the mount, and checks that after opening the file, so a link
- * swapped in mid-read can't bring outside content into the trusted
- * instructions block.
+ * recipe's mounts don't), and reads a file only if its canonical path lies
+ * inside the mount, which it checks after opening the file.
  *
- * Reads ask readFileFromDisk for at most maxBytes, so the bound is
- * agent-framework's. At 0.22.1 it holds for a file larger than maxBytes when
- * the read starts, and a file that grows past it during the read is read to
- * its end.
+ * Reads ask readFileFromDisk for at most maxBytes. At 0.22.1 that holds for
+ * a file larger than maxBytes when the read starts, but a file that grows
+ * past it during the read is read to its end, so the module cuts what it is
+ * given at maxBytes too (gatherContext).
  */
 
 import type {
@@ -74,12 +74,14 @@ export interface WorkspaceDiskReader {
 
 type DiskRead = { bytes: Buffer; size: number; truncated: boolean };
 
-/** A read of the file under way, which every turn that comes while it's
- *  pending waits on, so a read that never finishes holds one open file. */
+/** A read of the file under way, which every turn of its session that comes
+ *  while it's pending waits on, so a read that never finishes is one read
+ *  waiting, not one for each turn. */
 interface PendingRead {
   /** What the read gave, or why it gave nothing. */
   outcome: Promise<{ read: DiskRead } | { error: unknown }>;
-  /** When its budget runs out, counted from its start. */
+  /** When its budget runs out, counted from its start, on the monotonic
+   *  clock (performance.now), so a step in the wall clock doesn't move it. */
   deadline: number;
   /** Set when the session it was started for stops: what it gives after
    *  that changes nothing. */
@@ -109,11 +111,11 @@ export const DEFAULT_INSTRUCTIONS_MAX_BYTES = 32768;
 export class InstructionsModule implements Module {
   readonly name = 'instructions';
 
-  // gatherContext is one bounded file read — well under 2s. A modest
-  // explicit budget keeps a wedged filesystem from eating the registry-wide
-  // 15s default before inference proceeds without us. The read's own budget
-  // is three quarters of it (readBudgetMs), so a read that hangs raises the
-  // alert before the registry gives up on the turn with only a console line.
+  // gatherContext is one file read. A modest explicit budget keeps a wedged
+  // filesystem from eating the registry-wide 15s default before inference
+  // proceeds without us. The read's own budget is three quarters of it
+  // (readBudgetMs), so a read that hangs raises the alert before the
+  // registry gives up on the turn with only a line on stderr.
   readonly contextTimeoutMs: number = 2000;
 
   private readonly path: string;
@@ -153,12 +155,15 @@ export class InstructionsModule implements Module {
     // The host keeps this module across session switches, and what it reads
     // belongs to the session that's ending: the next session gives its own
     // workspace, whose mounts can be other directories (the `_config` mount
-    // sits in each session's store). A read under way ends with it. The
-    // reasons warned about go, so the next session's first failing read
-    // raises the alert again for the TUI, which drops its alerts at a
-    // switch. An alert that's up stays marked, so the next session's first
-    // successful read stands it down where it's still shown: the web UI's
-    // alert strip and the notices module's episode outlive the switch.
+    // sits in each session's store). The module lets go of a read under
+    // way, which runs on, since readFileFromDisk takes no signal; what it
+    // gives then changes nothing. The reasons warned about go, so the next
+    // session's first failing read raises the alert again for the TUI,
+    // which drops its alerts at a switch. An alert that's up stays marked,
+    // so the next session's first successful read stands it down where it's
+    // still shown: the web UI's alert strip and the notices module's episode
+    // outlive the switch. Until the next start, a turn that reaches the
+    // module injects nothing and changes nothing (gatherContext).
     if (this.pending) this.pending.ended = true;
     this.pending = null;
     this.workspace = null;
@@ -198,6 +203,10 @@ export class InstructionsModule implements Module {
    * share the one living document (that is the point of the module).
    */
   async gatherContext(_agentName: string): Promise<ContextInjection[]> {
+    // A module that isn't started, stopped or given the next session's
+    // workspace but not yet started, belongs to no running session: a turn
+    // that reaches it then injects nothing and changes nothing.
+    if (!this.ctx) return [];
     const workspace = this.workspace;
     if (!workspace) {
       this.unavailable('the workspace module isn\'t wired, so no instructions can be read');
@@ -220,13 +229,21 @@ export class InstructionsModule implements Module {
       this.unavailable(this.reasonFor(outcome.error));
       return [];
     }
-    const { bytes, size, truncated } = outcome.read;
+    const read = outcome.read;
+    // A read cut at the cap is of a file over it. agent-framework 0.22.1
+    // reads a file that grows after the read's size check whole, so the cap
+    // is held here too. Once the host's agent-framework floor includes
+    // anima-research/agent-framework#409, readFileFromDisk keeps maxBytes
+    // itself, and this second condition can go.
+    const over = read.truncated || read.bytes.byteLength > this.maxBytes;
+    const bytes = over ? read.bytes.subarray(0, this.maxBytes) : read.bytes;
+    const size = Math.max(read.size, read.bytes.byteLength);
 
     let content: string;
-    if (truncated) {
+    if (over) {
       // Back the cut up to a UTF-8 sequence boundary so a multibyte
       // character split at the cap never decodes to U+FFFD right before
-      // the marker. The bytes past the cap were never read, so detect a
+      // the marker. The bytes past the cap aren't kept, so detect a
       // straddle from the kept tail alone: find the last lead byte and
       // drop the sequence iff it declares more bytes than were kept.
       let cut = bytes.length;
@@ -283,7 +300,7 @@ export class InstructionsModule implements Module {
         (read) => ({ read }),
         (error: unknown) => ({ error }),
       ),
-      deadline: Date.now() + this.readBudgetMs,
+      deadline: performance.now() + this.readBudgetMs,
       ended: false,
     };
     void pending.outcome.then(() => {
@@ -297,7 +314,7 @@ export class InstructionsModule implements Module {
    *  a turn that comes after it, so a read that hangs costs later turns no
    *  wait. */
   private async within(pending: PendingRead): Promise<{ read: DiskRead } | { error: unknown } | 'late'> {
-    const left = pending.deadline - Date.now();
+    const left = pending.deadline - performance.now();
     if (left <= 0) return 'late';
     let timer: ReturnType<typeof setTimeout> | undefined;
     const late = new Promise<'late'>((resolve) => {
@@ -327,8 +344,9 @@ export class InstructionsModule implements Module {
   }
 
   /** No instructions this turn: log it and raise one ops alert per distinct
-   *  reason until the file loads again, under the host's agent's name, since
-   *  one loss reaches every agent it runs, subagents included. */
+   *  reason until the file loads again or the session ends, under the host's
+   *  agent's name, since one loss reaches every agent it runs, subagents
+   *  included. */
   private unavailable(reason: string): void {
     if (this.warned.has(reason)) return;
     this.warned.add(reason);

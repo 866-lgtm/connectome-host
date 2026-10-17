@@ -1433,14 +1433,17 @@ export class WebUiModule implements Module {
     } catch (err) {
       // A path no mount holds or one leading out of its mount, a file that is
       // itself a link the mount doesn't follow, and one whose canonical path
-      // lies outside the mount are forbidden. Anything else the read can't
-      // give is not found, a file that changed while it was read among them.
-      // The body is the read's message, which says why and names no host
-      // path; the status says forbidden or not found.
+      // lies outside the mount are forbidden. A mount whose directory can't
+      // be resolved is the server's fault, as no workspace is, and says
+      // nothing about the file. Anything else the read can't give is not
+      // found, a file that changed while it was read among them. The body is
+      // the read's message, which says why and names no host path; the
+      // status says forbidden, unavailable or not found.
       const read = err instanceof WorkspaceReadError ? err : null;
       if (read && ['unknown_mount', 'traversal', 'symlink', 'escape'].includes(read.code)) {
         return new Response(read.message, { status: 403 });
       }
+      if (read?.code === 'mount_unavailable') return new Response(read.message, { status: 503 });
       return new Response(read?.message ?? 'Not found', { status: 404 });
     }
   }

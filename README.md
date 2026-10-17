@@ -529,11 +529,13 @@ option.
 analogue) in a workspace mount and injects it into every agent's context on
 every turn — the resident agent and all ephemeral subagents. Edits take effect
 on the next turn; nothing is persisted to history. Defaults: path
-`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (reads are bounded
-to the cap); a missing file is fail-open (no injection, warn once), while a
-path naming a nonexistent mount fails at recipe load — including on the
-implicit default workspace (`input` + `products`), whose mount set can never
-satisfy the default path, so declare an `instructions` mount explicitly.
+`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (content past it is
+cut, with a marker); a missing or unreadable file is fail-open: no injection,
+and one log line and one `instructions-unavailable` ops alert for each reason
+in a session until the file loads again, which `instructions-unavailable-clear`
+stands down. A path naming a nonexistent mount fails at recipe load — including
+on the implicit default workspace (`input` + `products`), whose mount set can
+never satisfy the default path, so declare an `instructions` mount explicitly.
 
 **Who edits, and how it propagates**: the module reads *disk*; agent
 `workspace--write`/`edit` land in Chronicle and reach disk only on an
@@ -541,8 +543,10 @@ satisfy the default path, so declare an `instructions` mount explicitly.
 read-write instructions mount. On a read-only mount the flow reverses:
 human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
-and letting the agent make the edit. Symlinks that lead outside the mount are
-rejected (realpath containment), never injected.
+and letting the agent make the edit. The file is read through the
+workspace's `readFileFromDisk`, so a file that is itself a link isn't read on
+a recipe's mounts, which don't follow links, and neither is one whose
+canonical path lies outside its mount: either raises the alert instead.
 
 **Cache note**: at `position: "system"` the block lives in every agent's
 prompt-cache prefix, so each edit is a fleet-wide cache cold start on the next

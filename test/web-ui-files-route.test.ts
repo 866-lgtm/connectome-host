@@ -45,6 +45,7 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
       'files/gone.txt': new WorkspaceReadError('not_found', 'File not found: files/gone.txt', 'lstat', 'ENOENT'),
       'files/album': new WorkspaceReadError('directory', 'Path is a directory: files/album', 'lstat'),
       'files/moving.txt': new WorkspaceReadError('changed', 'File changed during read: files/moving.txt', 'stat'),
+      'gone/x.txt': new WorkspaceReadError('mount_unavailable', 'Mount unavailable: gone', 'realpath_root', 'ENOENT'),
     };
     standIn = {
       resolveAbsolutePath: () => join(root, 'resolved.txt'),
@@ -116,6 +117,12 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
       expect(res.status).toBe(404);
       expect(await res.text()).toBe(body);
     }
+  });
+
+  test("a mount whose directory can't be resolved is unavailable, not a missing file, and says why", async () => {
+    const res = await fetch(`${baseUrl}/files/gone/x.txt`);
+    expect(res.status).toBe(503);
+    expect(await res.text()).toBe('Mount unavailable: gone');
   });
 
   test('a host with no workspace answers that none is mounted', async () => {

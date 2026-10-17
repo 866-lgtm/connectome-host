@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -259,6 +259,16 @@ describe('InstructionsModule', () => {
     expect(textOf(await mod.gatherContext('a'))).toBe(`${DEFAULT_INSTRUCTIONS_HEADER}\n\n${'a'.repeat(10)}`);
   });
 
+  test('cuts at maxBytes a read that gave more, as for a file that grew while it was read', async () => {
+    // agent-framework 0.22.1 reads to its end a file that was within maxBytes
+    // when the read took its size and grew while it was read.
+    const grown = { bytes: Buffer.from('€'.repeat(10)), size: 5, truncated: false };
+    const mod = await moduleOver({ readFileFromDisk: async () => grown }, { maxBytes: 7 });
+
+    const text = textOf(await mod.gatherContext('a'));
+    expect(text).toBe(`${DEFAULT_INSTRUCTIONS_HEADER}\n\n€€\n\n[truncated: first 6 of 30 bytes]`);
+  });
+
   test('reads at most maxBytes from an oversized file', async () => {
     // Only the first maxBytes influence the injection, whatever the file's
     // size: the read asks for no more.
@@ -366,6 +376,25 @@ describe('InstructionsModule', () => {
     expect(alerts.map((a) => a.kind)).toEqual(['instructions-unavailable', 'instructions-unavailable-clear']);
   });
 
+  test("a step in the wall clock moves no read's budget", async () => {
+    const { reader, calls } = settledByTest();
+    const mod = await moduleOver(reader);
+    const first = mod.gatherContext('resident');
+    // An hour forward on the wall clock while the read is pending: a turn
+    // that joins it still has its budget, counted on the monotonic clock.
+    setSystemTime(new Date(Date.now() + 60 * 60 * 1000));
+    try {
+      const joining = mod.gatherContext('resident');
+      calls[0]!.resolve(readOf('on time'));
+      expect(textOf(await first)).toContain('on time');
+      expect(textOf(await joining)).toContain('on time');
+      expect(calls).toHaveLength(1);
+      expect(alerts).toEqual([]);
+    } finally {
+      setSystemTime();
+    }
+  });
+
   test('a stop with a read pending: the next session reads afresh, and the old read settling changes nothing', async () => {
     const { reader, calls } = settledByTest();
     const mod = await moduleOver(reader);
@@ -442,5 +471,73 @@ describe('InstructionsModule', () => {
     await mod.start(ctx);
     expect(await mod.gatherContext('resident')).toEqual([]);
     expect(alerts.at(-1)!.message).toBe("no instructions injected: the workspace module isn't wired, so no instructions can be read");
+  });
+
+  test("a turn that reaches the module while it isn't started injects nothing and changes nothing", async () => {
+    const { reader, calls } = settledByTest();
+    const mod = await moduleOver(reader);
+    await mod.stop();
+    // After the stop, and given the next session's workspace before its
+    // start, as the host does: no read, no log line, no alert.
+    expect(await mod.gatherContext('resident')).toEqual([]);
+    mod.setWorkspace(reader);
+    expect(await mod.gatherContext('resident')).toEqual([]);
+    expect(calls).toHaveLength(0);
+    expect(warnSpy).not.toHaveBeenCalled();
+    expect(alerts).toEqual([]);
+
+    // Started, the session's first failing read raises its alert and its
+    // first successful read stands it down: nothing those turns did is left
+    // to swallow the one or bring on the other.
+    const nextAlerts: Alert[] = [];
+    await mod.start(contextFor(nextAlerts));
+    const failing = mod.gatherContext('resident');
+    calls[0]!.reject(missing());
+    expect(await failing).toEqual([]);
+    const loading = mod.gatherContext('resident');
+    calls[1]!.resolve(readOf('loaded'));
+    expect(textOf(await loading)).toContain('loaded');
+    expect(nextAlerts.map((a) => a.kind)).toEqual(['instructions-unavailable', 'instructions-unavailable-clear']);
+  });
+
+  test("a read that fails after its session stopped raises nothing, and the next session's own failure still does", async () => {
+    const { reader, calls } = settledByTest();
+    const mod = await moduleOver(reader);
+    const stale = mod.gatherContext('resident');
+    expect(calls).toHaveLength(1);
+
+    await mod.stop();
+    const nextAlerts: Alert[] = [];
+    mod.setWorkspace(reader);
+    await mod.start(contextFor(nextAlerts));
+
+    calls[0]!.reject(missing());
+    expect(await stale).toEqual([]);
+    expect(alerts).toEqual([]);
+    expect(nextAlerts).toEqual([]);
+
+    const own = mod.gatherContext('resident');
+    calls[1]!.reject(missing());
+    expect(await own).toEqual([]);
+    expect(nextAlerts.map((a) => a.kind)).toEqual(['instructions-unavailable']);
+  });
+
+  test('a read that runs past its budget after its session stopped raises nothing in the next session', async () => {
+    const { reader, calls } = settledByTest();
+    const mod = new QuickInstructionsModule({ agentName: 'resident' });
+    await mod.start(ctx);
+    mod.setWorkspace(reader);
+    const stale = mod.gatherContext('resident');
+    expect(calls).toHaveLength(1);
+
+    await mod.stop();
+    const nextAlerts: Alert[] = [];
+    mod.setWorkspace(reader);
+    await mod.start(contextFor(nextAlerts));
+
+    // The old read's deadline passes in the next session.
+    expect(await stale).toEqual([]);
+    expect(alerts).toEqual([]);
+    expect(nextAlerts).toEqual([]);
   });
 });
