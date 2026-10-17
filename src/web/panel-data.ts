@@ -35,6 +35,7 @@ import {
   type ToolClassRow,
   type ToolClassSource,
 } from '../tool-lifecycle-config.js';
+import { effectiveContextBudgetTokens } from '../framework-agent-config.js';
 
 /** Minimal slice of AppContext the panel layer needs. Both the WebUI host
  *  and the headless child runtime satisfy this structurally. */
@@ -1390,7 +1391,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // app.recipe here plotted the wrong curve on any agent whose budget had
   // ever been changed at runtime. Fall back to the recipe only if the live
   // read is unavailable.
-  let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+  let maxTokens = effectiveContextBudgetTokens(app.recipe);
   let transition: string | undefined;
   try {
     const settings = (app.framework as unknown as {

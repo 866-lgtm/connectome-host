@@ -336,7 +336,9 @@ export class ObserverRegistry {
   /** `pollMs` is how often the file is checked; tests shorten it. */
   constructor(private readonly path: string, private readonly pollMs = 3000) {}
 
-  start(): void {
+  /** `onCheck` runs after every check of the file, whether or not it
+   *  changed, so a caller can act on grants that expire with time. */
+  start(onCheck?: () => void): void {
     const at = observersFileStat(this.path);
     this.present = 'sig' in at;
     // A file that's there but can't be reached is named once, as a check
@@ -345,7 +347,15 @@ export class ObserverRegistry {
       this.say(`[webui-observers] ${this.path} ${at.problem} — admitting no grants from it`);
     }
     if ('sig' in at) this.load(at.sig, readObserversFile(this.path), 'start');
-    this.poll = setInterval(() => this.check(), this.pollMs);
+    this.poll = setInterval(() => {
+      this.check();
+      if (!onCheck) return;
+      try {
+        onCheck();
+      } catch (err) {
+        console.error(`[webui-observers] after a check: ${errorText(err)}`);
+      }
+    }, this.pollMs);
     this.poll.unref();
   }
 
@@ -359,9 +369,12 @@ export class ObserverRegistry {
     }
     if (at.sig !== this.lastSig) {
       const read = readObserversFile(this.path);
-      // Gone between the stat and the read: a miss, as a failed stat is.
-      if (read.kind === 'missing') {
-        this.missed('is gone');
+      // Gone between the stat and the read, or a read that failed (EIO,
+      // EMFILE, EACCES): a miss, as a failed stat is, so a failure that
+      // passes doesn't take every grant away, and with them every observer's
+      // sessions and connections.
+      if (read.kind === 'missing' || (read.kind === 'unreadable' && read.readFailed === true)) {
+        this.missed(read.kind === 'missing' ? 'is gone' : read.problem);
         return;
       }
       this.load(at.sig, read, 'reload');
@@ -444,6 +457,17 @@ export class ObserverRegistry {
     return this.file?.observers ?? [];
   }
 
+  /** The scopes of the grant for `key`, a canonical key, while the file
+   *  holds it and it hasn't expired, as verifyHello reads both; otherwise
+   *  null. Sessions and open connections are checked against this, so they
+   *  end with their grant. */
+  liveScopes(key: string, now = Date.now()): Set<ObserverScope> | null {
+    const grant = this.grants().find((g) => g.key === key);
+    if (!grant) return null;
+    if (grant.expires && Date.parse(grant.expires) < now) return null;
+    return new Set(grant.scopes);
+  }
+
   /**
    * Verify an observer-hello identity envelope against the live grants.
    * Returns the grant + scope set, or null (with a stderr reason — auth
@@ -510,14 +534,21 @@ export interface ObserverSession {
 }
 
 export class ObserverSessions {
-  private sessions = new Map<string, ObserverSession & { expiresAt: number }>();
+  private sessions = new Map<string, ObserverSession & { expiresAt: number; key?: string }>();
 
-  mint(scopes: Set<ObserverScope>, opts?: { full?: boolean }): string {
+  /** A session is full (password) or an observer's, minted for the grant
+   *  `key` names as the registry holds it, so it can end with that grant. */
+  mint(scopes: Set<ObserverScope>, opts: { full: true } | { key: string }): string {
     // Opportunistic sweep — the map stays tiny (one entry per auth event).
     const now = Date.now();
     for (const [t, s] of this.sessions) if (s.expiresAt < now) this.sessions.delete(t);
     const token = randomBytes(32).toString('hex');
-    this.sessions.set(token, { scopes, full: opts?.full ?? false, expiresAt: now + SESSION_TTL_MS });
+    this.sessions.set(token, {
+      scopes,
+      full: 'full' in opts,
+      expiresAt: now + SESSION_TTL_MS,
+      key: 'key' in opts ? opts.key : undefined,
+    });
     return token;
   }
 
@@ -527,6 +558,40 @@ export class ObserverSessions {
     if (!s || s.expiresAt < Date.now()) return null;
     return { scopes: s.scopes, full: s.full };
   }
+
+  /** Narrow every observer session to the scopes its grant still has, and
+   *  end those whose grant is gone, expired or keeps none of their scopes;
+   *  run after each check of the grants file, which is when the registry
+   *  learns of a revoke, a narrowing or the file's removal. A lookup reads
+   *  what the last check left. A session's scopes only ever shrink: a grant
+   *  widened or given again later is a new decision, which the observer's
+   *  next hello takes up in a new session. Returns how many it ended. A
+   *  session already past its 12 hours ended on its own, so it's left alone
+   *  and not counted: lookup refuses it, and mint sweeps it. */
+  narrowToGrants(liveScopes: (key: string) => Set<ObserverScope> | null): number {
+    const now = Date.now();
+    let ended = 0;
+    for (const [token, s] of this.sessions) {
+      if (s.key === undefined || s.expiresAt < now || narrow(s, liveScopes(s.key))) continue;
+      this.sessions.delete(token);
+      ended++;
+    }
+    return ended;
+  }
+}
+
+/** Keep only the session's scopes that `live` still holds, storing the
+ *  narrowing as a new set, since the hello's connection holds the one the
+ *  session was minted with; false when the grant is gone or expired, or
+ *  keeps none of the session's scopes, so the session reaches nothing. */
+function narrow(s: { scopes: Set<ObserverScope> }, live: Set<ObserverScope> | null): boolean {
+  if (!live) return false;
+  if ([...s.scopes].some((scope) => !live.has(scope))) {
+    const kept = new Set([...s.scopes].filter((scope) => live.has(scope)));
+    if (kept.size === 0) return false;
+    s.scopes = kept;
+  }
+  return true;
 }
 
 /** Extract the observer session token from a request (cookie `fkm_obs`). */
@@ -618,4 +683,44 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
       ? {}
       : { localTree: emptyTree, childTrees: [] }),
   };
+}
+
+/** An open connection as the grant sweep sees it. */
+export interface ObserverConnection {
+  auth: string;
+  /** The grant a key-authenticated observer connected with, as the registry
+   *  holds its key. */
+  observerKey?: string;
+  /** That grant's label, as the hello gave it, which the log names it by. */
+  label?: string;
+  scopes: Set<ObserverScope> | null;
+  ws: { close(code?: number, reason?: string): void };
+}
+
+/** Close each observer connection whose grant is gone, expired or narrowed,
+ *  so a revoke, an expiry or the file's removal ends open connections as it
+ *  ends new hellos. A grant that's gone or expired closes with 4401, which
+ *  the web client takes as final, as it does a refused hello. A narrowed
+ *  grant closes with 4403 rather than narrowing the connection, since its
+ *  open subscriptions were checked against the old scopes, and the client
+ *  connects again with the new ones. Returns how many it closed. */
+export function closeConnectionsWithoutGrant(
+  connections: Iterable<ObserverConnection>,
+  registry: Pick<ObserverRegistry, 'liveScopes'>,
+): number {
+  let closed = 0;
+  for (const c of connections) {
+    if (c.auth !== 'observer') continue;
+    const live = c.observerKey === undefined ? null : registry.liveScopes(c.observerKey);
+    if (live && [...(c.scopes ?? [])].every((scope) => live.has(scope))) continue;
+    try {
+      if (live) c.ws.close(4403, 'observer grant narrowed');
+      else c.ws.close(4401, 'observer grant gone or expired');
+      closed++;
+    } catch (err) {
+      // One socket's failure doesn't keep the sweep from the rest.
+      console.error(`[webui-observers] observer connection couldn't be closed: ${c.label ?? 'no grant'} (${errorText(err)}); each check tries again while its grant is gone, expired or narrowed`);
+    }
+  }
+  return closed;
 }

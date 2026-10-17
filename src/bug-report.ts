@@ -157,7 +157,7 @@ export const HOST_LOG_TAGS = new Set([
   'host-mode', 'host-notice', 'identity', 'image', 'inference-dropped', 'inference-failed',
   'inference-hard-down', 'inference-refusal', 'inference-rewind', 'inference-stale',
   'kv-continuity-relaxation', 'kv-diag', 'kv-escalation', 'kv-overlap', 'kv-timing', 'kv-unified',
-  'liveness-watchdog', 'llm-calls', 'mcp', 'mcpl', 'membrane', 'membrane-oversize', 'membrane:bedrock',
+  'lessons', 'liveness-watchdog', 'llm-calls', 'mcp', 'mcpl', 'membrane', 'membrane-oversize', 'membrane:bedrock',
   'membrane:content', 'membrane:cost', 'membrane:gemini', 'membrane:normalize-tool-pairs',
   'membrane:openrouter', 'membrane:usage', 'merge-quarantine', 'merge-topology', 'message-store',
   'mint-preimage', 'notices', 'nudge', 'openai-codex', 'operator', 'operator-log', 'ops-alert',
