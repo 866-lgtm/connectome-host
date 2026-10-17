@@ -55,8 +55,13 @@ Events emitted while no client is connected are dropped, not buffered.
 `command`, by SIGTERM or SIGINT, or by `--exit-when-idle`. The child emits
 `lifecycle:exiting`, waits ~50 ms for it to flush, calls `framework.stop()`
 (which cancels in-flight streams rather than letting them finish), closes the
-server, unlinks the socket and pid file, and exits 0. `graceful: false` only
-changes the reason string.
+server, unlinks the socket and pid file, and exits once `headless.log` has
+taken its last lines: 0, or 1 if `framework.stop()` failed. It waits at
+most 2 s, then exits anyway with a line on its stderr. What it writes
+through `process.stdout.write` and `process.stderr.write` once the log has
+ended goes to its stderr too; Bun's `console.*` writes to its stdout and
+stderr directly, before and after. `graceful: false` only changes the
+reason string.
 
 ---
 

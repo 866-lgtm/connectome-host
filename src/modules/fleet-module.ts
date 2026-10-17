@@ -1254,12 +1254,14 @@ export class FleetModule implements Module {
 
     // The child's stdout and stderr go to startup.log for its whole life, or
     // nowhere if the parent can't open it as a regular file. headless.ts
-    // redirects process.stdout.write and process.stderr.write to headless.log,
-    // but Bun's console.* writes to the file descriptors directly (Bun 1.3.14
-    // and 1.4.3), so every console line the child prints lands here: a recipe
-    // error, a missing API key, an import crash, and a fatal error after the
-    // redirect, such as a failed listen. A failed launch quotes the end of
-    // what the child wrote here after its header, or says why it can't.
+    // redirects process.stdout.write and process.stderr.write to headless.log
+    // until its shutdown ends that log, but Bun's console.* writes to the file
+    // descriptors directly (Bun 1.3.14 and 1.4.3), so every console line the
+    // child prints lands here: a recipe error, a missing API key, an import
+    // crash, and a fatal error after the redirect, such as a failed listen. So
+    // does what the child writes once its shutdown has ended headless.log. A
+    // failed launch quotes the end of what the child wrote here after its
+    // header, or says why it can't.
     const { fd: startupFd, log: startupLog } = openStartupLog(join(dataDir, 'startup.log'),
       `\n--- launch ${new Date().toISOString()} recipe=${recipePath} pid=parent:${process.pid} ---\n`);
 

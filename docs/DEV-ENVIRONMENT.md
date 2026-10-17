@@ -234,8 +234,8 @@ systemd user unit in your home directory.
 
 ## 6. Runtimes
 
-- **bun** — runs the host (`bun src/index.ts …`).
-- **node ≥ 20** — runs the MCPL servers (node 22 also fine). nvm fine locally.
+- **bun ≥ 1.4.3** — runs the host (`bun src/index.ts …`).
+- **node ≥ 22.12** — builds the Web UI when the host installs, and runs the MCPL servers. nvm fine locally.
 - **Rust toolchain** — only to build `chronicle` from a checkout; the npm
   package ships prebuilt binaries.
 

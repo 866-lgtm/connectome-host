@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ANTHROPIC_PRICING_VERSION, priceAnthropicCall } from '../src/call-pricing.js';
+import { ANTHROPIC_PRICING_VERSION, anthropicCacheReadMultiplier, openaiCacheMultipliers, priceAnthropicCall } from '../src/call-pricing.js';
 
 const timestamp = '2026-07-13T12:00:00.000Z';
 
@@ -70,6 +70,43 @@ describe('Anthropic per-call pricing', () => {
     expect(cost?.total).toBe(30);
     expect(cost?.rates.inputPerMillion).toBe(5);
     expect(cost?.rates.outputPerMillion).toBe(25);
+  });
+
+  test('prices Opus 5.5 at $4/$20 with 0.05x reads, not at the Opus 5 rate its prefix also matches', () => {
+    const cost = priceAnthropicCall('claude-opus-5-5', timestamp, usage({
+      inputTokens: 1_000_000,
+      outputTokens: 1_000_000,
+      cacheReadTokens: 1_000_000,
+      cacheWrite1hTokens: 1_000_000,
+    }));
+    expect(cost?.rates.inputPerMillion).toBe(4);
+    expect(cost?.rates.outputPerMillion).toBe(20);
+    expect(cost?.cacheRead).toBeCloseTo(0.2, 9);
+    expect(cost?.cacheWrite1h).toBeCloseTo(8, 9);
+    expect(priceAnthropicCall('claude-opus-5', timestamp, usage({ inputTokens: 1_000_000 }))?.total).toBe(5);
+  });
+
+  test('anthropicCacheReadMultiplier strips Bedrock and gateway prefixes and defaults to 0.1x', () => {
+    expect(anthropicCacheReadMultiplier('claude-fable-5-1')).toBe(0.025);
+    expect(anthropicCacheReadMultiplier('claude-opus-5-5')).toBe(0.05);
+    expect(anthropicCacheReadMultiplier('anthropic/claude-opus-5-5')).toBe(0.05);
+    expect(anthropicCacheReadMultiplier('global.anthropic.claude-mythos-5-1')).toBe(0.025);
+    expect(anthropicCacheReadMultiplier('claude-opus-4-6')).toBe(0.1);
+    expect(anthropicCacheReadMultiplier('some-unknown-model')).toBe(0.1);
+  });
+
+  test('openaiCacheMultipliers: API writes carry 1.25x only on the GPT-5.6 / GPT-6 families; Codex never charges writes', () => {
+    expect(openaiCacheMultipliers('gpt-5.6-sol', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-6-astra', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-6.1-sol', 'api')).toEqual({ read: 0.05, write: 1.25 });
+    expect(openaiCacheMultipliers('openai/gpt-5.6-luna', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-5.4', 'api')).toEqual({ read: 0.1, write: 1 });
+    expect(openaiCacheMultipliers('gpt-4.1-mini', 'api')).toEqual({ read: 0.25, write: 1 });
+    expect(openaiCacheMultipliers('gpt-4o-mini', 'api')).toEqual({ read: 0.5, write: 1 });
+    expect(openaiCacheMultipliers('o3-mini', 'api')).toEqual({ read: 0.5, write: 1 });
+    expect(openaiCacheMultipliers('o3', 'api')).toEqual({ read: 0.25, write: 1 });
+    expect(openaiCacheMultipliers('gpt-5.6-sol', 'codex')).toEqual({ read: 0.1, write: 1 });
+    expect(openaiCacheMultipliers('gpt-6.1-sol', 'codex')).toEqual({ read: 0.05, write: 1 });
   });
 
   test('Fable 5.1 reads from cache at 0.025x, a quarter of the Fable 5 rate', () => {

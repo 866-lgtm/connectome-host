@@ -105,6 +105,7 @@ export const DEFAULT_TIERS: Readonly<Record<string, NoticeTier>> = Object.freeze
   'refusal-offpath': 'status',
   'context-maintenance-failed': 'status',
   'compression-quarantine': 'status',
+  'instructions-unavailable': 'status',
   // Normal operation noise.
   'refusal': 'silent',
 });
