@@ -1255,8 +1255,11 @@ export class FleetModule implements Module {
     // headless.ts installs its runtime log redirect — missing bun, bad
     // shebang, ANTHROPIC_API_KEY validation exit, recipe parse failure,
     // import crash — this is the only place that output can land.  After
-    // the runtime redirect runs, console output flows into headless.log
-    // instead; startup.log just holds the pre-redirect bootstrap slice.
+    // the runtime redirect runs, process.stdout.write and
+    // process.stderr.write flow into headless.log instead. Bun's console.*
+    // writes to the process's stdout and stderr directly, so console output
+    // still lands here, as does what the child writes once its shutdown has
+    // ended its log.
     const startupLogPath = join(dataDir, 'startup.log');
     try {
       appendFileSync(startupLogPath, `\n--- launch ${new Date().toISOString()} recipe=${recipePath} pid=parent:${process.pid} ---\n`);
