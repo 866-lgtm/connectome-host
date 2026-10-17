@@ -153,6 +153,39 @@ export function anthropicCacheReadMultiplier(model: string): number {
   return anthropicBaseRate(bare)?.cacheReadMultiplier ?? DEFAULT_CACHE_READ_MULTIPLIER;
 }
 
+/**
+ * OpenAI cache prices as multiples of a model's uncached input, for the
+ * standard kv-unified block (the ledger doesn't price OpenAI calls).
+ *
+ * - Writes: the API bills them at 1.25x for the GPT-5.6 and GPT-6 families
+ *   (the models its pricing table gives a cache-write price) and charges
+ *   nothing extra for the rest. Codex credit billing has no cache-write
+ *   charge on any model.
+ * - Reads: the cached-input rate, the same ratio on the API and in Codex
+ *   credits: 0.05x GPT-6.1 Sol, 0.25x gpt-4.1 / o3 / o4-mini, 0.5x gpt-4o /
+ *   o1 / o3-mini, 0.1x everything else.
+ *
+ * Sources: https://developers.openai.com/api/docs/pricing and
+ * https://learn.chatgpt.com/docs/pricing, read 2026-10-17. A gateway prefix
+ * (`openai/`) is stripped first.
+ */
+export function openaiCacheMultipliers(
+  model: string,
+  transport: 'api' | 'codex',
+): { read: number; write: number } {
+  const bare = model.replace(/^openai\//, '');
+  const writePremium = transport === 'api' && starts(bare, 'gpt-6', 'gpt-5.6');
+  return { read: openaiCacheReadMultiplier(bare), write: writePremium ? 1.25 : 1 };
+}
+
+function openaiCacheReadMultiplier(model: string): number {
+  if (starts(model, 'gpt-6.1-sol')) return 0.05;
+  if (starts(model, 'gpt-4.1', 'o4-mini')) return 0.25;
+  if (starts(model, 'gpt-4o', 'o1', 'o3-mini')) return 0.5;
+  if (starts(model, 'o3')) return 0.25;
+  return DEFAULT_CACHE_READ_MULTIPLIER;
+}
+
 function starts(model: string, ...prefixes: string[]): boolean {
   return prefixes.some((prefix) => model.startsWith(prefix));
 }

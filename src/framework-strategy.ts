@@ -5,7 +5,7 @@ import {
   type ConversationRouterConfig,
 } from '@animalabs/agent-framework';
 import type { Recipe, RecipeKvUnifiedConfig, RecipeStrategy } from './recipe.js';
-import { anthropicCacheReadMultiplier } from './call-pricing.js';
+import { anthropicCacheReadMultiplier, openaiCacheMultipliers } from './call-pricing.js';
 import { effectiveContextBudgetTokens, resolvePromptCaching } from './framework-agent-config.js';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { isBuiltinStrategyType, type ExtensionRegistry } from './extensions.js';
@@ -71,19 +71,25 @@ export const DEFAULT_RECENT_WINDOW_RATIO = 0.4;
  * every kv-unified production resident runs; only the cache prices vary,
  * because they must match what the provider actually bills, as multiples of
  * the model's base input price:
- *  - writes: 2x on the 1-hour cache, 1.25x on the 5-minute one (Bedrock only
- *    has the 5-minute cache), 1x on OpenAI (no write premium);
- *  - reads: the model's rate from the pricing table (0.025x Fable 5.1 /
- *    Mythos 5.1, 0.05x Opus 5.5, 0.1x elsewhere), 0.1x on OpenAI;
+ *  - Anthropic writes: 2x on the 1-hour cache, 1.25x on the 5-minute one
+ *    (Bedrock only has the 5-minute cache); reads: the model's rate from the
+ *    pricing table (0.025x Fable 5.1 / Mythos 5.1, 0.05x Opus 5.5, 0.1x
+ *    elsewhere);
+ *  - OpenAI: by model and transport (openaiCacheMultipliers): API writes
+ *    1.25x on the GPT-5.6 / GPT-6 families, 1x otherwise and on Codex;
  *  - prompt caching off (`agent.promptCaching: false`, or a Bedrock model
  *    without caching): 1 and 1, every token at the base price, so no layout
  *    is preferred for cache savings the agent never gets.
  */
 export function standardKvUnifiedConfig(recipe: Recipe, model: string): RecipeKvUnifiedConfig {
   const provider = recipe.agent.provider;
-  const openai = provider === 'openai-responses' || provider === 'openai-codex';
   const ttl = provider === 'bedrock' ? '5m' : (recipe.agent.cacheTtl ?? '1h');
   const uncached = resolvePromptCaching(recipe, model) === false;
+  const prices = uncached
+    ? { read: 1, write: 1 }
+    : provider === 'openai-responses' || provider === 'openai-codex'
+      ? openaiCacheMultipliers(model, provider === 'openai-codex' ? 'codex' : 'api')
+      : { read: anthropicCacheReadMultiplier(model), write: ttl === '5m' ? 1.25 : 2 };
   return {
     policy: {
       alpha: 0.7,
@@ -93,8 +99,8 @@ export function standardKvUnifiedConfig(recipe: Recipe, model: string): RecipeKv
       budgetOverLambda: 4_000,
       cacheLambda: 1,
       cacheScale: 100_000,
-      cacheReadPrice: uncached ? 1 : openai ? 0.1 : anthropicCacheReadMultiplier(model),
-      cacheWritePrice: uncached || openai ? 1 : ttl === '5m' ? 1.25 : 2,
+      cacheReadPrice: prices.read,
+      cacheWritePrice: prices.write,
       continuityLambda: 1,
       continuityScale: 100_000,
       continuityRecencyHalfLifeTokens: 100_000,

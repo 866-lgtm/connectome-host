@@ -53,9 +53,13 @@ describe('standard-recipe memory defaults', () => {
     expect(prices({ cacheTtl: '5m' }, 'claude-opus-4-6')).toEqual([0.1, 1.25]);
     // Bedrock has only the 5-minute cache, whatever the recipe asks for
     expect(prices({ provider: 'bedrock', cacheTtl: '1h' }, 'global.anthropic.claude-opus-4-6')).toEqual([0.1, 1.25]);
-    // OpenAI: no write premium
+    // OpenAI API: writes 1.25x on the GPT-5.6 / GPT-6 families, no premium on older models
+    expect(prices({ provider: 'openai-responses' }, 'gpt-5.6-sol')).toEqual([0.1, 1.25]);
+    expect(prices({ provider: 'openai-responses' }, 'gpt-6.1-sol')).toEqual([0.05, 1.25]);
+    expect(prices({ provider: 'openai-responses' }, 'gpt-4o')).toEqual([0.5, 1]);
+    // Codex credit billing: no cache-write charge on any model
     expect(prices({ provider: 'openai-codex' }, 'gpt-5.6-sol')).toEqual([0.1, 1]);
-    expect(prices({ provider: 'openai-responses' }, 'gpt-6')).toEqual([0.1, 1]);
+    expect(prices({ provider: 'openai-codex' }, 'gpt-6.1-sol')).toEqual([0.05, 1]);
     // Caching off: no cache prices at all, so no layout is preferred for savings never received
     expect(prices({ promptCaching: false }, 'claude-opus-4-6')).toEqual([1, 1]);
     expect(prices({ promptCaching: false, provider: 'openai-codex' }, 'gpt-5.6-sol')).toEqual([1, 1]);

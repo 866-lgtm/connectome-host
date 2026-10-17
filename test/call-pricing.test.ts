@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ANTHROPIC_PRICING_VERSION, anthropicCacheReadMultiplier, priceAnthropicCall } from '../src/call-pricing.js';
+import { ANTHROPIC_PRICING_VERSION, anthropicCacheReadMultiplier, openaiCacheMultipliers, priceAnthropicCall } from '../src/call-pricing.js';
 
 const timestamp = '2026-07-13T12:00:00.000Z';
 
@@ -93,6 +93,20 @@ describe('Anthropic per-call pricing', () => {
     expect(anthropicCacheReadMultiplier('global.anthropic.claude-mythos-5-1')).toBe(0.025);
     expect(anthropicCacheReadMultiplier('claude-opus-4-6')).toBe(0.1);
     expect(anthropicCacheReadMultiplier('some-unknown-model')).toBe(0.1);
+  });
+
+  test('openaiCacheMultipliers: API writes carry 1.25x only on the GPT-5.6 / GPT-6 families; Codex never charges writes', () => {
+    expect(openaiCacheMultipliers('gpt-5.6-sol', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-6-astra', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-6.1-sol', 'api')).toEqual({ read: 0.05, write: 1.25 });
+    expect(openaiCacheMultipliers('openai/gpt-5.6-luna', 'api')).toEqual({ read: 0.1, write: 1.25 });
+    expect(openaiCacheMultipliers('gpt-5.4', 'api')).toEqual({ read: 0.1, write: 1 });
+    expect(openaiCacheMultipliers('gpt-4.1-mini', 'api')).toEqual({ read: 0.25, write: 1 });
+    expect(openaiCacheMultipliers('gpt-4o-mini', 'api')).toEqual({ read: 0.5, write: 1 });
+    expect(openaiCacheMultipliers('o3-mini', 'api')).toEqual({ read: 0.5, write: 1 });
+    expect(openaiCacheMultipliers('o3', 'api')).toEqual({ read: 0.25, write: 1 });
+    expect(openaiCacheMultipliers('gpt-5.6-sol', 'codex')).toEqual({ read: 0.1, write: 1 });
+    expect(openaiCacheMultipliers('gpt-6.1-sol', 'codex')).toEqual({ read: 0.05, write: 1 });
   });
 
   test('Fable 5.1 reads from cache at 0.025x, a quarter of the Fable 5 rate', () => {
