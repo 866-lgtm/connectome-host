@@ -44,6 +44,7 @@ function host(shared?: string) {
     lines,
     setLessons(lessons: unknown[]) { state = structuredClone({ lessons }); },
     lessons: () => (state as { lessons: unknown[] }).lessons,
+    held: () => (state as { heldTwice?: string[] }).heldTwice,
     async start() {
       m = new LessonsModule({ globalPath: path });
       await logged(() => m!.start({ getState: () => structuredClone(state), setState: (s: unknown) => { state = structuredClone(s); } } as unknown as ModuleContext));
@@ -61,6 +62,18 @@ function host(shared?: string) {
 /** Entries other than the ones saves created, to compare a file before and after. */
 const kept = (entries: unknown[]) =>
   entries.filter(e => !(typeof e === 'object' && e !== null && /^saved|^again/.test(String((e as AnyObj).content))));
+
+/** The temporary file's name in an error's text, as a problem is named. */
+const tmpOf = (file: string) => join(dirname(file), 'lessons-<random>.tmp');
+
+/** Making the temporary file refused with `code`, while `refusing()`. */
+function refuseTemporaryFile(code: string, refusing: () => boolean = () => true) {
+  const realOpen = fs.openSync;
+  return spyOn(fs, 'openSync').mockImplementation(((p: fs.PathLike, ...rest: unknown[]) => {
+    if (String(p).endsWith('.tmp') && refusing()) throw Object.assign(new Error(`${code}: refused, open '${p}'`), { code });
+    return (realOpen as (...a: unknown[]) => number)(p, ...rest);
+  }) as typeof fs.openSync);
+}
 
 const contents = (entries: unknown[]) =>
   entries.map(e => (typeof e === 'object' && e !== null && !Array.isArray(e) ? (e as AnyObj).content : e));
@@ -275,6 +288,47 @@ describe('a save reads the shared file again and merges it in', () => {
       expect(contents(h.lessons())).toEqual(['X, in the file', 'Y']);
       expect((await h.call('boost', { id: 'y' })).success).toBe(true);
       expect(Number.isFinite((h.file() as AnyObj[])[1].updated)).toBe(true);
+    } finally { h.cleanup(); }
+  });
+
+  test('a copy stamped past Number.MAX_SAFE_INTEGER, which a change can\'t stamp past, ranks below one stamped as a clock would', async () => {
+    const h = host();
+    try {
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('x', 'X, hand-edited', 1e20)] }));
+      h.setLessons([lesson('x', 'X, here', 5)]);
+      await h.start();
+      expect(contents(h.lessons())).toEqual(['X, here']);
+      await h.save('saved');
+      expect(contents(h.file())).toEqual(['X, here', 'saved']);
+    } finally { h.cleanup(); }
+  });
+
+  test('a change to a copy stamped past Number.MAX_SAFE_INTEGER outranks it, so a failed write doesn\'t lose it to the file\'s copy', async () => {
+    const h = host();
+    try {
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('x', 'X', 1e20)] }));
+      h.setLessons([lesson('x', 'X', 1e20)]);
+      await h.start();
+      const refuse = refuseTemporaryFile('EIO');
+      try {
+        expect((await h.update('x', 'X, edited')).success).toBe(true);
+      } finally { refuse.mockRestore(); }
+      expect(contents(h.file())).toEqual(['X']);
+      await h.save('saved');
+      expect(contents(h.lessons())).toEqual(['X, edited', 'saved']);
+      expect(contents(h.file())).toEqual(['X, edited', 'saved']);
+    } finally { h.cleanup(); }
+  });
+
+  test('a change to a copy stamped Number.MAX_SAFE_INTEGER takes that same stamp, the largest one ranked', async () => {
+    const h = host();
+    try {
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('x', 'X', Number.MAX_SAFE_INTEGER)] }));
+      await h.start();
+      expect((await h.update('x', 'X, edited')).success).toBe(true);
+      expect((h.file() as AnyObj[])[0]).toMatchObject({ content: 'X, edited', updated: Number.MAX_SAFE_INTEGER });
+      expect((await h.update('x', 'X, edited again')).success).toBe(true);
+      expect((h.file() as AnyObj[])[0]).toMatchObject({ content: 'X, edited again', updated: Number.MAX_SAFE_INTEGER });
     } finally { h.cleanup(); }
   });
 });
@@ -596,6 +650,28 @@ describe('while the file holds an id of this host\'s lessons twice, the host cha
     } finally { h.cleanup(); }
   });
 
+  test('a change made while the file is away, whose write fails, is dropped once the file comes back resolved as the refusal advises, and both lessons are kept', async () => {
+    const h = host();
+    try {
+      // This host's copy is the one the refusal says to give a new id.
+      h.setLessons([lesson('x', 'two', 3)]);
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('x', 'one', 5), lesson('x', 'two', 3)] }));
+      await h.start();
+      expect(h.held()).toEqual(['x']);
+      rmSync(h.path);
+      // The write that would make the file again fails.
+      const refuse = refuseTemporaryFile('EACCES');
+      try {
+        expect((await h.update('x', 'two, edited while the file was away')).success).toBe(true);
+      } finally { refuse.mockRestore(); }
+      expect(h.held()).toEqual(['x']);
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('x', 'one', 5), lesson('y', 'two', 3)] }));
+      await h.save('saved');
+      expect(contents(h.lessons())).toEqual(['one', 'two', 'saved']);
+      expect(contents(h.file())).toEqual(['one', 'two', 'saved']);
+    } finally { h.cleanup(); }
+  });
+
   test('the advice isn\'t given for an id this host itself holds twice, which no fix in the file lets it write', async () => {
     const h = host();
     try {
@@ -856,7 +932,7 @@ describe('a save replaces the file whole where it can', () => {
         }) as typeof fs.openSync);
         return () => open.mockRestore();
       },
-      why: (h) => `this host can't replace it through a temporary file beside it (EACCES: permission denied, open '${fs.realpathSync(h.path)}.<random>.tmp')`,
+      why: (h) => `this host can't replace it through a temporary file beside it (EACCES: permission denied, open '${tmpOf(fs.realpathSync(h.path))}')`,
     },
     {
       name: 'a second name',
@@ -964,7 +1040,7 @@ describe('a save replaces the file whole where it can', () => {
         const text = JSON.stringify({ lessons: [lesson('theirs', 'from another host')] });
         writeFileSync(h.path, text);
         const real = fs.realpathSync(h.path);
-        const refusal = `${r.code}: refused, rename '${real}.<random>.tmp' -> '${real}'`;
+        const refusal = `${r.code}: refused, rename '${tmpOf(real)}' -> '${real}'`;
         await h.start();
         await h.save('saved');
         await h.save('saved again');
@@ -1006,7 +1082,7 @@ describe('a save replaces the file whole where it can', () => {
       try {
         const text = JSON.stringify({ lessons: [lesson('theirs', 'from another host')] });
         writeFileSync(h.path, text);
-        const refusal = `${code}: refused, open '${fs.realpathSync(h.path)}.<random>.tmp'`;
+        const refusal = `${code}: refused, open '${tmpOf(fs.realpathSync(h.path))}'`;
         await h.start();
         await h.save('saved');
         await h.save('saved again');
@@ -1027,6 +1103,20 @@ describe('a save replaces the file whole where it can', () => {
       } finally { spy.mockRestore(); rm.mockRestore(); h.cleanup(); }
     });
   }
+
+  test('a file whose name is near the longest a directory takes still saves, since the temporary file\'s name doesn\'t grow with it', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lessons-shared-'));
+    try {
+      // 225 bytes: 41 more, as the file's name and a UUID, would pass 255.
+      const h = host(join(dir, `${'l'.repeat(220)}.json`));
+      writeFileSync(h.path, JSON.stringify({ lessons: [lesson('theirs', 'from another host')] }));
+      await h.start();
+      await h.save('saved');
+      expect(contents(h.file())).toEqual(['from another host', 'saved']);
+      expect(h.lines).toEqual([]);
+      expect(readdirSync(dir)).toEqual([`${'l'.repeat(220)}.json`]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
 
   test('a first save into a directory that doesn\'t exist yet makes it', async () => {
     const base = host();
@@ -1086,7 +1176,7 @@ describe('a save replaces the file whole where it can', () => {
       if (String(p).endsWith('.tmp') && failures-- > 0) throw Object.assign(new Error(`EACCES: permission denied, open '${p}'`), { code: 'EACCES' });
       return (realOpen as (...a: unknown[]) => number)(p, ...rest);
     }) as typeof fs.openSync);
-    const refusal = `EACCES: permission denied, open '${h.path}.<random>.tmp'`;
+    const refusal = `EACCES: permission denied, open '${tmpOf(h.path)}'`;
     try {
       h.setLessons([lesson('mine', 'here')]);
       await h.start();

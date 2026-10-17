@@ -26,7 +26,7 @@ import {
   readFileSync, writeFileSync, mkdirSync, renameSync, rmSync, chmodSync, statSync, lstatSync, realpathSync, accessSync,
   openSync, fsyncSync, closeSync, constants, type Stats,
 } from 'node:fs';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { unknownToolResult } from './unknown-tool.js';
 import { shown } from './shown.js';
 
@@ -56,10 +56,10 @@ type StoredLesson = Omit<Lesson, 'content' | 'tags' | 'evidence' | 'confidence'>
 
 interface LessonsState {
   lessons: StoredLesson[];
-  /** The ids the last read found the shared file holding more than once,
-   *  of lessons this host holds once. The first read that finds one held
-   *  once again takes the file's copy, whatever the stamps (see
-   *  mergeShared). */
+  /** The ids the last read that could read the shared file found it
+   *  holding more than once, of lessons this host holds once. The first
+   *  read that finds one held once again takes the file's copy, whatever
+   *  the stamps (see mergeShared). */
   heldTwice?: string[];
 }
 
@@ -642,10 +642,12 @@ export class LessonsModule implements Module {
    *  While the file holds an id of this host's lessons twice, this host
    *  can't tell which entry its copy came from, so it changes neither (see
    *  heldTwiceRefusal) and keeps the id in heldTwice, which holds the ids
-   *  the last read found so. The first read to find such an id held once
-   *  takes the file's copy, whatever the stamps, so on a host that read the
-   *  file while it held the id twice, the lesson left keeps the id however
-   *  the operator resolved the two. A host that didn't merges by stamp.
+   *  the last read that could read the file found so; a read that finds no
+   *  file, or can't read it, keeps them. The first read to find such an id
+   *  held once takes the file's copy, whatever the stamps, so on a host
+   *  that read the file while it held the id twice, the lesson left keeps
+   *  the id however the operator resolved the two. A host that didn't
+   *  merges by stamp.
    *  Giving all but one with the latest `updated` a new id (see
    *  newIdAdvice) keeps every lesson on each host that holds no change to
    *  the lesson the file lacks, such as one lost to a write at nearly the
@@ -781,9 +783,9 @@ const IN_PLACE = new Set(['EACCES', 'EPERM', 'EBUSY', 'EXDEV', 'EROFS']);
  *  there, and an access control list or other extended attribute set on
  *  it isn't kept. A file not made yet is made the same way, with the mode a new file
  *  takes, so a first write that fails leaves no file, and two hosts making
- *  it at once leave one whole file. The temporary file's name is new at
- *  each write; a host that stops between making it and the rename leaves
- *  it beside the file.
+ *  it at once leave one whole file. The temporary file is
+ *  lessons-<random>.tmp beside the file, its name new at each write; a
+ *  host that stops between making it and the rename leaves it there.
  *
  *  It's written in place instead, as on main: through a link to a file not
  *  made yet, which a rename would replace with a plain file; for a file
@@ -807,7 +809,9 @@ function writeShared(path: string, text: string, inPlace: (key: string, why: str
     return;
   }
   const target = old === null ? path : realpathSync(path);
-  const tmp = `${target}.${randomUUID()}.tmp`;
+  // Its length doesn't depend on the file's name, so a name up to the
+  // longest a directory takes still leaves room for it.
+  const tmp = join(dirname(target), `lessons-${randomUUID()}.tmp`);
   const mode = old === null ? 0o666 : old.mode & 0o777;
   try {
     const fd = openSync(tmp, 'w', mode);
@@ -831,7 +835,7 @@ function writeShared(path: string, text: string, inPlace: (key: string, why: str
     const code = codeOf(err);
     // An error's text can name the temporary file, whose name is new at
     // each write, and a problem is named once by its text.
-    const said = errorText(err).replaceAll(tmp, `${target}.<random>.tmp`);
+    const said = errorText(err).replaceAll(tmp, join(dirname(target), 'lessons-<random>.tmp'));
     // With no file there, writing in place needs the same directory the
     // temporary file did, so there's nothing to fall back to.
     if (old === null || !IN_PLACE.has(code)) throw Object.assign(new Error(said), { code });
@@ -918,18 +922,23 @@ function statIfThere(path: string, stat: (path: string) => Stats = statSync): St
   }
 }
 
-/** A copy's `updated` as the merge ranks it: one that isn't a finite number
- *  ranks below every one that is. */
+/** A copy's `updated` as the merge ranks it: one that isn't a number no
+ *  greater than Number.MAX_SAFE_INTEGER ranks below every one that is. Past
+ *  that, adding one can give the same number, so a change couldn't always
+ *  stamp past the copy; no clock gives one (a Date holds at most 8.64e15),
+ *  and ranked by value, a hand edit's would outrank every change. */
 function stampOf(l: unknown): number {
   const u = isRecord(l) ? l.updated : undefined;
-  return typeof u === 'number' && Number.isFinite(u) ? u : -Infinity;
+  return typeof u === 'number' && Number.isFinite(u) && u <= Number.MAX_SAFE_INTEGER ? u : -Infinity;
 }
 
 /** The `updated` for a change made on a copy: now, or one past the copy's
  *  stamp when that's later, so the change outranks the copy it was made on
- *  in every host's merge, whatever the hosts' clocks say. */
+ *  in every host's merge, whatever the hosts' clocks say. A copy stamped
+ *  Number.MAX_SAFE_INTEGER itself is the exception: the change takes the
+ *  same stamp, and of the two, the one in the file wins, as for any tie. */
 function laterStamp(l: StoredLesson): number {
-  return Math.max(Date.now(), stampOf(l) + 1);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.max(Date.now(), stampOf(l) + 1));
 }
 
 /** The ids a merge with the shared file goes by: non-empty text that at most

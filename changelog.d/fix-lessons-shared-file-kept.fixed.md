@@ -14,7 +14,9 @@
   a lesson another host added since this one started, or a change another
   host made to the same lesson, is kept rather than written over. Of two
   copies of a lesson, the file's replaces the host's unless the host's is
-  newer, so a hand edit that left `updated` as it was is kept.
+  newer, so a hand edit that left `updated` as it was is kept. An
+  `updated` past `Number.MAX_SAFE_INTEGER`, which no clock gives, counts
+  as none.
 - A write replaces the shared file whole, through a temporary file beside
   it, synced to disk, given the file's permissions and renamed over it, so
   a write that fails leaves the file as it was, a machine that goes down
@@ -33,7 +35,7 @@
   next change, unless it left the file broken, which the log then says,
   and a write that makes the file because it wasn't there says so. A host
   that stops between making its temporary file and the rename leaves that
-  file beside the shared one.
+  file, `lessons-<random>.tmp`, beside the shared one.
 - Hosts stop loading entries without a named id, and keep them in the
   file. A named id is text, not empty, that the file holds once at most
   and the host once at most. An entry without one, or one that isn't an
