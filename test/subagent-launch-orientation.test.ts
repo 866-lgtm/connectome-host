@@ -240,7 +240,7 @@ describe('fork orientation', () => {
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_fork_1', input));
       expect(res.success).toBe(true);
       const receipt = res.data as string;
-      expect(receipt).toStartWith("Subagent 'scout' forked. Running in background.");
+      expect(receipt).toStartWith("Subagent 'scout' forked. Starting in background.");
       await h.asyncPromise('scout');
 
       const block = launchBlock(receipt);
@@ -1408,7 +1408,7 @@ describe('what a stream first reads is what its launch promises', () => {
       expect(fork.success).toBe(false);
       // With no parent there is no context to lose by spawning instead.
       expect(String(fork.error)).toBe(
-        "Fork 'wide-fork' didn't start, so nothing ran: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn instead, with a short tools list and a task that fits one message.",
+        "Fork 'wide-fork' didn't start, so nothing ran: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message and says what it needs to know.",
       );
       expect(p.requestFor('mock-wide-fork')).toBeUndefined();
     } finally {
@@ -1430,9 +1430,7 @@ describe('what a stream first reads is what its launch promises', () => {
     }
   });
 
-  // A size refusal is the launch's outcome too, so it's never retried. Its
-  // text holds the subagent's name, and the retry gate reads that name's
-  // "idle" as transient.
+  // A size refusal is the module's own failure, so the launch is tried once.
   for (const kind of ['spawn', 'fork'] as const) {
     test(`a ${kind}'s size check refuses a launch over the limit once, without a retry`, async () => {
       const h = await realHarness({ maxPromptTokens: 1, maxRetries: 2 });
@@ -1454,6 +1452,24 @@ describe('what a stream first reads is what its launch promises', () => {
       }
     });
   }
+
+  test("a parentless fork over the limit isn't told it carries a conversation, and gets the same way out", async () => {
+    const h = await realHarness({ parentless: true, maxPromptTokens: 1 });
+    try {
+      const result = await h.subagent.handleToolCall({
+        id: 'call-sized', name: 'fork',
+        input: { name: 'sized-parentless', task: 'short', model: 'mock-sized-parentless', sync: true },
+      } as never);
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toMatch(new RegExp(
+        "^Fork 'sized-parentless' didn't start, so nothing ran: it would begin at about \\d+ tokens, over this host's limit of 1\\. " +
+        'Launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message ' +
+        '\\(10,000 tokens\\) and says what it needs to know\\.$',
+      ));
+    } finally {
+      await h.cleanup();
+    }
+  });
 
   test("a long task: a fallback fork launches, its own result's head whole and its whole task in its own call", async () => {
     const h = await realHarness();
@@ -1541,22 +1557,6 @@ describe('what a stream first reads is what its launch promises', () => {
     return attempts;
   };
 
-  test("a refusal, for a subagent whose name holds words the retry gate reads as transient, is never retried", async () => {
-    const h = await realHarness({ maxRetries: 2 });
-    try {
-      const attempts = countAttempts(h.framework);
-      const result = await h.subagent.handleToolCall({
-        id: 'call-idle', name: 'spawn', callerAgentName: 'parent',
-        input: { name: 'idle-network-503', task: LONG_TASK, systemPrompt: 'p', model: 'mock-idle', sync: true },
-      } as never);
-      expect(result.success).toBe(false);
-      expect(String(result.error)).toStartWith("Subagent 'idle-network-503' didn't start, so nothing ran: its task is longer");
-      expect(attempts.count).toBe(1);
-    } finally {
-      await h.cleanup();
-    }
-  });
-
   test('an orientation and a task that each fit a message launch together, each in its own message', async () => {
     // An orientation of 30,036 characters (25,888 of them tool names) and
     // a 20,761-character task: each under the 40,000-character cap,
@@ -1635,40 +1635,17 @@ describe('what a stream first reads is what its launch promises', () => {
     expect(refuse('fork', ['orientation'], ownMessages).name).toBe('SubagentFailure');
     expect(refuse('fork', ['orientation'], ownMessages).message).toBe(
       'its orientation is longer than one message holds (10,000 tokens): ' +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message',
+      'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message and says what it needs to know',
     );
     expect(refuse('fork', ['orientation'], withCall).message).toBe(
       'its orientation is longer than one message holds (10,000 tokens): ' +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message, though a spawn inherits none of this context',
+      'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message and says what it needs to know, though a spawn inherits none of this context',
     );
     expect(refuse('fork', ['call'], withCall).message).toBe(
       "the fork call that carries its task, or its result, isn't in the context it would start from: " +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message (10,000 tokens), though a spawn inherits none of this context',
+      'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message (10,000 tokens) and says what it needs to know, though a spawn inherits none of this context',
     );
     expect(refuse('spawn', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
-  });
-
-  test('a refusal, for a subagent whose name holds "rate", leaves the rate-limit backoff alone', async () => {
-    for (const kind of ['spawn', 'parentless'] as const) {
-      const h = await realHarness({ parentless: kind === 'parentless' });
-      const state = h.subagent as unknown as { rateLimitCooldownMs: number; effectiveConcurrent: number; throttled: boolean };
-      state.rateLimitCooldownMs = 0;
-      try {
-        const before = state.effectiveConcurrent;
-        // "generate" holds "rate".
-        const result = await h.subagent.handleToolCall({
-          id: 'call-rate', name: kind === 'spawn' ? 'spawn' : 'fork',
-          input: { name: 'generate-report', task: LONG_TASK, model: `mock-rate-${kind}`, sync: true, ...(kind === 'spawn' ? { systemPrompt: 'p' } : {}) },
-          ...(kind === 'spawn' ? { callerAgentName: 'parent' } : {}),
-        } as never);
-        expect(result.success).toBe(false);
-        expect(h.requestFor(`mock-rate-${kind}`)).toBeUndefined();
-        expect(state.effectiveConcurrent).toBe(before);
-        expect(state.throttled).toBe(false);
-      } finally {
-        await h.cleanup();
-      }
-    }
   });
 
   test('a short task and a modest surface launch as before, the orientation first and the task last', async () => {

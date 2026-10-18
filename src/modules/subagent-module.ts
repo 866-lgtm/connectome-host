@@ -2671,6 +2671,15 @@ export class SubagentModule implements Module {
     return names;
   }
 
+  /** A refused fork's way out: a spawn. It takes a systemPrompt, which a
+   *  fork's caller needn't have given, and its own orientation and task
+   *  must each fit one message, or it's refused in turn. */
+  private spawnInstead(withCap = false): string {
+    const cap = withCap ? ` (${formatTokens(SUBAGENT_STRATEGY.maxMessageTokens)})` : '';
+    return 'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task ' +
+      `that fits one message${cap} and says what it needs to know`;
+  }
+
   /** Why a launch is refused when its stream wouldn't read what it
    *  promises: each part that was cut, and the way out for it. A fork takes
    *  no tools list, so its way out for a long orientation, or for a call the
@@ -2688,19 +2697,18 @@ export class SubagentModule implements Module {
     // A spawn's task is a message of its own, which the cap can cut, as a
     // parentless fork's is; a fork with a parent carries its task whole in
     // its call, so the spawn it becomes needs a task that fits one message.
-    const asSpawn = 'launch it as subagent--spawn instead, with a short tools list and a task that fits one message';
     const inherits = inheritsContext ? ', though a spawn inherits none of this context' : '';
     const reasons = cut.map((part) => {
       if (part === 'orientation') {
         return kind === 'spawn'
           ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
-          : `its orientation is longer than one message holds (${cap}): ${asSpawn}${inherits}`;
+          : `its orientation is longer than one message holds (${cap}): ${this.spawnInstead()}${inherits}`;
       }
       if (part === 'task') {
         return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
           `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
       }
-      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${asSpawn} (${cap})${inherits}`;
+      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${this.spawnInstead(true)}${inherits}`;
     });
     return new SubagentFailure(reasons.join('; and '));
   }
@@ -2749,7 +2757,7 @@ export class SubagentModule implements Module {
   private launchReceipt(launch: SubagentLaunch, head: string, ticket: { queued: boolean }): string {
     const slot = ticket.queued
       ? `Every subagent slot (${this.effectiveConcurrent}) is in use, so it waits for one to free, for up to ${Math.round(SLOT_TIMEOUT_MS / 1000)} s; if none does, it ends with an error, delivered as its result would be.`
-      : 'Running in background.';
+      : 'Starting in background.';
     return `${head} ${slot}\n\n${describeSubagentLaunch(launch)}`;
   }
   private async handleSpawn(input: SpawnInput, callerAgentName?: string): Promise<ToolResult> {
@@ -3501,10 +3509,13 @@ export class SubagentModule implements Module {
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
+            // A parentless fork carries no conversation, so only a fork with
+            // a parent is told it's the cause, and that a spawn leaves it.
+            const spawn = this.spawnInstead(true);
             throw new SubagentFailure(
-              `it would begin at about ${est} tokens, over this host's limit of ${this.maxPromptTokens}, ` +
-                'because a fork carries your whole conversation',
-              'Use subagent--spawn instead, with a name, a systemPrompt, and a task that says what it needs to know.',
+              `it would begin at about ${est} tokens, over this host's limit of ${this.maxPromptTokens}` +
+                (parentAgent ? ', because a fork carries your whole conversation' : ''),
+              `${spawn.charAt(0).toUpperCase()}${spawn.slice(1)}${parentAgent ? ', though a spawn inherits none of it' : ''}.`,
             );
           }
 
