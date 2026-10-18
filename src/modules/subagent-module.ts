@@ -412,11 +412,14 @@ export function undeliveredLaunchParts(
       : '';
   // A fork's call and its result arrive or go together in a launch's first
   // compile (context-manager 0.14.1): the head window doesn't end between a
-  // tool call and its result (getHeadWindowEnd), the recent window drops a
-  // leading result whose call it left out (emitRecentNewestFirst), and the
-  // cap passes a tool call whole and keeps every tool result, cut or
-  // replaced by an omission notice. So only the cap cuts a result that is
-  // there, and a result that isn't there is the call's part to say.
+  // tool call and its result (getHeadWindowEnd, whose anchorHeadToCoverage
+  // keeps that boundary while nothing owns a message, as in a launch's new
+  // store), the recent window doesn't start at a tool result
+  // (getUnheldRecentWindowStart) and drops a leading result whose call it
+  // left out (emitRecentNewestFirst), and the cap passes a tool call whole
+  // and keeps every tool result, cut or replaced by an omission notice. So
+  // only the cap cuts a result that is there, and a result that isn't there
+  // is the call's part to say.
   if (result !== undefined && !resultText.startsWith(delivery.head)) cut.push('orientation');
   const call = blocks.find((b) => {
     const block = b as { type?: unknown; id?: unknown };
@@ -493,10 +496,11 @@ export interface SubagentLaunch {
    *  filterToolNames; the stream's first context then states the surface
    *  they actually produced. */
   tools: {
-    /** What the stream is created with: the caller's own rules, narrowed by
-     *  a spawn's list, less the subagent tools at the depth limit, with
-     *  subagent--return; 'all' only for an unrestricted caller's fork or
-     *  spawn without a list, short of the depth limit. */
+    /** What the stream is created with: the calling stream's own rules
+     *  (see `parent`), narrowed by a spawn's list, less the subagent tools at
+     *  the depth limit, with subagent--return; 'all' only for a launch
+     *  without a list, short of the depth limit, whose calling stream is
+     *  unrestricted or absent. */
     allowed: 'all' | string[];
     /** The spawn caller's own list, as given: `allowed` is what gets
      *  subagent--return. */
@@ -510,7 +514,9 @@ export interface SubagentLaunch {
      *  call, and no subagent tools but subagent--return. */
     depthLimited: boolean;
   };
-  /** The calling stream as it was at the call; null when there is none. */
+  /** The calling stream as it was at the call: the caller, else the
+   *  configured parent agent; null when there is neither, or when the
+   *  configured parent agent isn't registered. */
   parent: null | {
     stream: string;
     model: string;
@@ -545,13 +551,16 @@ export interface SubagentStart {
   proseRouting: ProseRouting;
   /** The tools the stream is shown at its first inference. */
   tools: string[];
-  /** What the calling stream is shown now; undefined when it can't be read. */
+  /** What the calling stream (`SubagentLaunch.parent`) is shown now;
+   *  undefined when it can't be read, or when the launch has no calling
+   *  stream. */
   parentTools?: string[];
-  /** The agent settings the stream was created with, each rendered; and the
-   *  parent's (a fork's) or the caller's (a spawn's) at the start, read from
-   *  the agent the launch resolved at the call even once it has left the
-   *  framework; undefined for a launch with no calling stream. */
+  /** The agent settings the stream was created with, each rendered. */
   agentSettings: AgentSettings;
+  /** The parent's (a fork's) or the caller's (a spawn's) agent settings at
+   *  the start, each rendered, read from the agent the launch resolved at
+   *  the call even once it has left the framework; undefined only when the
+   *  launch has no calling stream (`SubagentLaunch.parent` is null). */
   parentAgentSettings?: AgentSettings;
 }
 
@@ -597,6 +606,14 @@ export function agentSettingsOf(agent: {
 }
 
 const formatTokens = (n: number): string => `${n.toLocaleString('en-US')} tokens`;
+
+/** Whether two tool-rule lists hold the same names, whatever their order or
+ *  repeats. */
+function sameNames(a: readonly string[], b: readonly string[]): boolean {
+  const x = new Set(a);
+  const y = new Set(b);
+  return x.size === y.size && [...x].every((name) => y.has(name));
+}
 
 /** "a", "a and b", "a, b and c" */
 function joinAll(items: readonly string[]): string {
@@ -744,14 +761,17 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
 
   // What the stream is created with (tools.allowed): the caller's own rules,
   // narrowed by a spawn's list, all resolved at the call; at the depth limit
-  // only what the process offered of them then, less the subagent tools.
-  // What the process offered of them is `granted`, which is what this names.
+  // only what the process offered of them then, less the subagent tools but
+  // subagent--return. What the process offered of them is `granted`, which is
+  // what this names.
   const allowed = launch.tools.allowed;
   const requested = launch.tools.requested;
   const callerRules = p?.allowedTools ?? 'all';
   // filterToolNames' ensureReturn adds subagent--return to a restricted
-  // caller's rules that lack it, so the stream's rules are theirs and that.
+  // caller's rules, or a spawn's list, that lack it; each line says where
+  // it was added.
   const addsReturn = callerRules !== 'all' && !callerRules.includes('subagent--return');
+  const listAddsReturn = requested !== undefined && !requested.includes('subagent--return');
   const granted = launch.tools.granted ?? (allowed === 'all' ? [] : allowed);
   const depth = launch.tools.depthLimited;
   const explicit = launch.proseRouting === 'explicit';
@@ -802,23 +822,31 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   // The rules are the caller's own: the line says so itself.
   let inherited = false;
   if (allowed === 'all') {
-    // Only an unrestricted caller's launch without a list, short of the
-    // depth limit, is unrestricted.
+    // Only a launch without a list, short of the depth limit, whose calling
+    // stream is unrestricted or absent, is unrestricted.
     toolRule = 'no restriction';
   } else if (requested !== undefined) {
-    // What the list grants, not the list: subagent--return named once. The
-    // grant is the board at the call; the stream's own Tools line says what
-    // it's shown when it starts.
-    toolRule = granted.length === 1 && !shownHelp
-      ? `only subagent--return${requested.length === 0 ? ': the caller listed no tools' : ''}`
-      : gets(" from the caller's list", ', as the process offered them at the call');
+    // What the list grants, not the list: subagent--return named once, and
+    // said to be added where the list lacks it. The grant is the board at
+    // the call; the stream's own Tools line says what it's shown when it
+    // starts.
+    const onlyReturn = granted.length === 1 && !shownHelp;
+    toolRule = onlyReturn
+      ? `only subagent--return${listAddsReturn ? ', added' : ''}${requested.length === 0 ? ': the caller listed no tools' : ''}`
+      : gets(
+        ` from the caller's list${listAddsReturn ? ', with subagent--return added' : ''}`,
+        ', as the process offered them at the call',
+      );
     const missing = notGiven(requested);
-    if (missing.length > 0) toolRule += `; the caller's list also names ${joinAll(missing)}, which this stream isn't given at the call`;
+    // "also" where the line has already named something from the list.
+    const also = onlyReturn && listAddsReturn ? '' : 'also ';
+    if (missing.length > 0) toolRule += `; the caller's list ${also}names ${joinAll(missing)}, which this stream isn't given at the call`;
     if (depth) toolRule += '; at this depth, no subagent tool but subagent--return';
   } else if (callerRules !== 'all') {
     // A fork, or a spawn without a list, keeps a restricted caller's rules,
     // with subagent--return: at the depth limit only what the process
-    // offers of them, less the subagent tools.
+    // offers of them, less the subagent tools but subagent--return. Either
+    // way the line says where subagent--return was added.
     inherited = true;
     const n = callerRules.length;
     // Short of the depth limit it keeps the rules whole, with subagent--return
@@ -827,7 +855,7 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     // read as keeping only that.
     toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and ` +
       (depth
-        ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools: ${gets('', '')}`
+        ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools${addsReturn ? ', with subagent--return added' : ' but subagent--return'}: ${gets('', '')}`
         : `this stream keeps those rules${addsReturn ? ', with subagent--return added' : ''}; it's given ${gets('', ', as the process offered them at the call')}`);
     const missing = notGiven(callerRules);
     if (missing.length > 0) toolRule += `; ${them}'s rules also allow ${joinSome(missing)}, which this stream isn't given at the call`;
@@ -836,10 +864,12 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     toolRule = 'every tool the process offers at the call except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
   }
   if (p) {
-    // The same as the caller's when nothing narrowed or added to them:
-    // unrestricted, or a restricted caller's kept whole that already hold
-    // subagent--return.
-    const same = requested === undefined && !launch.tools.depthLimited && !addsReturn;
+    // A launch without a list is the same as its caller's when the stream is
+    // created with the caller's rules: both unrestricted, or the same names,
+    // whatever the depth limit or ensureReturn did to reach them.
+    const same = requested === undefined && (allowed === 'all'
+      ? callerRules === 'all'
+      : callerRules !== 'all' && sameNames(allowed, callerRules));
     const theirs = p.allowedTools === 'all'
       ? `${them} has no restriction`
       : p.allowedTools.length === 0
