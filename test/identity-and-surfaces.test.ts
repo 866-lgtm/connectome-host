@@ -18,6 +18,13 @@ import { IdentityError, IdentityModule } from '../src/modules/identity-module.ts
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
 import { ObserversModule } from '../src/modules/observers-module.ts';
 
+// agent-framework's code for a link among a path's directories that stays
+// inside the mount, from its release with anima-research/agent-framework#468.
+const PARENT_SYMLINK = 'parent_symlink' as WorkspaceReadError['code'];
+// anima-research/agent-framework#460's code for a path in another mount's
+// directory nested in the one named.
+const OTHER_MOUNT = 'other_mount' as WorkspaceReadError['code'];
+
 const REQUEST_BODY_MAX_FOR_TEST = 256 * 1024;
 
 // Temporary directories and stores a test makes are removed after it, passed
@@ -1654,14 +1661,22 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     expect(bodies).toEqual([]);
   });
 
-  // The link policy is the file's own; a directory on the path may be a link,
-  // and the read still sends only a file whose canonical path is in the mount.
+  // A directory on the path that links out of the mount: agent-framework
+  // 0.22.2 follows the link and refuses the file, whose canonical path lies
+  // outside, and its release with anima-research/agent-framework#468 refuses
+  // the link itself. Both say escape, in words of their own.
   it('refuses a file reached through a parent directory that links out of the mount', async () => {
-    const { dir, mountDir, outside, bodies, upload } = await mounted();
+    const { dir, mountDir, outside, workspace, bodies, upload } = await mounted();
     symlinkSync(outside, join(mountDir, 'out'));
+    const read = await workspace.readFileFromDisk('files/out/host-secret.txt').then(
+      () => null,
+      (err: WorkspaceReadError) => err,
+    );
+    expect(read?.code).toBe('escape');
     const res = await upload('files/out/host-secret.txt');
     expect(res.error).toContain('Nothing was sent to "orrery": "files/out/host-secret.txt" couldn\'t be read from disk');
-    expect(res.error).toContain('Symlink escape detected: files/out/host-secret.txt');
+    expect(res.error).toContain(read!.message.replace(/\.+$/, ''));
+    expect(res.error).toContain('It leads, through a link, outside this mount');
     expect(res.error).not.toContain(dir);
     expect(bodies).toEqual([]);
   });
@@ -1673,6 +1688,46 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     const res = await upload('files/album');
     expect(res.error).toContain('Nothing was sent to "orrery": "files/album" couldn\'t be read from disk');
     expect(res.error).toContain('Path is a directory: files/album');
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses a file in a nested mount's directory, and names the path to use", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/inner/x.txt', 'store bytes');
+    // As anima-research/agent-framework#460 reports a path in another mount's directory nested in the one named.
+    workspace.readFileFromDisk = async (path) => {
+      throw new WorkspaceReadError(
+        OTHER_MOUNT,
+        `"${path}" lies in mount "inner", nested in mount "files", which neither reads nor writes it: use "inner/x.txt".`,
+        'parse',
+      );
+    };
+    const res = await upload('files/inner/x.txt');
+    // The file is the nested mount's, so the outer mount's copy isn't sent
+    // or weighed, and the reason names the path to use.
+    expect(res.error).toBe('Nothing was sent to "orrery": "files/inner/x.txt" lies in mount "inner", nested in mount ' +
+      '"files", which neither reads nor writes it: use "inner/x.txt".');
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses a file reached through a link among its directories, and says what can be done", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/via/x.txt', 'store bytes');
+    // As agent-framework's release with anima-research/agent-framework#468
+    // reports a link among a path's directories that stays inside the mount.
+    workspace.readFileFromDisk = async (path) => {
+      throw new WorkspaceReadError(
+        PARENT_SYMLINK,
+        `${path}: "files/via" is a symlink to "files/real", which this mount does not follow; the mount's host can set followSymlinks: true`,
+        'readlink',
+      );
+    };
+    const res = await upload('files/via/x.txt');
+    expect(res.error).toContain('Nothing was sent to "orrery": "files/via/x.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('"files/via" is a symlink to "files/real"');
+    expect(res.error).toContain('A directory on its path is a link, and this mount doesn\'t follow links. If the link ' +
+      'leads to a directory, which the reason shows by saying the mount\'s host can set followSymlinks, name the file ' +
+      'by its path there. Otherwise ask your operator');
     expect(bodies).toEqual([]);
   });
 
@@ -1752,6 +1807,30 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     await putInStore('files/gone.txt', 'written through the workspace');
     expect((await upload('files/gone.txt')).success).toBe(true);
     expect(bodies.map(String)).toEqual(['written through the workspace']);
+  });
+
+  // A linked directory on the path that leads nowhere, on a mount that doesn't
+  // follow links: agent-framework 0.22.2 reads the path as one disk has no
+  // file at (not_found with ENOENT), so the workspace's copy stands in, and its
+  // release with anima-research/agent-framework#468 refuses the link as
+  // parent_symlink, so nothing is sent.
+  it('answers a path through a linked directory that leads nowhere as the mount\'s read does', async () => {
+    const { mountDir, workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/gone/x.txt', 'written through the workspace');
+    symlinkSync(join(mountDir, 'missing'), join(mountDir, 'gone'));
+    const read = await workspace.readFileFromDisk('files/gone/x.txt').then(
+      () => null,
+      (err: WorkspaceReadError) => err,
+    );
+    const res = await upload('files/gone/x.txt');
+    if (read?.code === 'not_found') {
+      expect(res.success).toBe(true);
+      expect(bodies.map(String)).toEqual(['written through the workspace']);
+    } else {
+      expect(read?.code).toBe(PARENT_SYMLINK);
+      expect(res.error).toContain(read!.message.replace(/\.+$/, ''));
+      expect(bodies).toEqual([]);
+    }
   });
 
   it("sends the workspace's copy where disk has no file: never materialized, under a file, a name disk can't hold, a gone mount", async () => {

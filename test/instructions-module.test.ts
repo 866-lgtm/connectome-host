@@ -11,6 +11,13 @@ import {
   type WorkspaceDiskReader,
 } from '../src/modules/instructions-module.js';
 
+// agent-framework's code for a link among a path's directories that stays
+// inside the mount, from its release with anima-research/agent-framework#468.
+const PARENT_SYMLINK = 'parent_symlink' as WorkspaceReadError['code'];
+// anima-research/agent-framework#460's code for a path in another mount's
+// directory nested in the one named.
+const OTHER_MOUNT = 'other_mount' as WorkspaceReadError['code'];
+
 type Alert = { kind: string; agent: string; message: string };
 
 /** A module context that records the ops alerts raised through it, called
@@ -60,10 +67,10 @@ describe('InstructionsModule', () => {
   let ctx: ModuleContext;
 
   /** A WorkspaceModule with one mount named `mountName` over the test's directory. */
-  function workspaceOver(mountName: string): WorkspaceModule {
+  function workspaceOver(mountName: string, mount: { followSymlinks?: boolean } = {}): WorkspaceModule {
     const store = JsStore.openOrCreate({ path: join(storeDir, `store-${stores.length}`) });
     stores.push(store as { close?: () => void });
-    const workspace = new WorkspaceModule({ mounts: [{ name: mountName, path: dir, mode: 'read-only', watch: 'never' }] });
+    const workspace = new WorkspaceModule({ mounts: [{ name: mountName, path: dir, mode: 'read-only', watch: 'never', ...mount }] });
     workspace.initStore(store);
     return workspace;
   }
@@ -286,8 +293,9 @@ describe('InstructionsModule', () => {
     expect(text).not.toContain('-end');
   });
 
-  // A recipe's mounts don't follow links, so a file that is itself a link is
-  // refused even when it names another file in the same mount.
+  // A mount doesn't follow links unless the recipe sets followSymlinks, so
+  // here a file that is itself a link is refused even when it names another
+  // file in the same mount.
   test('a file that is itself a link injects nothing, and the alert names the remedy', async () => {
     writeFileSync(join(dir, 'real.md'), 'legit content');
     symlinkSync('real.md', join(dir, 'AGENTS.md'));
@@ -317,17 +325,65 @@ describe('InstructionsModule', () => {
     );
   });
 
-  test('a file reached through a linked directory inside the mount is read', async () => {
-    // agent-framework refuses a file that is itself a link, and one whose
-    // canonical path leaves the mount; a linked directory is followed while
-    // what it leads to stays inside the mount.
+  test('a file reached through a linked directory inside the mount is read as the mount reads it', async () => {
+    // agent-framework 0.22.2 follows a linked directory that stays inside the
+    // mount on any mount. Its release with anima-research/agent-framework#468
+    // refuses one on a mount that doesn't follow links (parent_symlink), and
+    // the alert gives the read's own words, which name the link and the
+    // mount's followSymlinks setting.
     mkdirSync(join(dir, 'v2'));
     writeFileSync(join(dir, 'v2', 'AGENTS.md'), 'the second version');
     symlinkSync('v2', join(dir, 'current'));
-    const mod = await moduleOver(workspaceOver('instructions'), { path: 'instructions/current/AGENTS.md' });
+    const workspace = workspaceOver('instructions');
+    const refused = await workspace.readFileFromDisk('instructions/current/AGENTS.md').then(
+      () => null,
+      (err: WorkspaceReadError) => err,
+    );
+    const mod = await moduleOver(workspace, { path: 'instructions/current/AGENTS.md' });
+
+    if (refused === null) {
+      expect(textOf(await mod.gatherContext('a'))).toContain('the second version');
+      expect(alerts).toEqual([]);
+    } else {
+      expect(refused.code).toBe(PARENT_SYMLINK);
+      expect(await mod.gatherContext('a')).toEqual([]);
+      expect(alerts.map((a) => a.message)).toEqual([`no instructions injected: ${refused.message}`]);
+    }
+  });
+
+  test('a mount that follows links reads a file through a linked directory', async () => {
+    mkdirSync(join(dir, 'v2'));
+    writeFileSync(join(dir, 'v2', 'AGENTS.md'), 'the second version');
+    symlinkSync('v2', join(dir, 'current'));
+    const mod = await moduleOver(workspaceOver('instructions', { followSymlinks: true }), { path: 'instructions/current/AGENTS.md' });
 
     expect(textOf(await mod.gatherContext('a'))).toContain('the second version');
     expect(alerts).toEqual([]);
+  });
+
+  test("a link among the path's directories is reported in the read's own words", async () => {
+    const message = 'instructions/current/AGENTS.md: "instructions/current" is a symlink to "instructions/v2", which this ' +
+      'mount does not follow; the mount\'s host can set followSymlinks: true';
+    const mod = await moduleOver(
+      { readFileFromDisk: async () => { throw new WorkspaceReadError(PARENT_SYMLINK, message, 'readlink'); } },
+      { path: 'instructions/current/AGENTS.md' },
+    );
+
+    expect(await mod.gatherContext('a')).toEqual([]);
+    expect(alerts.map((a) => a.message)).toEqual([`no instructions injected: ${message}`]);
+  });
+
+  test("a path in a nested mount's directory is reported in the read's own words, which name the path to use", async () => {
+    // As anima-research/agent-framework#460 reports a path in another mount's directory nested in the one named.
+    const message = '"instructions/inner/AGENTS.md" lies in mount "inner", nested in mount "instructions", which neither ' +
+      'reads nor writes it: use "inner/AGENTS.md".';
+    const mod = await moduleOver(
+      { readFileFromDisk: async () => { throw new WorkspaceReadError(OTHER_MOUNT, message, 'parse'); } },
+      { path: 'instructions/inner/AGENTS.md' },
+    );
+
+    expect(await mod.gatherContext('a')).toEqual([]);
+    expect(alerts.map((a) => a.message)).toEqual([`no instructions injected: ${message}`]);
   });
 
   test('each distinct reason in one loss raises its own alert, once', async () => {

@@ -35,10 +35,13 @@
  *
  * Requires the workspace module: the configured path is a mount-prefixed
  * workspace path ("<mountName>/<relativePath>"). validateRecipe enforces the
- * pairing. The file is read through WorkspaceModule.readFileFromDisk, which
- * refuses a file that is itself a link unless its mount follows links (a
- * recipe's mounts don't), and reads a file only if its canonical path lies
- * inside the mount, which it checks after opening the file.
+ * pairing. The file is read through WorkspaceModule.readFileFromDisk, which,
+ * unless its mount follows links (off unless the recipe sets
+ * followSymlinks), refuses a file that is itself a link and, from
+ * agent-framework's release with anima-research/agent-framework#468, one
+ * reached through a linked directory too, and reads a file only if its
+ * canonical path lies inside the mount, which it checks after opening the
+ * file.
  *
  * Reads ask readFileFromDisk for at most maxBytes. At 0.22.2 that holds for
  * a file larger than maxBytes when the read starts, but a file that grows
@@ -345,6 +348,17 @@ export class InstructionsModule implements Module {
       return `"${this.path}" leads outside its mount through a link, the file itself or a directory on its path: ` +
         'move the file into the mount, so that neither it nor a directory on its path is a link that leads out';
     }
+    // Any other code is given in the read's own words, which name the path
+    // or, for a mount that's unavailable, the mount.
+    // That includes `parent_symlink`, from agent-framework's release with
+    // anima-research/agent-framework#468, for a link among the path's
+    // directories that leads neither out of the mount nor into a nested
+    // mount's directory: its message names the link and, where it leads
+    // somewhere, its target, and for a linked directory the mount's
+    // followSymlinks setting, so a remedy of the host's own would be wrong
+    // for some of them. It includes `other_mount` too, for a path in, or
+    // reached through a link into, a nested mount's directory, whose message
+    // names that mount and the path to use there.
     return error instanceof Error ? error.message : String(error);
   }
 

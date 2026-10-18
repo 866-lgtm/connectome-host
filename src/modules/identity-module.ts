@@ -57,16 +57,24 @@ import { unknownToolResult } from './unknown-tool.js';
  *  that resolves the root first reports it as mount_unavailable with ENOENT.
  *  mount_unavailable with any other errno, or none, is a root the read
  *  couldn't resolve or trust, where disk may hold a file it couldn't reach,
- *  so the upload is refused. */
+ *  so the upload is refused. On a mount that doesn't follow links,
+ *  agent-framework 0.22.2 reads a link among the path's directories that
+ *  leads nowhere or to a file as not_found (ENOENT or ENOTDIR), so the
+ *  workspace's copy stands in, and its release with
+ *  anima-research/agent-framework#468 refuses either as parent_symlink, so
+ *  the upload is refused there. */
 function diskHasNoFile(error: WorkspaceReadError): boolean {
   const gone = ['ENOENT', 'ENOTDIR'];
   if (error.code === 'mount_unavailable') return gone.includes(error.errno ?? '');
   return error.code === 'not_found' && [...gone, 'ENAMETOOLONG'].includes(error.errno ?? '');
 }
 
-/** What the agent can do about any other refusal of a disk read, by its code. */
+/** What the agent can do about any other refusal of a disk read, by its code.
+ *  `parent_symlink` comes from agent-framework's release with
+ *  anima-research/agent-framework#468, past the version this host's types
+ *  come from, so it's matched as a string. */
 function diskRemedy(error: WorkspaceReadError): string {
-  switch (error.code) {
+  switch (error.code as string) {
     case 'directory':
       return 'Name a file, not a directory.';
     case 'symlink':
@@ -74,8 +82,21 @@ function diskRemedy(error: WorkspaceReadError): string {
       return 'It\'s a link, and this mount doesn\'t follow links. If you know it points to a file in the workspace, name ' +
         'that file by its own path; otherwise an upload can\'t send it, though your operator can put the file in the workspace.';
     case 'escape':
-      return 'It leads, through a link, to a file outside the workspace, and an upload sends only files inside it. If ' +
-        'that file should be sent, your operator can put it in the workspace.';
+      // A mount's own check: the file may lie in another mount, which the
+      // reason doesn't say.
+      return 'It leads, through a link, outside this mount, and an upload sends only a file that lies inside the mount ' +
+        'it\'s named through. If you know the file lies in another mount, name it by its path there; otherwise your ' +
+        'operator can put it in the workspace.';
+    case 'parent_symlink':
+      // The read's own reason names the link and, where it leads somewhere,
+      // its target. Only for a directory does it add the setting the mount's
+      // host can change, which is how the agent can tell that case: there
+      // the file can be named by its path through the directory, and
+      // following links would help. Elsewhere neither would. The route's
+      // real-read test pins those words.
+      return 'A directory on its path is a link, and this mount doesn\'t follow links. If the link leads to a ' +
+        'directory, which the reason shows by saying the mount\'s host can set followSymlinks, name the file by its ' +
+        'path there. Otherwise ask your operator, giving them this reason.';
     case 'changed':
       return 'It changed while it was being read, and calling again reads it afresh.';
     default:
@@ -1038,8 +1059,14 @@ export class IdentityModule implements Module {
       if (!(err instanceof WorkspaceReadError)) throw err;
       onDisk = err;
     }
-    // A path no mount holds, or one leading out of its mount, has no copy anywhere.
-    if (onDisk.code === 'unknown_mount' || onDisk.code === 'traversal') {
+    // A path no mount holds, or one leading out of its mount, has no copy
+    // anywhere. One in another mount's directory nested in it, or reached
+    // through a link into one (`other_mount`, from
+    // anima-research/agent-framework#460, and for a link from the release
+    // with anima-research/agent-framework#468), is that mount's: the reason
+    // names the mount and the path to use there, so the outer mount's
+    // workspace isn't offered in its place.
+    if (['unknown_mount', 'traversal', 'other_mount'].includes(onDisk.code)) {
       return { refusal: `${nothingSent} ${sentence(onDisk.message)}` };
     }
     const diskReason = sentence(`${onDisk.message}${onDisk.errno ? ` (${onDisk.errno})` : ''}`);

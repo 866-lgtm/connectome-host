@@ -710,9 +710,11 @@ export interface RecipeWorkspaceMount {
   watchRootPollMs?: number;
   /**
    * Passed to agent-framework's mount: whether the workspace follows a
-   * symlink inside the mount (the framework's default is off). The
-   * framework still doesn't read through a link whose target lies outside
-   * the mount.
+   * symlink inside the mount (the framework's default is off), a file that
+   * is itself a link and, from the framework's release with
+   * anima-research/agent-framework#468, a link among a path's directories
+   * too, which earlier releases follow either way. The framework still
+   * doesn't read through a link whose target lies outside the mount.
    */
   followSymlinks?: boolean;
 }

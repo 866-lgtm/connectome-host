@@ -1260,8 +1260,10 @@ export class WebUiModule implements Module {
 
     // Workspace file passthrough: /files/<mount>/<path...>
     // Reads through WorkspaceModule.readFileFromDisk, which refuses a file
-    // that is itself a link unless the mount follows links, and reads a file
-    // only if its canonical path lies inside the mount.
+    // that is itself a link unless the mount follows links (and, from
+    // agent-framework's release with anima-research/agent-framework#468, a
+    // link among its directories too), and reads a file only if its
+    // canonical path lies inside the mount.
     if (url.pathname.startsWith('/files/')) {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
@@ -1499,17 +1501,23 @@ export class WebUiModule implements Module {
       // opened, so a path spelt with a trailing slash keeps its extension's.
       return new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { 'content-type': mimeFor(realPath) } });
     } catch (err) {
-      // A path no mount holds or one leading out of its mount, a file that is
-      // itself a link the mount doesn't follow, and one whose canonical path
-      // lies outside the mount are forbidden. A mount the read can't resolve
-      // after finding the file is the server's fault, as no workspace is, and
-      // says nothing about the file. Anything else the read can't give is not
-      // found: a file that changed while it was read, and a mount whose
-      // directory has gone, which the read finds no file in. The body is
-      // the read's message, which says why and names no host path; the
-      // status says forbidden, unavailable or not found.
+      // A path no mount holds or one leading out of its mount, one in another
+      // mount's directory nested in it or reached through a link into one
+      // (`other_mount`, from anima-research/agent-framework#460 and, for a
+      // link, the release with anima-research/agent-framework#468), a file
+      // that is itself a link the mount doesn't follow or one reached through
+      // such a link among its directories (`parent_symlink`, from that
+      // release), and one whose canonical path lies outside the mount are
+      // forbidden. A mount the read can't resolve after finding the file is
+      // the server's fault, as no workspace is, and says nothing about the
+      // file. Anything else the read can't give is not found: a file that
+      // changed while it was read, and a mount whose directory has gone,
+      // which the read finds no file in. The body is the read's message,
+      // which says why, names no host path, and for a nested mount names the
+      // path to use there; the status says forbidden, unavailable or not
+      // found.
       const read = err instanceof WorkspaceReadError ? err : null;
-      if (read && ['unknown_mount', 'traversal', 'symlink', 'escape'].includes(read.code)) {
+      if (read && ['unknown_mount', 'traversal', 'other_mount', 'symlink', 'parent_symlink', 'escape'].includes(read.code)) {
         return new Response(read.message, { status: 403 });
       }
       if (read?.code === 'mount_unavailable') return new Response(read.message, { status: 503 });
