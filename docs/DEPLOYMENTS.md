@@ -153,16 +153,18 @@ the working directory):
 
 A box that runs the stack from checkouts of `main` (the
 [DEV-ENVIRONMENT](./DEV-ENVIRONMENT.md) layout) takes each change as it
-pulls, with no release in between. agent-framework's and connectome-host's
-releases stop while an issue labelled `release-hold` is open in their
-repository. Such an issue says that `main` as it stands would harm someone
-running it, and what has to happen first. A pull doesn't stop for it, and
-the layout's other repositories have no holds. So:
+pulls, with no release in between. agent-framework's, chronicle's and
+connectome-host's releases stop while an issue labelled `release-hold` is
+open in their repository. Such an issue says that `main` as it stands
+would harm someone running it, and what has to happen first. A pull
+doesn't stop for it, and the layout's other repositories have no holds.
+So:
 
 - **Before pulling,** look at the open holds. The repositories are public,
   so their issue pages need no login:
   ```
   https://github.com/anima-research/agent-framework/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
+  https://github.com/anima-research/chronicle/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
   https://github.com/anima-research/connectome-host/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
   ```
   With `gh` logged in, `gh issue list --label release-hold` in each
@@ -195,8 +197,11 @@ the layout's other repositories have no holds. So:
   (`DATA_DIR`), its fleet children's data directories (`data/<child>`
   under its working directory, unless a launch named another), the MCPL
   server settings it saves in its working directory (`mcpl-servers.json`
-  and `mcpl-servers.agent.json`), and the files its `.env` names, such as
-  `HEARTBEAT_CONFIG_FILE` and `DISCORD_SUBSCRIPTIONS_FILE`. Then update
+  and `mcpl-servers.agent.json`), and the files its MCPL servers keep
+  their state in, such as heartbeat-mcpl's `HEARTBEAT_CONFIG_FILE` and
+  those discord-mcpl's README lists under
+  [Stored state](https://github.com/anima-research/discord-mcpl#stored-state).
+  Then update
   the host and the libraries it loads together (`git switch main` first
   in a checkout left detached), since the host's code expects the library
   versions beside it. Install and build them bottom-up as
