@@ -410,12 +410,13 @@ export function undeliveredLaunchParts(
       ? (result.content as Array<{ type?: unknown; text?: unknown }>)
           .map((c) => (c.type === 'text' && typeof c.text === 'string' ? c.text : '')).join('')
       : '';
-  // A fork's call and its result arrive or go together: the context
-  // manager's recent window keeps the newest messages first and drops a
-  // leading result whose call it left out (context-manager 0.14.1's
-  // emitRecentNewestFirst), and its cap passes a tool call whole. So only
-  // the cap cuts a result that is there, and a result that isn't there is
-  // the call's part to say.
+  // A fork's call and its result arrive or go together in a launch's first
+  // compile (context-manager 0.14.1): the head window doesn't end between a
+  // tool call and its result (getHeadWindowEnd), the recent window drops a
+  // leading result whose call it left out (emitRecentNewestFirst), and the
+  // cap passes a tool call whole and keeps every tool result, cut or
+  // replaced by an omission notice. So only the cap cuts a result that is
+  // there, and a result that isn't there is the call's part to say.
   if (result !== undefined && !resultText.startsWith(delivery.head)) cut.push('orientation');
   const call = blocks.find((b) => {
     const block = b as { type?: unknown; id?: unknown };
@@ -547,8 +548,9 @@ export interface SubagentStart {
   /** What the calling stream is shown now; undefined when it can't be read. */
   parentTools?: string[];
   /** The agent settings the stream was created with, each rendered; and the
-   *  parent's (a fork's) or the caller's (a spawn's) at the start, undefined
-   *  when that stream is gone. */
+   *  parent's (a fork's) or the caller's (a spawn's) at the start, read from
+   *  the agent the launch resolved at the call even once it has left the
+   *  framework; undefined for a launch with no calling stream. */
   agentSettings: AgentSettings;
   parentAgentSettings?: AgentSettings;
 }
@@ -747,6 +749,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   const allowed = launch.tools.allowed;
   const requested = launch.tools.requested;
   const callerRules = p?.allowedTools ?? 'all';
+  // filterToolNames' ensureReturn adds subagent--return to a restricted
+  // caller's rules that lack it, so the stream's rules are theirs and that.
+  const addsReturn = callerRules !== 'all' && !callerRules.includes('subagent--return');
   const granted = launch.tools.granted ?? (allowed === 'all' ? [] : allowed);
   const depth = launch.tools.depthLimited;
   const explicit = launch.proseRouting === 'explicit';
@@ -816,13 +821,14 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     // offers of them, less the subagent tools.
     inherited = true;
     const n = callerRules.length;
-    // Short of the depth limit it keeps the rules whole, and is given what
-    // the process offers of them: two facts, so that a stream given only
-    // subagent--return isn't read as keeping only that.
+    // Short of the depth limit it keeps the rules whole, with subagent--return
+    // added where they lack it, and is given what the process offers of
+    // them: two facts, so that a stream given only subagent--return isn't
+    // read as keeping only that.
     toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and ` +
       (depth
         ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools: ${gets('', '')}`
-        : `this stream keeps those rules; it's given ${gets('', ', as the process offered them at the call')}`);
+        : `this stream keeps those rules${addsReturn ? ', with subagent--return added' : ''}; it's given ${gets('', ', as the process offered them at the call')}`);
     const missing = notGiven(callerRules);
     if (missing.length > 0) toolRule += `; ${them}'s rules also allow ${joinSome(missing)}, which this stream isn't given at the call`;
   } else {
@@ -830,9 +836,10 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
     toolRule = 'every tool the process offers at the call except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
   }
   if (p) {
-    // The same as the caller's when nothing narrowed them: unrestricted, or
-    // a restricted caller's kept whole.
-    const same = requested === undefined && !launch.tools.depthLimited;
+    // The same as the caller's when nothing narrowed or added to them:
+    // unrestricted, or a restricted caller's kept whole that already hold
+    // subagent--return.
+    const same = requested === undefined && !launch.tools.depthLimited && !addsReturn;
     const theirs = p.allowedTools === 'all'
       ? `${them} has no restriction`
       : p.allowedTools.length === 0

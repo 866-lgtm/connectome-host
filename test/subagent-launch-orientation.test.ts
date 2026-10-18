@@ -365,8 +365,9 @@ describe('fork orientation', () => {
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_fork_11', input));
       await h.asyncPromise('wide');
       const block = launchBlock(res.data as string);
-      expect(block).toContain('- Tool rules: the parent is restricted to 1, and this stream keeps those rules; it\'s given only these 2, as the process offered them at the call: agent_settings and subagent--return.');
-      expect(line(block, '- Against the parent at the call:')).toMatch(/Same: [^.]*tool rules/);
+      expect(block).toContain('- Tool rules: the parent is restricted to 1, and this stream keeps those rules, with subagent--return added; it\'s given only these 2, as the process offered them at the call: agent_settings and subagent--return.');
+      // The stream's rules are the parent's and subagent--return, so not the same.
+      expect(line(block, '- Against the parent at the call:')).toMatch(/Differs in [^.]*tool rules/);
       const run = h.runs[0]!;
       expect(run.allowedTools).toEqual(['agent_settings', 'subagent--return']);
       const parentTools = h.framework.listToolClasses('parent').map((t) => t.tool);
@@ -561,6 +562,10 @@ describe("a spawn's tool rule says what the list grants", () => {
       "- Tool rules: only these 2 from the caller's list, as the process offered them at the call: probe--t1 and subagent--return; the caller has no restriction.",
     );
     expect(await ruleFor(['subagent--return', 'subagent--return'])).toBe('- Tool rules: only subagent--return; the caller has no restriction.');
+    // A repeated name the stream isn't given is named once among those too.
+    expect(await ruleFor(['gone--t1', 'gone--t1'])).toBe(
+      "- Tool rules: only subagent--return; the caller's list also names gone--t1, which this stream isn't given at the call; the caller has no restriction.",
+    );
   });
 
   test("names every listed tool the stream isn't given at the call, past ten too", async () => {
@@ -687,7 +692,7 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
         const run = h.runs[0]!;
         if (maxDepth === 3) {
           expect(line(block, '- Tool rules')).toBe(
-            "- Tool rules: the parent is restricted to 2, and this stream keeps those rules; it's given only these 3: probe--t1 and subagent--return, as the process " +
+            "- Tool rules: the parent is restricted to 2, and this stream keeps those rules, with subagent--return added; it's given only these 3: probe--t1 and subagent--return, as the process " +
               'offered them at the call, and prose_help, which explicit prose routing shows.',
           );
           expect(line(block, '- Prose routing')).toBe(`- Prose routing: explicit, inherited from the parent: ${ROUTING_EFFECT.explicit}${PROSE_HELP}.`);
@@ -711,7 +716,7 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
     const unoffered = Array.from({ length: 12 }, (_, i) => `gone--t${i}`);
     const { rule } = await launch('fork', unoffered, {});
     expect(rule).toBe(
-      "- Tool rules: the parent is restricted to 12, and this stream keeps those rules; it's given only subagent--return; " +
+      "- Tool rules: the parent is restricted to 12, and this stream keeps those rules, with subagent--return added; it's given only subagent--return; " +
         `the parent's rules also allow ${unoffered.slice(0, 10).join(', ')} and 2 more, which this stream isn't given at the call.`,
     );
   });
@@ -719,7 +724,7 @@ describe("a launch from a restricted caller keeps the caller's rules, and its to
   test("a parent's rule for a tool the process doesn't offer is kept, and named among what the stream isn't given at the call", async () => {
     const { rule, run } = await launch('fork', ['probe--t1', 'no-such-tool'], {});
     expect(rule).toBe(
-      '- Tool rules: the parent is restricted to 2, and this stream keeps those rules; it\'s given only these 2, as the process offered them at the call: ' +
+      '- Tool rules: the parent is restricted to 2, and this stream keeps those rules, with subagent--return added; it\'s given only these 2, as the process offered them at the call: ' +
         "probe--t1 and subagent--return; the parent's rules also allow no-such-tool, which this stream isn't given at the call.",
     );
     expect(run.allowedTools).toEqual(['probe--t1', 'no-such-tool', 'subagent--return']);
@@ -737,7 +742,7 @@ describe('what a launch block says beyond the settings it compares', () => {
       await h.asyncPromise('bare');
       const rule = line(launchBlock(res.data as string), '- Tool rules');
       // The fork keeps the restriction, with subagent--return.
-      expect(rule).toBe('- Tool rules: the parent is restricted to no tools, and this stream keeps those rules; it\'s given only subagent--return.');
+      expect(rule).toBe('- Tool rules: the parent is restricted to no tools, and this stream keeps those rules, with subagent--return added; it\'s given only subagent--return.');
       expect(rule).not.toContain('0: ');
     } finally {
       await h.cleanup();
@@ -969,6 +974,10 @@ describe('a queued launch', () => {
       const forkReceipt = (await h.subagent.handleToolCall(call('fork', 'toolu_second', fork))).data as string;
       const spawn = { name: 'third', systemPrompt: 'spawn prompt', task: 'wait as well' };
       const spawnReceipt = (await h.subagent.handleToolCall(call('spawn', 'toolu_third', spawn))).data as string;
+      // A spawn says it waits, as a fork does.
+      expect(spawnReceipt).toStartWith(
+        "Subagent 'third' spawned. Every subagent slot (1) is in use, so it waits for one to free, for up to 120 s; if none does, it ends with an error, delivered as its result would be.",
+      );
 
       // While both wait, the values their launches took from the parent change.
       const parent = h.framework.getAgent('parent')! as unknown as {
@@ -1680,6 +1689,8 @@ describe('lists about another stream are named in part, so only the stream\'s ow
       expect(result.success).toBe(true);
       const wire = JSON.stringify(h.requestFor('mock-from-narrow')!.messages);
       expect(wire).toContain('- Tool rules: the parent is restricted to 2, and this stream keeps those rules; it\'s given only these 2, as the process offered them at the call: subagent--fork and subagent--return.');
+      // Its rules already hold subagent--return, so they're the parent's, the same.
+      expect(wire).toMatch(/Same: [^.]*tool rules/);
       expect(wire).not.toContain('bulk--');
     } finally {
       await h.cleanup();
@@ -1713,7 +1724,7 @@ describe('what counts as delivered: each shape\'s own carriers, whole', () => {
     // the call's part to say, not a cut orientation.
     expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('other', 'HEAD'))], delivery)).toEqual(['call']);
     // A context that lost the call lost its result with it: one part, the
-    // call's, since the cap didn't cut the orientation.
+    // call's. 'orientation' is for a result that is there and cut.
     expect(undeliveredLaunchParts(msgs(text('earlier')), delivery)).toEqual(['call']);
   });
 });
