@@ -1509,14 +1509,16 @@ export class WebUiModule implements Module {
       // that is itself a link the mount doesn't follow or one reached through
       // such a link among its directories (`parent_symlink`, from that
       // release), and one whose canonical path lies outside the mount are
-      // forbidden. A mount the read can't resolve after finding the file is
-      // the server's fault, as no workspace is, and says nothing about the
-      // file. Anything else the read can't give is not found: a file that
-      // changed while it was read, and a mount whose directory has gone,
-      // which the read finds no file in. The body is the read's message,
-      // which says why, names no host path, and for a nested mount names the
-      // path to use there; the status says forbidden, unavailable or not
-      // found.
+      // forbidden. A mount the read refuses as unavailable
+      // (`mount_unavailable`) is the server's fault, as no workspace is, and
+      // says nothing about the file. Anything else the read can't give is not
+      // found, such as a file that changed while it was read. A mount whose
+      // directory has gone is not found on agent-framework 0.22.2, whose read
+      // finds no file in it, and unavailable from the release with
+      // anima-research/agent-framework#533, whose read checks the mount's
+      // root. The body is the read's message, which says why, names no host
+      // path, and for a nested mount names the path to use there; the status
+      // says forbidden, unavailable or not found.
       const read = err instanceof WorkspaceReadError ? err : null;
       if (read && ['unknown_mount', 'traversal', 'other_mount', 'symlink', 'parent_symlink', 'escape'].includes(read.code)) {
         return new Response(read.message, { status: 403 });
