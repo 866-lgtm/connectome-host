@@ -14,7 +14,7 @@
  * surface in full), and `message-appended` live pushes of stored messages.
  */
 
-import type { Line } from '../commands.js';
+import type { Line } from '../output-line.js';
 
 export const WEB_PROTOCOL_VERSION = 1;
 

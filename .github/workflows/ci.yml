@@ -81,9 +81,12 @@ jobs:
   # and the web build is `vite build`, which doesn't either, so a type
   # error, such as a name in a typed list of recipe keys that's no longer a
   # key, would reach main unseen. The root's tsconfig includes src/ alone,
-  # so test/ and scripts/ aren't checked. The web app's program also checks
-  # the host files src/web/protocol.ts reaches through its type import from
-  # src/commands.ts, src/tui.ts among them, with Node's types but not
+  # so test/ and scripts/ aren't checked. Its isolatedModules has the host's
+  # check also reject what bun can't transpile one module at a time: a
+  # type-only name re-exported without `export type`, for one, passes the
+  # rest of the check and fails when bun loads the module. The web app's
+  # program also checks the host modules it imports from src/web/ and
+  # src/state/, and the ones those import in turn, with Node's types but not
   # Bun's: Bun's globals or bun: modules used in one of those fail the web
   # step while the host step passes. Types don't depend on the runtime, so
   # one job at the Node floor does it.
