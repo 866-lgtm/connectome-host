@@ -165,6 +165,17 @@ const timerDelay = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0, ms
  *  of 2,000). */
 const TIMER_SLACK_MS = 2;
 
+/** The number every agent name the module makes ends in: the time in ms, or
+ *  one past the last name's number once that has caught up with the time.
+ *  agent-framework refuses to create an agent under a name it has seen in
+ *  the framework's life, and a retry, or a new run under a name an earlier
+ *  run used, can start in the same millisecond as an earlier attempt. */
+let lastNameStamp = 0;
+function nameStamp(): number {
+  lastNameStamp = Math.max(Date.now(), lastNameStamp + 1);
+  return lastNameStamp;
+}
+
 /** Persisted subagent state (stored in Chronicle module state).
  *  'cancelled' = terminal-but-benign (user cancel, zombie reclaim, supersession).
  *  Postmortem 2026-05-28 P1 #4: separated from 'failed' so the TUI subagent
@@ -2068,7 +2079,7 @@ export class SubagentModule implements Module {
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        const agentName = `spawn-${input.name}-${Date.now()}`;
+        const agentName = `spawn-${input.name}-${nameStamp()}`;
         this.runOfAttempt.set(agentName, input.name);
         // An attempt starts with no result an earlier attempt, or an earlier
         // run under the name, stashed with return.
@@ -2259,11 +2270,12 @@ export class SubagentModule implements Module {
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        // Unique agent name: include depth + timestamp to prevent collisions when
-        // a child fork uses the same display name as its parent (e.g. both called
-        // "fork-level-2"). Without this, the child overwrites the parent in the
-        // framework's agents Map, and the parent's completion promise never resolves.
-        const suffix = attempt === 0 ? `d${childDepth}-${Date.now()}` : `d${childDepth}-retry${attempt}-${Date.now()}`;
+        // Unique agent name: include depth and nameStamp()'s number to prevent
+        // collisions when a child fork uses the same display name as its parent
+        // (e.g. both called "fork-level-2"). Without this, the child overwrites
+        // the parent in the framework's agents Map, and the parent's completion
+        // promise never resolves.
+        const suffix = attempt === 0 ? `d${childDepth}-${nameStamp()}` : `d${childDepth}-retry${attempt}-${nameStamp()}`;
         const agentName = `${input.name}-${suffix}`;
         this.runOfAttempt.set(agentName, input.name);
         // An attempt starts with no result an earlier attempt, or an earlier

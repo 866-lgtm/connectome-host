@@ -48,7 +48,7 @@ Start by reading [`../recipes/SETUP.md`](../recipes/SETUP.md) — it covers the 
 
 You need all of:
 
-- Bun, Node 20+, an Anthropic API key (from SETUP.md).
+- Bun 1.4.3+, Node 22.12+, an Anthropic API key (from SETUP.md).
 - **Zulip**: a bot account with API credentials, subscribed to the channel you want the Clerk to staff. Name that channel in `.env` as `ZULIP_CHANNEL` (e.g. `tracker-miner-f`) — `clerk.json` won't load without it. `.zuliprc` in the project directory.
 - **Zulip MCP server** built and reachable at `../zulip_mcp/build/index.js`, the path both recipes reference (see SETUP.md Step 2).
 - **Miner data sources**: the shipped miner recipe wires GitLab (set `GITLAB_TOKEN` / `GITLAB_API_URL` in `.env`, or remove the `gitlab` block) and DuckDuckGo web search (a sibling checkout). Notion and Scribe are opt-in — see SETUP.md.

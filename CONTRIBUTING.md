@@ -207,12 +207,14 @@ agree` job fails when `bun.lock` doesn't match `package.json`
 (`bun install --frozen-lockfile`) or when the two resolve the stack's
 packages (`@animalabs/*`) differently (`node scripts/lockfiles-agree.mjs`,
 which follows the stack's dependencies from the root, through each stack
-package's own, comparing registry versions and GitHub commits; a pin of
-another kind, such as a link, fails as one it can't compare, and the
-relock below doesn't clear it; other packages may differ, and a stack
-package that only a third-party package depends on isn't reached). So
-when you change a
-dependency, update `package-lock.json` with npm, then make `bun.lock`
+package's own, comparing registry versions, GitHub commits and tarball
+URLs; a pin of another kind on both sides, such as a link, fails as one
+it can't compare, and the relock below doesn't clear it, while against a
+pin of a known kind it differs; other packages may differ, and a stack
+package that only a third-party package depends on, or one declared
+under an alias outside `@animalabs/`, isn't reached). So
+when you change a dependency, update
+`package-lock.json` with npm, then make `bun.lock`
 follow it as for `web/`: delete `bun.lock` and run
 `bun install --lockfile-only`.
 
