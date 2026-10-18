@@ -1,3 +1,11 @@
+// A copy of agent-framework's scripts/release-bump.mjs
+// (https://github.com/anima-research/agent-framework), taken from commit
+// 19cd94a (pull request #348), and the same apart from this opening comment
+// and the version hook's name in two comments, release-changelog.ts here.
+// A change to the check lands there first, with its tests, and is then
+// ported here with this commit updated, its tests with it
+// (test/release-bump.test.ts, under bun:test).
+//
 // Runs in npm's `preversion` lifecycle hook (see package.json), where npm
 // gives both versions (npm_old_version, npm_new_version) before it writes
 // anything: npm 8, 9, 10 and 11.17 all do, checked with `npm version patch`
