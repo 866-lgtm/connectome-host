@@ -39,6 +39,7 @@ import type {
 } from '@animalabs/agent-framework';
 import { WorkspaceReadError } from '@animalabs/agent-framework';
 import { unknownToolResult } from './unknown-tool.js';
+import { workspaceReadFields } from '../workspace-read-result.js';
 import type { ServerWebSocket } from 'bun';
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -2407,12 +2408,12 @@ export class WebUiModule implements Module {
    *  keeps the SPA decoupled from module implementation details. */
 
   private async workspaceMod(): Promise<
-    | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+    | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; structured?: unknown; error?: string }> }
     | undefined
   > {
     if (!sharedServer?.app) return undefined;
     return sharedServer.app.framework.getAllModules().find((m) => m.name === 'workspace') as
-      | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+      | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; structured?: unknown; error?: string }> }
       | undefined;
   }
 
@@ -2487,13 +2488,7 @@ export class WebUiModule implements Module {
         this.send(client, { type: 'error', message: `read ${path} failed: ${result.error ?? 'unknown'}` });
         return;
       }
-      const data = (result.data ?? {}) as {
-        path?: string;
-        totalLines?: number;
-        fromLine?: number;
-        toLine?: number;
-        content?: string;
-      };
+      const data = workspaceReadFields(result);
       const totalLines = data.totalLines ?? 0;
       const reportedToLine = data.toLine ?? totalLines;
       let content = data.content ?? '';
