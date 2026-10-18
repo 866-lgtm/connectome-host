@@ -35,7 +35,10 @@ import type {
   ToolResult,
   TraceEvent,
   SessionUsageSnapshot,
+  WorkspaceModule,
 } from '@animalabs/agent-framework';
+import { WorkspaceReadError } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 import type { ServerWebSocket } from 'bun';
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -111,6 +114,7 @@ import { loadRecipe } from '../recipe.js';
 import {
   ObserverRegistry,
   ObserverSessions,
+  closeConnectionsWithoutGrant,
   sessionTokenFromRequest,
   traceRequiredScope,
   filterEntryForScopes,
@@ -147,7 +151,7 @@ export interface WebUiModuleConfig {
    * literal credentials to a recipe.
    */
   basicAuth?: { username: string; password: string };
-  /** Path to the SPA build output. Default: `<cwd>/dist/web`. */
+  /** Path to the SPA build output. Default: this package's own `dist/web`. */
   staticDir?: string;
   /**
    * Origin allowlist for the WebSocket upgrade. Browsers do not enforce
@@ -210,6 +214,10 @@ interface ClientState {
   /** Observer grant label (key-authenticated clients) — the requester name
    *  recorded in the operator log for any action this client takes. */
   label?: string;
+  /** The grant a key-authenticated client connected with; each check of the
+   *  grants file closes the connection once that grant is gone, expired or
+   *  narrowed. */
+  observerKey?: string;
   /** Kills pending connections that never complete the hello. */
   authTimer?: ReturnType<typeof setTimeout>;
   /** Open peek subscriptions for this client, keyed by scope. Each entry
@@ -220,6 +228,11 @@ interface ClientState {
 
 /** Default port — picked to be memorable and unlikely to collide. */
 const DEFAULT_PORT = 7340;
+
+/** What to do about a missing bundle: a checkout builds it, and the npm
+ *  package carries it built, without the web/ sources to build it from. */
+const BUNDLE_REMEDY =
+  'In a checkout, run `npm run build:web` (the postinstall runs it); an installed package carries it built, so reinstall the package.';
 
 /** HTTP route → panel op, for ?scope=<child> proxying. /curve (the HTML
  *  page) is deliberately absent: it is served locally and its own fetch of
@@ -467,7 +480,17 @@ export class WebUiModule implements Module {
       fleetEventDetacher: null,
       messageListenerDetacher: null,
     };
-    state.observers?.start();
+    // Each check also ends the sessions of grants that are gone or expired,
+    // narrows the rest, and closes the open connections of grants that are
+    // gone, expired or narrowed.
+    const observers = state.observers;
+    observers?.start(() => {
+      const ended = state.observerSessions.narrowToGrants((key) => observers.liveScopes(key));
+      const closed = closeConnectionsWithoutGrant(state.clients.values(), observers);
+      if (closed > 0 || ended > 0) {
+        console.error(`[webui-observers] closed ${closed} observer connection(s) whose grant is gone, expired or narrowed, and ended ${ended} observer session(s) whose grant is gone, expired or keeps none of their scopes`);
+      }
+    });
     state.server = Bun.serve({
       port,
       hostname: host,
@@ -492,12 +515,12 @@ export class WebUiModule implements Module {
     sharedServer = state;
     // A missing bundle otherwise shows at run time only as a 503 to whoever
     // opens the page. Say it once, where the operator starting the host
-    // looks. This also covers a skipped postinstall (e.g. `--ignore-scripts`),
-    // which can't report anything itself.
+    // looks. This also covers a checkout's skipped postinstall (e.g.
+    // `--ignore-scripts`), which can't report anything itself.
     if (!existsSync(join(state.staticRoot, 'index.html'))) {
       console.warn(
         `[webui] bundle not found at ${state.staticRoot}: the Web UI will answer 503 until it is built. ` +
-        `Run \`npm run build:web\` (or postinstall) to produce it.`,
+        BUNDLE_REMEDY,
       );
     }
 
@@ -541,8 +564,8 @@ export class WebUiModule implements Module {
 
   getTools(): ToolDefinition[] { return []; }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    return { success: false, error: 'WebUiModule has no tools', isError: true };
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -1188,9 +1211,9 @@ export class WebUiModule implements Module {
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
-    // Resolves through WorkspaceModule.resolveAbsolutePath, which enforces
-    // mount-relative containment and the mount's read-permission. We never
-    // serve a path the agent framework's mount layer wouldn't itself serve.
+    // Reads through WorkspaceModule.readFileFromDisk, which refuses a file
+    // that is itself a link unless the mount follows links, and reads a file
+    // only if its canonical path lies inside the mount.
     if (url.pathname.startsWith('/files/')) {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
@@ -1418,18 +1441,31 @@ export class WebUiModule implements Module {
     const inMountPath = decoded.slice(slash + 1);
     const mountPrefixed = `${mount}/${inMountPath}`;
 
-    const ws = sharedServer.app.framework.getModule('workspace');
-    if (!ws || !('resolveAbsolutePath' in ws)) {
-      return new Response('Workspace not mounted', { status: 503 });
-    }
-    const abs = (ws as { resolveAbsolutePath: (p: string) => string | null }).resolveAbsolutePath(mountPrefixed);
-    if (!abs) return new Response('Forbidden', { status: 403 });
-
+    const ws = sharedServer.app.framework.getModule('workspace') as WorkspaceModule | undefined;
+    if (!ws) return new Response('Workspace not mounted', { status: 503 });
     try {
-      const data = await readFile(abs);
-      return new Response(data, { headers: { 'content-type': mimeFor(abs) } });
-    } catch {
-      return new Response('Not found', { status: 404 });
+      const { bytes, realPath } = await ws.readFileFromDisk(mountPrefixed);
+      // The read's bytes sit on an ordinary ArrayBuffer, never shared memory,
+      // so they're a BodyInit as they are: the assertion tells the types so,
+      // without copying the file. The type comes from the file the read
+      // opened, so a path spelt with a trailing slash keeps its extension's.
+      return new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { 'content-type': mimeFor(realPath) } });
+    } catch (err) {
+      // A path no mount holds or one leading out of its mount, a file that is
+      // itself a link the mount doesn't follow, and one whose canonical path
+      // lies outside the mount are forbidden. A mount the read can't resolve
+      // after finding the file is the server's fault, as no workspace is, and
+      // says nothing about the file. Anything else the read can't give is not
+      // found: a file that changed while it was read, and a mount whose
+      // directory has gone, which the read finds no file in. The body is
+      // the read's message, which says why and names no host path; the
+      // status says forbidden, unavailable or not found.
+      const read = err instanceof WorkspaceReadError ? err : null;
+      if (read && ['unknown_mount', 'traversal', 'symlink', 'escape'].includes(read.code)) {
+        return new Response(read.message, { status: 403 });
+      }
+      if (read?.code === 'mount_unavailable') return new Response(read.message, { status: 503 });
+      return new Response(read?.message ?? 'Not found', { status: 404 });
     }
   }
 
@@ -1469,7 +1505,7 @@ export class WebUiModule implements Module {
         return new Response(data, { headers: { 'content-type': 'text/html', 'cache-control': cacheControlFor(indexPath) } });
       } catch {
         return new Response(
-          `WebUI bundle not found at ${sharedServer!.staticRoot}. Run \`npm run build:web\` (or postinstall) to produce it.`,
+          `WebUI bundle not found at ${sharedServer!.staticRoot}. ${BUNDLE_REMEDY}`,
           { status: 503, headers: { 'content-type': 'text/plain' } },
         );
       }
@@ -1516,10 +1552,11 @@ export class WebUiModule implements Module {
     client.auth = 'observer';
     client.scopes = result.scopes;
     client.label = result.grant.label;
+    client.observerKey = result.grant.key;
     this.send(client, {
       type: 'observer-ack',
       scopes: [...result.scopes],
-      sessionToken: sharedServer!.observerSessions.mint(result.scopes),
+      sessionToken: sharedServer!.observerSessions.mint(result.scopes, { key: result.grant.key }),
       label: result.grant.label,
     });
     console.error(`[webui-observers] observer connected: ${result.grant.label} scopes=[${[...result.scopes].join(',')}]`);
@@ -3782,6 +3819,8 @@ export function __getSharedServerPortForTests(): number | null {
 export async function __resetSharedServerForTests(): Promise<void> {
   if (!sharedServer) return;
   try { sharedServer.server.stop(true); } catch { /* ignore */ }
+  // The grants file's checks, and the sweep that runs after each, end too.
+  sharedServer.observers?.stop();
   // Detach any fleet listener / aggregator so the next start runs clean.
   sharedServer.fleetEventDetacher?.();
   sharedServer.treeAggregator?.dispose();

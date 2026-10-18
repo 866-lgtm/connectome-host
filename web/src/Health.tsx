@@ -18,6 +18,8 @@
 
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
+import { healthEntry } from '@conhost/web/health-lookup';
+import { quarantineHeld } from '@conhost/web/quarantine-alert';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -67,9 +69,6 @@ export const CREDENTIAL_ALERT_KINDS = [
   'quota-spent', 'quota-unreadable', 'auth-expiring', 'auth-expired', 'auth-rejected', 'auth-login-required',
 ] as const;
 
-/** Shape of GET /healthz — framework healthSnapshot() plus the host's
- *  compressionQuarantine / runtimeSettings extensions. All fields optional
- *  and defensively read: health rendering must survive version skew. */
 /** Rendered composition of the last compile — what was actually SENT. */
 export interface ContextComposition {
   head?: { messages: number; tokens: number };
@@ -83,6 +82,11 @@ export interface ContextComposition {
  *  the fields this panel aggregates are read. */
 export type LedgerRow = CallLedgerRow;
 
+/** Shape of GET /healthz — framework healthSnapshot() plus the host's
+ *  extensions: credential, the per-agent compressionQuarantine,
+ *  compressionDebt, contextComposition and runtimeSettings, readFailures,
+ *  and callLedger. All fields optional and defensively read: health
+ *  rendering must survive version skew. */
 export interface HealthSnapshot {
   at?: string;
   credential?: CredentialInfo;
@@ -108,7 +112,9 @@ export interface HealthSnapshot {
       lastCategory?: string;
     } | null;
   }>;
-  compressionQuarantine?: Record<string, { count?: number; keys?: string[] }>;
+  /** Each agent's quarantine status: records (`count`) and their keys, and the
+   *  quarantined spans (`spans`) when context-manager lists them. */
+  compressionQuarantine?: Record<string, { count?: number; keys?: string[]; spans?: unknown[] }>;
 
   /** cm's single-authority debt reduction (getCompressionDebt) — the QUEUE
 
@@ -148,6 +154,11 @@ export interface HealthSnapshot {
     transition?: string;
     transitionReason?: string;
   }>;
+  /** Per-agent reads that threw, by agent and then section, with what the
+   *  error said. Present only when one threw. Such an agent is missing from
+   *  that section, as an agent with nothing to report there is, but only a
+   *  failed read has an entry here. */
+  readFailures?: Record<string, Record<string, string>>;
 }
 
 const fmtTokens = (n: number): string => {
@@ -453,10 +464,13 @@ export function HealthPanel(props: {
   onCredentialAction?(actionId: string): void;
 }) {
   const agents = () => props.health?.agents ?? [];
-  const quarantine = (name: string) => props.health?.compressionQuarantine?.[name];
-  const debt = (name: string) => props.health?.compressionDebt?.[name];
-  const settings = (name: string) => props.health?.runtimeSettings?.[name];
-  const composition = (name: string) => props.health?.contextComposition?.[name];
+  // Each section is looked up by own key (healthEntry), so an agent whose name
+  // is also an Object.prototype member reads as missing when it is.
+  const quarantine = (name: string) => healthEntry(props.health?.compressionQuarantine, name);
+  const debt = (name: string) => healthEntry(props.health?.compressionDebt, name);
+  const settings = (name: string) => healthEntry(props.health?.runtimeSettings, name);
+  const composition = (name: string) => healthEntry(props.health?.contextComposition, name);
+  const failures = (name: string) => healthEntry(props.health?.readFailures, name);
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -542,7 +556,7 @@ export function HealthPanel(props: {
 
             <Show when={quarantine(a.name) && (quarantine(a.name)!.count ?? 0) > 0}>
               <div class="text-rose-300 bg-rose-950/30 border border-rose-900/50 rounded px-2 py-1">
-                ⚠ {quarantine(a.name)!.count} chunk(s) in compression quarantine — raw spans
+                ⚠ {quarantineHeld(quarantine(a.name)!)} — raw spans
                 accumulate until the window can't fit. Inspect, then branch, pin, or clear.
                 <Show when={(quarantine(a.name)!.keys?.length ?? 0) > 0}>
                   <div class="text-rose-400/70 truncate" title={quarantine(a.name)!.keys!.join(', ')}>
@@ -552,11 +566,28 @@ export function HealthPanel(props: {
               </div>
             </Show>
 
+            {/* A section this agent couldn't be read for is missing from the
+                snapshot; say so, rather than show it as nothing to report. */}
+            <Show when={failures(a.name)}>
+              {(f) => (
+                <div class="text-rose-300/90">
+                  <For each={Object.entries(f())}>
+                    {([section, message]) => (
+                      <div class="truncate" title={message}>{section} couldn't be read: {message}</div>
+                    )}
+                  </For>
+                </div>
+              )}
+            </Show>
+
             {/* Compression debt: the organ's QUEUE, not the render composition.
                 An old stack that reports nothing must say so — absence
-                rendered as zero invites misreads. */}
+                rendered as zero invites misreads. A failed read is listed
+                above instead. */}
             <Show when={debt(a.name)} fallback={
-              <div class="text-neutral-600">compression debt: not reported by this stack</div>
+              <Show when={healthEntry(failures(a.name), 'compressionDebt') === undefined}>
+                <div class="text-neutral-600">compression debt: not reported by this stack</div>
+              </Show>
             }>
               <div class={
                 debt(a.name)!.state === 'critical' ? 'text-rose-300'

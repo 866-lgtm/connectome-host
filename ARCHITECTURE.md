@@ -168,19 +168,23 @@ conditions are required so the headers can never reach a vendor endpoint.
 
 - **`autobiographical`** (default) — context-manager's
   `AutobiographicalStrategy`. The host turns on **adaptive resolution** and
-  **kv-stable folding** unless the recipe says otherwise: the raw tail stays
+  **kv-unified folding** unless the recipe says otherwise: the raw tail stays
   verbatim, and the middle is folded — each stretch rendered raw or as an
   L1…L8 memory — just enough to fit the context budget, by a solver that
-  disturbs the already-cached prefix as little as it can. Memories are written by the agent's own model
+  weighs budget fit, cache cost and continuity. Memories are written by the agent's own model
   (`compressionModel` defaults to `agent.model`) in the agent's own voice
   (`summaryParticipant` defaults to `agent.name`). Host defaults:
-  `headWindowTokens` 4000, `recentWindowTokens` 30000, `maxMessageTokens`
-  10000. About 48 further context-manager keys pass through verbatim,
-  among them the live-image limits `maxLiveImages`, `imageStripDepthTokens`
-  and `maxLiveImageBytes` (context-manager defaults 6, 30000 and 20 MiB; zero
-  disables each). `foldingStrategy: "kv-unified"` is an opt-in cost-aware
-  solver; its `kvUnified` block must set `treeifyNonContiguousSummaries` and
-  `preserveGapBearingSummaries` explicitly, and not both `true`.
+  `contextBudgetTokens` 300000, `headWindowTokens` 4000,
+  `recentWindowTokens` 40% of the budget (120000 at the default),
+  `maxMessageTokens` 10000. Without a `kvUnified` block the host supplies its
+  standard one (`standardKvUnifiedConfig`), with cache prices matched to the
+  provider, `cacheTtl` and model; a written block must be complete, set
+  `treeifyNonContiguousSummaries` and `preserveGapBearingSummaries`
+  explicitly, and not both `true`. Residents built on `kv-stable` pin
+  `foldingStrategy: "kv-stable"`. About 48 further context-manager keys pass
+  through verbatim, among them the live-image limits `maxLiveImages`,
+  `imageStripDepthTokens` and `maxLiveImageBytes` (context-manager defaults
+  6, 30000 and 20 MiB; zero disables each).
 - **`frontdesk`** (`src/strategies/frontdesk-strategy.ts`) — the same, plus
   channel provenance headers, topic-aware chunk boundaries and preservation of
   unanswered questions and @mentions. For agents that staff a channel.
@@ -245,11 +249,15 @@ Framework features configured by top-level recipe keys rather than modules:
 - **Agent overlay.** `mcpl-servers.agent.json` holds servers the agent deployed
   for itself (`mcplAdmin`); they load unconditionally, and tombstones in it
   suppress servers the agent unloaded. The overlay can never grant
-  `toolLifecycle` or `inheritEnv`.
+  `enabledCapabilities`, `toolLifecycle`, `inheritEnv` or
+  `allowHostCommands`: the boot leaves them out of every overlay entry.
 - **Child env.** Stdio servers get agent-framework's allowlist of host
   variables (`CHILD_ENV_ALLOWLIST`: path, home, locale, temp dirs, TLS CA and
-  proxy settings), then `DISCORD_SUPPRESSED_REACTIONS_BASELINE` (the entry can
-  override it), the entry's `env` and `AGENT_TIMEZONE` (`composeMcplChildEnv`).
+  proxy settings), then the entry's `env` and the host's `AGENT_TIMEZONE`
+  (`composeMcplChildEnv`). agent-framework adds its derived
+  `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the
+  entry sets one with tokens, or the host's own environment does for an
+  `inheritEnv` entry.
   Anything else from `.env` must be mapped in the entry's `env`.
   `inheritEnv: true` on an operator entry passes the whole host env. Each
   server's stderr goes to `sessions/<id>/mcpl-stderr/<server>.log` (rotated
@@ -386,7 +394,8 @@ Claude Code transcripts are ingested by the procedure in
 ## Runtime and dependencies
 
 - **Bun** runs the host (OpenTUI's native core requires it; Bun also loads
-  `.env`). **Node/npm** builds the WebUI (`postinstall` / `bun run build:web`).
+  `.env`). **Node/npm** builds the WebUI in a checkout (`postinstall` /
+  `bun run build:web`); the npm package carries it built.
 - `@animalabs/agent-framework`, `context-manager`, `membrane` and
   `chronicle` come from npm; chronicle ships prebuilt native binaries, so no
   Rust toolchain is needed unless you build it from source. For working on the

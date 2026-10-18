@@ -34,7 +34,7 @@ the host is put together is in [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Quick start
 
 ```bash
-# Prerequisites: Bun and Node.js 20+ (Node builds the web UI), plus credentials
+# Prerequisites: Bun 1.4.3+ and Node.js 22.12+ (Node builds the web UI), plus credentials
 export ANTHROPIC_API_KEY=sk-ant-...     # or ANTHROPIC_AUTH_TOKEN (Claude subscription)
 
 bun install                                   # also builds the web UI bundle
@@ -90,11 +90,15 @@ Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
 
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
-the autobiographical memory strategy with adaptive resolution, **KV-stable
-folding** (compile plans that preserve prompt-cache prefixes), compression by
+the autobiographical memory strategy with adaptive resolution, **kv-unified
+folding** (a cost-aware solver that weighs budget fit, prompt-cache cost and
+continuity), a 300k context budget with a 120k verbatim tail, compression by
 the agent's own model, and summaries voiced as the agent itself
-(`summaryParticipant` defaults to `agent.name`). Set a `strategy` block only
-to tune windows/budgets or opt into a different strategy type (`frontdesk`
+(`summaryParticipant` defaults to `agent.name`). The 300k budget assumes a
+1M-window model: on a 200k-window model, set `agent.contextBudgetTokens`
+yourself. Set a `strategy` block only to tune windows/budgets, to pin
+`foldingStrategy: "kv-stable"` for a resident whose store was built under it,
+or to opt into a different strategy type (`frontdesk`
 for channel-staffing agents, `passthrough` for none) — see
 `docs/AGENT-ONBOARDING.md` for sizing guidance on long-lived agents and
 [`docs/AGENT-MEMORY-GUIDE.md`](docs/AGENT-MEMORY-GUIDE.md) for how it works.
@@ -194,11 +198,11 @@ Per server, `requestTimeoutMs` raises the framework's JSON-RPC timeout (60 s
 by default) for slow tools, and `agent.retry` passes a Membrane retry policy
 through for flaky gateways.
 
-Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the host's `DISCORD_SUPPRESSED_REACTIONS_BASELINE`, then the entry's `env`, then `AGENT_TIMEZONE`. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
+Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the entry's `env`, then the host's `AGENT_TIMEZONE`. agent-framework then adds its derived `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the entry's `env` sets one with tokens, or, for an `inheritEnv` entry, the host's own environment does. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
 
-Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server. Put a full-inheritance grant in the recipe or operator server file instead.
+Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server, as they strip `allowHostCommands`, `enabledCapabilities` and `toolLifecycle`, and the startup warnings name each one an overlay entry sets. Put `inheritEnv` or `toolLifecycle` in the recipe, or in `mcpl-servers.json` for a server the recipe names, instead, and `allowHostCommands` or `enabledCapabilities` in a server the recipe defines itself, with its own command or url and an id `mcpl-servers.json` doesn't define, since neither `mcpl-servers.json` nor a recipe's override of a server from it passes those two on.
 
-Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file.
+Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file. Likewise, a `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's environment becomes an inheriting child's whole baseline, in place of agent-framework's protective default. The framework logs when it does.
 
 ### Feature sets and tool names
 
@@ -529,11 +533,13 @@ option.
 analogue) in a workspace mount and injects it into every agent's context on
 every turn — the resident agent and all ephemeral subagents. Edits take effect
 on the next turn; nothing is persisted to history. Defaults: path
-`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (reads are bounded
-to the cap); a missing file is fail-open (no injection, warn once), while a
-path naming a nonexistent mount fails at recipe load — including on the
-implicit default workspace (`input` + `products`), whose mount set can never
-satisfy the default path, so declare an `instructions` mount explicitly.
+`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (content past it is
+cut, with a marker); a missing or unreadable file is fail-open: no injection,
+and one log line and one `instructions-unavailable` ops alert for each reason
+in a session until the file loads again, which `instructions-unavailable-clear`
+stands down. A path naming a nonexistent mount fails at recipe load — including
+on the implicit default workspace (`input` + `products`), whose mount set can
+never satisfy the default path, so declare an `instructions` mount explicitly.
 
 **Who edits, and how it propagates**: the module reads *disk*; agent
 `workspace--write`/`edit` land in Chronicle and reach disk only on an
@@ -541,8 +547,10 @@ satisfy the default path, so declare an `instructions` mount explicitly.
 read-write instructions mount. On a read-only mount the flow reverses:
 human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
-and letting the agent make the edit. Symlinks that lead outside the mount are
-rejected (realpath containment), never injected.
+and letting the agent make the edit. The file is read through the
+workspace's `readFileFromDisk`, so a file that is itself a link isn't read on
+a recipe's mounts, which don't follow links, and neither is one whose
+canonical path lies outside its mount: either raises the alert instead.
 
 **Cache note**: at `position: "system"` the block lives in every agent's
 prompt-cache prefix, so each edit is a fleet-wide cache cold start on the next
@@ -553,7 +561,7 @@ are one free-form curated document, always present verbatim.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) runs the host; [Node.js](https://nodejs.org/) 20+ and npm build the web UI
+- [Bun](https://bun.sh/) 1.4.3+ runs the host; [Node.js](https://nodejs.org/) 22.12+ and npm build the web UI
 - No Rust toolchain: `@animalabs/chronicle` ships prebuilt native binaries
 - Credentials for one provider: an Anthropic API key, a Claude subscription
   OAuth token (`claude setup-token`), an OpenAI or OpenRouter key, AWS
@@ -565,6 +573,11 @@ are one free-form curated document, always present verbatim.
 ```bash
 bun install      # or npm install; the postinstall step builds the web UI
 ```
+
+Installed from npm instead (`npm install @animalabs/connectome-host`), the
+package carries the web UI already built. npm 12 and bun may report its
+`postinstall` as blocked: it builds the web UI only in a checkout, so nothing
+is lost.
 
 ## Environment variables
 
@@ -641,8 +654,9 @@ or supply credentials for a remote deployment:
 "modules": { "webui": { "basicAuth": { "username": "${WEBUI_USERNAME}", "password": "${WEBUI_PASSWORD}" } } }
 ```
 
-Build the SPA bundle once with `bun run build:web` (also runs on install via
-postinstall). Deployment behind a reverse proxy, observer access and all
+In a checkout, build the SPA bundle once with `bun run build:web` (also runs
+on install via postinstall); the npm package carries it built. Deployment
+behind a reverse proxy, observer access and all
 endpoints are covered in [`docs/webui-deployment.md`](docs/webui-deployment.md).
 
 - Chat with full interiority: thinking blocks, tool calls + results, live streaming, inline images

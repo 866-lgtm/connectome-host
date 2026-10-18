@@ -67,12 +67,14 @@ module. Keep it on **loopback** and reach it via SSH tunnel. See
   recipe's `${VAR}`s name (e.g. `WEBUI_USER` / `WEBUI_PASS`); optionally
   `CONNECTOME_OPS_WEBHOOK` (ops alerts, below). The host reads `.env`, but a
   stdio MCPL server sees only the variables its entry maps in `env` (plus a
-  small system allowlist and the host's `AGENT_TIMEZONE` and
-  `DISCORD_SUPPRESSED_REACTIONS_BASELINE`), unless the entry sets
+  small system allowlist, the host's `AGENT_TIMEZONE` and agent-framework's
+  default `DISCORD_SUPPRESSED_REACTIONS_BASELINE`), unless the entry sets
   `inheritEnv: true`, which passes the host's whole environment: an unmapped
   `DISCORD_GUILD_ID` is unset for discord-mcpl, which then serves every
-  channel the bot is invited to. See DEV-ENVIRONMENT for file-defined
-  servers.
+  channel the bot is invited to. With `inheritEnv`, a
+  `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's
+  environment replaces agent-framework's default. See DEV-ENVIRONMENT for
+  file-defined servers.
 - `data/` — chronicle store + per-session `config/gate.json` (wake policies;
   append-only reconcile, so reorder the **live** file, not just the recipe).
 
@@ -87,6 +89,15 @@ module. Keep it on **loopback** and reach it via SSH tunnel. See
 Labels/units follow `cc.<agent>.agent` (launchd) / `<agent>-agent.service`
 (systemd). (launchd: a plain `kill`/`stop` respawns via KeepAlive — use `bootout`
 to stop, `kickstart -k` to restart.)
+
+A restart can make auxiliary model calls before any user message: agent-framework
+immediately drains restored Context Manager compression/merge debt. This happens only
+when the store has pending maintenance, and it is visible in the new process's
+`llm-calls.<iso>.jsonl`; it is not an agent wake or a user turn. To avoid it, stop the
+resident first, then drain the debt offline with `bun scripts/warmup-session.ts
+<session> --agent <recipe agent.name> --data-dir <DATA_DIR> --model <compressionModel>`.
+Recipes that change `--l1-budget`, `--l2-budget`, `--l3-budget`, or
+`--merge-threshold` must pass the same values to the warmup command.
 
 **Logs / observability** (`data/` below is `DATA_DIR`, default `./data` under
 the working directory):

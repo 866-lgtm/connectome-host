@@ -29,6 +29,8 @@ import type {
   ToolCall,
   ToolResult,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
 
 export interface ReasoningSettings {
   enabled: boolean;
@@ -97,13 +99,12 @@ export class SettingsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return {
-      success: false,
-      error:
-        `Unknown tool: ${call.name}. Reasoning controls moved into agent_settings ` +
-        `(fields reasoning_enabled / reasoning_budget_tokens).`,
-      isError: true,
-    };
+    return unknownToolResult(
+      this,
+      call.name,
+      'Reasoning is set through agent_settings, in its fields reasoning_enabled, reasoning_budget_tokens, ' +
+      'reasoning_display and reasoning_effort.',
+    );
   }
 
   /**
@@ -153,31 +154,47 @@ export class SettingsModule implements Module {
       keys: ['reasoning_enabled', 'reasoning_budget_tokens', 'reasoning_display', 'reasoning_effort'],
       get: () => this.reasoningSettingsView(),
       update: (_agentName, patch) => {
+        // Every field is checked before any applies, and every problem is
+        // named, so one refusal shows all there is to fix.
         const next = { ...this.state.reasoning };
+        const problems: string[] = [];
         if (patch.reasoning_enabled !== undefined) {
           if (typeof patch.reasoning_enabled !== 'boolean') {
-            throw new Error('reasoning_enabled must be a boolean');
+            problems.push(`reasoning_enabled must be true or false, not ${shown(patch.reasoning_enabled)}`);
+          } else {
+            next.enabled = patch.reasoning_enabled;
           }
-          next.enabled = patch.reasoning_enabled;
         }
         if (patch.reasoning_budget_tokens !== undefined) {
-          const budget = Number(patch.reasoning_budget_tokens);
-          if (!Number.isFinite(budget)) {
-            throw new Error('reasoning_budget_tokens must be a number');
+          const budget = patch.reasoning_budget_tokens;
+          if (typeof budget !== 'number' || !Number.isFinite(budget)) {
+            problems.push(
+              `reasoning_budget_tokens must be a number of tokens, not ${shown(budget)} ` +
+              '(the least it takes is 1024, and a smaller number counts as 1024)',
+            );
+          } else {
+            next.budgetTokens = Math.max(1024, Math.round(budget));
           }
-          next.budgetTokens = Math.max(1024, Math.round(budget));
         }
         if (patch.reasoning_display !== undefined) {
           if (patch.reasoning_display !== 'summarized' && patch.reasoning_display !== 'omitted') {
-            throw new Error("reasoning_display must be 'summarized' or 'omitted'");
+            problems.push(`reasoning_display must be "summarized" or "omitted", not ${shown(patch.reasoning_display)}`);
+          } else {
+            next.display = patch.reasoning_display;
           }
-          next.display = patch.reasoning_display;
         }
         if (patch.reasoning_effort !== undefined) {
           if (!REASONING_EFFORTS.includes(patch.reasoning_effort as ReasoningEffort)) {
-            throw new Error(`reasoning_effort must be one of: ${REASONING_EFFORTS.join(', ')}`);
+            problems.push(
+              `reasoning_effort must be one of ${REASONING_EFFORTS.map((e) => `"${e}"`).join(', ')}, ` +
+              `not ${shown(patch.reasoning_effort)}`,
+            );
+          } else {
+            next.effort = patch.reasoning_effort as ReasoningEffort;
           }
-          next.effort = patch.reasoning_effort as ReasoningEffort;
+        }
+        if (problems.length > 0) {
+          throw new Error(`The reasoning settings weren't changed: ${problems.join('; ')}.`);
         }
         this.state.reasoning = next;
         if (patch.reasoning_effort !== undefined) this.effortOverride = next.effort;

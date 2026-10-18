@@ -9,9 +9,13 @@
  * Input:   {type:"subscribe",events:[...]} | {type:"text",content} |
  *          {type:"command",command:"/..."} | {type:"shutdown",graceful?}
  *
- * stdout + stderr are redirected to {DATA_DIR}/headless.log so the IPC
- * channel is the only structured output path (parent uses the socket, not
- * pipes).  PID lives at {DATA_DIR}/headless.pid for parent-side liveness.
+ * process.stdout.write and process.stderr.write are redirected to
+ * {DATA_DIR}/headless.log so the IPC channel is the only structured output
+ * path (parent uses the socket, not pipes).  Bun's console.* writes to file
+ * descriptors 1 and 2 directly, not through those methods, so console lines
+ * go wherever those descriptors point: for a fleet child, the startup.log
+ * its parent opened.  PID lives at {DATA_DIR}/headless.pid for parent-side
+ * liveness.
  *
  * One client at a time.  Client disconnect does NOT exit the process —
  * children stay up across parent restarts and accept the next connection.
@@ -55,6 +59,43 @@ function parseHeadlessArgs(argv: string[]): HeadlessOptions {
 }
 
 // ---------------------------------------------------------------------------
+// The log's last lines
+// ---------------------------------------------------------------------------
+
+/** How long an exit waits for headless.log to take what was written to it. */
+const LOG_FLUSH_LIMIT_MS = 2_000;
+
+/** The log stream stdout and stderr writes go to, once runHeadless has
+ *  opened it. It stays set after the log ends, so a later endHeadlessLog
+ *  ends the same stream: it resolves at that stream's finish, or at once if
+ *  the stream has already finished. */
+let activeLog: WriteStream | null = null;
+
+/**
+ * End headless.log's stream, resolving once what was written to it is in
+ * the file, or after LOG_FLUSH_LIMIT_MS if it never finishes, which the
+ * host then says on its own stderr. process.exit drops a stream's pending
+ * writes, so the exits made while the log is open wait for this first:
+ * runHeadless's graceful shutdown, and main()'s handler for a fatal error.
+ * (Other exits, such as an uncaught exception, don't.) Without an open log
+ * it resolves at once.
+ */
+export function endHeadlessLog(): Promise<void> {
+  const stream = activeLog;
+  if (!stream) return Promise.resolve();
+  return new Promise((done) => {
+    const limit = setTimeout(() => {
+      // This reaches the process's own stderr: under Bun console.error
+      // writes there directly, and under Node through the redirect, which
+      // sends what's written once the log has ended there.
+      console.error(`[host] headless.log hadn't taken its last lines after ${LOG_FLUSH_LIMIT_MS / 1000} s, so this exit goes ahead without them`);
+      done();
+    }, LOG_FLUSH_LIMIT_MS);
+    stream.end(() => { clearTimeout(limit); done(); });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Main entry
 // ---------------------------------------------------------------------------
 
@@ -67,41 +108,52 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
 
   mkdirSync(dataDir, { recursive: true });
 
-  // -- Redirect stdout/stderr BEFORE anything else may log --
-  // The IPC socket is the only structured output channel; stdout/stderr
-  // become a debug log on disk.  Done first so any later console.log from
-  // framework code lands in the file, not on a parent's pipe.
+  // -- Redirect stdout/stderr writes BEFORE anything else here may log --
+  // The IPC socket is the only structured output channel; direct
+  // process.stdout/stderr.write calls become a debug log on disk.  Bun's
+  // console.* bypasses these methods and writes to descriptors 1 and 2,
+  // which for a fleet child are its startup.log, so console lines from
+  // framework code land there, not here.
   //
   // Match the real process.stdout.write overload signature so libraries
   // passing (chunk, cb) or (chunk, encoding, cb) for backpressure /
   // flush confirmation don't have their callbacks silently swallowed.
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' });
+  activeLog = logStream;
   // Where this run's lines begin, as the TUI marks its error log: /bug reads
   // only the current session's (bug-report.ts).
   logStream.write(`\n${sessionMarker(new Date())}\n`);
   type StdWrite = typeof process.stdout.write;
-  const makeRedirect = (): StdWrite => {
-    const redirect = function (
-      this: unknown,
-      chunk: string | Uint8Array,
-      encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
-      cb?: (err?: Error | null) => void,
-    ): boolean {
-      if (typeof encodingOrCb === 'function') {
-        return logStream.write(chunk, encodingOrCb);
-      }
-      if (encodingOrCb !== undefined) {
-        return logStream.write(chunk, encodingOrCb, cb);
-      }
-      return logStream.write(chunk);
-    } as StdWrite;
-    return redirect;
+  // From here, the host's own log lines and every write through
+  // process.stdout.write or process.stderr.write come through here, as one
+  // debug log. Once endHeadlessLog has ended the stream, such a line goes to
+  // the process's own stderr instead, whichever stream it was written to:
+  // writing it to the ended stream would make the stream error, drop the
+  // lines still pending and, with nothing listening, end the process.
+  const toStderr = process.stderr.write.bind(process.stderr) as (...args: unknown[]) => boolean;
+  const writeLog = (
+    chunk: string | Uint8Array,
+    encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
+    cb?: (err?: Error | null) => void,
+  ): boolean => {
+    if (logStream.writableEnded) return toStderr(chunk, encodingOrCb, cb);
+    return typeof encodingOrCb === 'function'
+      ? logStream.write(chunk, encodingOrCb)
+      : logStream.write(chunk, encodingOrCb as BufferEncoding, cb);
   };
+  const makeRedirect = (): StdWrite => function (
+    this: unknown,
+    chunk: string | Uint8Array,
+    encodingOrCb?: BufferEncoding | ((err?: Error | null) => void),
+    cb?: (err?: Error | null) => void,
+  ): boolean {
+    return writeLog(chunk, encodingOrCb, cb);
+  } as StdWrite;
   process.stdout.write = makeRedirect();
   process.stderr.write = makeRedirect();
 
   const log = (msg: string): void => {
-    logStream.write(`[${new Date().toISOString()}] ${msg}\n`);
+    writeLog(`[${new Date().toISOString()}] ${msg}\n`);
   };
 
   log(`headless start pid=${process.pid} dataDir=${dataDir} socket=${socketPath}`);
@@ -127,6 +179,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   } catch (err) {
     log(`pid file write failed: ${String(err)}`);
   }
+
+  // Initialize shutdown state before listen can expose ready to a client.
+  let shuttingDown = false;
 
   // -- Connection state --
   let currentClient: Socket | null = null;
@@ -435,9 +490,10 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // don't carry across parents.
     subscription = new Set<string>(['*']);
 
+    socket.setEncoding('utf8');
     let buffer = '';
-    socket.on('data', (chunk) => {
-      buffer += chunk.toString('utf-8');
+    socket.on('data', (chunk: string) => {
+      buffer += chunk;
       let nlIdx: number;
       while ((nlIdx = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, nlIdx).trim();
@@ -507,7 +563,6 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   });
 
   // -- Shutdown --
-  let shuttingDown = false;
   async function gracefulShutdown(reason: string): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
@@ -517,14 +572,17 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // Give the exiting event a tick to flush onto the socket.
     await new Promise((r) => setTimeout(r, 50));
 
-    try { await app.framework.stop(); } catch (err) { log(`framework.stop() failed: ${String(err)}`); }
+    let exitCode = 0;
+    try { await app.framework.stop(); } catch (err) {
+      exitCode = 1;
+      log(`framework.stop() failed: ${String(err)}`);
+    }
     try { server.close(); } catch (err) { log(`server.close() failed: ${String(err)}`); }
     try { if (existsSync(socketPath)) unlinkSync(socketPath); } catch (err) { log(`socket unlink failed: ${String(err)}`); }
     try { if (existsSync(pidPath)) unlinkSync(pidPath); } catch (err) { log(`pid unlink failed: ${String(err)}`); }
-    try { logStream.end(); } catch { /* noop */ }
 
-    // Small delay so logStream.end() can flush before we exit.
-    setTimeout(() => process.exit(0), 50);
+    // Exit once the log holds its last lines, a failed stop's included.
+    void endHeadlessLog().then(() => process.exit(exitCode));
   }
 
   process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
