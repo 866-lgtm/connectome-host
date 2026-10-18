@@ -85,6 +85,7 @@ import { createBranchState, resetBranchState, handleExport, type BranchState } f
 import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
 import { buildFrameworkStrategy, buildConversationsConfig } from './framework-strategy.js';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
+import { quarantineAlarm, type QuarantineStatus } from './web/quarantine-alert.js';
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
 import { loadExtensions } from './extensions.js';
 import { QuotaMeter, AnthropicOAuthQuotaSource, CodexQuotaSource, quotaProviderHold } from './quota-meter.js';
@@ -615,39 +616,24 @@ agents: [agentConfig],
 
   // Compression-quarantine klaxon → the framework's ops-alert channel
   // (failures.log + ops:alert trace + CONNECTOME_OPS_WEBHOOK). The strategy
-  // re-fires this every alarm interval for as long as ANY chunk is
+  // re-fires this every alarm interval for as long as ANY span is
   // quarantined: quarantined spans stay raw, the fold floor creeps, and the
   // picker eventually cannot fit the window — a guaranteed future outage
-  // that must never be a silent state.
+  // that must never be a silent state. quarantineAlarm decides what each
+  // call sends: the alarm, or the all-clear under its own kind.
   // Duck-typed on both sides so version skew in either dep degrades to a
   // no-op (the strategy's own stderr klaxon still fires) instead of a crash.
   {
     const alarmCapable = strategy as unknown as {
-      setQuarantineAlarmHandler?: (fn: (status: { count: number; keys: string[] }) => void) => void;
+      setQuarantineAlarmHandler?: (fn: (status: QuarantineStatus) => void) => void;
     };
     const notify = (framework as unknown as {
       notifyOps?: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => void;
     }).notifyOps?.bind(framework);
     if (alarmCapable.setQuarantineAlarmHandler && notify) {
       alarmCapable.setQuarantineAlarmHandler((status) => {
-        if (status.count === 0) {
-          // All-clear travels the same channel the alarm did, under a
-          // DISTINCT kind: the alarm kind's 15-min ops cooldown must never
-          // swallow the stand-down (silence after an alarm is ambiguous).
-          notify(
-            'compression-quarantine-clear',
-            agentName,
-            'compression quarantine EMPTY — all debt paid; alarm stands down.',
-            { count: 0 },
-          );
-          return;
-        }
-        notify(
-          'compression-quarantine',
-          agentName,
-          `${status.count} chunk(s) in compression quarantine — spans stay raw and WILL eventually exhaust the context budget. Operator action required (inspect refusing content; branch, pin, or clear).`,
-          { count: status.count, keys: status.keys },
-        );
+        const alert = quarantineAlarm(status);
+        notify(alert.kind, agentName, alert.message, alert.data);
       });
     }
   }
@@ -971,6 +957,9 @@ function countLines(path: string): number {
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
+
+/** What a fatal error waits for before exiting: headless mode's log. */
+let beforeFatalExit: (() => Promise<void>) | undefined;
 
 async function main() {
   const recipe = await resolveRecipe();
@@ -1400,7 +1389,8 @@ async function main() {
 
   try {
     if (headless) {
-      const { runHeadless } = await import('./headless.js');
+      const { runHeadless, endHeadlessLog } = await import('./headless.js');
+      beforeFatalExit = endHeadlessLog;
       await runHeadless(app, process.argv.slice(2));
     } else if (noTui) {
       await runPiped(app);
@@ -1414,7 +1404,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Fatal error:', err);
+  // Headless, headless.log may still hold lines written just before the
+  // failure, such as the server's error; exiting at once would drop them.
+  await beforeFatalExit?.();
   process.exit(1);
 });
