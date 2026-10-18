@@ -138,7 +138,7 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
     }
   });
 
-  test("a mount the read can't resolve after finding the file is unavailable, not a missing file, and says why", async () => {
+  test("a mount the read can't resolve is unavailable, not a missing file, and says why", async () => {
     const res = await fetch(`${baseUrl}/files/gone/x.txt`);
     expect(res.status).toBe(503);
     expect(await res.text()).toBe('Mount unavailable: gone');
@@ -217,9 +217,12 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
     }
   });
 
-  // The read looks for the file before it resolves the mount's directory, so
-  // a directory already gone is no file there, not an unavailable mount.
-  test("agent-framework's read: a mount whose directory has gone answers that the file isn't found", async () => {
+  // agent-framework 0.22.2's read looks for the file before it resolves the
+  // mount's directory, so a directory already gone is no file there. From the
+  // release with anima-research/agent-framework#533, the read checks the
+  // mount's root, and a root that has gone is an unavailable mount. The route
+  // answers as the read does, in the read's words.
+  test("agent-framework's read: a mount whose directory has gone answers as the read does", async () => {
     const dir = mkdtempSync(join(tmpdir(), 'webui-files-gone-'));
     const gone = join(dir, 'gone');
     mkdirSync(gone);
@@ -230,9 +233,18 @@ describe("the web UI's /files/ route serves only what the mount's own read gives
     workspace = real;
     try {
       rmSync(gone, { recursive: true, force: true });
+      const read = await real.readFileFromDisk('gone/x.txt').then(
+        () => null,
+        (err: WorkspaceReadError) => err,
+      );
       const res = await fetch(`${baseUrl}/files/gone/x.txt`);
-      expect(res.status).toBe(404);
-      expect(await res.text()).toBe('File not found: gone/x.txt');
+      const got = { status: res.status, body: await res.text() };
+      if (read?.code === 'mount_unavailable') {
+        expect(got).toEqual({ status: 503, body: 'Mount unavailable: gone' });
+      } else {
+        expect(read?.code).toBe('not_found');
+        expect(got).toEqual({ status: 404, body: 'File not found: gone/x.txt' });
+      }
     } finally {
       workspace = standIn;
       store.close?.();
