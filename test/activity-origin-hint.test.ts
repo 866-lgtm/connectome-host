@@ -124,8 +124,9 @@ describe("the origin hint comes only from what the mount's own read gives", () =
         trace('inference:completed');
         return (typing.at(-1)!.metadata as { topic?: string } | undefined)?.topic;
       };
-      // A recipe's mounts don't follow links, so the read refuses a file that
-      // is itself a link, even one naming a file in the same mount.
+      // A mount doesn't follow links unless the recipe sets followSymlinks, so
+      // here the read refuses a file that is itself a link, even one naming a
+      // file in the same mount.
       expect(await topicAfter('files/linked.md')).toBeUndefined();
       expect(await topicAfter('files/late.md')).toBeUndefined();
       expect(await topicAfter('files/early.md')).toBe('in-the-head');

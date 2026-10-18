@@ -265,9 +265,10 @@ export class ActivityModule implements Module {
     for (const mountPath of mountPaths) {
       try {
         // readFileFromDisk refuses a file that is itself a link unless the
-        // mount follows links, reads a file only if its canonical path lies
-        // inside the mount, and is asked for no more than the head the hint
-        // needs.
+        // mount follows links (and, from agent-framework's release with
+        // anima-research/agent-framework#468, one reached through a linked
+        // directory), reads a file only if its canonical path lies inside the
+        // mount, and is asked for no more than the head the hint needs.
         const { bytes } = await workspace.readFileFromDisk(mountPath, { maxBytes: ORIGIN_HEAD_BYTES });
         // agent-framework 0.22.2 reads a file that grows after the read's
         // size check whole, so the head is cut here too. Once the host's

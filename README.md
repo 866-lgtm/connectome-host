@@ -551,9 +551,11 @@ human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
 and letting the agent make the edit. The file is read through the
 workspace's `readFileFromDisk`, so on a mount that doesn't follow links, a
-recipe's default, a file that is itself a link isn't read, and on any mount
-one whose canonical path lies outside it isn't either, a link that leads out
-included: either raises the alert instead.
+recipe's default, a file that is itself a link isn't read (nor, from
+agent-framework's release with anima-research/agent-framework#468, is one
+reached through a linked directory), and on any mount one whose canonical
+path lies outside it isn't either, a link that leads out included: either
+raises the alert instead.
 
 **Cache note**: at `position: "system"` the block lives in every agent's
 prompt-cache prefix, so each edit is a fleet-wide cache cold start on the next
