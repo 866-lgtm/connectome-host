@@ -2752,12 +2752,6 @@ function errnoCode(err: unknown): string {
   return (err as NodeJS.ErrnoException | null)?.code ?? String(err);
 }
 
-/** Bun.stripANSI, reached through globalThis: the web UI's typecheck reads
- *  this module (through commands.ts) without Bun's types. */
-function stripANSI(text: string): string {
-  return (globalThis as unknown as { Bun: { stripANSI(text: string): string } }).Bun.stripANSI(text);
-}
-
 /**
  * The end of what the child wrote to startup.log during this launch, under a
  * line that says where it's from, for a failed launch's error, or a line that
@@ -2821,7 +2815,7 @@ function quoteStartupOutput(log: StartupLog): string {
   // stray one. A sequence that really spans lines, such as sixel graphics,
   // leaves its later lines as printable noise.
   let lines = text.split('\n')
-    .map((line) => stripANSI(line).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ''));
+    .map((line) => Bun.stripANSI(line).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, ''));
   // Blank lines at the end go, unless they're all there is.
   let end = lines.length;
   while (end > 0 && lines[end - 1]!.trim() === '') end--;
