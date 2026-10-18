@@ -281,7 +281,7 @@ ln -sfn ../../../connectome-local/context-manager/node_modules/@animalabs/chroni
       }
     },
     "proseRouting": "locus",
-    "refusalHandling": { "retries": 2, "autoRewind": false, "maxRewinds": 15, "announceHumanTurns": true }
+    "refusalHandling": { "retries": 2, "autoRewind": false, "maxRewinds": 15 }
   },
   "modules": { "webui": { "port": 7343, "host": "127.0.0.1",
                           "basicAuth": { "username": "${WEBUI_USER}", "password": "${WEBUI_PASS}" } },
