@@ -576,7 +576,7 @@ describe('the stop', () => {
   });
 
   for (const call of [spawn, fork]) {
-    test(`a user's cancel stops a ${call.name}'s run through it, and says it ran`, async () => {
+    test(`a user's cancel stops a ${call.name}'s run through it, and its stop says no output yet, not that nothing ran`, async () => {
       const h = await harness({ maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
       try {
         const sub = internal(h.subagent);
@@ -1054,8 +1054,8 @@ describe('a cancel reaches the whole run', () => {
         expect(child.text).toContain(
           `${call === fork ? "Fork 'child'" : "Subagent 'child'"} didn't start, so nothing ran: no concurrency slot opened within 50 ms ` +
           '(1 running against a limit of 1, 0 others waiting). Wait for one of the subagents below to finish, or raise the limit ' +
-          `with subagent--concurrency, then call subagent--${call === fork ? 'fork' : 'spawn'} again. At most 1 run at once here, so start ` +
-          'no more than that together.\nSlots held by:\n  - lead [spawn] ',
+          `with subagent--concurrency, then call subagent--${call === fork ? 'fork' : 'spawn'} again. Start no more than 1 at a time ` +
+          'here.\nSlots held by:\n  - lead [spawn] ',
         );
         expect(sub.parentMap.has('child')).toBe(false);
       } finally { await h.cleanup(); }

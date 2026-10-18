@@ -332,7 +332,7 @@ describe('a spawn\'s or fork\'s failure says whether anything ran, and what to d
       expect(first).toStartWith(
         "Subagent 'c' didn't start, so nothing ran: no concurrency slot opened within 50 ms (2 running against a limit of 2, " +
         '0 others waiting). Wait for one of the subagents below to finish, or raise the limit with subagent--concurrency, then ' +
-        'call subagent--spawn again. At most 2 run at once here, so start no more than that together.\nSlots held by:\n  - a [spawn] ',
+        'call subagent--spawn again. Start no more than 2 at a time here.\nSlots held by:\n  - a [spawn] ',
       );
       // While a rate limit's halving holds, raising the ceiling doesn't raise
       // the limit, so the remedy is to wait.
@@ -342,9 +342,82 @@ describe('a spawn\'s or fork\'s failure says whether anything ran, and what to d
       expect(held2).toStartWith(
         "Fork 'd' didn't start, so nothing ran: no concurrency slot opened within 50 ms (2 running against a limit of 2, " +
         '0 others waiting). A rate limit holds the limit at 2. It rises by one after every three subagents that finish without ' +
-        'error, up to 4. Wait for one of the subagents below to finish, then call subagent--fork again. At most 2 run at once ' +
-        'here, so start no more than that together.\nSlots held by:\n',
+        'error, up to 4. Wait for one of the subagents below to finish, then call subagent--fork again. Start no more than 2 at ' +
+        'a time here.\nSlots held by:\n',
       );
+    } finally { release(); await h.cleanup(); }
+  });
+
+  test('no slot in time after a rate limit at a limit of 1: the remedy is to wait, since raising it wouldn\'t take effect at once', async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, (agent) => (agent.name.startsWith('spawn-r-')
+      ? Promise.reject(new Error('429 Too Many Requests'))
+      : new Promise(() => { /* holds its slot */ })));
+    const sub = internal(h.subagent);
+    const acquire = (sub as unknown as { acquireSlot: (k: 'spawn' | 'fork', ms?: number, c?: Promise<never>) => Promise<unknown> });
+    const slot = acquire.acquireSlot.bind(h.subagent);
+    acquire.acquireSlot = (kind, _ms, cancelled) => slot(kind, 50, cancelled);
+    try {
+      // A run meets a rate limit at a limit of 1, which can't halve, so
+      // nothing holds the limit below the ceiling and the status has no note.
+      expect((await h.subagent.handleToolCall(spawn('r', { sync: true }))).error)
+        .toStartWith("Subagent 'r' stopped and returned no result: 429 Too Many Requests.");
+      expect(sub.throttled).toBe(true);
+      expect(h.subagent.getConcurrencyStatus()).toEqual({ configured: 1, effective: 1, active: 0, queued: 0 });
+      await h.subagent.handleToolCall(spawn('a'));
+      await until(() => sub.activeSubagents.get('spawn-a')?.status === 'running');
+      const wait = 'Wait for one of the subagents below to finish, then call subagent--spawn again. Start no more than 1 at a ' +
+        'time here.\nSlots held by:\n  - a [spawn] ';
+      expect((await h.subagent.handleToolCall(spawn('c', { sync: true }))).error).toStartWith(
+        "Subagent 'c' didn't start, so nothing ran: no concurrency slot opened within 50 ms (1 running against a limit of 1, " +
+        "0 others waiting). A rate limit was hit at this limit, so raising it wouldn't take effect at once. " + wait,
+      );
+      // Raising it leaves the limit at 1 for now, as the remedy says.
+      expect((await h.subagent.handleToolCall(call('concurrency', { maxConcurrent: 2 }))).data).toEqual({
+        configured: 2, effective: 1, active: 1, queued: 0,
+        note: 'A rate limit holds the limit at 1. It rises by one after every three subagents that finish without error, up to 2.',
+      });
+      expect((await h.subagent.handleToolCall(spawn('d', { sync: true }))).error).toStartWith(
+        "Subagent 'd' didn't start, so nothing ran: no concurrency slot opened within 50 ms (1 running against a limit of 1, " +
+        '0 others waiting). A rate limit holds the limit at 1. It rises by one after every three subagents that finish ' +
+        'without error, up to 2. ' + wait,
+      );
+    } finally { await h.cleanup(); }
+  });
+
+  test('at a limit of 1, once a subagent finishes without error after the rate limit, the wait offers the raise again, and a raise takes effect at once', async () => {
+    let release!: () => void;
+    const done = new Promise<void>((r) => { release = r; });
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, (agent) => (agent.name.startsWith('spawn-r-')
+      ? Promise.reject(new Error('429 Too Many Requests'))
+      : agent.name.startsWith('spawn-a-')
+        ? done.then(() => ({ speech: 'ok', toolCallsCount: 0 }))
+        : new Promise(() => { /* holds its slot */ })));
+    const sub = internal(h.subagent);
+    const acquire = (sub as unknown as { acquireSlot: (k: 'spawn' | 'fork', ms?: number, c?: Promise<never>) => Promise<unknown> });
+    const slot = acquire.acquireSlot.bind(h.subagent);
+    acquire.acquireSlot = (kind, _ms, cancelled) => slot(kind, 50, cancelled);
+    try {
+      await h.subagent.handleToolCall(spawn('r', { sync: true }));
+      expect(sub.throttled).toBe(true);
+      await h.subagent.handleToolCall(spawn('a'));
+      await until(() => sub.activeSubagents.get('spawn-a')?.status === 'running');
+      expect((await h.subagent.handleToolCall(spawn('c', { sync: true }))).error).toContain(
+        "A rate limit was hit at this limit, so raising it wouldn't take effect at once. Wait for one of the subagents below",
+      );
+      // One success at the ceiling clears it, so the wait offers the raise again.
+      release();
+      await until(() => sub.activeSubagents.get('spawn-a')?.status === 'completed');
+      expect(sub.throttled).toBe(false);
+      await h.subagent.handleToolCall(spawn('b'));
+      await until(() => sub.activeSubagents.get('spawn-b')?.status === 'running');
+      expect((await h.subagent.handleToolCall(spawn('d', { sync: true }))).error).toStartWith(
+        "Subagent 'd' didn't start, so nothing ran: no concurrency slot opened within 50 ms (1 running against a limit of 1, " +
+        '0 others waiting). Wait for one of the subagents below to finish, or raise the limit with subagent--concurrency, then ' +
+        'call subagent--spawn again. Start no more than 1 at a time here.\nSlots held by:\n  - b [spawn] ',
+      );
+      // And a raise then takes effect at once.
+      expect((await h.subagent.handleToolCall(call('concurrency', { maxConcurrent: 2 }))).data)
+        .toEqual({ configured: 2, effective: 2, active: 1, queued: 0 });
     } finally { release(); await h.cleanup(); }
   });
 
@@ -361,7 +434,7 @@ describe('a spawn\'s or fork\'s failure says whether anything ran, and what to d
       expect(failure?.why).toBe('no concurrency slot opened within 50 ms (1 running against a limit of 1, 1 other waiting)');
       expect(failure?.remedy).toBe(
         'Wait for a running subagent to finish, or raise the limit with subagent--concurrency, then call subagent--spawn again. ' +
-        'At most 1 run at once here, so start no more than that together.',
+        'Start no more than 1 at a time here.',
       );
       sub.releaseSlot(held.slot);
       sub.releaseSlot((await later).slot);

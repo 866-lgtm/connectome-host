@@ -27,9 +27,9 @@
   over the module's limit says what to shorten, or for a fork, which
   carries the whole conversation, to spawn instead. No concurrency slot in
   time says how many run against what limit, and to wait or raise the
-  limit, or, while a rate limit holds the limit down, that it rises as
-  subagents finish without error, and to wait. The async time limit says
-  how to give a run longer.
+  limit; while a rate limit holds the limit, it says only to wait, and how
+  the limit recovers when it's below the ceiling. The async time limit
+  says how to give a run longer.
 - A reclaimed subagent's result opens `[Stopped: it showed no activity for
   over 120 s, so the host reclaimed its slot]`, where it read
   `[Terminated: zombie]`. A peek that finds no subagent by that name says

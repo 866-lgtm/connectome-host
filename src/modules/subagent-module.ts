@@ -1102,17 +1102,20 @@ export class SubagentModule implements Module {
           : '';
         const others = this.waitQueue.length;
         const holder = holders.length > 0 ? 'one of the subagents below' : 'a running subagent';
-        // While a rate limit's halving holds, a higher ceiling leaves the
-        // limit where it is (setConcurrency), so only waiting helps.
+        // While `throttled` holds, as it does after a rate limit at a limit
+        // of 1 too, a higher ceiling leaves the limit where it is
+        // (setConcurrency), so only waiting helps. Below the ceiling, the
+        // concurrency tool's note says how the limit recovers.
         const { note } = this.getConcurrencyStatus();
-        const remedy = note
-          ? `${note} Wait for ${holder} to finish, then call subagent--${kind} again.`
+        const remedy = this.throttled
+          ? `${note ?? "A rate limit was hit at this limit, so raising it wouldn't take effect at once."} ` +
+            `Wait for ${holder} to finish, then call subagent--${kind} again.`
           : `Wait for ${holder} to finish, or raise the limit with subagent--concurrency, then call subagent--${kind} again.`;
 
         reject(new SubagentFailure(
           `no concurrency slot opened within ${duration(slotTimeoutMs)} (${this.activeConcurrent} running against ` +
           `a limit of ${this.effectiveConcurrent}, ${others} other${others === 1 ? '' : 's'} waiting)`,
-          `${remedy} At most ${this.effectiveConcurrent} run at once here, so start no more than that together.` +
+          `${remedy} Start no more than ${this.effectiveConcurrent} at a time here.` +
           holderLines,
         ));
       }, slotTimeoutMs);
