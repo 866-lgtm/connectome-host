@@ -9,7 +9,7 @@ import { afterAll, describe, expect, test } from 'bun:test';
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import type { AgentFramework } from '@animalabs/agent-framework';
 
 import {
@@ -280,7 +280,7 @@ describe('the guarantee', () => {
 describe('the shapes', () => {
   test('the error log is read from its current session only, as tags and error shapes', () => {
     const exists = () => true;
-    const session = currentSession([
+    const log = [
       '--- session 2026-10-11T22:00:00.000Z ---',
       '[mcpl] old',
       '--- session 2026-10-11T23:00:00.000Z ---',
@@ -297,10 +297,11 @@ describe('the shapes', () => {
       `    at b (${join(ROOT, 'src/b.ts')}:2:1)`,
       `    at c (${join(ROOT, 'src/c.ts')}:3:1)`,
       'error: Bun prints uncaught errors this way',
-      `    at e (file://${join(ROOT, 'src/e.ts')}:5:1)`,
+      `    at e (${pathToFileURL(join(ROOT, 'src/e.ts')).href}:5:1)`,
       `    at f (${join(ROOT, 'node_modules/@animalabs/agent-framework/dist/src/framework.js')}:9:1)`,
-    ].join('\n'));
-    expect(session.includes('old')).toBe(false);
+    ];
+    const session = currentSession(log.join('\n'));
+    expect(session).toBe(log.slice(3).join('\n'));
     const parsed = parseErrorLog(session, fakeScope());
     expect([...parsed.tags.entries()]).toEqual([['shutdown', 1], ['mcpl', 1]]);
     expect(parsed.otherTags).toBe(0);
