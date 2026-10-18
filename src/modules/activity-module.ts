@@ -20,7 +20,9 @@ import type {
   TraceEvent,
   WorkspaceModule,
 } from '@animalabs/agent-framework';
-import { open } from 'node:fs/promises';
+import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
+import { addressedPush } from './addressed-push.js';
 
 export interface ActivityModuleConfig {
   initialChannels?: string[];
@@ -43,6 +45,9 @@ const TURN_END_TRACES: ReadonlySet<string> = new Set([
 interface ActivityState {
   channels: string[];
 }
+
+/** How much of a file's head the origin hint is read from. */
+const ORIGIN_HEAD_BYTES = 2048;
 
 /**
  * Parse a loose origin hint out of a file's top lines. Used when an inference
@@ -97,7 +102,8 @@ export class ActivityModule implements Module {
    *  contract asks, and when setFramework replaces the framework. */
   private unsubscribeTrace: (() => void) | null = null;
 
-  /** Most recent incoming-message metadata per channel. Handed back to the
+  /** Most recent metadata per channel, from incoming traffic or a person's
+   *  message addressed to the agent as a push. Handed back to the
    *  originating server on each typing notification so routing hints (e.g.
    *  Zulip topic) land where the conversation is active. */
   private lastMetadata = new Map<string, Record<string, unknown>>();
@@ -188,12 +194,19 @@ export class ActivityModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    const channel = typeof (call.input as { channel?: unknown }).channel === 'string'
-      ? ((call.input as { channel: string }).channel)
-      : null;
-    if (!channel) {
-      return { success: false, isError: true, error: 'channel (string) is required' };
+    if (call.name !== 'show_in' && call.name !== 'hide_in') return unknownToolResult(this, call.name);
+    const given = (call.input as { channel?: unknown } | undefined)?.channel;
+    if (typeof given !== 'string' || given.length === 0) {
+      return {
+        success: false,
+        isError: true,
+        error:
+          `Nothing changed: activity--${call.name} needs channel, the channel's MCPL id exactly as its ` +
+          `incoming events show it, such as "zulip:tracker-miner-f"` +
+          (given === undefined || given === '' ? '.' : `, not ${shown(given)}.`),
+      };
     }
+    const channel = given;
 
     if (call.name === 'show_in') {
       const added = !this.channels.has(channel);
@@ -222,12 +235,13 @@ export class ActivityModule implements Module {
       };
     }
 
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    // Track the most recent incoming-message metadata per channel so typing
-    // notifications can echo it back to the originating server as routing hints.
+    // Track each channel's latest message routing hints, from channels/incoming
+    // or a counted push, so typing notifications can echo them back to the
+    // originating server.
     if (event.type === 'mcpl:channel-incoming') {
       const e = event as unknown as {
         channelId: string;
@@ -239,6 +253,13 @@ export class ActivityModule implements Module {
         merged.threadId = e.threadId;
       }
       this.lastMetadata.set(e.channelId, merged);
+    }
+    // A person's message addressed to the agent from a closed channel arrives
+    // as a push, with the server's routing hints in its origin (zulip_mcp's
+    // topic among them), as channels/incoming carries them in its metadata.
+    else if (event.type === 'mcpl:push-event') {
+      const pushed = addressedPush(event);
+      if (pushed) this.lastMetadata.set(pushed.channelId, { ...pushed.origin });
     }
     // Workspace-triggered inferences have no incoming-message metadata, so
     // peek at the file's head for an origin hint and populate routing metadata
@@ -255,28 +276,25 @@ export class ActivityModule implements Module {
     if (!workspace) return;
 
     for (const mountPath of mountPaths) {
-      const abs = workspace.resolveAbsolutePath(mountPath);
-      if (!abs) continue;
-
       try {
-        const fd = await open(abs, 'r');
-        try {
-          const buf = Buffer.alloc(2048);
-          const { bytesRead } = await fd.read(buf, 0, buf.length, 0);
-          const head = buf.toString('utf8', 0, bytesRead);
-
-          const origin = parseOriginHint(head);
-          if (origin && this.channels.has(origin.channelId)) {
-            // Merge with any existing metadata so other keys (e.g. senderEmail)
-            // survive if the origin refresh is subsequent to an incoming message.
-            const prior = this.lastMetadata.get(origin.channelId) ?? {};
-            this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
-          }
-        } finally {
-          await fd.close();
+        // readFileFromDisk refuses a file that is itself a link unless the
+        // mount follows links, reads a file only if its canonical path lies
+        // inside the mount, and is asked for no more than the head the hint
+        // needs.
+        const { bytes } = await workspace.readFileFromDisk(mountPath, { maxBytes: ORIGIN_HEAD_BYTES });
+        // agent-framework 0.22.2 reads a file that grows after the read's
+        // size check whole, so the head is cut here too. Once the host's
+        // agent-framework floor includes anima-research/agent-framework#409,
+        // readFileFromDisk keeps maxBytes itself, and this cut can go.
+        const origin = parseOriginHint(bytes.subarray(0, ORIGIN_HEAD_BYTES).toString('utf8'));
+        if (origin && this.channels.has(origin.channelId)) {
+          // Merge with any existing metadata so other keys (e.g. senderEmail)
+          // survive if the origin refresh is subsequent to an incoming message.
+          const prior = this.lastMetadata.get(origin.channelId) ?? {};
+          this.lastMetadata.set(origin.channelId, { ...prior, topic: origin.topic });
         }
       } catch {
-        // File unreadable / gone / etc. — silently skip.
+        // Unreadable, gone, or refused by the mount: silently skip.
       }
     }
   }
