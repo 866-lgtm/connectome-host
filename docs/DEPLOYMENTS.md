@@ -153,22 +153,22 @@ the working directory):
 
 A box that runs the stack from checkouts of `main` (the
 [DEV-ENVIRONMENT](./DEV-ENVIRONMENT.md) layout) takes each change as it
-pulls, with no release in between. agent-framework's, chronicle's and
-connectome-host's releases stop while an issue labelled `release-hold` is
-open in their repository. Such an issue says that `main` as it stands
-would harm someone running it, and what has to happen first. A pull
-doesn't stop for it, and the layout's other repositories have no holds.
-So:
+pulls, with no release in between. Some of the stack's repositories stop
+their releases while an issue labelled `release-hold` is open in them.
+Such an issue says that `main` as it stands would harm someone running
+it, and what has to happen first. A pull doesn't stop for it. So:
 
-- **Before pulling,** look at the open holds. The repositories are public,
-  so their issue pages need no login:
+- **Before pulling,** look for open holds. The layout's repositories
+  belong to anima-research and antra-tess, and one search covers both. It
+  needs no login:
   ```
-  https://github.com/anima-research/agent-framework/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
-  https://github.com/anima-research/chronicle/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
-  https://github.com/anima-research/connectome-host/issues?q=is%3Aissue+is%3Aopen+label%3Arelease-hold
+  https://github.com/search?q=label%3Arelease-hold+is%3Aissue+is%3Aopen+org%3Aanima-research+user%3Aantra-tess&type=issues
   ```
-  With `gh` logged in, `gh issue list --label release-hold` in each
-  repository shows the same. While a hold applies to your box, keep every
+  With `gh` logged in, this shows the same:
+  ```bash
+  gh search issues --owner anima-research --owner antra-tess --label release-hold --state open
+  ```
+  While a hold applies to your box, keep every
   checkout on the commit it has, since the host and its libraries move
   together. If you can't read the list, treat a hold as open until you
   can. Then read what each checkout would take. Where the repository keeps
@@ -176,7 +176,7 @@ So:
   ```bash
   git fetch && git diff HEAD origin/main -- CHANGELOG.md changelog.d
   ```
-  heartbeat-mcpl and mcpl-core-ts keep none, so read their commits with
+  Where a repository keeps none, read its commits with
   `git log --oneline HEAD..origin/main` after the fetch.
 - **If a hold names a commit you already run,** go back, below, to
   commits from before it. In a checkout that contains the commit,
