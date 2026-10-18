@@ -371,13 +371,18 @@ export interface RecipeAgent {
    * RecipeMockConfig. */
   mock?: RecipeMockConfig;
   /**
-   * Content-refusal handling. When `autoRewind` is on, a `stop_reason: refusal`
-   * turn triggers an automatic rewind of the triggering turn + retry (keeping
-   * the agent on its own model). See agent-framework AgentConfig.refusalHandling.
+   * Content-refusal handling, handed whole to agent-framework's
+   * AgentConfig.refusalHandling (framework-agent-config.ts), where
+   * agent-framework documents `retries`, `autoRewind` and `maxRewinds`.
    */
   refusalHandling?: {
+    retries?: number;
     autoRewind?: boolean;
     maxRewinds?: number;
+    /**
+     * @deprecated No agent-framework release reads it, so on any release it
+     * changes nothing. A recipe that still sets it loads as before.
+     */
     announceHumanTurns?: boolean;
   };
 }
