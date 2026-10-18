@@ -23,6 +23,7 @@ import type {
 import { unknownToolResult } from './unknown-tool.js';
 import { shown } from './shown.js';
 import { STREAM_END_TRACES } from '../state/turn-trace.js';
+import { addressedPush } from './addressed-push.js';
 
 export interface ActivityModuleConfig {
   initialChannels?: string[];
@@ -88,7 +89,8 @@ export class ActivityModule implements Module {
    *  contract asks, and when setFramework replaces the framework. */
   private unsubscribeTrace: (() => void) | null = null;
 
-  /** Most recent incoming-message metadata per channel. Handed back to the
+  /** Most recent metadata per channel, from incoming traffic or a person's
+   *  message addressed to the agent as a push. Handed back to the
    *  originating server on each typing notification so routing hints (e.g.
    *  Zulip topic) land where the conversation is active. */
   private lastMetadata = new Map<string, Record<string, unknown>>();
@@ -224,8 +226,9 @@ export class ActivityModule implements Module {
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
-    // Track the most recent incoming-message metadata per channel so typing
-    // notifications can echo it back to the originating server as routing hints.
+    // Track each channel's latest message routing hints, from channels/incoming
+    // or a counted push, so typing notifications can echo them back to the
+    // originating server.
     if (event.type === 'mcpl:channel-incoming') {
       const e = event as unknown as {
         channelId: string;
@@ -237,6 +240,13 @@ export class ActivityModule implements Module {
         merged.threadId = e.threadId;
       }
       this.lastMetadata.set(e.channelId, merged);
+    }
+    // A person's message addressed to the agent from a closed channel arrives
+    // as a push, with the server's routing hints in its origin (zulip_mcp's
+    // topic among them), as channels/incoming carries them in its metadata.
+    else if (event.type === 'mcpl:push-event') {
+      const pushed = addressedPush(event);
+      if (pushed) this.lastMetadata.set(pushed.channelId, { ...pushed.origin });
     }
     // Workspace-triggered inferences have no incoming-message metadata, so
     // peek at the file's head for an origin hint and populate routing metadata
@@ -259,7 +269,7 @@ export class ActivityModule implements Module {
         // inside the mount, and is asked for no more than the head the hint
         // needs.
         const { bytes } = await workspace.readFileFromDisk(mountPath, { maxBytes: ORIGIN_HEAD_BYTES });
-        // agent-framework 0.22.1 reads a file that grows after the read's
+        // agent-framework 0.22.2 reads a file that grows after the read's
         // size check whole, so the head is cut here too. Once the host's
         // agent-framework floor includes anima-research/agent-framework#409,
         // readFileFromDisk keeps maxBytes itself, and this cut can go.

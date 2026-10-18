@@ -55,6 +55,7 @@ import type {
   TraceEvent,
 } from '@animalabs/agent-framework';
 import { unknownToolResult } from './unknown-tool.js';
+import { addressedPush } from './addressed-push.js';
 
 export type NoticeTier = 'silent' | 'status' | 'reply';
 
@@ -400,6 +401,10 @@ export class NoticesModule implements Module {
     if (event.type === 'mcpl:channel-incoming') {
       const e = event as unknown as { channelId: string };
       await this.replyIfDown(e.channelId);
+    } else {
+      // A person's mention in a closed channel, reply or first DM arrives as a push.
+      const pushed = addressedPush(event);
+      if (pushed) await this.replyIfDown(pushed.channelId);
     }
     return {};
   }
@@ -620,7 +625,8 @@ export class NoticesModule implements Module {
 
   // --------------------------------------------------------------- replies
 
-  /** Incoming traffic on a channel while the agent is down: say so, once. */
+  /** Traffic on a channel while the agent is down (incoming traffic, or a
+   *  person's message addressed to it as a push): say so, once. */
   private async replyIfDown(channelId: string): Promise<void> {
     const ep = this.agentEpisode();
     if (!ep || episodeTier(ep) !== 'reply') return;

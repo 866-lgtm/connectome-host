@@ -918,6 +918,9 @@ function countLines(path: string): number {
 // Main
 // ---------------------------------------------------------------------------
 
+/** What a fatal error waits for before exiting: headless mode's log. */
+let beforeFatalExit: (() => Promise<void>) | undefined;
+
 async function main() {
   const recipe = await resolveRecipe();
   const provider = recipe.agent.provider ?? 'anthropic';
@@ -1346,7 +1349,8 @@ async function main() {
 
   try {
     if (headless) {
-      const { runHeadless } = await import('./headless.js');
+      const { runHeadless, endHeadlessLog } = await import('./headless.js');
+      beforeFatalExit = endHeadlessLog;
       await runHeadless(app, process.argv.slice(2));
     } else if (noTui) {
       await runPiped(app);
@@ -1360,7 +1364,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Fatal error:', err);
+  // Headless, headless.log may still hold lines written just before the
+  // failure, such as the server's error; exiting at once would drop them.
+  await beforeFatalExit?.();
   process.exit(1);
 });

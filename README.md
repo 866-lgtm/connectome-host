@@ -200,7 +200,7 @@ through for flaky gateways.
 
 Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the entry's `env`, then the host's `AGENT_TIMEZONE`. agent-framework then adds its derived `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the entry's `env` sets one with tokens, or, for an `inheritEnv` entry, the host's own environment does. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
 
-Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server. Put a full-inheritance grant in the recipe or operator server file instead.
+Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server, as they strip `allowHostCommands`, `enabledCapabilities` and `toolLifecycle`, and the startup warnings name each one an overlay entry sets. Put `inheritEnv` or `toolLifecycle` in the recipe, or in `mcpl-servers.json` for a server the recipe names, instead, and `allowHostCommands` or `enabledCapabilities` in a server the recipe defines itself, with its own command or url and an id `mcpl-servers.json` doesn't define, since neither `mcpl-servers.json` nor a recipe's override of a server from it passes those two on.
 
 Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file. Likewise, a `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's environment becomes an inheriting child's whole baseline, in place of agent-framework's protective default. The framework logs when it does.
 
@@ -574,6 +574,11 @@ are one free-form curated document, always present verbatim.
 bun install      # or npm install; the postinstall step builds the web UI
 ```
 
+Installed from npm instead (`npm install @animalabs/connectome-host`), the
+package carries the web UI already built. npm 12 and bun may report its
+`postinstall` as blocked: it builds the web UI only in a checkout, so nothing
+is lost.
+
 ## Environment variables
 
 | Variable | Default | Description |
@@ -649,8 +654,9 @@ or supply credentials for a remote deployment:
 "modules": { "webui": { "basicAuth": { "username": "${WEBUI_USERNAME}", "password": "${WEBUI_PASSWORD}" } } }
 ```
 
-Build the SPA bundle once with `bun run build:web` (also runs on install via
-postinstall). Deployment behind a reverse proxy, observer access and all
+In a checkout, build the SPA bundle once with `bun run build:web` (also runs
+on install via postinstall); the npm package carries it built. Deployment
+behind a reverse proxy, observer access and all
 endpoints are covered in [`docs/webui-deployment.md`](docs/webui-deployment.md).
 
 - Chat with full interiority: thinking blocks, tool calls + results, live streaming, inline images
