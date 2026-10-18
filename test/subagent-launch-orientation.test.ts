@@ -1351,7 +1351,7 @@ describe('what a stream first reads is what its launch promises', () => {
         } as never);
         expect(result.success).toBe(false);
         expect(String(result.error)).toBe(
-          `Subagent long-${kind} wasn't launched: its task is longer than one message holds (10,000 tokens): ` +
+          `${kind === 'spawn' ? 'Subagent' : 'Fork'} 'long-${kind}' didn't start, so nothing ran: its task is longer than one message holds (10,000 tokens): ` +
           `shorten or split it, or put the detail in a file, ${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path.`,
         );
         expect(h.requestFor(model)).toBeUndefined();
@@ -1393,7 +1393,7 @@ describe('what a stream first reads is what its launch promises', () => {
       expect(spawn.success).toBe(false);
       // The short task is its own message, so it arrives, and only the orientation is named.
       expect(String(spawn.error)).toBe(
-        "Subagent wide-spawn wasn't launched: its orientation, which names the spawn's tools in full, is longer than one message holds (10,000 tokens): give the spawn a shorter tools list.",
+        "Subagent 'wide-spawn' didn't start, so nothing ran: its orientation, which names the spawn's tools in full, is longer than one message holds (10,000 tokens): give the spawn a shorter tools list.",
       );
       expect(h.requestFor('mock-wide-spawn')).toBeUndefined();
     } finally {
@@ -1408,7 +1408,7 @@ describe('what a stream first reads is what its launch promises', () => {
       expect(fork.success).toBe(false);
       // With no parent there is no context to lose by spawning instead.
       expect(String(fork.error)).toBe(
-        "Subagent wide-fork wasn't launched: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn instead, with a short tools list and a task that fits one message.",
+        "Fork 'wide-fork' didn't start, so nothing ran: its orientation is longer than one message holds (10,000 tokens): launch it as subagent--spawn instead, with a short tools list and a task that fits one message.",
       );
       expect(p.requestFor('mock-wide-fork')).toBeUndefined();
     } finally {
@@ -1446,8 +1446,8 @@ describe('what a stream first reads is what its launch promises', () => {
         }
         const result = await h.subagent.handleToolCall({ id: 'fork-point', name: kind, input, callerAgentName: 'parent' } as never);
         expect(result.success).toBe(false);
-        expect(String(result.error)).toContain(`Prompt too large for subagent sized-idle-${kind}: ~`);
-        expect(String(result.error)).toContain('its orientation included (limit: 1)');
+        expect(String(result.error)).toContain(`${kind === 'spawn' ? 'Subagent' : 'Fork'} 'sized-idle-${kind}' didn't start, so nothing ran: `);
+        expect(String(result.error)).toContain("over this host's limit of 1");
         expect(attempts.count).toBe(1);
       } finally {
         await h.cleanup();
@@ -1523,7 +1523,7 @@ describe('what a stream first reads is what its launch promises', () => {
       await notice;
       expect(failures).toEqual([{
         name: 'long-async',
-        message: "Subagent long-async wasn't launched: its task is longer than one message holds (10,000 tokens): " +
+        message: "Subagent 'long-async' didn't start, so nothing ran: its task is longer than one message holds (10,000 tokens): " +
           'shorten or split it, or put the detail in a file, give the spawn a tool that can read it, and pass the path.',
       }]);
       expect(h.requestFor('mock-long-async')).toBeUndefined();
@@ -1541,7 +1541,7 @@ describe('what a stream first reads is what its launch promises', () => {
     return attempts;
   };
 
-  test("a refusal is never retried, even when its text holds a word the retry gate reads as transient", async () => {
+  test("a refusal, for a subagent whose name holds words the retry gate reads as transient, is never retried", async () => {
     const h = await realHarness({ maxRetries: 2 });
     try {
       const attempts = countAttempts(h.framework);
@@ -1550,7 +1550,7 @@ describe('what a stream first reads is what its launch promises', () => {
         input: { name: 'idle-network-503', task: LONG_TASK, systemPrompt: 'p', model: 'mock-idle', sync: true },
       } as never);
       expect(result.success).toBe(false);
-      expect(String(result.error)).toStartWith("Subagent idle-network-503 wasn't launched: its task is longer");
+      expect(String(result.error)).toStartWith("Subagent 'idle-network-503' didn't start, so nothing ran: its task is longer");
       expect(attempts.count).toBe(1);
     } finally {
       await h.cleanup();
@@ -1626,26 +1626,29 @@ describe('what a stream first reads is what its launch promises', () => {
   test("a fork with a call, which would inherit its parent's context, is told that a spawn inherits none of it", () => {
     const subagent = new SubagentModule({ provider: 'mock', defaultModel: 'mock' });
     const refuse = (subagent as unknown as {
-      launchRefusal(kind: 'spawn' | 'fork', name: string, cut: string[], delivery: unknown): Error;
+      launchRefusal(kind: 'spawn' | 'fork', cut: string[], delivery: unknown): Error;
     }).launchRefusal.bind(subagent);
     const withCall = { kind: 'fork-result', callId: 'c', head: 'HEAD', task: 'TASK' };
     const ownMessages = { kind: 'message', orientation: 'ORIENT', taskBlock: 'TASK' };
-    expect(refuse('fork', 'f', ['orientation'], ownMessages).message).toBe(
-      "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message.',
+    // The module's own failure, which the retry loop ends on unread, and the
+    // reasons alone: failedRun puts them after "didn't start, so nothing ran".
+    expect(refuse('fork', ['orientation'], ownMessages).name).toBe('SubagentFailure');
+    expect(refuse('fork', ['orientation'], ownMessages).message).toBe(
+      'its orientation is longer than one message holds (10,000 tokens): ' +
+      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message',
     );
-    expect(refuse('fork', 'f', ['orientation'], withCall).message).toBe(
-      "Subagent f wasn't launched: its orientation is longer than one message holds (10,000 tokens): " +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message, though a spawn inherits none of this context.',
+    expect(refuse('fork', ['orientation'], withCall).message).toBe(
+      'its orientation is longer than one message holds (10,000 tokens): ' +
+      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message, though a spawn inherits none of this context',
     );
-    expect(refuse('fork', 'f', ['call'], withCall).message).toBe(
-      "Subagent f wasn't launched: the fork call that carries its task, or its result, isn't in the context it would start from: " +
-      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message (10,000 tokens), though a spawn inherits none of this context.',
+    expect(refuse('fork', ['call'], withCall).message).toBe(
+      "the fork call that carries its task, or its result, isn't in the context it would start from: " +
+      'launch it as subagent--spawn instead, with a short tools list and a task that fits one message (10,000 tokens), though a spawn inherits none of this context',
     );
-    expect(refuse('spawn', 's', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
+    expect(refuse('spawn', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
   });
 
-  test('a refusal leaves the rate-limit backoff alone, even when its text holds "rate"', async () => {
+  test('a refusal, for a subagent whose name holds "rate", leaves the rate-limit backoff alone', async () => {
     for (const kind of ['spawn', 'parentless'] as const) {
       const h = await realHarness({ parentless: kind === 'parentless' });
       const state = h.subagent as unknown as { rateLimitCooldownMs: number; effectiveConcurrent: number; throttled: boolean };
