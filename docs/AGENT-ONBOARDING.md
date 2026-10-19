@@ -698,12 +698,15 @@ as on `kv-unified`; the store is left intact. `report` logs the violations and b
 silently ignored), so the error's "set topologyPolicy: 'report'" hint is not reachable from a
 recipe — repair the store. Separately, a merge that would mint a crossed node is refused into the
 merge quarantine. Both show on `/healthz` as `compressionDebt.<agent>.topologyViolations` /
-`.topologyRefusals`, with `state: critical`. Before **any** context-manager upgrade of an existing
-resident — including a host upgrade from a pre-0.12 context-manager — run the audit on a **copy of
-the stopped store**:
+`.topologyRefusals`, with `state: critical`. For **any** context-manager upgrade of an existing
+resident — including a host upgrade from a pre-0.12 context-manager, which has no audit script of
+its own — install the upgrade and, before starting the resident on it, run the new version's audit
+on a **copy of the stopped store**:
 `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json > audit.json`
-(exit 0 clean, 2 violations, 1 could not open; a warning that it saw no summaries means a wrong
-`--namespace`). Repair the *stopped* store, after a cold backup, with
+(exit 0 clean, 2 violations, 1 it didn't finish, such as a usage error or a store it could not
+open; a warning on stderr that it saw nothing to audit means a wrong `--namespace`, a copy without
+the strategy state, or a store with no summaries yet). Repair the *stopped* store, after a cold
+backup, with
 `node …/dist/scripts/repair-topology.js <store> --namespace agents/<agent> [--mode lossless|compact|rebuild] [--rebuild-since <messageId|ISO date>] [--apply]`
 — a dry run unless `--apply`; after `--apply` it reopens the store under `reject` to verify (exit
 0 clean or verified, 2 plan incomplete or verification failed, 1 usage/open error). `lossless`

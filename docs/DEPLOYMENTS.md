@@ -239,44 +239,57 @@ while a clone installs from its tag's `bun.lock`. So:
 - **To update,** copy the install's `package.json` and its lockfile
   (`package-lock.json`, or `bun.lock` for an install made with bun), or in a
   clone note the tag you're on (`git describe --tags`). Note the versions
-  `npm ls @animalabs/context-manager @animalabs/chronicle` names, and the
-  version of any MCPL server the notes say to update. Stop every agent that
-  runs from the install, and its fleet children, as "Updating checkouts"
-  says. If the notes say going back isn't safe, copy what each agent keeps,
-  which "Updating checkouts" lists. Then install the new version: `npm
-  install @animalabs/connectome-host@<version>`, or `bun add
+  `npm ls @animalabs/agent-framework @animalabs/context-manager
+  @animalabs/chronicle` names, and the version of any MCPL server the notes
+  say to update. Stop every agent that runs from the install, and its fleet
+  children, as "Updating checkouts" says. Then install the new version:
+  `npm install @animalabs/connectome-host@<version>`, or `bun add
   @animalabs/connectome-host@<version>`, or in a clone `git fetch --tags`,
-  `git checkout v<version>` and `bun install`, and any MCPL server version
-  the notes name. In a clone, `bun install` also builds the Web UI. If it
-  says that build failed, run `bun run build:web`, as it says, before
-  starting, since the build from before would be served. Start the agents
-  once that's done, after the store audit below if the install moved
-  context-manager.
-- **If the install moved context-manager or chronicle,** so that `npm ls`
-  names another version of either now, copy each stopped store, and keep
-  the copy as it was for as long as you might go back. These two decide
-  how a store is kept on disk, and a newer one can write a store an older
-  one can't read, as chronicle 0.3.0's notes say of its own. The stores are
-  the session directories, `sessions/<id>`, in each agent's `DATA_DIR` and
-  in its fleet children's data directories. If context-manager moved, copy
-  each store a second time, and audit that copy with the command
-  [AGENT-ONBOARDING §11.8](./AGENT-ONBOARDING.md#11-critical-gotchas-read-before-deploying)
-  gives: after the install, so the script is the new version's, and before
-  starting, since the new version's first open is what refuses a store or
-  changes it. Opening a store changes it, the audit's open included, so the
-  copy you keep is never the one audited. Exit 0 is clean, unless it warned
-  that it saw no summaries, which means the `--namespace` was wrong: run it
-  again with the right one. On violations (exit 2), or a copy it couldn't
-  open (exit 1), go back, below, or repair as §11.8 says.
+  `git checkout v<version>` and `bun install`. Update any MCPL server the
+  notes name the way you installed it, and restart one the recipe reaches
+  by `url`, since it runs apart from the host. In a clone, `bun install` also
+  builds the Web UI. If it says that build failed, run `bun run build:web`,
+  as it says, before starting: until it succeeds, the Web UI serves
+  whatever `dist/web` holds, which isn't this version's build.
+- **Before starting them,** run `npm ls` as before and compare. For each of
+  the three libraries that moved, read its notes between the two versions,
+  `https://github.com/anima-research/<library>/blob/main/CHANGELOG.md`, for
+  what they say about going back. Then:
+  - **If context-manager or chronicle moved, or any notes say going back
+    isn't safe,** copy what each agent keeps, which "Updating checkouts"
+    lists, and keep the copy as it was for as long as you might go back.
+    Those two libraries decide how a store is kept on disk, and a newer one
+    can write a store an older one can't read, as chronicle 0.3.0's notes
+    say of its own.
+  - **If context-manager moved,** copy each store again and audit that copy
+    with the command
+    [AGENT-ONBOARDING §11.8](./AGENT-ONBOARDING.md#11-critical-gotchas-read-before-deploying)
+    gives. The stores are the session directories, `sessions/<id>`, in each
+    agent's `DATA_DIR` and in its fleet children's data directories. Audit
+    after the install, so the script is the new version's, and before
+    starting, since the new version's first open is what refuses a store or
+    changes it. Opening a store changes it, the audit's open included, so
+    the copy you keep is never the one audited. Exit 0 is clean. If it also
+    warned, on stderr, that it saw nothing to audit, check the store copy's
+    path and that `--namespace` names the agent (`agents/<agent>`), and run
+    it again: a store that has never been compressed has no summaries, so
+    it warns with the right ones too. Exit 2 lists violations: go back,
+    below, or repair the stopped store as §11.8 says. Exit 1 means it didn't
+    finish, and its message says why: correct the command if that's what it
+    names, and if it couldn't open the copy, go back rather than start the
+    agents on that store.
+
+  Then start them.
 - **To go back,** stop the agents again and restore the copied
   `package.json` and lockfile together, then run `npm ci`, or `bun install
   --frozen-lockfile`. The install rewrote the version in `package.json`, so
   a lockfile restored alone is refused. In a clone, check out the tag you
-  noted and run `bun install`. Put back the version of any MCPL server you
-  updated, and any recipe or `.env` change you made for the newer version.
-  Then put back the store copies you kept as they were, if context-manager
-  or chronicle moved, and the data copy if you made one. Restoring either
-  discards what the agents recorded since it was made. Then start them.
+  noted and run `bun install`, then `bun run build:web` if it says the Web
+  UI's build failed. Put back the version of any MCPL server you updated,
+  restarting one the recipe reaches by `url`, and any recipe or `.env`
+  change you made for the newer version. Then restore the data copy, if you
+  made one, which discards what the agents recorded since it was made.
+  Then start them.
 
 ---
 
