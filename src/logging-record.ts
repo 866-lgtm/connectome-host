@@ -67,8 +67,9 @@ function without(record: Record<string, unknown>, keys: readonly string[], trunc
 /** The head's and the classification's strings, numbers and booleans, and
  *  an error object's name and message, each text cut to
  *  MAX_LAST_RESORT_CHARS. At most a few dozen KB, so it always fits, and
- *  building it can't throw. */
-function lastResort(record: Record<string, unknown>): string {
+ *  building it can't throw. Its marker says what sent the line here: the
+ *  record without its raw bodies couldn't be serialized, or didn't fit. */
+function lastResort(record: Record<string, unknown>, unserializable: boolean): string {
   const kept: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(pick(record, HEAD_AND_ERROR))) {
     if (typeof value === 'string') kept[key] = boundText(value, MAX_LAST_RESORT_CHARS);
@@ -84,7 +85,9 @@ function lastResort(record: Record<string, unknown>): string {
       if (Object.keys(error).length > 0) kept.error = error;
     }
   }
-  kept.truncated = 'only bounded head and classification kept (record exceeded size guard or could not be serialized)';
+  kept.truncated = unserializable
+    ? 'only bounded head and classification kept (the record could not be serialized)'
+    : 'only bounded head and classification kept (record exceeded size guard)';
   return JSON.stringify(kept);
 }
 
@@ -112,5 +115,5 @@ export function serializeRecord(record: Record<string, unknown>): string {
     ? 'raw bodies dropped (they could not be serialized)'
     : 'raw bodies dropped (record exceeded size guard)');
   if (withoutRaw !== undefined && fits(withoutRaw)) return withoutRaw + '\n';
-  return lastResort(record) + '\n';
+  return lastResort(record, withoutRaw === undefined) + '\n';
 }
