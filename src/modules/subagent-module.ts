@@ -2438,7 +2438,11 @@ export class SubagentModule implements Module {
     let messageCount = 0;
     let lastMessageSnippet = '';
     try {
-      const compiled = await live.contextManager.compile();
+      // A dry compile: a peek only reads, so it mustn't commit the stream's
+      // fold state or queue its compression, as a real compile would. A plan
+      // over the budget it compiles at is returned, where a real compile
+      // refuses it.
+      const compiled = await live.contextManager.compile(undefined, undefined, { dryRun: true });
       messageCount = compiled.messages.length;
       // Extract a short snippet from the last message for observability
       // without dumping the entire context into the caller's window.
@@ -3263,7 +3267,10 @@ export class SubagentModule implements Module {
 
           // The stream must read what the launch promises: refuse it when
           // its orientation or its whole task isn't in the launch's compile
-          // of its first context.
+          // of its first context. It's a real compile, not a dry one: a dry
+          // compile returns an over-budget plan where a real one refuses it,
+          // and the stream's context is fresh, so its first request's compile
+          // starts from what this one leaves.
           const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
           // The race takes compile's result when compiling settles first, so
           // a cancel that lands just after is thrown here: the run ends
@@ -3493,7 +3500,17 @@ export class SubagentModule implements Module {
           // plus a synthetic intention-framed fork tool_use/tool_result.
           if (parentAgent) {
             const parentCM = parentAgent.getContextManager();
-            const { messages: compiled } = await Promise.race([parentCM.compile(), cancel.promise]);
+            // A dry compile: the fork reads the parent's context as a real
+            // compile would give it, without committing the parent's fold
+            // state or queuing its compression on the parent's behalf. A plan
+            // over the budget it compiles at, the manager's default, is
+            // returned, where a real compile refused it and failed the fork;
+            // the fork's own launch check, a real compile of its own context,
+            // still refuses a first context the fork can't use.
+            const { messages: compiled } = await Promise.race([
+              parentCM.compile(undefined, undefined, { dryRun: true }),
+              cancel.promise,
+            ]);
             const cutAtCall = orient({ kind: 'cut-at-call' });
             const transformed = callToolUseId
               ? materialiseStructuralFork(
@@ -3572,7 +3589,8 @@ export class SubagentModule implements Module {
           // The stream must read what the launch promises: refuse it when
           // its orientation or its whole task isn't in the launch's compile
           // of its first context. A fork with a call reads its whole task in
-          // that call.
+          // that call. It's a real compile, as a spawn's is, so an over-budget
+          // first context is refused here, before the run starts.
           const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
           // The race takes compile's result when compiling settles first, so
           // a cancel that lands just after is thrown here: the run ends
