@@ -192,7 +192,17 @@ export const JOURNAL_STEPS = [
 export type JournalStep = typeof JOURNAL_STEPS[number];
 
 /** One line of journal.jsonl, written by the launcher, except `commit` and
- *  `notes`, which the host writes. */
+ *  `notes`, which the host writes. The journal carries each request from the
+ *  first change to its data on, so the line that lets the data change goes in
+ *  before it does: a switch's `trial-start` before its trial starts, and a Go
+ *  back's `go-back` once the Go back has prepared and synced everything it
+ *  needs, such as a restore's staged items or the newer data's copy set
+ *  aside, and before it changes any data. An ok `go-back` says the data may
+ *  change from that line on: a start that finds it with no ok `trial-start`,
+ *  `commit` or `fallback` after it resumes that Go back from the line,
+ *  whatever the mark file holds.
+ *  A `go-back` that isn't ok, refused or failed, says the data wasn't
+ *  touched. */
 export interface JournalLine {
   v: 1;
   at: string;
@@ -205,8 +215,10 @@ export interface JournalLine {
   /** The id of the mark a launcher's line acts on: every step of the switch
    *  it asks for, its fallback included, and a Go back's. */
   mark?: string;
-  /** On a `go-back` line: whether it kept the newer data rather than restoring
-   *  the copy, as its mark's `keepData` asked. */
+  /** On every ok `go-back` line: whether the Go back keeps the newer data
+   *  rather than restoring the copy, as its mark's `keepData` asked. A start
+   *  that resumes the Go back reads it here, since it goes on whatever the
+   *  mark file holds. */
   keptData?: boolean;
 }
 
@@ -448,14 +460,13 @@ export function unfinishedTrial(lines: JournalLine[], current: string | null): J
 }
 
 /** Whether a mark's request has run its course: its switch committed, so
- *  `current` names its `to`, or a fallback from its trial succeeded, so the
- *  same failing trial isn't started again. A switch refused before its trial
+ *  `current` names its `to`, or a fallback that names it succeeded, so the
+ *  same failing request isn't run again. A switch refused before its trial
  *  leaves the mark standing, and the next start tries it again. A Go back's
- *  `go-back` line doesn't spend its mark, though it says the restore is done:
- *  spent there, the mark would leave the newer release to start on the
- *  restored data. Like any mark, it's spent by its commit, the older
- *  release's, or by a fallback from its trial. It needs no clock, since a new
- *  request to the same release has a new id. */
+ *  `go-back` line doesn't spend its mark, since the Go back is under way from
+ *  there, not done. Like any mark, it's spent by its commit, the older
+ *  release's, or by a successful fallback that names it. It needs no clock,
+ *  since a new request to the same release has a new id. */
 export function markSpent(mark: Mark, lines: JournalLine[], current: string | null): boolean {
   // No line can say that a mark without an id has run, though a line that
   // names no mark has no id either.
@@ -472,9 +483,10 @@ export function readMark(root: string): Mark | null {
   const path = installPaths(root).mark;
   const mark = readRecord<Mark>(path, 'mark');
   if (mark === null) return null;
-  const remedy = 'Removing the mark file drops its request, which can then be made again, unless the journal ' +
-    'shows the request under way: a switch whose trial has started, or a Go back whose restore has run, is ' +
-    'taken from the journal whatever the mark file holds.';
+  const remedy = 'Removing the mark file drops its request, which can then be made again, unless the request is ' +
+    'under way: a switch from its ok trial-start line, or a Go back from its ok go-back line, until current ' +
+    'names the release it asked for or an ok fallback line follows. A request under way goes on from the ' +
+    "journal whatever the mark file holds, and before those lines a request hasn't changed the data.";
   if (!pathSegment(mark.id)) {
     throw new ContractError(
       `The mark at ${path} has no id this release can use: an id names the request and the directory a restore ` +

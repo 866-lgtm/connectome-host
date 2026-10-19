@@ -265,7 +265,7 @@ describe('the update contract', () => {
     expect(unfinishedTrial([line('trial-start'), line('commit'), later, { ...line('fallback'), to: '0.12.0' }], '0.11.0')).toBeNull();
   });
 
-  test('a mark is spent once its switch commits or a fallback from its trial succeeds, and stands while a switch is refused or its trial runs', () => {
+  test('a mark is spent once its switch commits or a fallback for it succeeds, and stands while a switch is refused or its trial runs', () => {
     expect(markSpent(mark, [], '0.10.2')).toBe(false);
     expect(markSpent(mark, [{ ...line('children-check', 'refused'), mark: mark.id }], '0.10.2')).toBe(false);
     expect(markSpent(mark, [{ ...line('trial-start'), mark: mark.id }], '0.10.2')).toBe(false);
@@ -320,9 +320,10 @@ describe('the update contract', () => {
     // id, and one that names this mark's, which spends one that has it.
     appendJournal(root, line('fallback'));
     appendJournal(root, { ...line('fallback'), mark: mark.id });
-    const remedy = 'Removing the mark file drops its request, which can then be made again, unless the journal ' +
-      'shows the request under way: a switch whose trial has started, or a Go back whose restore has run, is ' +
-      'taken from the journal whatever the mark file holds.';
+    const remedy = 'Removing the mark file drops its request, which can then be made again, unless the request is ' +
+      'under way: a switch from its ok trial-start line, or a Go back from its ok go-back line, until current ' +
+      'names the release it asked for or an ok fallback line follows. A request under way goes on from the ' +
+      "journal whatever the mark file holds, and before those lines a request hasn't changed the data.";
     const noUsableId = new ContractError(
       `The mark at ${paths.mark} has no id this release can use: an id names the request and the directory a restore ` +
       `sets aside into, so it is one path segment (the host writes a random UUID). ${remedy}`,
