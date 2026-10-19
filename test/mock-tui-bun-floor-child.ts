@@ -1,16 +1,19 @@
 /**
- * A TUI start under a Bun below the host's floor, for test/bun-floor.test.ts.
- * It sets process.versions.bun to the version it's given before anything
- * imports the check, so the check's own start-up call runs as it does in a
- * host: against the host's package.json, printing with console.warn to this
- * process's stderr. runTui then starts with a saved session of 50 messages,
- * more than its view holds. Prints one `TUI_FRAME` line of JSON: the text of
- * the frame the TUI draws first.
+ * A TUI start under the Bun version it's given, for test/bun-floor.test.ts.
+ * It sets process.versions.bun to that version before anything imports the
+ * check, so the check's own start-up call runs as it does in a host: against
+ * the host's package.json, printing with console.warn to this process's
+ * stderr. runTui then starts with a saved session of 50 messages, more than
+ * its view holds. Prints one `TUI_FRAME` line of JSON: the text of the frame
+ * the TUI draws once runTui has set up its view.
  */
 import { mock } from 'bun:test';
 import * as core from '@opentui/core';
 import { createTestRenderer } from '@opentui/core/testing';
 
+// runTui sends stderr to its error log, so what goes wrong is told on stdout.
+// Set first, so a hang anywhere below, the import included, ends here.
+const watchdog = setTimeout(() => { process.stdout.write('TUI_ERROR timed out\n'); process.exit(2); }, 20000);
 const [running] = process.argv.slice(2);
 process.versions.bun = running!;
 const { renderer, renderOnce, captureCharFrame } = await createTestRenderer({ width: 100, height: 24, exitOnCtrlC: false });
@@ -39,8 +42,6 @@ const app = {
   },
 } as unknown as Parameters<typeof runTui>[0];
 
-// runTui sends stderr to its error log, so what goes wrong is told on stdout.
-const watchdog = setTimeout(() => { process.stdout.write('TUI_ERROR timed out\n'); process.exit(2); }, 20000);
 void runTui(app).catch((error: unknown) => {
   process.stdout.write(`TUI_ERROR ${error instanceof Error ? error.message : String(error)}\n`);
   process.exit(1);

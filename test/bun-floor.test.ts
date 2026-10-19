@@ -54,11 +54,28 @@ describe('the start-up warning for a Bun below the floor', () => {
 
   test('the host imports the check before anything else runs', () => {
     const index = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf-8');
-    // Only whitespace and comments come before it. A `//` comment is taken
-    // whole, to its line's end, so an import commented out doesn't count.
-    expect(index).toMatch(/^(?:\s|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*import '\.\/bun-floor-check\.js';/);
+    expect(afterLeadingComments(index)).toStartWith("import './bun-floor-check.js';");
   });
 });
+
+/** What follows the whitespace and whole comments `src` starts with. A `//`
+ *  comment runs to its line's end, and a block comment to the first `*\/`
+ *  after it opens, so a comment can't take in the code after it. */
+function afterLeadingComments(src: string): string {
+  let rest = src;
+  for (;;) {
+    rest = rest.trimStart();
+    if (rest.startsWith('//')) {
+      const end = rest.indexOf('\n');
+      rest = end < 0 ? '' : rest.slice(end + 1);
+    } else if (rest.startsWith('/*')) {
+      const end = rest.indexOf('*/', 2);
+      rest = end < 0 ? '' : rest.slice(end + 2);
+    } else {
+      return rest;
+    }
+  }
+}
 
 describe('the check at start', () => {
   const dir = mkdtempSync(join(tmpdir(), 'bun-floor-'));
@@ -74,6 +91,9 @@ describe('the check at start', () => {
     const notice = checkBunFloor(pkg, (line) => lines.push(line));
     expect(lines).toEqual([notice!]);
     expect(notice).toStartWith(`[host] connectome-host 9.9.9 needs Bun >=99.0.0 (engines.bun in its package.json), and this is Bun ${process.versions.bun}.`);
+    // A version that isn't a string isn't named.
+    const odd = checkBunFloor(pkgAt('odd.json', JSON.stringify({ version: 5, engines: { bun: '>=99.0.0' } })), () => {});
+    expect(odd).toStartWith('[host] connectome-host needs Bun >=99.0.0');
   });
 
   test('prints nothing when this Bun meets the floor, or the package.json is missing or not JSON', () => {
@@ -87,33 +107,59 @@ describe('the check at start', () => {
   });
 });
 
-describe('a TUI start under a Bun below the floor', () => {
-  // test/mock-tui-bun-floor-child.ts gives the check Bun 1.3.14 before it
-  // loads, and starts runTui with a saved session longer than its view.
-  test("prints the warning once as the check loads, and the TUI's first view shows it below the history", async () => {
-    const pkg = JSON.parse(readFileSync(HOST_PACKAGE_JSON, 'utf-8'));
-    const expected = bunFloorWarning(pkg.engines, '1.3.14', pkg.version)!;
+describe('a TUI start', () => {
+  // test/mock-tui-bun-floor-child.ts gives the check the Bun version it's
+  // given before it loads, and starts runTui with a saved session longer than
+  // its view. Its own watchdog ends a hang at 20 s; this kills it at 25.
+  async function startTui(bun: string) {
     const dir = realpathSync(mkdtempSync(join(tmpdir(), 'bun-floor-tui-')));
+    const child = Bun.spawn([process.execPath, join(import.meta.dir, 'mock-tui-bun-floor-child.ts'), bun], {
+      cwd: dir, env: { ...process.env, DATA_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+    });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 25000);
     try {
-      const child = Bun.spawn([process.execPath, join(import.meta.dir, 'mock-tui-bun-floor-child.ts'), '1.3.14'], {
-        cwd: dir, env: { ...process.env, DATA_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
-      });
       const [stdout, stderr, code] = await Promise.all([
         new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
       ]);
       expect(stdout).not.toContain('TUI_ERROR');
       expect(code).toBe(0);
-      // The check's own call at load, with its defaults: the host's
-      // package.json, and console.warn to stderr.
-      expect(stderr.split('\n').filter(line => line.startsWith('[host] '))).toEqual([expected]);
       const frame: string = JSON.parse(stdout.match(/TUI_FRAME ([^\n]*)/)![1]!);
-      // The view keeps to its bottom: the history's start is out of sight,
-      // and the warning, wrapped, is in it.
-      expect(frame).not.toContain('history 01');
-      expect(frame).toContain(`[host] connectome-host ${pkg.version} needs Bun ${pkg.engines.bun} (engines.bun`);
-      expect(frame).toContain('start the host again.');
+      return { warnings: stderr.split('\n').filter((line) => line.startsWith('[host] ')), lines: frame.split('\n') };
     } finally {
+      clearTimeout(timer);
       rmSync(dir, { recursive: true, force: true });
     }
+  }
+  const hostPackage = () => JSON.parse(readFileSync(HOST_PACKAGE_JSON, 'utf-8'));
+  const END = '── end history ──';
+
+  test("under a Bun below the floor: the warning once as the check loads, and in the TUI's view below the history", async () => {
+    const pkg = hostPackage();
+    const expected = bunFloorWarning(pkg.engines, '1.3.14', pkg.version);
+    // What this test needs: Bun 1.3.14 below the host's floor.
+    expect(expected).not.toBeNull();
+    const { warnings, lines } = await startTui('1.3.14');
+    // The check's own call at load, with its defaults: the host's
+    // package.json, and console.warn to stderr.
+    expect(warnings).toEqual([expected!]);
+    // The view keeps to its bottom: the history's start is out of sight,
+    // its last message and its end are in it, and the warning, wrapped,
+    // comes right after.
+    expect(lines.join('\n')).not.toContain('history 01');
+    expect(lines.some((line) => line.startsWith('history 50'))).toBe(true);
+    const end = lines.findIndex((line) => line.startsWith(END));
+    expect(end).toBeGreaterThanOrEqual(0);
+    expect(lines[end + 1]).toStartWith(`[host] connectome-host ${pkg.version} needs Bun ${pkg.engines.bun} (engines.bun`);
+    expect(lines.slice(end + 1).join(' ')).toContain('start the host again.');
+  }, 30000);
+
+  test('under a Bun at the floor: no warning, and nothing added after the history', async () => {
+    const floor = /^>=(\d+\.\d+\.\d+)$/.exec(hostPackage().engines.bun)![1]!;
+    const { warnings, lines } = await startTui(floor);
+    expect(warnings).toEqual([]);
+    // The history's end is the view's last line, right above the status bar.
+    const end = lines.findIndex((line) => line.startsWith(END));
+    expect(end).toBeGreaterThanOrEqual(0);
+    expect(lines[end + 1]).toContain('idle]');
   }, 30000);
 });
