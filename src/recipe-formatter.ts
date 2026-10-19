@@ -39,9 +39,9 @@ export function recipeFormatter(
  * through one formatter, so a subagent takes it whatever its own prompt or
  * model. Under a recipe whose agent has a prompt, a subagent spawned or forked
  * with an empty one has the tools alone as its system text, so membrane opens
- * its requests with `[Start]` where it would have given the CLI-simulation
- * frame. That's meant: a task subagent works without the frame, which exists
- * for a prefill-era agent's own transcript.
+ * its requests with its [Start] marker where it would have given the
+ * CLI-simulation frame. That's meant: a task subagent works without the
+ * frame, which exists for a prefill-era agent's own transcript.
  */
 export function xmlToolsInSystem(recipe: Recipe, model: string): boolean {
   return recipe.agent.systemPrompt !== '' && resolvePromptCaching(recipe, model) !== false;
