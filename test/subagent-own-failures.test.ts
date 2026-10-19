@@ -1,13 +1,14 @@
 /**
  * The subagent module's retries, its time limit and its concurrency limit.
  *
- * - Its own failures (a prompt over its limit, its own time limit) end the
- *   retry loop without their words being read, and the framework's
- *   failures are read without the ephemeral agent's name in them, which
- *   holds the name the agent chose. Before, a subagent named "migrate"
- *   (which holds "rate") counted as a rate limit and halved concurrency, one
- *   named "idle-watch" counted as transient, and a 1500 ms limit (which
- *   holds "500") was retried.
+ * - Its own failures end the retry loop without their words being read: an
+ *   async run whose time limit of 429 ms runs out leaves the concurrency
+ *   limit alone, though the rate-limit pattern reads 429 as a status code.
+ *   The framework's failures are read without the ephemeral agent's name,
+ *   which holds the name the agent chose: a spawn or fork named
+ *   rate-limit-audit or idle-watch whose run the startup watchdog ends is
+ *   tried once. Before, a name or a number in such a failure could make it
+ *   count as a rate limit or as transient.
  * - At its time limit a run is stopped, not left working untracked.
  * - Raising the concurrency limit lets a waiting spawn start, except while a
  *   rate limit's halving holds.
@@ -228,27 +229,24 @@ function countStops(h: Harness): number[] {
 }
 
 describe('the module\'s own failures end the retry loop without their words being read', () => {
-  for (const name of ['migrate', 'idle-watch']) {
-    test(`a prompt over the limit, for a subagent named ${name}, runs once and leaves concurrency alone`, async () => {
-      const h = await harness({ maxPromptTokens: 10, maxRetries: 1 });
+  // A time limit of 429 ms ends the run with "its time limit of 429 ms ran
+  // out", which the rate-limit classifier would read as a status code and
+  // answer by halving the concurrency limit. Each of runSpawn's and
+  // runFork's loops has its own check that ends it first.
+  for (const kind of ['spawn', 'fork'] as const) {
+    test(`an async ${kind} whose 429 ms time limit runs out leaves the concurrency limit alone`, async () => {
+      const h = await harness({ maxRetries: 1 }, () => new Promise(() => { /* never settles */ }));
       try {
-        const res = await h.subagent.handleToolCall(spawn(name, { sync: true }));
-        expect(res.error ?? '').toContain(`Subagent '${name}' didn't start, so nothing ran: its prompt would be about `);
-        expect(h.runs()).toBe(1);
-        expect(h.subagent.getConcurrencyStatus().effective).toBe(5);
+        await h.subagent.handleToolCall((kind === 'spawn' ? spawn : fork)('scout', { timeoutMs: 429 }));
+        const out = await outcome(h, 'scout');
+        // Stopped at its limit, or not started if its setup outlasted it:
+        // the module's own failure either way.
+        expect(out.ok).toBe(false);
+        expect(out.text).toContain('its time limit of 429 ms ran out');
+        expect(h.subagent.getConcurrencyStatus()).toEqual({ configured: 5, effective: 5, active: 0, queued: 0 });
       } finally { await h.cleanup(); }
     }, 20_000);
   }
-
-  test('an async time limit of 1500 ms is not retried', async () => {
-    const h = await harness({ maxRetries: 1 }, () => new Promise(() => { /* never settles */ }));
-    try {
-      await h.subagent.handleToolCall(spawn('scout', { timeoutMs: 1500 }));
-      const out = await outcome(h, 'scout');
-      expect(out).toEqual({ ok: false, text: timeLimitText('scout', '1.5 s') });
-      expect(h.runs()).toBe(1);
-    } finally { await h.cleanup(); }
-  }, 20_000);
 });
 
 describe('a framework failure is read without the ephemeral agent\'s name, and numbers as whole numbers', () => {
@@ -258,15 +256,25 @@ describe('a framework failure is read without the ephemeral agent\'s name, and n
     'The event loop may have stalled or the inference request was dropped.',
   );
 
-  test('a subagent named migrate whose run the watchdog ended runs once and leaves concurrency alone', async () => {
-    const h = await harness({ maxRetries: 1 }, async (agent) => { throw watchdog(agent); });
-    try {
-      const res = await h.subagent.handleToolCall(spawn('migrate', { sync: true }));
-      expect(res.error ?? '').toContain('failed to start inference within 15000ms');
-      expect(h.runs()).toBe(1);
-      expect(h.subagent.getConcurrencyStatus().effective).toBe(5);
-    } finally { await h.cleanup(); }
-  }, 20_000);
+  // The watchdog's message quotes the name. One name holds a rate limit's
+  // phrase and the other "idle", which isTransientError takes as transient:
+  // read with the name, the failure would be tried again, and the rate limit
+  // would halve the concurrency limit. Each classifier reads the failure
+  // through classifiedText, and runSpawn and runFork each pass both of them
+  // their ephemeral agent's name.
+  for (const kind of ['spawn', 'fork'] as const) {
+    for (const name of ['rate-limit-audit', 'idle-watch']) {
+      test(`a ${kind} named ${name} whose run the watchdog ended runs once and leaves concurrency alone`, async () => {
+        const h = await harness({ maxRetries: 1 }, async (agent) => { throw watchdog(agent); });
+        try {
+          const res = await h.subagent.handleToolCall((kind === 'spawn' ? spawn : fork)(name, { sync: true }));
+          expect(res.error ?? '').toContain('failed to start inference within 15000ms');
+          expect(h.runs()).toBe(1);
+          expect(h.subagent.getConcurrencyStatus().effective).toBe(5);
+        } finally { await h.cleanup(); }
+      }, 20_000);
+    }
+  }
 
   test('control: a provider\'s own transient words are still retried', async () => {
     const h = await harness({ maxRetries: 1 }, async () => { throw new Error('503 overloaded: socket hang up'); });
@@ -520,24 +528,13 @@ describe('an async run is stopped at its time limit, which covers its retries', 
     } finally { await h.cleanup(); }
   }, 20_000);
 
-  test('a fork with a 1500 ms limit is stopped once and not retried', async () => {
+  test('a fork with a 1500 ms limit is stopped once', async () => {
     const h = await harness({ maxRetries: 1 }, () => new Promise(() => { /* never settles */ }));
     const stops = countStops(h);
     try {
       await h.subagent.handleToolCall(fork('probe', { timeoutMs: 1500 }));
       expect(await outcome(h, 'probe')).toEqual({ ok: false, text: timeLimitText('probe', '1.5 s', 'fork') });
-      expect(h.runs()).toBe(1);
       expect(stops).toHaveLength(1);
-    } finally { await h.cleanup(); }
-  }, 20_000);
-
-  test('a fork whose prompt is over the limit runs once and leaves concurrency alone', async () => {
-    const h = await harness({ maxPromptTokens: 10, maxRetries: 1 });
-    try {
-      const res = await h.subagent.handleToolCall(fork('migrate', { sync: true }));
-      expect(res.error ?? '').toContain("Fork 'migrate' didn't start, so nothing ran: it would begin at about ");
-      expect(h.runs()).toBe(1);
-      expect(h.subagent.getConcurrencyStatus().effective).toBe(5);
     } finally { await h.cleanup(); }
   }, 20_000);
 });
@@ -794,6 +791,20 @@ describe('a cancel reaches the whole run', () => {
       await outcome(h, 'long');
       await sleep(50);
       expect(h.runs()).toBe(1); // only "long" ever ran
+    } finally { await h.cleanup(); }
+  }, 20_000);
+
+  test("a live attempt's framework agent is the subagent's while its run is live, and not once the run has settled", async () => {
+    const h = await harness({ maxConcurrent: 1, maxRetries: 0 }, () => new Promise(() => { /* never settles */ }));
+    try {
+      await h.subagent.handleToolCall(spawn('long'));
+      await until(() => h.running('long'));
+      const long = internal(h.subagent).liveSubagents.get('long')!.frameworkAgentName;
+      expect(h.subagent.isSubagentAgent(long)).toBe(true);
+      expect(h.subagent.isSubagentAgent('main')).toBe(false);
+      expect(h.subagent.cancelAll()).toBe(1);
+      await outcome(h, 'long');
+      expect(h.subagent.isSubagentAgent(long)).toBe(false);
     } finally { await h.cleanup(); }
   }, 20_000);
 

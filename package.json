@@ -18,7 +18,7 @@
     "start": "bun src/index.ts",
     "dev": "bun --watch src/index.ts",
     "test": "bun test",
-    "preversion": "node scripts/release-holds.mjs",
+    "preversion": "node scripts/release-bump.mjs && node scripts/release-holds.mjs",
     "version": "bun scripts/release-changelog.ts && git add CHANGELOG.md changelog.d",
     "prepack": "node scripts/pack-contents.mjs",
     "prepublishOnly": "node scripts/release-holds.mjs",

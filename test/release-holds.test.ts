@@ -20,6 +20,8 @@ const SCRIPT = fileURLToPath(
 );
 const PACK_CONTENTS = fileURLToPath(new URL("../scripts/pack-contents.mjs", import.meta.url));
 const PACKAGE_JSON = fileURLToPath(new URL("../package.json", import.meta.url));
+// preversion runs the bump check before the hold check.
+const BUMP = fileURLToPath(new URL("../scripts/release-bump.mjs", import.meta.url));
 
 interface Seen {
   url: string;
@@ -101,6 +103,7 @@ function wiredProject(): string {
   });
   mkdirSync(join(dir, "scripts"));
   copyFileSync(SCRIPT, join(dir, "scripts", "release-holds.mjs"));
+  copyFileSync(BUMP, join(dir, "scripts", "release-bump.mjs"));
   copyFileSync(PACK_CONTENTS, join(dir, "scripts", "pack-contents.mjs"));
   writeFileSync(join(dir, ".npmrc"), "");
   mkdirSync(join(dir, "dist", "web"), { recursive: true });

@@ -25,6 +25,7 @@ import { AgentFramework, KnowledgeStrategy } from '@animalabs/agent-framework';
 import type { Module, ToolCall, AgentConfig } from '@animalabs/agent-framework';
 import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
 import { recipeFormatter } from '../src/recipe-formatter.js';
+import type { Recipe } from '../src/recipe.js';
 import {
   SubagentModule, type SubagentModuleConfig, type SubagentLaunch, agentSettingsOf, describeSubagentStart, toolDifferences, undeliveredLaunchParts,
 } from '../src/modules/subagent-module.js';
@@ -1372,10 +1373,13 @@ describe('what a stream first reads is what its launch promises', () => {
       storePath: join(dir, 'store'),
       // Built as the host builds a recipe's formatter, so anthropic-xml runs
       // in XML tool mode: membrane would otherwise pick native tools for it.
+      // The recipe's agent has the parent's prompt and caching, so an
+      // anthropic-xml agent's tools go into its system block.
       membrane: new Membrane(adapter, {
         formatter: recipeFormatter(
-          opts.formatter === 'anthropic-xml' ? 'anthropic-xml' : undefined,
+          { agent: { systemPrompt: 'p', ...(opts.formatter === 'anthropic-xml' ? { formatter: 'anthropic-xml' } : {}) } } as unknown as Recipe,
           opts.formatter === 'openai-responses' ? 'openai-responses' : 'mock',
+          'mock',
         ),
       }),
       agents: [{ name: 'parent', model: 'mock', systemPrompt: 'p', maxTokens: 256, ...(opts.parentTools ? { allowedTools: opts.parentTools } : {}) }],

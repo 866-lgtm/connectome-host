@@ -35,10 +35,13 @@
  *
  * Requires the workspace module: the configured path is a mount-prefixed
  * workspace path ("<mountName>/<relativePath>"). validateRecipe enforces the
- * pairing. The file is read through WorkspaceModule.readFileFromDisk, which
- * refuses a file that is itself a link unless its mount follows links (a
- * recipe's mounts don't), and reads a file only if its canonical path lies
- * inside the mount, which it checks after opening the file.
+ * pairing. The file is read through WorkspaceModule.readFileFromDisk, which,
+ * unless its mount follows links (off unless the recipe sets
+ * followSymlinks), refuses a file that is itself a link and, from
+ * agent-framework's release with anima-research/agent-framework#468, one
+ * reached through a linked directory too, and reads a file only if its
+ * canonical path lies inside the mount, which it checks after opening the
+ * file.
  *
  * Reads ask readFileFromDisk for at most maxBytes. At 0.22.2 that holds for
  * a file larger than maxBytes when the read starts, but a file that grows
@@ -335,14 +338,27 @@ export class InstructionsModule implements Module {
   private reasonFor(error: unknown): string {
     const code = (error as { code?: unknown } | null)?.code;
     if (code === 'symlink') return `"${this.path}" is a link, which its mount doesn't follow: put the file itself at that path`;
-    // The read refuses a file that is itself a link before it checks where
-    // the file lies, and a recipe's mounts don't follow links, so an escape
-    // comes from a linked directory on the path that leads out of the mount:
-    // a file put "at that path" would go through it.
+    // On a mount that doesn't follow links, a recipe's default, the read
+    // refuses a file that is itself a link before it checks where the file
+    // lies, so an escape comes from a linked directory on the path. On one
+    // that follows them (`followSymlinks`), the file itself can be the link
+    // that leads out. Either way a file put "at that path" would still go
+    // through the link, so the remedy is to move it.
     if (code === 'escape') {
-      return `"${this.path}" lies outside its mount, through a linked directory on its path: move the file ` +
-        'into the mount, out from behind that link';
+      return `"${this.path}" leads outside its mount through a link, the file itself or a directory on its path: ` +
+        'move the file into the mount, so that neither it nor a directory on its path is a link that leads out';
     }
+    // Any other code is given in the read's own words, which name the path
+    // or, for a mount that's unavailable, the mount.
+    // That includes `parent_symlink`, from agent-framework's release with
+    // anima-research/agent-framework#468, for a link among the path's
+    // directories that leads neither out of the mount nor into a nested
+    // mount's directory: its message names the link and, where it leads
+    // somewhere, its target, and for a linked directory the mount's
+    // followSymlinks setting, so a remedy of the host's own would be wrong
+    // for some of them. It includes `other_mount` too, for a path in, or
+    // reached through a link into, a nested mount's directory, whose message
+    // names that mount and the path to use there.
     return error instanceof Error ? error.message : String(error);
   }
 

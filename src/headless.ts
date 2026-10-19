@@ -31,6 +31,7 @@ import type { AppContext } from './index.js';
 import { type IncomingCommand, matchesSubscription } from './modules/fleet-types.js';
 import { AgentTreeReducer } from './state/agent-tree-reducer.js';
 import { takeRecipeWarnings } from './recipe.js';
+import { workspaceReadFields } from './workspace-read-result.js';
 
 // ---------------------------------------------------------------------------
 // Local types
@@ -401,7 +402,7 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
       }
       case 'request-workspace-file': {
         const mod = app.framework.getAllModules().find((m) => m.name === 'workspace') as
-          | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+          | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; structured?: unknown; error?: string }> }
           | undefined;
         if (!mod) {
           reply({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: 'workspace module not loaded' });
@@ -416,7 +417,7 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
             reply({ type: 'workspace-file-snapshot', corrId: cmd.corrId, path: cmd.path, totalLines: 0, fromLine: 1, toLine: 0, content: '', truncated: false, error: result.error ?? 'read failed' });
             return;
           }
-          const data = (result.data ?? {}) as { path?: string; totalLines?: number; fromLine?: number; toLine?: number; content?: string };
+          const data = workspaceReadFields(result);
           const totalLines = data.totalLines ?? 0;
           const toLine = data.toLine ?? totalLines;
           reply({

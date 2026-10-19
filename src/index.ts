@@ -31,7 +31,7 @@ import {
   OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
-import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { LoggingAnthropicAdapter, offPathRefusalAlert } from './logging-adapter.js';
 import { recipeFormatter } from './recipe-formatter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
@@ -67,6 +67,7 @@ import { InstructionsModule } from './modules/instructions-module.js';
 import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
 import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
+import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
 import { resolveAgentName } from './agent-name.js';
@@ -77,6 +78,9 @@ import {
   loadRecipeDetailed,
   saveRecipe,
   loadSavedRecipe,
+  SavedRecipeDirectoryError,
+  savedRecipeDirectory,
+  savedRecipePath,
   clearSavedRecipe,
   parseRecipeArg,
   deprecatedConversationsNotices,
@@ -161,23 +165,33 @@ async function resolveRecipe(): Promise<Recipe> {
   const { source, noRecipe } = parseRecipeArg(process.argv);
 
   if (noRecipe) {
-    clearSavedRecipe(config.dataDir);
+    try {
+      clearSavedRecipe(config.dataDir);
+    } catch (err) {
+      stopAtSavedRecipe('clear the saved recipe', err);
+    }
     console.log('Starting with default recipe.');
     return DEFAULT_RECIPE;
   }
 
   if (source) {
+    let loaded: Awaited<ReturnType<typeof loadRecipeDetailed>>;
     try {
-      // Save the unresolved (pre-substitution) form: $DATA_DIR is typically
-      // host-mounted and backed up, so resolved secrets must never land there.
-      const { recipe, persistable } = await loadRecipeDetailed(source);
-      saveRecipe(config.dataDir, persistable);
-      console.log(`Loaded recipe: ${recipe.name}${recipe.description ? ` — ${recipe.description}` : ''}`);
-      return recipe;
+      loaded = await loadRecipeDetailed(source);
     } catch (err) {
       console.error(`Failed to load recipe from ${source}:`, err instanceof Error ? err.message : err);
       process.exit(1);
     }
+    try {
+      // Save the unresolved (pre-substitution) form: $DATA_DIR is typically
+      // host-mounted and backed up, so resolved secrets must never land there.
+      saveRecipe(config.dataDir, loaded.persistable);
+    } catch (err) {
+      stopAtSavedRecipe('save the recipe to', err);
+    }
+    const { recipe } = loaded;
+    console.log(`Loaded recipe: ${recipe.name}${recipe.description ? ` — ${recipe.description}` : ''}`);
+    return recipe;
   }
 
   // Try saved recipe. Re-resolves ${VAR} references against the CURRENT
@@ -191,13 +205,36 @@ async function resolveRecipe(): Promise<Recipe> {
     }
   } catch (err) {
     console.error(
-      `Failed to resume saved recipe from ${config.dataDir}:`,
+      `Failed to resume the saved recipe ${savedRecipePath(config.dataDir)}:`,
       err instanceof Error ? err.message : err,
     );
+    console.error(err instanceof SavedRecipeDirectoryError
+      ? SAVED_RECIPE_DIRECTORY_LINE
+      : 'Fix what it names (the file, or a variable missing from the environment), start with a recipe file to replace it, or start with --no-recipe to clear it.');
     process.exit(1);
   }
 
   return DEFAULT_RECIPE;
+}
+
+/** What a directory at the saved recipe's path needs; nothing the host does replaces one. */
+const SAVED_RECIPE_DIRECTORY_LINE =
+  'Move or remove it, then start again: the host saves its recipe there as a file, so the source of a bind mount there has to be a file that exists before the container starts.';
+
+/**
+ * Stop startup on a failure to save or clear the saved recipe, naming its
+ * path, and saying so where the cause is a directory there: a save fails with
+ * EISDIR, and a clear with ERR_FS_EISDIR, when a directory there is what
+ * stopped it, itself or (for a save) through a link. Any other failure, such
+ * as a clear of a link in a data directory the host can't write, prints its
+ * own error.
+ */
+function stopAtSavedRecipe(failedTo: string, err: unknown): never {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  const directory = code === 'EISDIR' || code === 'ERR_FS_EISDIR' ? savedRecipeDirectory(config.dataDir) : null;
+  console.error(`Failed to ${failedTo} ${savedRecipePath(config.dataDir)}:`, directory ?? (err instanceof Error ? err.message : err));
+  if (directory !== null) console.error(SAVED_RECIPE_DIRECTORY_LINE);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -812,55 +849,13 @@ async function runPiped(app: AppContext) {
   const { createInterface } = await import('node:readline');
   const { handleCommand } = await import('./commands.js');
 
-  let inferenceResolve: (() => void) | null = null;
-
-  app.framework.onTrace((event) => {
-    const e = event as unknown as Record<string, unknown>;
-    switch (event.type) {
-      case 'inference:started':
-        process.stdout.write('\n');
-        break;
-      case 'inference:tokens': {
-        const content = e.content as string;
-        if (content) process.stdout.write(content);
-        break;
-      }
-      case 'inference:completed':
-        process.stdout.write('\n');
-        inferenceResolve?.();
-        inferenceResolve = null;
-        break;
-      case 'inference:failed':
-        console.error(`\nError: ${e.error}`);
-        inferenceResolve?.();
-        inferenceResolve = null;
-        break;
-      case 'inference:tool_calls_yielded': {
-        const calls = e.calls as Array<{ name: string }>;
-        console.log(`\n[tools] ${calls.map(c => c.name).join(', ')}`);
-        break;
-      }
-      case 'tool:started': {
-        const toolInput = e.input ? JSON.stringify(e.input) : '';
-        const truncated = toolInput.length > 120 ? toolInput.slice(0, 120) + '...' : toolInput;
-        console.log(`[tool] ${e.tool}${truncated ? ' ' + truncated : ''}`);
-        break;
-      }
-    }
+  const turns = createPipedTurns(app.agentName, {
+    write: (text) => { process.stdout.write(text); },
+    log: (line) => { console.log(line); },
+    error: (line) => { console.error(line); },
   });
-
-  function waitForInference(): Promise<void> {
-    return new Promise(resolve => {
-      // The timer only caps the wait. Clear it once the inference settles:
-      // a pending 120 s timer held the event loop open, so a batch run sat
-      // for two minutes after `Done.` before the process exited.
-      const timer = setTimeout(() => {
-        if (inferenceResolve === settle) { inferenceResolve = null; resolve(); }
-      }, 120_000);
-      const settle = (): void => { clearTimeout(timer); resolve(); };
-      inferenceResolve = settle;
-    });
-  }
+  const traces = traceFollower((event) => turns.onTrace(event as { type: string; [key: string]: unknown }));
+  traces.follow(app.framework);
 
   async function processLine(line: string): Promise<boolean> {
     const trimmed = line.trim();
@@ -876,7 +871,8 @@ async function runPiped(app: AppContext) {
         }
       }
       if (result.switchToSessionId) {
-        await app.switchSession(result.switchToSessionId);
+        const sessionId = result.switchToSessionId;
+        await switchFollowing(traces, () => app.switchSession(sessionId), () => app.framework);
         console.log('Session switched.');
       }
     } else {
@@ -884,7 +880,7 @@ async function runPiped(app: AppContext) {
         type: 'external-message', source: 'cli',
         content: trimmed, metadata: {}, triggerInference: true,
       });
-      await waitForInference();
+      await turns.waitForTurn();
     }
     return false;
   }
@@ -1267,7 +1263,7 @@ async function main() {
     // gives generic retryable errors — e.g. a gateway 502 — zero retries; only
     // 529/overloaded_error has a dedicated schedule.
     ...(recipe.agent.retry ? { retry: recipe.agent.retry } : {}),
-    formatter: recipeFormatter(recipe.agent.formatter, provider),
+    formatter: recipeFormatter(recipe, provider, resolveModel(recipe)),
     // Caching default for internal callers (autobio compression,
     // executeMerge), which read Membrane's defaultPromptCaching rather
     // than the per-agent flag. Applies on EVERY provider whenever the
@@ -1315,7 +1311,7 @@ async function main() {
     : null;
   credentialsRef = credentials;
   if (credentials && (adapter instanceof LoggingAnthropicAdapter || adapter instanceof LoggingProviderAdapter)) {
-    adapter.onProviderError = (error) => credentials.observeError(error);
+    adapter.onProviderError = (error: unknown) => credentials.observeError(error);
     adapter.onProviderSuccess = () => credentials.observeSuccess();
   }
 
@@ -1370,13 +1366,8 @@ async function main() {
       const fw = app.framework as unknown as {
         notifyOpsAlert?: (kind: string, agent: string, msg: string, data?: Record<string, unknown>) => void;
       };
-      fw.notifyOpsAlert?.(
-        'refusal-offpath',
-        app.agentName,
-        `off-path refusal (category=${info.category ?? 'unknown'}) on a ${info.messages}-message ` +
-          `complete() call (~${Math.round(info.inputTokens / 1000)}k tok) — likely compression/summarizer`,
-        { ...info },
-      );
+      const alert = offPathRefusalAlert(info);
+      fw.notifyOpsAlert?.(alert.kind, app.agentName, alert.message, alert.data);
     };
   }
 

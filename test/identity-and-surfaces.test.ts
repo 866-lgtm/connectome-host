@@ -18,6 +18,13 @@ import { IdentityError, IdentityModule } from '../src/modules/identity-module.ts
 import { McplAdminModule } from '../src/modules/mcpl-admin-module.ts';
 import { ObserversModule } from '../src/modules/observers-module.ts';
 
+// agent-framework's code for a link among a path's directories that stays
+// inside the mount, from its release with anima-research/agent-framework#468.
+const PARENT_SYMLINK = 'parent_symlink' as WorkspaceReadError['code'];
+// anima-research/agent-framework#460's code for a path in another mount's
+// directory nested in the one named.
+const OTHER_MOUNT = 'other_mount' as WorkspaceReadError['code'];
+
 const REQUEST_BODY_MAX_FOR_TEST = 256 * 1024;
 
 // Temporary directories and stores a test makes are removed after it, passed
@@ -791,12 +798,16 @@ describe('identity: what the agent reads when a call fails', () => {
     expect(seen.orrery).toBe(0);
   });
 
-  // Every saveAs form agent-framework's own write accepts goes out and is
-  // saved, and every form it would refuse is refused before anything is
-  // sent: none goes out only to have its answer lost. Each form is also
-  // written straight through the workspace's write, so the two verdicts are
-  // compared form by form.
-  it("sends every saveAs the workspace's write accepts, and nothing it would refuse", async () => {
+  // Every saveAs form without a "." or ".." part after its mount's name that
+  // agent-framework's own write accepts goes out and is saved, and every form
+  // it would refuse is refused before anything is sent: none goes out only to
+  // have its answer lost. Each of those forms is also written straight
+  // through the workspace's write, so the two verdicts are compared form by
+  // form. A form with such a part the host refuses itself, naming the plain
+  // path: agent-framework 0.22.2's write refuses such a path, and its release
+  // with anima-research/agent-framework#536 reads one that stays in the mount
+  // as the plain path it names.
+  it('sends every saveAs without a "." or ".." part after its mount\'s name that the workspace\'s write accepts, and nothing it would refuse', async () => {
     const dir = tempDir('ident-saveas-');
     mkdirSync(join(dir, 'files'));
     mkdirSync(join(dir, 'docs'));
@@ -811,19 +822,23 @@ describe('identity: what the agent reads when a call fails', () => {
     workspace.initStore(store);
     const { mod, ready, seen } = registeredModule({ workspace });
     await ready;
-    // Each form names a file no other form does, so no form's save decides another's.
+    // No two forms the host sends name the same file, so no form's save decides another's.
     const forms = [
       'files/out.json', 'files/sub/out.json', 'files/end.json/', 'files/twice//slash.json', 'files/dir/', 'files/a//b/c.json',
       'files/ends.json//', 'files/./out.json', 'files/sub/../out.json', 'files/sub/./out.json', 'files//out.json',
       'files/../out.json', 'files/', 'files', '/files/out.json', './files/out.json', 'nope/out.json', 'docs/out.json',
       'FILES/out.json', 'files//', `files/${join(dir, 'files')}/inside.json`,
     ];
+    const dotted = (form: string) => form.split('/').slice(1).some((part) => part === '.' || part === '..');
     const outcomes: Record<string, string> = {};
+    const reasons: Record<string, string | undefined> = {};
     const writes: Record<string, string> = {};
     for (const saveAs of forms) {
       const before = seen.orrery;
       const res = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }));
       outcomes[saveAs] = res.success ? 'sent and saved' : seen.orrery === before ? 'not sent' : 'sent, answer lost';
+      reasons[saveAs] = res.error;
+      if (dotted(saveAs)) continue;
       // The workspace's own verdict on the same form, as its write gives it.
       try {
         const written = await workspace.writeBinary(saveAs, Buffer.from('{}'), 'application/json');
@@ -833,7 +848,13 @@ describe('identity: what the agent reads when a call fails', () => {
       }
     }
     expect(Object.values(outcomes)).not.toContain('sent, answer lost');
-    for (const form of forms) expect([form, outcomes[form] === 'sent and saved']).toEqual([form, writes[form] === 'accepted']);
+    for (const form of forms) {
+      if (dotted(form)) {
+        expect([form, outcomes[form], reasons[form]]).toEqual([form, 'not sent', expect.stringContaining(
+          `"${form}" has a "." or ".." in it, which the workspace can't save to; name the file by its plain path, such as "files/out.json".`,
+        )]);
+      } else expect([form, outcomes[form] === 'sent and saved']).toEqual([form, writes[form] === 'accepted']);
+    }
     expect(Object.keys(outcomes).filter((form) => outcomes[form] === 'sent and saved')).toEqual([
       'files/out.json', 'files/sub/out.json', 'files/end.json/', 'files/twice//slash.json', 'files/dir/', 'files/a//b/c.json',
       'files/ends.json//',
@@ -1654,14 +1675,22 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     expect(bodies).toEqual([]);
   });
 
-  // The link policy is the file's own; a directory on the path may be a link,
-  // and the read still sends only a file whose canonical path is in the mount.
+  // A directory on the path that links out of the mount: agent-framework
+  // 0.22.2 follows the link and refuses the file, whose canonical path lies
+  // outside, and its release with anima-research/agent-framework#468 refuses
+  // the link itself. Both say escape, in words of their own.
   it('refuses a file reached through a parent directory that links out of the mount', async () => {
-    const { dir, mountDir, outside, bodies, upload } = await mounted();
+    const { dir, mountDir, outside, workspace, bodies, upload } = await mounted();
     symlinkSync(outside, join(mountDir, 'out'));
+    const read = await workspace.readFileFromDisk('files/out/host-secret.txt').then(
+      () => null,
+      (err: WorkspaceReadError) => err,
+    );
+    expect(read?.code).toBe('escape');
     const res = await upload('files/out/host-secret.txt');
     expect(res.error).toContain('Nothing was sent to "orrery": "files/out/host-secret.txt" couldn\'t be read from disk');
-    expect(res.error).toContain('Symlink escape detected: files/out/host-secret.txt');
+    expect(res.error).toContain(read!.message.replace(/\.+$/, ''));
+    expect(res.error).toContain('It leads, through a link, outside this mount');
     expect(res.error).not.toContain(dir);
     expect(bodies).toEqual([]);
   });
@@ -1673,6 +1702,46 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     const res = await upload('files/album');
     expect(res.error).toContain('Nothing was sent to "orrery": "files/album" couldn\'t be read from disk');
     expect(res.error).toContain('Path is a directory: files/album');
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses a file in a nested mount's directory, and names the path to use", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/inner/x.txt', 'store bytes');
+    // As anima-research/agent-framework#460 reports a path in another mount's directory nested in the one named.
+    workspace.readFileFromDisk = async (path) => {
+      throw new WorkspaceReadError(
+        OTHER_MOUNT,
+        `"${path}" lies in mount "inner", nested in mount "files", which neither reads nor writes it: use "inner/x.txt".`,
+        'parse',
+      );
+    };
+    const res = await upload('files/inner/x.txt');
+    // The file is the nested mount's, so the outer mount's copy isn't sent
+    // or weighed, and the reason names the path to use.
+    expect(res.error).toBe('Nothing was sent to "orrery": "files/inner/x.txt" lies in mount "inner", nested in mount ' +
+      '"files", which neither reads nor writes it: use "inner/x.txt".');
+    expect(bodies).toEqual([]);
+  });
+
+  it("refuses a file reached through a link among its directories, and says what can be done", async () => {
+    const { workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/via/x.txt', 'store bytes');
+    // As agent-framework's release with anima-research/agent-framework#468
+    // reports a link among a path's directories that stays inside the mount.
+    workspace.readFileFromDisk = async (path) => {
+      throw new WorkspaceReadError(
+        PARENT_SYMLINK,
+        `${path}: "files/via" is a symlink to "files/real", which this mount does not follow; the mount's host can set followSymlinks: true`,
+        'readlink',
+      );
+    };
+    const res = await upload('files/via/x.txt');
+    expect(res.error).toContain('Nothing was sent to "orrery": "files/via/x.txt" couldn\'t be read from disk');
+    expect(res.error).toContain('"files/via" is a symlink to "files/real"');
+    expect(res.error).toContain('A directory on its path is a link, and this mount doesn\'t follow links. If the link ' +
+      'leads to a directory, which the reason shows by saying the mount\'s host can set followSymlinks, name the file ' +
+      'by its path there. Otherwise ask your operator');
     expect(bodies).toEqual([]);
   });
 
@@ -1724,10 +1793,20 @@ describe('identity request: fromFile reads only what the mount allows', () => {
   });
 
   it('refuses a path no mount holds, and one leading out of its mount, each with its own reason', async () => {
-    const { bodies, upload } = await mounted();
+    const { bodies, upload, workspace } = await mounted();
     expect((await upload('nope/grid.png')).error).toBe('Nothing was sent to "orrery": Unknown mount: "nope". Available: files.');
+    // A path that climbs out of its mount: agent-framework 0.22.2 says it
+    // "resolves outside mount", and its release with
+    // anima-research/agent-framework#536 says it "climbs above the root" of
+    // the mount. The upload passes on the read's own refusal.
+    const climb = await workspace.readFileFromDisk('files/../outside/host-secret.txt').then(
+      () => { throw new Error('agent-framework read a path that climbs out of its mount'); },
+      (err: WorkspaceReadError) => err,
+    );
+    expect(climb.code).toBe('traversal');
+    expect(climb.message).toStartWith('Path traversal detected: "files/../outside/host-secret.txt" ');
     expect((await upload('files/../outside/host-secret.txt')).error).toBe(
-      'Nothing was sent to "orrery": Path traversal detected: "files/../outside/host-secret.txt" resolves outside mount "files".',
+      `Nothing was sent to "orrery": ${climb.message.trim().replace(/\.+$/, '')}.`,
     );
     expect(bodies).toEqual([]);
   });
@@ -1752,6 +1831,30 @@ describe('identity request: fromFile reads only what the mount allows', () => {
     await putInStore('files/gone.txt', 'written through the workspace');
     expect((await upload('files/gone.txt')).success).toBe(true);
     expect(bodies.map(String)).toEqual(['written through the workspace']);
+  });
+
+  // A linked directory on the path that leads nowhere, on a mount that doesn't
+  // follow links: agent-framework 0.22.2 reads the path as one disk has no
+  // file at (not_found with ENOENT), so the workspace's copy stands in, and its
+  // release with anima-research/agent-framework#468 refuses the link as
+  // parent_symlink, so nothing is sent.
+  it('answers a path through a linked directory that leads nowhere as the mount\'s read does', async () => {
+    const { mountDir, workspace, putInStore, bodies, upload } = await mounted();
+    await putInStore('files/gone/x.txt', 'written through the workspace');
+    symlinkSync(join(mountDir, 'missing'), join(mountDir, 'gone'));
+    const read = await workspace.readFileFromDisk('files/gone/x.txt').then(
+      () => null,
+      (err: WorkspaceReadError) => err,
+    );
+    const res = await upload('files/gone/x.txt');
+    if (read?.code === 'not_found') {
+      expect(res.success).toBe(true);
+      expect(bodies.map(String)).toEqual(['written through the workspace']);
+    } else {
+      expect(read?.code).toBe(PARENT_SYMLINK);
+      expect(res.error).toContain(read!.message.replace(/\.+$/, ''));
+      expect(bodies).toEqual([]);
+    }
   });
 
   it("sends the workspace's copy where disk has no file: never materialized, under a file, a name disk can't hold, a gone mount", async () => {

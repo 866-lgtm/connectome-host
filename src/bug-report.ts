@@ -155,7 +155,7 @@ export const HOST_LOG_TAGS = new Set([
   'credential', 'credential-monitor', 'deprecated', 'diagnostics', 'discord', 'discord-awareness', 'echo',
   'estimator-calibration', 'fleet', 'framework', 'gate', 'gate-telemetry', 'heartbeat', 'host', 'host-command',
   'host-mode', 'host-notice', 'identity', 'image', 'inference-dropped', 'inference-failed',
-  'inference-hard-down', 'inference-refusal', 'inference-rewind', 'inference-stale',
+  'inference-hard-down', 'inference-refusal', 'inference-rewind', 'inference-stale', 'interrupt',
   'kv-continuity-relaxation', 'kv-diag', 'kv-escalation', 'kv-overlap', 'kv-timing', 'kv-unified',
   'lessons', 'liveness-watchdog', 'llm-calls', 'mcp', 'mcpl', 'membrane', 'membrane-oversize', 'membrane:bedrock',
   'membrane:content', 'membrane:cost', 'membrane:gemini', 'membrane:normalize-tool-pairs',
@@ -219,7 +219,7 @@ export interface ServerRow {
 
 export interface ProviderFailure {
   at: string;
-  kind: 'complete' | 'stream' | null;
+  kind: 'complete' | 'stream' | 'keepalive' | null;
   provider: string | null;
   status: number | null;
   type: string | null;
@@ -526,7 +526,7 @@ export function summarizeProviderCalls(
       : opts.fallbackProvider ?? null;
     failures.push({
       at: at.replace(/\.\d+Z$/, 'Z'),
-      kind: record.kind === 'complete' || record.kind === 'stream' ? record.kind : null,
+      kind: record.kind === 'complete' || record.kind === 'stream' || record.kind === 'keepalive' ? record.kind : null,
       provider,
       status,
       type: typeof record.errorType === 'string' && MEMBRANE_ERROR_TYPES.has(record.errorType) ? record.errorType : null,
