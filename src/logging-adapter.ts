@@ -2,8 +2,9 @@
 // response, and any error to a JSONL log file. Restores the Hermes-era
 // `llm-calls.<iso>.jsonl` visibility we lose on the connectome stack by
 // default. Successful calls keep a compact request summary; the full raw
-// request is retained only for refusals and errors, where forensic inspection
-// matters (a keepalive poke's only with full payloads: see below). Serializing the full raw + normalized request on every tool-loop
+// request is retained only for refusals, anomalous responses and errors,
+// where forensic inspection matters (a keepalive poke's only with full
+// payloads: see below). Serializing the full raw + normalized request on every tool-loop
 // turn previously created several simultaneous copies of a large context and
 // contributed to production OOMs.
 //
@@ -24,8 +25,8 @@
 // One file per process lifetime (timestamped at construction). Each line is a
 // JSON object with shape:
 //   { type: 'call'|'error', kind: 'complete'|'stream'|'keepalive', timestamp, durationMs,
-//     requestSummary, rawRequest?, rawResponse, error?, errorType?,
-//     httpStatus?, providerErrorCode?, retryable?, errorChars? }
+//     messageId?, requestId?, requestSummary, rawRequest?, rawResponse, anomaly?,
+//     error?, errorType?, httpStatus?, providerErrorCode?, retryable?, errorChars? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
 // a non-Error's text (logging-error-fields.ts). The request summary leaves
 // out only the parts it can't read; a record whose response can't be read
@@ -36,6 +37,19 @@
 // A keepalive row also carries `keepalive: { key, lane, startedAt }`: the
 // lineage it refreshed, its lane, and when its send began. It keeps the
 // replayed request only with full payloads on, whatever its outcome.
+//
+// A response row also carries, when the provider response exposes them,
+// `messageId` (the provider's message id) and `requestId` (the provider's
+// request id, the handle a provider needs to look a call up), so a call can
+// be reported upstream without its content.
+//
+// An anomalous response keeps its full raw request too, and its row carries
+// `anomaly` (see responseAnomaly) plus one timestamped stderr line, so the
+// call can be replayed and reported. Anomalous: a response holding a client
+// `tool_use` block whose stop reason is anything but 'tool_use' (the provider
+// asked for no tool round, so the call is dropped downstream: observed
+// 2026-10-19 as `end_turn` with a complete tool call), or one whose raw
+// response lists `anomalies` of its own.
 
 import { AnthropicAdapter, cacheLineageKey } from '@animalabs/membrane';
 import type {
@@ -115,6 +129,108 @@ function envFlag(value: string | undefined, name = 'LLM_CALLS_FULL_PAYLOADS'): b
     );
   }
   return false;
+}
+
+/** A response the provider shaped inconsistently, as its llm-calls row names it. */
+export interface ResponseAnomaly {
+  kind: 'tool_use_with_stop_reason' | 'provider_reported';
+  /** The stop reason the row's raw response carries. */
+  stopReason: string | null;
+  /** The provider's own terminal reason, before any default was applied:
+   *  null when the provider reported none (a defaulted `end_turn` then
+   *  reads as stopReason 'end_turn', providerStopReason null). Absent when
+   *  the response doesn't say. */
+  providerStopReason?: string | null;
+  /** Names of the response's client tool_use blocks, in order. */
+  toolNames: string[];
+  /** The raw response's own `anomalies` list, when it carries one. */
+  reported?: unknown[];
+}
+
+/**
+ * Whether a provider response is anomalous, and how. A client `tool_use`
+ * block under any stop reason but 'tool_use' is one: the caller runs tool
+ * rounds only on 'tool_use', so the call is lost. That includes `max_tokens`
+ * and `refusal` (a call cut off mid-input) as well as `end_turn`,
+ * `stop_sequence` and a missing reason, since a lost tool call is worth a
+ * replayable record whatever stopped it. Server-side tool blocks
+ * (`server_tool_use`) are not client calls and don't count. A raw response
+ * carrying a non-empty `anomalies` array (a provider adapter's own
+ * diagnosis) is one too. Reading never throws.
+ */
+export function responseAnomaly(response: unknown): ResponseAnomaly | undefined {
+  return guarded(() => {
+    const r = response as {
+      content?: unknown;
+      stopReason?: unknown;
+      providerStopReason?: unknown;
+      raw?: { content?: unknown; stop_reason?: unknown; anomalies?: unknown } | null;
+    } | null | undefined;
+    if (!r || typeof r !== 'object') return undefined;
+    const raw = r.raw && typeof r.raw === 'object' ? r.raw : undefined;
+    const blocks = Array.isArray(raw?.content) ? raw!.content as unknown[]
+      : Array.isArray(r.content) ? r.content as unknown[] : [];
+    const toolNames = blocks
+      .filter((b): b is { type: string; name?: unknown } =>
+        !!b && typeof b === 'object' && (b as { type?: unknown }).type === 'tool_use')
+      .map((b) => (typeof b.name === 'string' ? b.name : '?'));
+    const rawStop = raw && 'stop_reason' in raw ? raw.stop_reason : r.stopReason;
+    const stopReason = typeof rawStop === 'string' ? rawStop : null;
+    const reported = Array.isArray(raw?.anomalies) && (raw!.anomalies as unknown[]).length > 0
+      ? raw!.anomalies as unknown[] : undefined;
+    const mismatched = toolNames.length > 0 && stopReason !== 'tool_use';
+    if (!mismatched && !reported) return undefined;
+    const anomaly: ResponseAnomaly = {
+      kind: mismatched ? 'tool_use_with_stop_reason' : 'provider_reported',
+      stopReason,
+      toolNames,
+    };
+    if ('providerStopReason' in r) {
+      anomaly.providerStopReason = typeof r.providerStopReason === 'string' ? r.providerStopReason : null;
+    }
+    if (reported) anomaly.reported = reported;
+    return anomaly;
+  });
+}
+
+/** The provider's message id and request id, where the response exposes
+ *  them: membrane's raw response (the API message on complete(), whose
+ *  request id the SDK attaches as `_request_id`), or fields a provider
+ *  adapter adds (`request_id`, `requestId`). Each is a non-empty string or
+ *  absent. Reading never throws. */
+export function responseIds(response: unknown): { messageId?: string; requestId?: string } {
+  const out: { messageId?: string; requestId?: string } = {};
+  guarded(() => {
+    const r = response as { raw?: Record<string, unknown> | null; requestId?: unknown } | null | undefined;
+    const raw = r?.raw && typeof r.raw === 'object' ? r.raw : undefined;
+    const str = (v: unknown): string | undefined => (typeof v === 'string' && v.length > 0 ? v : undefined);
+    const messageId = str(raw?.id);
+    const requestId = str(raw?.request_id) ?? str(raw?.requestId) ?? str(raw?._request_id) ?? str(r?.requestId);
+    if (messageId) out.messageId = messageId;
+    if (requestId) out.requestId = requestId;
+  });
+  return out;
+}
+
+/** The one stderr line an anomalous call prints, timestamped so it can be
+ *  placed in an append-mode log that stamps nothing itself. */
+export function anomalyLogLine(
+  timestamp: string,
+  kind: 'complete' | 'stream',
+  model: unknown,
+  anomaly: ResponseAnomaly,
+  ids: { messageId?: string; requestId?: string },
+): string {
+  const provider = anomaly.providerStopReason === undefined ? ''
+    : ` (provider: ${anomaly.providerStopReason ?? 'none'})`;
+  const what = anomaly.kind === 'tool_use_with_stop_reason'
+    ? `tool_use with stop_reason=${anomaly.stopReason ?? 'none'}${provider}`
+    : `provider-reported (${anomaly.reported?.length ?? 0})`;
+  return `[llm-calls] ${timestamp} ANOMALY ${what} kind=${kind} model=${typeof model === 'string' ? model : '?'}`
+    + ` tools=${anomaly.toolNames.join(',') || '-'}`
+    + (ids.requestId ? ` request=${ids.requestId}` : '')
+    + (ids.messageId ? ` message=${ids.messageId}` : '')
+    + ' — full request kept in this call\'s llm-calls row';
 }
 
 /** What the off-path refusal dragnet hears of one refused call. */
@@ -474,10 +590,17 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     }
   }
 
-  private refusalRawRequest(response: ProviderResponse, rawRequest: unknown): unknown {
+  /** The raw request a successful call's row keeps: every call's with full
+   *  payloads on, otherwise a refusal's or an anomalous response's (see
+   *  responseAnomaly), the calls someone will need to replay or report. */
+  private retainedRawRequest(
+    response: ProviderResponse,
+    rawRequest: unknown,
+    anomaly: ResponseAnomaly | undefined = responseAnomaly(response),
+  ): unknown {
     if (this.fullPayloads) return rawRequest;
     const raw = (response as { raw?: { stop_reason?: string } }).raw;
-    return raw?.stop_reason === 'refusal' ? rawRequest : undefined;
+    return raw?.stop_reason === 'refusal' || anomaly ? rawRequest : undefined;
   }
 
   /** Wrap options to capture the raw provider request via the membrane
@@ -521,20 +644,30 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
       const errorFields = 'error' in outcome ? describeErrorObject(outcome.error, true) : undefined;
       const summary = this.requestSummary(request, rawRequest);
       const head = { type: errorFields ? 'error' : 'call', kind, timestamp, durationMs };
+      // Read once each; reading never throws.
+      const anomaly = 'response' in outcome ? responseAnomaly(outcome.response) : undefined;
+      const ids = 'response' in outcome ? responseIds(outcome.response) : {};
       let record: Record<string, unknown>;
       try {
         record = 'response' in outcome
           ? {
               ...head,
+              ...ids,
               requestSummary: summary,
-              rawRequest: this.refusalRawRequest(outcome.response, rawRequest),
+              rawRequest: this.retainedRawRequest(outcome.response, rawRequest, anomaly),
               rawResponse: (outcome.response as { raw?: unknown }).raw ?? null,
+              ...(anomaly ? { anomaly } : {}),
             }
           : { ...head, requestSummary: summary, rawRequest, ...errorFields };
       } catch {
         record = { ...head, summaryUnavailable: true, ...errorFields };
       }
       this.log(record);
+      if (anomaly) {
+        try {
+          console.error(anomalyLogLine(timestamp, kind, summary.model, anomaly, ids));
+        } catch { /* never throw from logging */ }
+      }
       try {
         const error = errorFields?.error;
         const errorText = error === undefined ? undefined
