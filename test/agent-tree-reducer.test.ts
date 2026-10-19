@@ -85,19 +85,22 @@ describe('AgentTreeReducer', () => {
     expect(node.completedAt).toBe(ts(1));
   });
 
-  test('inference:exhausted from in-band stream abort also produces cancelled (P1 #3)', () => {
-    // Postmortem 2026-05-28 F1: AF used to emit inference:exhausted for
-    // budget-restart / stream-side cancel paths. Same semantics as aborted —
-    // benign termination, not a fault. AF PR #55 (≥ 0.6.5) suppresses the
-    // endTurn/budget-restart cases at the source, but genuine cancels and
-    // reboot-induced exhausted still arrive, and the mapping must keep
-    // handling streams from older AF.
+  test('inference:exhausted ends a node as failed, after a failure and alone', () => {
+    // From agent-framework 0.22.3 a stop and a shutdown end a turn with
+    // inference:aborted alone, so exhausted means the turn failed for good:
+    // its retries were spent, or its stream was aborted for another reason.
     const r = new AgentTreeReducer();
     r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
-    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'budget', timestamp: ts(1) });
-    const node = r.getNode('a')!;
-    expect(node.phase).toBe('cancelled');
-    expect(node.status).toBe('cancelled');
+    r.applyEvent({ type: 'inference:failed', agentName: 'a', error: 'overloaded', timestamp: ts(1) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'overloaded', timestamp: ts(2) });
+    r.applyEvent({ type: 'inference:started', agentName: 'b', timestamp: ts(0) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'b', error: 'Stream aborted: timeout', timestamp: ts(1) });
+    for (const name of ['a', 'b']) {
+      const node = r.getNode(name)!;
+      expect(node.phase).toBe('failed');
+      expect(node.status).toBe('failed');
+    }
+    expect(r.getNode('a')!.completedAt).toBe(ts(2));
   });
 
   test('inference:turn_ended is terminal in its own right (AF PR #55: no trailing exhausted)', () => {
@@ -113,20 +116,6 @@ describe('AgentTreeReducer', () => {
     expect(node.phase).toBe('done');
     expect(node.status).toBe('completed');
     expect(node.completedAt).toBe(ts(1));
-  });
-
-  test('older AF: the exhausted trailing an endTurn re-terminates as cancelled (harmless)', () => {
-    // Pre-0.6.5 streams still deliver turn_ended followed by the spurious
-    // exhausted. The node flips completed → cancelled one event later; both
-    // are terminal-and-benign, so renderers stay correct either way. Pinned
-    // so the compat behavior is a documented choice, not an accident.
-    const r = new AgentTreeReducer();
-    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
-    r.applyEvent({ type: 'inference:turn_ended', agentName: 'a', timestamp: ts(1) });
-    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'Stream aborted: user', timestamp: ts(2) });
-    const node = r.getNode('a')!;
-    expect(node.phase).toBe('cancelled');
-    expect(node.status).toBe('cancelled');
   });
 
   // Postmortem 2026-05-28 F1: the reducer never transitions status to 'completed'.
