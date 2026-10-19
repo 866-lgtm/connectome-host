@@ -25,7 +25,7 @@
 // JSON object with shape:
 //   { type: 'call'|'error', kind: 'complete'|'stream'|'keepalive', timestamp, durationMs,
 //     requestSummary, rawRequest?, rawResponse, error?, errorType?,
-//     httpStatus?, providerErrorCode?, retryable?, errorChars? }
+//     httpStatus?, providerErrorCode?, retryable?, errorChars?, truncated? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
 // a non-Error's text (logging-error-fields.ts). The request summary leaves
 // out only the parts it can't read; a record whose response can't be read
@@ -36,6 +36,9 @@
 // A keepalive row also carries `keepalive: { key, lane, startedAt }`: the
 // lineage it refreshed, its lane, and when its send began. It keeps the
 // replayed request only with full payloads on, whatever its outcome.
+// Every line, newline included, stays within the shared 16 MiB UTF-8 cap
+// (logging-record.ts): an oversized or unserializable record drops its raw
+// bodies first, then its summaries, and `truncated` says what was dropped.
 
 import { AnthropicAdapter, cacheLineageKey } from '@animalabs/membrane';
 import type {
@@ -48,6 +51,7 @@ import type {
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { describeErrorObject } from './logging-error-fields.js';
+import { serializeRecord } from './logging-record.js';
 
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
@@ -293,7 +297,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
 
   private log(record: Record<string, unknown>): void {
     try {
-      appendFileSync(this.logPath, JSON.stringify(record) + '\n');
+      appendFileSync(this.logPath, serializeRecord(record));
     } catch {
       // never throw from logging
     }
