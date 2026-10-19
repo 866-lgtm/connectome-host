@@ -363,8 +363,8 @@ export interface SubagentPeekSnapshot {
 
 /**
  * Build the tool_result text the fork stream sees in place of the launch
- * receipt the parent stream sees (launchReceipt: forked, running or waiting
- * for a slot, then the launch description).
+ * receipt the parent stream sees (launchReceipt: accepted as a fork,
+ * starting or waiting for a slot, then the launch description).
  *
  * The wording frames the fork as a parallel continuation of the same self
  * rather than a separate agent — both streams inherit everything, the fork
@@ -437,9 +437,21 @@ const SUBAGENT_STREAM_TOKENS = 500_000;
  * string tool result or replaces it with an omission notice, while tool
  * calls and structured results pass whole. So what was stored can still be
  * missing from what the stream reads. A launch's check compiles the stream's
- * context as its first inference will: the launch sets no context budget,
- * so both use the context manager's default, and both cap and select the
- * stored messages before any injection is added.
+ * context the way its first inference will: the launch sets no context
+ * budget, so both use the context manager's default, and both cap and
+ * select the stored messages before any injection is added. What it reads
+ * is the launch's own compile. Between the two, only the stream's own
+ * compression can change what's selected, and it can reach a fork's call
+ * and result only when their result message, with what's added after it
+ * before the first request, is longer than the stream's recent window,
+ * which context-manager 0.14.1 counts newest-first in its store's
+ * estimates, raw until the stream's first call calibrates them
+ * (getUnheldRecentWindowStart). agent-framework 0.22.2 adds up to two such
+ * messages at the stream's first start: the prose-routing primer under
+ * explicit or hybrid routing (maybePrimeProseMode), and a one-line routing
+ * notice under locus or hybrid routing once the stream's channel resolves
+ * (announceLocusIfChanged). A fork's restated task nearly as long as the
+ * window would make that so.
  */
 export type LaunchDelivery =
   /** A spawn's or a parentless fork's own first messages: the orientation,
@@ -623,7 +635,8 @@ export interface SubagentStart {
   /** The stream's prose routing, as created; stated here only when the
    *  launch didn't set it. */
   proseRouting: ProseRouting;
-  /** The tools the stream is shown at its first inference. */
+  /** The tools the stream is shown, as the board stands when the launch
+   *  composes its first context. */
   tools: string[];
   /** What the calling stream (`SubagentLaunch.parent`) is shown now;
    *  undefined when it can't be read, or when the launch has no calling
@@ -939,8 +952,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
   }
   if (p) {
     // A launch without a list is the same as its caller's when the stream is
-    // created with the caller's rules: both unrestricted, or the same names,
-    // whatever the depth limit or ensureReturn did to reach them.
+    // created with the caller's rules: both unrestricted, or the same names
+    // once the depth limit and ensureReturn have had their say, so a
+    // subagent--return that ensureReturn adds makes them differ.
     const same = requested === undefined && (allowed === 'all'
       ? callerRules === 'all'
       : callerRules !== 'all' && sameNames(allowed, callerRules));
@@ -978,8 +992,9 @@ export function describeSubagentLaunch(launch: SubagentLaunch): string {
 /**
  * What the stream's own first context adds after the launch block: what it
  * actually inherited, its context budget as created, its prose routing when
- * the launch left that to the framework, and the tools it is shown at its
- * first inference, beside what its caller is shown now. All
+ * the launch left that to the framework, and the tools it is shown, read
+ * from the board as the launch composes its context, beside what its caller
+ * is shown now. All
  * of it is known only when the stream is created, which can be well after
  * the call if the launch waited for a slot.
  */
@@ -1000,10 +1015,12 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
       // repeat, as it always has.
       "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
         'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
-        "message is dropped. The call's assistant message and its result message keep their other blocks, " +
-        "with sibling fork calls and their results removed and this call's result rewritten as this message, " +
-        "which comes first in its message, so if that message is over the cap, what's cut is text after it. " +
-        'No other message after the call is included.',
+        "message is dropped, and this stream's own strategy caps and selects them as it does every message. " +
+        "The call's assistant message keeps its other blocks, with sibling fork calls removed. Its result " +
+        "message keeps the turn's other results, with sibling forks' results removed, and leads with this " +
+        "call's result rewritten as this message, so if that message is over the cap, what's cut is what comes " +
+        "after it. If the parent's context held no result message for the call, one is made holding this " +
+        "call's result alone. No other message after the call is included.",
     );
   } else if (inh.kind === 'compiled-at-start') {
     lines.push(
@@ -1011,7 +1028,8 @@ export function describeSubagentStart(launch: SubagentLaunch, start: SubagentSta
         // A sync fork's call, or one whose round isn't stored yet, was never
         // in that context.
         (inh.reason === 'no-call-id' ? 'the fork call had no id to cut at' : "the fork call wasn't in that context") +
-        '. It can include turns that came after the call. An exact repeat of an earlier message is dropped.',
+        '. It can include turns that came after the call. An exact repeat of an earlier message is dropped, ' +
+        "and this stream's own strategy caps and selects what remains as it does every message.",
     );
   } else if (inh.reason === 'spawn') {
     lines.push("- Inherited: nothing; a spawn starts from its task.");
@@ -1143,11 +1161,14 @@ export function materialiseStructuralFork(
 
   // Fork assistant turn with sibling fork tool_use blocks stripped. The
   // matching tool_use is excluded from siblingForkIds by construction, so
-  // this filter always keeps at least one block.
-  const trimmedAssistantContent = forkAssistantMsg.content.filter(b => {
-    if (!isToolUseContent(b)) return true;
-    return !(b.name === 'subagent--fork' && siblingForkIds.has(b.id));
-  });
+  // this filter always keeps at least one block. In XML tool mode every
+  // call of a round carries the round's raw <function_calls> text (rawXml,
+  // agent-framework 0.22.2), which membrane's anthropic-xml formatter
+  // replays in place of the blocks, siblings included. So beside a removed
+  // sibling, the calls kept drop it and are rendered from their blocks.
+  const trimmedAssistantContent = forkAssistantMsg.content
+    .filter(b => !(isToolUseContent(b) && b.name === 'subagent--fork' && siblingForkIds.has(b.id)))
+    .map((b): ContentBlock => (siblingForkIds.size > 0 && isToolUseContent(b) && b.rawXml !== undefined ? withoutRawXml(b) : b));
   out.push({ participant: forkAssistantMsg.participant, content: trimmedAssistantContent });
 
   // Matching tool_result user turn — rewritten with intention framing; siblings stripped.
@@ -1157,10 +1178,15 @@ export function materialiseStructuralFork(
     // The fork's own result leads its message, ahead of the turn's other
     // results: every message is capped and the cap keeps a message's
     // beginning, so a sibling's length can't push out the framed result's
-    // head (its orientation).
+    // head (its orientation). It's named as the framework names the results
+    // it stores from a tool round (agent-framework 0.22.2 keeps toolName for
+    // XML replay's <tool_name>): in XML tool mode a result carries no call id,
+    // so its name is what tells it apart when it leads results whose calls
+    // come first.
     const trimmedResultContent: ContentBlock[] = [{
       type: 'tool_result',
       toolUseId: callToolUseId,
+      toolName: 'subagent--fork',
       content: intentionFramed,
     }];
     for (const b of matchingMsg.content) {
@@ -1175,6 +1201,7 @@ export function materialiseStructuralFork(
       content: [{
         type: 'tool_result',
         toolUseId: callToolUseId,
+        toolName: 'subagent--fork',
         content: intentionFramed,
       }],
     });
@@ -1182,6 +1209,13 @@ export function materialiseStructuralFork(
 
   // Post-fork tail intentionally dropped.
   return out;
+}
+
+/** A block without the raw XML text of the round it was parsed from. */
+function withoutRawXml<T extends { rawXml?: string }>(block: T): T {
+  const copy = { ...block };
+  delete copy.rawXml;
+  return copy;
 }
 
 // ---------------------------------------------------------------------------
@@ -2652,9 +2686,13 @@ export class SubagentModule implements Module {
   }
 
   /**
-   * The tools an ephemeral stream is shown at its first inference. The
-   * framework builds that surface (agentToolSurface) from the shared board
-   * filtered by the agent's own permissions, plus prose_help under explicit
+   * The tools an ephemeral stream is shown, as the board stands when the
+   * launch composes its first context. The framework reads the board again
+   * when it assembles the first request, so a server that changes its tools
+   * in between isn't reflected here; the request's own tool list is what
+   * the stream can call. The framework builds that surface
+   * (agentToolSurface) from the shared board filtered by the agent's own
+   * permissions, plus prose_help under explicit
    * prose routing when those permissions allow it (agent-framework 0.22.2's
    * availableToolsForPresentation). An ephemeral agent has no presentation
    * and isn't the subconscious, so nothing else applies, and it isn't
@@ -2671,10 +2709,14 @@ export class SubagentModule implements Module {
     return names;
   }
 
-  /** A refused fork's way out: a spawn. It takes a systemPrompt, which a
-   *  fork's caller needn't have given, and its own orientation and task
-   *  must each fit one message, or it's refused in turn. */
-  private spawnInstead(withCap = false): string {
+  /** A refused fork's way out: a spawn, where the caller's tool rules allow
+   *  one. It takes a systemPrompt, which a fork's caller needn't have given,
+   *  and its own orientation and task must each fit one message, or it's
+   *  refused in turn. A caller whose rules don't allow subagent--spawn is
+   *  told to do the work in its own stream, rather than sent to a tool it
+   *  can't call. */
+  private spawnInstead(canSpawn: boolean, withCap = false): string {
+    if (!canSpawn) return "do it in this stream instead, since subagent--spawn isn't among your tools";
     const cap = withCap ? ` (${formatTokens(SUBAGENT_STRATEGY.maxMessageTokens)})` : '';
     return 'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task ' +
       `that fits one message${cap} and says what it needs to know`;
@@ -2691,8 +2733,11 @@ export class SubagentModule implements Module {
     kind: 'spawn' | 'fork',
     cut: ReadonlyArray<'orientation' | 'task' | 'call'>,
     delivery: LaunchDelivery,
+    /** Whether the caller's tool rules allow subagent--spawn: a fork's way
+     *  out names a spawn only then. */
+    canSpawn: boolean,
   ): SubagentFailure {
-    const inheritsContext = delivery.kind === 'fork-result';
+    const inheritsContext = delivery.kind === 'fork-result' && canSpawn;
     const cap = formatTokens(SUBAGENT_STRATEGY.maxMessageTokens);
     // A spawn's task is a message of its own, which the cap can cut, as a
     // parentless fork's is; a fork with a parent carries its task whole in
@@ -2702,13 +2747,13 @@ export class SubagentModule implements Module {
       if (part === 'orientation') {
         return kind === 'spawn'
           ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
-          : `its orientation is longer than one message holds (${cap}): ${this.spawnInstead()}${inherits}`;
+          : `its orientation is longer than one message holds (${cap}): ${this.spawnInstead(canSpawn)}${inherits}`;
       }
       if (part === 'task') {
         return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
           `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
       }
-      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${this.spawnInstead(true)}${inherits}`;
+      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${this.spawnInstead(canSpawn, true)}${inherits}`;
     });
     return new SubagentFailure(reasons.join('; and '));
   }
@@ -2809,7 +2854,7 @@ export class SubagentModule implements Module {
 
     // runSpawn ran synchronously up to its slot wait, so `ticket` already
     // says whether this launch is starting or queued.
-    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' spawned.`, ticket) };
+    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' accepted as a spawn.`, ticket) };
   }
 
   private async handleFork(input: ForkInput, callerAgentName?: string, callToolUseId?: string): Promise<ToolResult> {
@@ -2861,7 +2906,7 @@ export class SubagentModule implements Module {
 
     // runFork ran synchronously up to its slot wait, so `ticket` already
     // says whether this launch is starting or queued.
-    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' forked.`, ticket) };
+    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' accepted as a fork.`, ticket) };
   }
 
   /** A refusal when a subagent already has this name. A name means one
@@ -3191,7 +3236,8 @@ export class SubagentModule implements Module {
           contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
 
           // The stream must read what the launch promises: refuse it when
-          // its orientation or its whole task isn't in its first context.
+          // its orientation or its whole task isn't in the launch's compile
+          // of its first context.
           const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
           // The race takes compile's result when compiling settles first, so
           // a cancel that lands just after is thrown here: the run ends
@@ -3200,7 +3246,7 @@ export class SubagentModule implements Module {
           cancel.throwIfFired();
           const delivery: LaunchDelivery = { kind: 'message', orientation, taskBlock: input.task };
           const cut = undeliveredLaunchParts(messages, delivery);
-          if (cut.length > 0) throw this.launchRefusal('spawn', cut, delivery);
+          if (cut.length > 0) throw this.launchRefusal('spawn', cut, delivery, true);
 
           // Pre-validate prompt size
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
@@ -3358,6 +3404,9 @@ export class SubagentModule implements Module {
       // never another later registered under its name: the receipt and the
       // stream's orientation describe the parent at the call.
       const parentAgent = launch.parentAgent;
+      // A refused fork's way out is a spawn only for a caller whose rules
+      // allow one; with no parent stream there's no rule to read.
+      const canSpawn = parentAgent?.canUseTool('subagent--spawn') ?? true;
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
@@ -3469,6 +3518,7 @@ export class SubagentModule implements Module {
               contextManager.addMessage('user', [{
                 type: 'tool_result',
                 toolUseId: fallbackForkId,
+                toolName: 'subagent--fork',
                 content: buildIntentionFramedForkResult(input.name, input.task, childDepth, this.maxDepth, atStart),
               }] as ContentBlock[]);
               delivery = {
@@ -3494,8 +3544,9 @@ export class SubagentModule implements Module {
           }
 
           // The stream must read what the launch promises: refuse it when
-          // its orientation or its whole task isn't in its first context. A
-          // fork with a call reads its whole task in that call.
+          // its orientation or its whole task isn't in the launch's compile
+          // of its first context. A fork with a call reads its whole task in
+          // that call.
           const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
           // The race takes compile's result when compiling settles first, so
           // a cancel that lands just after is thrown here: the run ends
@@ -3503,7 +3554,7 @@ export class SubagentModule implements Module {
           // Nothing below awaits before the attempt's race.
           cancel.throwIfFired();
           const cut = undeliveredLaunchParts(messages, delivery);
-          if (cut.length > 0) throw this.launchRefusal('fork', cut, delivery);
+          if (cut.length > 0) throw this.launchRefusal('fork', cut, delivery, canSpawn);
 
           // Pre-validate prompt size
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
@@ -3511,11 +3562,11 @@ export class SubagentModule implements Module {
           if (est > this.maxPromptTokens) {
             // A parentless fork carries no conversation, so only a fork with
             // a parent is told it's the cause, and that a spawn leaves it.
-            const spawn = this.spawnInstead(true);
+            const spawn = this.spawnInstead(canSpawn, true);
             throw new SubagentFailure(
               `it would begin at about ${est} tokens, over this host's limit of ${this.maxPromptTokens}` +
                 (parentAgent ? ', because a fork carries your whole conversation' : ''),
-              `${spawn.charAt(0).toUpperCase()}${spawn.slice(1)}${parentAgent ? ', though a spawn inherits none of it' : ''}.`,
+              `${spawn.charAt(0).toUpperCase()}${spawn.slice(1)}${parentAgent && canSpawn ? ', though a spawn inherits none of it' : ''}.`,
             );
           }
 

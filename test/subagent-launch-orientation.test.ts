@@ -12,8 +12,10 @@
  * framework, and the tools it is shown beside what its parent is shown now.
  *
  * Most cases stub runEphemeralToCompletion and read the child's stored
- * context. The last describe block runs the real one against the mock
- * provider and reads the first request the child actually sends.
+ * context. Two describe blocks, 'the first request a fork actually sends'
+ * and 'what a stream first reads is what its launch promises', run the
+ * real one against the mock provider and read the first request the child
+ * actually sends.
  */
 import { describe, test, expect } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -21,7 +23,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AgentFramework, KnowledgeStrategy } from '@animalabs/agent-framework';
 import type { Module, ToolCall, AgentConfig } from '@animalabs/agent-framework';
-import { AnthropicXmlFormatter, Membrane, MockAdapter, NativeFormatter, OpenAIResponsesFormatter } from '@animalabs/membrane';
+import { Membrane, MockAdapter, NativeFormatter } from '@animalabs/membrane';
+import { recipeFormatter } from '../src/recipe-formatter.js';
 import {
   SubagentModule, type SubagentModuleConfig, type SubagentLaunch, agentSettingsOf, describeSubagentStart, toolDifferences, undeliveredLaunchParts,
 } from '../src/modules/subagent-module.js';
@@ -34,11 +37,14 @@ interface Run {
   maxTokens: number;
   systemPrompt: string;
   /** The model, stream budget, strategy message cap and tool rules it was
-   *  created with. The strategy's windows have no public
-   *  reader. */
+   *  created with. */
   model: string;
   maxStreamTokens: number;
   maxMessageTokens: number | undefined;
+  /** The strategy's windows, compression model and auto-tick as created.
+   *  They have no public reader, so they're read from the strategy's own
+   *  config (context-manager 0.14.1's AutobiographicalStrategy). */
+  strategyConfig: { headWindowTokens?: number; recentWindowTokens?: number; compressionModel?: string; autoTickOnNewMessage?: boolean };
   allowedTools: 'all' | string[];
   /** The text the launch composed, as stored (before the message cap): a
    *  fork's tool_result message, or a spawn's or parentless fork's own
@@ -60,6 +66,17 @@ function textOf(content: unknown): string {
     if (block.type === 'tool_result') return textOf(block.content);
     return '';
   }).join('\n');
+}
+
+/** A created strategy's windows, compression model and auto-tick. */
+function strategyConfigOf(strategy: unknown): Run['strategyConfig'] {
+  const config = (strategy as { config?: Record<string, unknown> }).config ?? {};
+  return {
+    headWindowTokens: config.headWindowTokens as number | undefined,
+    recentWindowTokens: config.recentWindowTokens as number | undefined,
+    compressionModel: config.compressionModel as string | undefined,
+    autoTickOnNewMessage: config.autoTickOnNewMessage as boolean | undefined,
+  };
 }
 
 /** A module offering `count` plain tools, to widen the shared board. */
@@ -133,6 +150,7 @@ async function makeHarness(opts: {
         model: a.model,
         maxStreamTokens: a.maxStreamTokens,
         maxMessageTokens: (a.getContextManager().getStrategy() as { maxMessageTokens?: number }).maxMessageTokens,
+        strategyConfig: strategyConfigOf(a.getContextManager().getStrategy()),
         allowedTools: a.allowedTools,
         firstContext: launchText(messages),
         allText: messages.map((m) => textOf(m.content)).join('\n'),
@@ -195,10 +213,12 @@ function seedForkCall(framework: AgentFramework, id: string, input: Record<strin
 const CUT_AT_EXCHANGE =
   "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
   'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
-  "message is dropped. The call's assistant message and its result message keep their other blocks, " +
-  "with sibling fork calls and their results removed and this call's result rewritten as this message, " +
-  "which comes first in its message, so if that message is over the cap, what's cut is text after it. " +
-  'No other message after the call is included.';
+  "message is dropped, and this stream's own strategy caps and selects them as it does every message. " +
+  "The call's assistant message keeps its other blocks, with sibling fork calls removed. Its result " +
+  "message keeps the turn's other results, with sibling forks' results removed, and leads with this " +
+  "call's result rewritten as this message, so if that message is over the cap, what's cut is what comes " +
+  "after it. If the parent's context held no result message for the call, one is made holding this " +
+  "call's result alone. No other message after the call is included.";
 
 /** What the orientation says each prose-routing mode does with plain text. */
 const ROUTING_EFFECT = {
@@ -240,7 +260,7 @@ describe('fork orientation', () => {
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_fork_1', input));
       expect(res.success).toBe(true);
       const receipt = res.data as string;
-      expect(receipt).toStartWith("Subagent 'scout' forked. Starting in background.");
+      expect(receipt).toStartWith("Subagent 'scout' accepted as a fork. Starting in background.");
       await h.asyncPromise('scout');
 
       const block = launchBlock(receipt);
@@ -257,6 +277,8 @@ describe('fork orientation', () => {
       expect(block).toContain("- Model: mock-alt (the parent's: mock).");
       expect(block).toContain("- Provider: mock, on the same connection as the parent's.");
       expect(block).toContain("- Recent window: 80,000 tokens (the parent's isn't reported).");
+      expect(block).toContain("- Head window: 2,000 tokens (the parent's isn't reported).");
+      expect(block).toContain("- Compression model: mock-alt (the parent's isn't reported).");
       expect(block).toContain("- Output limit: 256 tokens, the same as the parent's.");
       // The harness parent sets no mode, so it runs the framework's default.
       expect(block).toContain(`- Prose routing: locus, inherited from the parent: ${ROUTING_EFFECT.locus}.`);
@@ -265,6 +287,10 @@ describe('fork orientation', () => {
 
       const run = h.runs[0]!;
       expect(run.proseRouting).toBe('locus');
+      // The stream's strategy is created with the windows and compression model its block states.
+      expect(run.strategyConfig).toStrictEqual({
+        headWindowTokens: 2_000, recentWindowTokens: 80_000, compressionModel: 'mock-alt', autoTickOnNewMessage: true,
+      });
       expect(run.firstContext).toContain('Two parallel streams of you continue from this point');
       expect(run.firstContext).toContain(block);
       const start = startSection(run.firstContext);
@@ -885,6 +911,30 @@ describe("an agent setting that can't be read", () => {
   });
 });
 
+describe('each agent setting is read from its own field', () => {
+  test('moving one field moves its setting alone', () => {
+    const base = agentSettingsOf({});
+    const cases: Array<[Parameters<typeof agentSettingsOf>[0], string, string]> = [
+      [{ thinking: { enabled: true, type: 'adaptive' } }, 'extended thinking', 'adaptive'],
+      [{ providerParams: { top_k: 5, reasoning: {} } }, 'provider parameters', 'set (reasoning and top_k)'],
+      [{ promptCaching: true }, 'prompt caching', 'on'],
+      [{ cacheTtl: '5m' }, 'prompt-cache TTL', '5m'],
+      [{ prefillUserMessage: 'go on' }, 'prefill user message', 'set'],
+      [{ getRuntimeSettings: () => ({ sameRoundThinkTextPolicy: 'strip' }) }, 'same-round think-text policy', 'strip'],
+      [{ refusalHandling: { mode: 'rewind' } }, 'refusal handling', 'set'],
+      [{ toolResultGuard: { enabled: true } }, 'tool-result guard', 'on'],
+      [{ toolWrapperProseGuard: true }, 'tool-wrapper prose guard', 'on'],
+    ];
+    expect(new Set(cases.map(([, name]) => name))).toStrictEqual(new Set(Object.keys(base)));
+    for (const [agent, name, value] of cases) {
+      const moved = agentSettingsOf(agent);
+      expect(moved[name]).toBe(value);
+      expect(base[name]).not.toBe(value);
+      for (const other of Object.keys(base)) if (other !== name) expect(moved[other]).toBe(base[other]);
+    }
+  });
+});
+
 describe('a module without its framework yet', () => {
   test('is built with no config, and answers a launch with an error rather than a throw', async () => {
     const bare = new SubagentModule();
@@ -922,7 +972,7 @@ describe('a queued launch', () => {
       seedForkCall(h.framework, 'toolu_second', second);
       const res = await h.subagent.handleToolCall(call('fork', 'toolu_second', second));
       const receipt = res.data as string;
-      expect(receipt).toStartWith("Subagent 'second' forked. Every subagent slot (1) is in use, so it waits for one to free, for up to 120 s; if none does, it ends with an error, delivered as its result would be.");
+      expect(receipt).toStartWith("Subagent 'second' accepted as a fork. Every subagent slot (1) is in use, so it waits for one to free, for up to 120 s; if none does, it ends with an error, delivered as its result would be.");
       const block = launchBlock(receipt);
       expect(line(block, '- Against the parent at the call')).toBe(
         '- Against the parent at the call: Differs in recent window and message cap. ' +
@@ -1011,7 +1061,7 @@ describe('a queued launch', () => {
       expect(run.firstContext).toContain(block);
       expect(run.allText).toContain('POST_CALL_ARRIVAL');
       expect(startSection(run.firstContext)).toContain(
-        "- Inherited: the parent's whole compiled context as it was when this stream started, because the fork call wasn't in that context. It can include turns that came after the call. An exact repeat of an earlier message is dropped.",
+        "- Inherited: the parent's whole compiled context as it was when this stream started, because the fork call wasn't in that context. It can include turns that came after the call. An exact repeat of an earlier message is dropped, and this stream's own strategy caps and selects what remains as it does every message.",
       );
     } finally {
       await h.cleanup();
@@ -1029,7 +1079,7 @@ describe('a queued launch', () => {
       const spawnReceipt = (await h.subagent.handleToolCall(call('spawn', 'toolu_third', spawn))).data as string;
       // A spawn says it waits, as a fork does.
       expect(spawnReceipt).toStartWith(
-        "Subagent 'third' spawned. Every subagent slot (1) is in use, so it waits for one to free, for up to 120 s; if none does, it ends with an error, delivered as its result would be.",
+        "Subagent 'third' accepted as a spawn. Every subagent slot (1) is in use, so it waits for one to free, for up to 120 s; if none does, it ends with an error, delivered as its result would be.",
       );
 
       // While both wait, the values their launches took from the parent change.
@@ -1296,6 +1346,8 @@ describe('what a stream first reads is what its launch promises', () => {
     maxPromptTokens?: number;
     maxRetries?: number;
     formatter?: 'anthropic-xml' | 'openai-responses';
+    /** The parent's tool rules, when it's restricted. */
+    parentTools?: string[];
   } = {}) {
     const dir = mkdtempSync(join(tmpdir(), 'launch-delivered-'));
     const adapter = new MockAdapter({ defaultResponse: 'done' });
@@ -1318,12 +1370,15 @@ describe('what a stream first reads is what its launch promises', () => {
     };
     const framework = await AgentFramework.create({
       storePath: join(dir, 'store'),
+      // Built as the host builds a recipe's formatter, so anthropic-xml runs
+      // in XML tool mode: membrane would otherwise pick native tools for it.
       membrane: new Membrane(adapter, {
-        formatter: opts.formatter === 'anthropic-xml'
-          ? new AnthropicXmlFormatter()
-          : opts.formatter === 'openai-responses' ? new OpenAIResponsesFormatter() : new NativeFormatter(),
+        formatter: recipeFormatter(
+          opts.formatter === 'anthropic-xml' ? 'anthropic-xml' : undefined,
+          opts.formatter === 'openai-responses' ? 'openai-responses' : 'mock',
+        ),
       }),
-      agents: [{ name: 'parent', model: 'mock', systemPrompt: 'p', maxTokens: 256 }],
+      agents: [{ name: 'parent', model: 'mock', systemPrompt: 'p', maxTokens: 256, ...(opts.parentTools ? { allowedTools: opts.parentTools } : {}) }],
       modules: [subagent as never, ...(opts.tools ? [bulk] : [])],
     });
     subagent.setFramework(framework);
@@ -1452,6 +1507,99 @@ describe('what a stream first reads is what its launch promises', () => {
       }
     });
   }
+
+  test("a fork over the limit from a caller whose rules don't allow subagent--spawn is told to do it in its own stream", async () => {
+    const h = await realHarness({ maxPromptTokens: 1, parentTools: ['subagent--fork'] });
+    try {
+      const input = { name: 'sized-no-spawn', task: 'short', model: 'mock-sized-no-spawn', sync: true };
+      const cm = h.framework.getAgent('parent')!.getContextManager();
+      cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+      cm.addMessage('parent', [{ type: 'tool_use', id: 'fork-no-spawn', name: 'subagent--fork', input }] as never);
+      const result = await h.subagent.handleToolCall({ id: 'fork-no-spawn', name: 'fork', input, callerAgentName: 'parent' } as never);
+      expect(result.success).toBe(false);
+      expect(String(result.error)).toMatch(new RegExp(
+        "^Fork 'sized-no-spawn' didn't start, so nothing ran: it would begin at about \\d+ tokens, over this host's limit of 1, " +
+        "because a fork carries your whole conversation\\. Do it in this stream instead, since subagent--spawn isn't among your tools\\.$",
+      ));
+      expect(h.requestFor('mock-sized-no-spawn')).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  test("a fork refused for its call is told the way out its caller's own rules allow: a spawn, or its own stream", async () => {
+    for (const canSpawn of [false, true]) {
+      const h = await realHarness(canSpawn ? {} : { parentTools: ['subagent--fork'] });
+      try {
+        const input = { name: `stale-${canSpawn}`, task: 'the task this call carries', model: `mock-stale-${canSpawn}`, sync: true };
+        const cm = h.framework.getAgent('parent')!.getContextManager();
+        cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+        // The stored call carries another task, so the fork's own call
+        // doesn't carry this one: the delivery check's 'call' part.
+        cm.addMessage('parent', [{ type: 'tool_use', id: 'fork-stale', name: 'subagent--fork', input: { ...input, task: 'an earlier task' } }] as never);
+        const result = await h.subagent.handleToolCall({ id: 'fork-stale', name: 'fork', input, callerAgentName: 'parent' } as never);
+        expect(result.success).toBe(false);
+        expect(String(result.error)).toBe(
+          `Fork '${input.name}' didn't start, so nothing ran: the fork call that carries its task, or its result, isn't in the context it would start from: ` +
+          (canSpawn
+            ? 'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message (10,000 tokens) ' +
+              'and says what it needs to know, though a spawn inherits none of this context.'
+            : "do it in this stream instead, since subagent--spawn isn't among your tools."),
+        );
+        expect(h.requestFor(input.model)).toBeUndefined();
+      } finally {
+        await h.cleanup();
+      }
+    }
+  });
+
+  test("in XML tool mode, a fork's first request shows no sibling fork, and each result names its tool, so its own is told apart where it leads", async () => {
+    for (const path of ['structural', 'fallback'] as const) {
+      const h = await realHarness({ formatter: 'anthropic-xml' });
+      try {
+        const input = { name: `xml-${path}`, task: 'short', model: `mock-xml-${path}`, sync: true };
+        const cm = h.framework.getAgent('parent')!.getContextManager();
+        cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
+        if (path === 'structural') {
+          // As agent-framework 0.22.2 stores an XML round: each call carries
+          // the round's raw text, a sibling fork's included, and each result
+          // is named, in call order.
+          const sibling = { name: 'sibling', task: 'SIBLING-TASK' };
+          const raw = '<function_calls>\n<invoke name="files--read">\n<parameter name="path">notes</parameter>\n</invoke>\n' +
+            `<invoke name="subagent--fork">\n<parameter name="task">${sibling.task}</parameter>\n</invoke>\n` +
+            `<invoke name="subagent--fork">\n<parameter name="task">${input.task}</parameter>\n</invoke>\n</function_calls>`;
+          cm.addMessage('parent', [
+            { type: 'tool_use', id: 'read-x', name: 'files--read', input: { path: 'notes' }, rawXml: raw },
+            { type: 'tool_use', id: 'fork-sibling', name: 'subagent--fork', input: sibling, rawXml: raw },
+            { type: 'tool_use', id: 'fork-x', name: 'subagent--fork', input, rawXml: raw },
+          ] as never);
+          cm.addMessage('user', [
+            { type: 'tool_result', toolUseId: 'read-x', toolName: 'files--read', content: 'NOTES' },
+            { type: 'tool_result', toolUseId: 'fork-sibling', toolName: 'subagent--fork', content: 'accepted' },
+            { type: 'tool_result', toolUseId: 'fork-x', toolName: 'subagent--fork', content: 'accepted' },
+          ] as never);
+        }
+        const result = await h.subagent.handleToolCall({ id: 'fork-x', name: 'fork', input, callerAgentName: 'parent' } as never);
+        expect(result.success).toBe(true);
+        const wire = JSON.stringify(h.requestFor(input.model));
+        const forkResult = wire.indexOf('<result>\\n<tool_name>subagent--fork</tool_name>\\n<stdout>\\n');
+        expect(forkResult).toBeGreaterThan(-1);
+        expect(wire.indexOf(`Launch of fork '${input.name}'`, forkResult)).toBeGreaterThan(forkResult);
+        // Every result is named: the fork's alone, or the fork's leading the read's.
+        expect(wire.split('<result>').length - 1).toBe(path === 'structural' ? 2 : 1);
+        expect(wire.split('<tool_name>').length - 1).toBe(path === 'structural' ? 2 : 1);
+        if (path === 'structural') {
+          expect(wire.indexOf('<result>\\n<tool_name>files--read</tool_name>\\n<stdout>\\nNOTES')).toBeGreaterThan(forkResult);
+          // The sibling's call and result are gone, its task with them: the
+          // kept calls render from their blocks, not the round's raw text.
+          expect(wire).not.toContain('SIBLING-TASK');
+          expect(wire).toContain('<invoke name=\\"files--read\\">');
+        }
+      } finally {
+        await h.cleanup();
+      }
+    }
+  });
 
   test("a parentless fork over the limit isn't told it carries a conversation, and gets the same way out", async () => {
     const h = await realHarness({ parentless: true, maxPromptTokens: 1 });
@@ -1625,9 +1773,10 @@ describe('what a stream first reads is what its launch promises', () => {
 
   test("a fork with a call, which would inherit its parent's context, is told that a spawn inherits none of it", () => {
     const subagent = new SubagentModule({ provider: 'mock', defaultModel: 'mock' });
-    const refuse = (subagent as unknown as {
-      launchRefusal(kind: 'spawn' | 'fork', cut: string[], delivery: unknown): Error;
+    const refusal = (subagent as unknown as {
+      launchRefusal(kind: 'spawn' | 'fork', cut: string[], delivery: unknown, canSpawn: boolean): Error;
     }).launchRefusal.bind(subagent);
+    const refuse = (kind: 'spawn' | 'fork', cut: string[], delivery: unknown) => refusal(kind, cut, delivery, true);
     const withCall = { kind: 'fork-result', callId: 'c', head: 'HEAD', task: 'TASK' };
     const ownMessages = { kind: 'message', orientation: 'ORIENT', taskBlock: 'TASK' };
     // The module's own failure, which the retry loop ends on unread, and the
@@ -1646,6 +1795,14 @@ describe('what a stream first reads is what its launch promises', () => {
       'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task that fits one message (10,000 tokens) and says what it needs to know, though a spawn inherits none of this context',
     );
     expect(refuse('spawn', ['orientation', 'task'], ownMessages).message).toContain('give the spawn a shorter tools list; and its task is longer');
+    // A caller whose rules don't allow subagent--spawn isn't sent to it.
+    const noSpawn = (cut: string[]) => refusal('fork', cut, withCall, false).message;
+    expect(noSpawn(['orientation'])).toBe(
+      "its orientation is longer than one message holds (10,000 tokens): do it in this stream instead, since subagent--spawn isn't among your tools",
+    );
+    expect(noSpawn(['call'])).toBe(
+      "the fork call that carries its task, or its result, isn't in the context it would start from: do it in this stream instead, since subagent--spawn isn't among your tools",
+    );
   });
 
   test('a short task and a modest surface launch as before, the orientation first and the task last', async () => {
@@ -1751,6 +1908,9 @@ describe('what counts as delivered: each shape\'s own carriers, whole', () => {
     const result = (id: string, content: string) => ({ type: 'tool_result', toolUseId: id, content });
     expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('c1', 'HEAD\n\nYour intention for this stream: TA[truncated]'))], delivery)).toEqual([]);
     expect(undeliveredLaunchParts([...msgs(call('c1', 'TASK')), ...msgs(result('c1', 'HE[truncated]'))], delivery)).toEqual(['orientation']);
+    // The fork's own call carrying another task, or none, doesn't carry this one.
+    expect(undeliveredLaunchParts([...msgs(call('c1', 'OTHER TASK')), ...msgs(result('c1', 'HEAD'))], delivery)).toEqual(['call']);
+    expect(undeliveredLaunchParts([...msgs({ type: 'tool_use', id: 'c1', name: 'subagent--fork', input: {} }), ...msgs(result('c1', 'HEAD'))], delivery)).toEqual(['call']);
     // Another call carrying the same task isn't this fork's call.
     expect(undeliveredLaunchParts([...msgs(call('other', 'TASK')), ...msgs(result('c1', 'HEAD'))], delivery)).toEqual(['call']);
     // Another result isn't this fork's: its own result isn't there, which is
@@ -1772,5 +1932,10 @@ describe("a fork's tools set against its parent's", () => {
     expect(text).toContain('extra-9 and 5 more');
     for (const name of names('lacks', 15)) expect(text).toContain(name);
     expect(text).toEndWith('lacks-13 and lacks-14');
+  });
+
+  test('an empty list adds no clause', () => {
+    expect(toolDifferences(['extra-0'], [])).toBe('it also has extra-0');
+    expect(toolDifferences([], ['lacks-0'])).toBe("it doesn't have lacks-0");
   });
 });
