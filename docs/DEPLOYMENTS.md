@@ -257,7 +257,9 @@ while a clone installs from its tag's `bun.lock`. So:
 - **Before starting them,** run `npm ls` as before and compare. For each of
   the three libraries that moved, read its notes between the two versions,
   `https://github.com/anima-research/<library>/blob/main/CHANGELOG.md`, for
-  what they say about going back. Then:
+  what they say about going back. Read the same in the notes of any MCPL
+  server you'll update, between the version you noted and the new one: its
+  own changelog, or its commits if it keeps none. Then:
   - **If context-manager or chronicle moved, or any notes say going back
     isn't safe,** copy what each agent keeps, which "Updating checkouts"
     lists, and keep the copy as it was for as long as you might go back.
@@ -289,17 +291,18 @@ while a clone installs from its tag's `bun.lock`. So:
     it, and start the servers you stopped.
 
   Then start the agents.
-- **To go back,** stop the agents again, and any MCPL server the recipe
-  reaches by `url`, and restore the copied `package.json` and lockfile
-  together, then run `npm ci`, or `bun install --frozen-lockfile`. The
-  install rewrote the version in `package.json`, so a lockfile restored
-  alone is refused. In a clone, check out the tag you noted and run `bun
-  install`, then `bun run build:web` if it says the Web UI's build failed or
-  scripts were off. Put back the version of any MCPL server you updated, and
-  any recipe or `.env` change you made for the newer version. Then restore
-  the copy of what each agent keeps, if you made one, which discards what
-  the agents recorded since it was made; the audited store copies aren't
-  for restoring. Then start the servers you stopped, and the agents.
+- **To go back,** stop the agents again, with any fleet children still
+  running, and any MCPL server the recipe reaches by `url`. Restore the
+  copied `package.json` and lockfile together, then run `npm ci`, or `bun
+  install --frozen-lockfile`. The install rewrote the version in
+  `package.json`, so a lockfile restored alone is refused. In a clone,
+  check out the tag you noted and run `bun install`, then `bun run
+  build:web` if it says the Web UI's build failed or scripts were off. Put
+  back the version of any MCPL server you updated, and any recipe or `.env`
+  change you made for the newer version. Then restore the copy of what each
+  agent keeps, if you made one, which discards what the agents recorded
+  since it was made; the audited store copies aren't for restoring. Then
+  start the servers you stopped, and the agents.
 
 ---
 
