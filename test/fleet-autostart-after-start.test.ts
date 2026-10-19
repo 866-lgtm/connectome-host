@@ -81,8 +81,9 @@ describe('FleetModule autoStart, after the framework has started', () => {
 
   test('autoStartRecorded() resolves once each launch has recorded its child, before the child is ready', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'fleet-autostart-recorded-'));
-    // The mock child never opens its socket, so its launch stays under way
-    // until the socket wait ends, long after the launch has recorded it.
+    // The mock child never opens its socket, so its launch is still waiting
+    // for it long after the launch has recorded the child, until the stop
+    // below ends the child.
     const recipe = join(dir, 'leaf.json');
     writeFileSync(recipe, JSON.stringify({ noSocket: true }));
     const fleet = new FleetModule({
@@ -92,6 +93,9 @@ describe('FleetModule autoStart, after the framework has started', () => {
       sigtermEscalationMs: 100,
       autoStart: [{ name: 'leaf', recipe, dataDir: join(dir, 'leaf') }],
     });
+    // The spy lets each launch run, and keeps what it returns.
+    const launches = spyOn(fleet as any, 'handleLaunch');
+    const logged: string[] = [];
     try {
       await fleet.start(ctx);
       // Nothing is under way yet, so there's nothing to wait for.
@@ -102,9 +106,20 @@ describe('FleetModule autoStart, after the framework has started', () => {
       expect(fleet.getChildren().get('leaf')?.status).toBe('starting');
       expect([...fleet.autoStartLaunching()]).toEqual([]);
     } finally {
-      await fleet.stop();
-      rmSync(dir, { recursive: true, force: true });
+      // The stop ends the child while its launch still waits for the socket,
+      // so the launch fails, and logs that as it ends, which can be after the
+      // stop has returned. The test waits for that end, so no line of its
+      // launch lands in a later test's spy.
+      const log = spyOn(console, 'error').mockImplementation((line) => { logged.push(String(line)); });
+      try {
+        await fleet.stop();
+        await Promise.allSettled(launches.mock.results.map(({ value }) => value));
+      } finally {
+        log.mockRestore();
+        rmSync(dir, { recursive: true, force: true });
+      }
     }
+    expect(logged).toEqual([expect.stringMatching(/^\[fleet\] autoStart "leaf" failed: /)]);
   });
 
   test('launchAutoStart() leaves a child that start() adopted alone', async () => {
