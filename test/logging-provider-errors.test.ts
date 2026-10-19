@@ -298,7 +298,7 @@ describe('LoggingProviderAdapter error records', () => {
     expect(await wrapped.complete(request)).toBe(response);
     const [record] = records(path);
     expect(record).toMatchObject({ type: 'call', provider: 'ok-fixture', kind: 'complete' });
-    expect(record!.truncated).toBe('only the head and the error kept (the record could not be serialized)');
+    expect(record!.truncated).toBe('only bounded head and classification kept (record exceeded size guard or could not be serialized)');
     expect('response' in record!).toBe(false);
   });
 

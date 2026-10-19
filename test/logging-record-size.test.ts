@@ -153,14 +153,15 @@ describe('serializeRecord drops parts in order, each step checked against the ca
     expect(both.parsed.truncated).toBe('raw bodies dropped (they could not be serialized)');
   });
 
-  test('an oversized summary leaves the head and the error, an object error and the keepalive included', () => {
+  test("an oversized summary leaves the head's values and the error's name and message", () => {
     const error = { name: 'Error', message: 'invalid request', stack: 'Error: invalid request' };
     const keepalive = { key: 'lineage-1', reason: 'ttl' };
     const { bytes, parsed } = line({ ...head, error, keepalive, requestSummary: { toolNames: [BIG] }, rawRequest: 'small' });
     expect(bytes).toBeLessThanOrEqual(CAP);
-    expect(fields(parsed, [...Object.keys(head), 'keepalive'])).toEqual({ ...head, error, keepalive });
+    expect(fields(parsed, Object.keys(head))).toEqual({ ...head, error: { name: 'Error', message: 'invalid request' } });
     expect(has(parsed, 'requestSummary')).toBe(false);
-    expect(parsed.truncated).toBe('only the head and the error kept (record exceeded size guard)');
+    expect(has(parsed, 'keepalive')).toBe(false);
+    expect(parsed.truncated).toBe('only bounded head and classification kept (record exceeded size guard or could not be serialized)');
   });
 
   test("a head too big for its own line leaves bounded scalars and the error's name and message", () => {
@@ -204,7 +205,7 @@ describe('serializeRecord drops parts in order, each step checked against the ca
     const { parsed } = line(record);
     expect(fields(parsed, ['type', 'provider', 'kind', 'timestamp'])).toEqual({ type: 'call', provider: 'unit-test', kind: 'stream', timestamp: call.timestamp });
     expect(has(parsed, 'durationMs')).toBe(false);
-    expect(parsed.truncated).toBe('only the head and the error kept (the record could not be serialized)');
+    expect(parsed.truncated).toBe('only bounded head and classification kept (record exceeded size guard or could not be serialized)');
   });
 
   test('serializing leaves the record as it was', () => {

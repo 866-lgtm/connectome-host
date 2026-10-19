@@ -7,10 +7,9 @@
 // A record that fits is written exactly as JSON.stringify gives it. One over
 // the cap, or one that can't be serialized (a cycle or a BigInt), loses parts
 // in a fixed order, each step checked against the cap again: first the raw
-// request, where there's a raw response to keep, then both raw bodies, then
-// everything but the head and the error, and last everything but the head's
-// and the classification's scalar values and the error's name and message,
-// each text cut to a bound.
+// request, where there's a raw response to keep, then both raw bodies, and
+// last everything but the head's and the classification's scalar values and
+// the error's name and message, each text cut to a bound.
 // `truncated` states which step the line came from. The record itself is
 // never changed: observers read it, while the call ledger's restore reads
 // the line, so a restored call has only what its line kept.
@@ -23,19 +22,16 @@ import { boundText } from './logging-error-fields.js';
 /** Most UTF-8 bytes one line may take, its newline included. */
 export const MAX_RECORD_BYTES = 16 * 1024 * 1024;
 
-/** The head and the error: what a record keeps when even its summaries are
- *  too big or can't be serialized. */
+/** The head and the error: the fields whose scalar values the last fallback
+ *  keeps, with an error object's name and message. */
 const HEAD_AND_ERROR = ['type', 'provider', 'kind', 'timestamp', 'durationMs', 'keepalive', 'error', 'errorType',
   'httpStatus', 'providerErrorCode', 'retryable', 'errorChars', 'summaryUnavailable'];
 
 /** Longest text the last fallback keeps of any one field. */
 const MAX_LAST_RESORT_CHARS = 1_024;
 
-/** Whether `line` and its newline fit the cap. A UTF-16 unit takes one to
- *  three UTF-8 bytes, so only a line near the cap needs counting. */
+/** Whether `line` and its newline fit the cap, in UTF-8 bytes. */
 function fits(line: string): boolean {
-  if (line.length * 3 + 1 <= MAX_RECORD_BYTES) return true;
-  if (line.length + 1 > MAX_RECORD_BYTES) return false;
   return Buffer.byteLength(line, 'utf8') + 1 <= MAX_RECORD_BYTES;
 }
 
@@ -116,12 +112,5 @@ export function serializeRecord(record: Record<string, unknown>): string {
     ? 'raw bodies dropped (they could not be serialized)'
     : 'raw bodies dropped (record exceeded size guard)');
   if (withoutRaw !== undefined && fits(withoutRaw)) return withoutRaw + '\n';
-  const headAndError = stringify({
-    ...pick(record, HEAD_AND_ERROR),
-    truncated: withoutRaw === undefined
-      ? 'only the head and the error kept (the record could not be serialized)'
-      : 'only the head and the error kept (record exceeded size guard)',
-  });
-  if (headAndError !== undefined && fits(headAndError)) return headAndError + '\n';
   return lastResort(record) + '\n';
 }

@@ -136,8 +136,8 @@ export class LoggingProviderAdapter implements ProviderAdapter {
    * (logging-record.ts): when it can't be serialized whole (a cycle or a
    * BigInt in a raw body), or it's over the guard, it drops the raw request,
    * keeping the raw response if the line then fits, then both raw bodies,
-   * then all but the head and the error, until the line fits, so the error
-   * text survives either way.
+   * then all but the head's values and the error's name and message, until
+   * the line fits, so the error text survives either way.
    */
   private log(record: Record<string, unknown>): void {
     try {
