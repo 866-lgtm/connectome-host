@@ -687,23 +687,27 @@ before touching `treeifyNonContiguousSummaries`. `flat-profile` is the robust fa
 — this is not a permissions problem. The bot also needs **Read Message History** for backscroll
 (separate from View Channel).
 
-**11.8 — Store topology audit, and opening a store mutates it.** Since context-manager 0.12.0
-(this host depends on ^0.13.0) every load audits the summary archive for crossed ownership — a
-summary whose leaves are not contiguous in store order (the pre-0.12 head-window ratchet,
-restore/branch interleavings, hand surgery). Under the default `topologyPolicy: reject`,
-`ContextManager.open` throws `StoreTopologyError` and the resident does not boot — on `kv-stable`
-as on `kv-unified`; the store is left intact. `report` logs the violations and boots; a
+**11.8 — Store topology audit, and opening a store mutates it.** Since context-manager 0.12.0,
+every load audits the summary archive for crossed ownership — a summary whose leaves are not
+contiguous in store order (the pre-0.12 head-window ratchet, restore/branch interleavings, hand
+surgery). Under the default `topologyPolicy: reject`, `ContextManager.open` throws
+`StoreTopologyError` and the resident does not boot — on `kv-stable` as on `kv-unified`; the store
+keeps its history, though by then the open has rewritten its snapshot cadence, as an open of an
+existing store does on chronicle 0.3.0 or later. `report` logs the violations and boots; a
 `kvUnified` block with `preserveGapBearingSummaries` or `treeifyNonContiguousSummaries` set to
 `true` defaults to it. This host does not forward a `strategy.topologyPolicy` recipe key (it is
 silently ignored), so the error's "set topologyPolicy: 'report'" hint is not reachable from a
 recipe — repair the store. Separately, a merge that would mint a crossed node is refused into the
 merge quarantine. Both show on `/healthz` as `compressionDebt.<agent>.topologyViolations` /
-`.topologyRefusals`, with `state: critical`. Before **any** context-manager upgrade of an existing
-resident — including a host upgrade from a pre-0.12 context-manager — run the audit on a **copy of
-the stopped store**:
+`.topologyRefusals`, with `state: critical`. For **any** upgrade of an existing resident to
+context-manager 0.12 or later — including one from a pre-0.12 context-manager, which has no audit
+script of its own — install the upgrade and, before starting the resident on it, run the new
+version's audit on a **copy of the stopped store**:
 `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json > audit.json`
-(exit 0 clean, 2 violations, 1 could not open; a warning that it saw no summaries means a wrong
-`--namespace`). Repair the *stopped* store, after a cold backup, with
+(exit 2 violations, 1 it didn't finish, such as a usage error or a store it could not open, and 0
+clean; a warning on stderr that it saw nothing to audit, which can come with exit 0 or 2, means a
+wrong `--namespace`, a copy without the strategy state, a store with no summaries yet, or chunks
+none of which is linked to a summary). Repair the *stopped* store, after a cold backup, with
 `node …/dist/scripts/repair-topology.js <store> --namespace agents/<agent> [--mode lossless|compact|rebuild] [--rebuild-since <messageId|ISO date>] [--apply]`
 — a dry run unless `--apply`; after `--apply` it reopens the store under `reject` to verify (exit
 0 clean or verified, 2 plan incomplete or verification failed, 1 usage/open error). `lossless`
