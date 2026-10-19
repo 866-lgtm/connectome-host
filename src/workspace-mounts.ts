@@ -30,9 +30,10 @@ export function buildWorkspaceMounts(
   let mounts: MountConfig[];
   if (typeof workspace === 'object' && workspace.mounts) {
     // Every key the recipe gives goes to the framework as it is: the recipe's
-    // mount keys are the framework's MountConfig keys (recipe.ts checks the
-    // two lists against each other, and validation refuses any other key),
-    // so a key the framework adds can't be read here and dropped. Keys the
+    // mount keys are the framework's MountConfig keys, less those recipe.ts
+    // names in MountKeyNotPassedOn (recipe.ts checks the two lists against
+    // each other, and validation refuses any other key), so a key the
+    // framework adds can't be read here and dropped. Keys the
     // recipe leaves out keep the framework's defaults, except that the path
     // resolves from the working directory, mode defaults to read-write, and
     // watch to 'never', since the host does not need chokidar filesystem

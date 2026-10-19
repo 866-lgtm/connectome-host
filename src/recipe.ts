@@ -663,8 +663,9 @@ export interface RecipeCredentialFileField {
 }
 
 /**
- * A recipe's workspace mount: every key of agent-framework's MountConfig,
- * passed to the framework as given but for `path`, which is resolved
+ * A recipe's workspace mount: every key of agent-framework's MountConfig but
+ * those named in `MountKeyNotPassedOn`, passed to the framework as given but
+ * for `path`, which is resolved
  * (workspace-mounts.ts), with `mode` and `watch` optional because the host
  * defaults them. The maximum file size is
  * operator-configurable because binary service artifacts may legitimately
@@ -1699,13 +1700,25 @@ const timerMs = (min: number): MountValueCheck => (v) =>
     : `a whole number of milliseconds from ${min} to ${TIMER_MS_MAX}`;
 
 /**
+ * Mount keys an agent-framework release adds before the host passes them on:
+ * `include`, from agent-framework #536. The checks below and the recipe's
+ * mount type leave them out, so this file typechecks against a framework
+ * with the key and against one without it, and a recipe that gives one is
+ * refused as an unknown key, as before. The host's step to the release that
+ * carries a key gives it a check here, adds it to `RecipeWorkspaceMount`, and
+ * takes it out of this list.
+ */
+type MountKeyNotPassedOn = 'include';
+
+/**
  * Each workspace mount key, with what its value must be: what the framework
  * reads as the recipe means it. It's typed by the framework's `MountConfig`,
  * so a framework release that adds a mount key fails this typecheck until the
- * key has a check here, and the mount builder then passes it on unchanged
- * (workspace-mounts.ts). A key it doesn't name stops the recipe loading (#275).
+ * key has a check here or is named in `MountKeyNotPassedOn`, and the mount
+ * builder then passes it on unchanged (workspace-mounts.ts). A key it doesn't
+ * name stops the recipe loading (#275).
  */
-const MOUNT_KEY_CHECKS: { readonly [K in keyof MountConfig]-?: MountValueCheck } = {
+const MOUNT_KEY_CHECKS: { readonly [K in Exclude<keyof MountConfig, MountKeyNotPassedOn>]-?: MountValueCheck } = {
   name: nonEmptyText,
   path: nonEmptyText,
   mode: oneOf(MOUNT_MODES),
@@ -1725,7 +1738,7 @@ const MOUNT_KEY_CHECKS: { readonly [K in keyof MountConfig]-?: MountValueCheck }
     ? null : `true, false, or a list of ${listed(MOUNT_WAKE_OPS)}`,
   autoMaterialize: trueOrFalse,
 };
-const RECIPE_MOUNT_KEYS = Object.keys(MOUNT_KEY_CHECKS) as Array<keyof MountConfig & string>;
+const RECIPE_MOUNT_KEYS = Object.keys(MOUNT_KEY_CHECKS) as Array<Exclude<keyof MountConfig, MountKeyNotPassedOn> & string>;
 /** The keys a recipe's mount must give; the builder supplies `mode` and `watch`. */
 const REQUIRED_MOUNT_KEYS: readonly string[] = ['name', 'path'];
 
@@ -1735,7 +1748,7 @@ type IsNever<T> = [T] extends [never] ? true : false;
 // don't follow yet.
 const mountListsInStep: [
   ListsExactly<keyof Extract<RecipeModules['workspace'], object> & string, typeof RECIPE_WORKSPACE_KEYS>,
-  ListsExactly<keyof RecipeWorkspaceMount & string, Array<keyof MountConfig & string>>,
+  ListsExactly<keyof RecipeWorkspaceMount & string, Array<Exclude<keyof MountConfig, MountKeyNotPassedOn> & string>>,
   ListsExactly<MountConfig['mode'], typeof MOUNT_MODES>,
   ListsExactly<Exclude<MountConfig['watch'], undefined>, typeof MOUNT_WATCH_VALUES>,
   ListsExactly<Extract<Exclude<MountConfig['wakeOnChange'], undefined>, readonly unknown[]>[number], typeof MOUNT_WAKE_OPS>,
