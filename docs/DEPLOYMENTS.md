@@ -221,6 +221,43 @@ it, and what has to happen first. A pull doesn't stop for it. So:
   agent-framework 0.22.1's notes, for example, say what going back to
   0.22.0 does with what 0.22.1 stored.
 
+## Updating an install
+
+An install of the published package (`npm install
+@animalabs/connectome-host`, or `bun add`) takes a new version only when
+you install one, and a clone of connectome-host when you check out its tag.
+So:
+
+- **Before updating,** read the new version's `CHANGELOG.md`
+  (`https://github.com/anima-research/connectome-host/blob/v<version>/CHANGELOG.md`)
+  back to the version you run, Breaking first, and what its entries say
+  about going back. Check `bun --version` against the new version's Bun
+  floor, which a Breaking entry names when it rises.
+- **To update,** copy the install's `package.json` and its lockfile
+  (`package-lock.json`, or `bun.lock` for an install made with bun), and
+  note the version `npm ls @animalabs/context-manager` names. Stop every
+  agent that runs from the install, and its fleet children, as "Updating
+  checkouts" says. If the notes say going back isn't safe, copy what each
+  agent keeps, which "Updating checkouts" lists. Then install the new
+  version: `npm install @animalabs/connectome-host@<version>`, or
+  `bun add @animalabs/connectome-host@<version>`, or in a clone
+  `git fetch --tags`, `git checkout v<version>` and `bun install`, and any
+  MCPL server version the notes name.
+- **If the install moved context-manager,** so that `npm ls` names another
+  version now, copy each stopped store twice, and audit one copy with the
+  new version's script before starting, as
+  [AGENT-ONBOARDING §11.8](./AGENT-ONBOARDING.md#11-critical-gotchas-read-before-deploying)
+  says. Opening a store changes it, the audit's open included, so keep the
+  other copy as it was until the new version has run. If the audit finds
+  violations, go back, below, or repair as §11.8 says. Then start them.
+- **To go back,** stop the agents again and restore the copied
+  `package.json` and lockfile together, then run `npm ci`, or `bun install
+  --frozen-lockfile`. The install rewrote the version in `package.json`, so
+  a lockfile restored alone is refused. In a clone, check out the tag you
+  ran before and run `bun install`. Then put back the store copies you kept
+  as they were, if context-manager moved, and the data copy if you made
+  one, which discards what the agents recorded since. Then start them.
+
 ---
 
 ## Wake gating (loop fix)
