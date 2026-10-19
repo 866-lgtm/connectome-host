@@ -46,6 +46,7 @@ import { parseFleetRoute } from './modules/fleet-types.js';
 import { handleCommand, resetBranchState } from './commands.js';
 import { formatQuotaReadout } from './quota-meter.js';
 import { takeRecipeWarnings } from './recipe.js';
+import { bunFloorNotice } from './bun-floor-check.js';
 import { effectiveContextBudgetTokens } from './framework-agent-config.js';
 
 /** Format a token count compactly: 1.2M / 3.5k / 42. */
@@ -2960,6 +2961,10 @@ export async function runTui(app: AppContext): Promise<void> {
   addLine(`Error log: ${logPath}`, DIM_GRAY);
   rootTraces.follow(app.framework);
   loadSessionHistory();
+  // Printed at start too, but the alternate screen hides that line. After the
+  // history, since the view keeps to its bottom and would scroll a line above
+  // a long history out of sight.
+  if (bunFloorNotice) addLine(bunFloorNotice, YELLOW);
 
   // ── Cleanup ────────────────────────────────────────────────────────
 
