@@ -224,39 +224,59 @@ it, and what has to happen first. A pull doesn't stop for it. So:
 ## Updating an install
 
 An install of the published package (`npm install
-@animalabs/connectome-host`, or `bun add`) takes a new version only when
-you install one, and a clone of connectome-host when you check out its tag.
-So:
+@animalabs/connectome-host`, or `bun add`) changes version only when npm or
+bun is run to change it, `npm update` and `bun update` included, and a
+clone of connectome-host when you check out another tag. An install
+resolves the libraries' ranges as they stand that day, so it can run
+library releases newer than the ones the release's own lockfile pins,
+while a clone installs from its tag's `bun.lock`. So:
 
 - **Before updating,** read the new version's `CHANGELOG.md`
   (`https://github.com/anima-research/connectome-host/blob/v<version>/CHANGELOG.md`)
   back to the version you run, Breaking first, and what its entries say
-  about going back. Check `bun --version` against the new version's Bun
-  floor, which a Breaking entry names when it rises.
+  about going back. Check `node --version` and `bun --version` against the
+  new version's floors, which a Breaking entry names when they rise.
 - **To update,** copy the install's `package.json` and its lockfile
-  (`package-lock.json`, or `bun.lock` for an install made with bun), and
-  note the version `npm ls @animalabs/context-manager` names. Stop every
-  agent that runs from the install, and its fleet children, as "Updating
-  checkouts" says. If the notes say going back isn't safe, copy what each
-  agent keeps, which "Updating checkouts" lists. Then install the new
-  version: `npm install @animalabs/connectome-host@<version>`, or
-  `bun add @animalabs/connectome-host@<version>`, or in a clone
-  `git fetch --tags`, `git checkout v<version>` and `bun install`, and any
-  MCPL server version the notes name.
-- **If the install moved context-manager,** so that `npm ls` names another
-  version now, copy each stopped store twice, and audit one copy with the
-  new version's script before starting, as
+  (`package-lock.json`, or `bun.lock` for an install made with bun), or in a
+  clone note the tag you're on (`git describe --tags`). Note the versions
+  `npm ls @animalabs/context-manager @animalabs/chronicle` names, and the
+  version of any MCPL server the notes say to update. Stop every agent that
+  runs from the install, and its fleet children, as "Updating checkouts"
+  says. If the notes say going back isn't safe, copy what each agent keeps,
+  which "Updating checkouts" lists. Then install the new version: `npm
+  install @animalabs/connectome-host@<version>`, or `bun add
+  @animalabs/connectome-host@<version>`, or in a clone `git fetch --tags`,
+  `git checkout v<version>` and `bun install`, and any MCPL server version
+  the notes name. In a clone, `bun install` also builds the Web UI. If it
+  says that build failed, run `bun run build:web`, as it says, before
+  starting, since the build from before would be served. Start the agents
+  once that's done, after the store audit below if the install moved
+  context-manager.
+- **If the install moved context-manager or chronicle,** so that `npm ls`
+  names another version of either now, copy each stopped store, and keep
+  the copy as it was for as long as you might go back. These two decide
+  how a store is kept on disk, and a newer one can write a store an older
+  one can't read, as chronicle 0.3.0's notes say of its own. The stores are
+  the session directories, `sessions/<id>`, in each agent's `DATA_DIR` and
+  in its fleet children's data directories. If context-manager moved, copy
+  each store a second time, and audit that copy with the command
   [AGENT-ONBOARDING §11.8](./AGENT-ONBOARDING.md#11-critical-gotchas-read-before-deploying)
-  says. Opening a store changes it, the audit's open included, so keep the
-  other copy as it was until the new version has run. If the audit finds
-  violations, go back, below, or repair as §11.8 says. Then start them.
+  gives: after the install, so the script is the new version's, and before
+  starting, since the new version's first open is what refuses a store or
+  changes it. Opening a store changes it, the audit's open included, so the
+  copy you keep is never the one audited. Exit 0 is clean, unless it warned
+  that it saw no summaries, which means the `--namespace` was wrong: run it
+  again with the right one. On violations (exit 2), or a copy it couldn't
+  open (exit 1), go back, below, or repair as §11.8 says.
 - **To go back,** stop the agents again and restore the copied
   `package.json` and lockfile together, then run `npm ci`, or `bun install
   --frozen-lockfile`. The install rewrote the version in `package.json`, so
   a lockfile restored alone is refused. In a clone, check out the tag you
-  ran before and run `bun install`. Then put back the store copies you kept
-  as they were, if context-manager moved, and the data copy if you made
-  one, which discards what the agents recorded since. Then start them.
+  noted and run `bun install`. Put back the version of any MCPL server you
+  updated, and any recipe or `.env` change you made for the newer version.
+  Then put back the store copies you kept as they were, if context-manager
+  or chronicle moved, and the data copy if you made one. Restoring either
+  discards what the agents recorded since it was made. Then start them.
 
 ---
 
