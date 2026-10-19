@@ -121,23 +121,37 @@ describe("an anthropic-xml agent's tool definitions", () => {
     expect(xmlToolsInSystem(recipe({ provider: 'bedrock' }), 'anthropic.claude-sonnet-4-5-20250929-v1:0')).toBe(true);
   });
 
-  test("stay in the transcript of an agent with no system prompt, which keeps membrane's CLI-simulation frame", () => {
-    // A transcript that opens with the agent's own turn.
-    const opening: NormalizedMessage[] = [
-      { participant: 'Rhys', content: [{ type: 'text', text: 'the file reads' }] },
-      { participant: 'Lari', content: [{ type: 'text', text: 'go on' }] },
-    ];
-    const built = (r: Recipe) => (recipeFormatter(r, 'anthropic', 'claude-haiku-4-5') as AnthropicXmlFormatter)
-      .buildMessages(opening, { participantMode: 'multiuser', assistantParticipant: 'Rhys', tools, toolMode: 'xml', systemPrompt: '' });
-    const asMain = new AnthropicXmlFormatter({ toolMode: 'xml' }).buildMessages(opening, {
-      participantMode: 'multiuser', assistantParticipant: 'Rhys', tools, toolMode: 'xml', systemPrompt: '',
-    });
-    const kept = built(xmlRecipe({ systemPrompt: '' }));
-    expect(JSON.stringify(kept)).toBe(JSON.stringify(asMain));
-    expect(JSON.stringify(kept.systemContent)).toContain('CLI simulation mode');
-    expect(JSON.stringify(kept.messages[0])).toContain('cat untitled.txt');
-    // What the system block would have done to it.
-    expect(JSON.stringify(built(xmlRecipe()).systemContent)).not.toContain('CLI simulation mode');
+  test("stay in the transcript of an agent with no system prompt, which keeps membrane's CLI-simulation frame, whoever's turn opens it", () => {
+    // In XML mode each message's text goes into the agent's own blocks, so membrane gives every request whose system
+    // text is empty the frame, unless its first message carries an image or the recipe sets a prefill user message:
+    // here a transcript that opens with the agent's turn, and one that opens with another's.
+    for (const opening of [
+      [
+        { participant: 'Rhys', content: [{ type: 'text', text: 'the file reads' }] },
+        { participant: 'Lari', content: [{ type: 'text', text: 'go on' }] },
+      ],
+      [
+        { participant: 'Lari', content: [{ type: 'text', text: 'read the file' }] },
+        { participant: 'Rhys', content: [{ type: 'text', text: 'the file reads' }] },
+        { participant: 'Lari', content: [{ type: 'text', text: 'go on' }] },
+      ],
+    ] as NormalizedMessage[][]) {
+      const built = (r: Recipe) => (recipeFormatter(r, 'anthropic', 'claude-haiku-4-5') as AnthropicXmlFormatter)
+        .buildMessages(opening, { participantMode: 'multiuser', assistantParticipant: 'Rhys', tools, toolMode: 'xml', systemPrompt: '' });
+      const asMain = new AnthropicXmlFormatter({ toolMode: 'xml' }).buildMessages(opening, {
+        participantMode: 'multiuser', assistantParticipant: 'Rhys', tools, toolMode: 'xml', systemPrompt: '',
+      });
+      const kept = built(xmlRecipe({ systemPrompt: '' }));
+      expect(JSON.stringify(kept)).toBe(JSON.stringify(asMain));
+      expect(JSON.stringify(kept.systemContent)).toContain('CLI simulation mode');
+      expect(JSON.stringify(kept.messages[0])).toContain('cat untitled.txt');
+      // What the system block would have done to it, as it does to a subagent's request with an empty prompt under
+      // a recipe whose agent has one: `[Start]`, and a system block of the tools alone, on purpose.
+      const moved = built(xmlRecipe());
+      expect(JSON.stringify(moved.systemContent)).not.toContain('CLI simulation mode');
+      expect(JSON.stringify(moved.systemContent)).toContain('Read a file from the workspace');
+      expect(JSON.stringify(moved.messages[0])).toContain('[Start]');
+    }
   });
 
 });

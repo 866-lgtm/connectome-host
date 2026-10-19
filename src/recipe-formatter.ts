@@ -25,17 +25,23 @@ export function recipeFormatter(
  *
  * The move pays only in cache reads, so without caching the tools stay where
  * membrane puts them by default, as on main. So they do without a system
- * prompt: membrane gives a transcript that opens with the agent's own turn its
- * CLI-simulation frame only when the request's system text is empty, and
- * tools in the system text would take that frame away from the prefill-era
- * agents the `anthropic-xml` pin exists for. The recipe's prompt is what the
+ * prompt: in XML mode each message's text goes into the agent's own blocks, so
+ * membrane gives a request whose system text is empty its CLI-simulation frame
+ * whoever's turn its transcript opens with, unless its first message carries
+ * an image or the recipe sets a prefill user message, and tools in the system
+ * text would take that frame away from the prefill-era agents the
+ * `anthropic-xml` pin exists for. The recipe's prompt is what the
  * host can read when it builds the formatter, so an agent whose recipe has no
  * prompt keeps main's request even when its requests carry injected system
  * text (instructions, a heartbeat), which leaves it no frame at stake.
  *
  * The answer is the recipe's for every agent the host runs: they all send
  * through one formatter, so a subagent takes it whatever its own prompt or
- * model.
+ * model. Under a recipe whose agent has a prompt, a subagent spawned or forked
+ * with an empty one has the tools alone as its system text, so membrane opens
+ * its requests with `[Start]` where it would have given the CLI-simulation
+ * frame. That's meant: a task subagent works without the frame, which exists
+ * for a prefill-era agent's own transcript.
  */
 export function xmlToolsInSystem(recipe: Recipe, model: string): boolean {
   return recipe.agent.systemPrompt !== '' && resolvePromptCaching(recipe, model) !== false;
