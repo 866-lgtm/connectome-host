@@ -1,5 +1,5 @@
 import { describe, test, expect, afterAll } from 'bun:test';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -28,9 +28,11 @@ describe('the start-up warning for a Bun below the floor', () => {
     }
   });
 
-  test('the floor is read only as >=X.Y.Z, with or without spaces', () => {
+  test('the floor is read only as a string >=X.Y.Z, with or without spaces', () => {
     expect(bunFloorWarning({ bun: ' >= 1.4.3 ' }, '1.3.14', '0.10.2')).toContain('needs Bun >= 1.4.3 (engines.bun');
-    for (const bun of ['^1.4.3', '1.4.3', '>=1.4', '>=1.4.3 <2', '>1.4.3', '', 7, null]) {
+    // The last two aren't strings: String() would read the array as a floor,
+    // and throw on the object.
+    for (const bun of ['^1.4.3', '1.4.3', '>=1.4', '>=1.4.3 <2', '>1.4.3', '', 7, null, ['>=1.4.3'], JSON.parse('{"toString":null}')]) {
       expect({ bun, warning: bunFloorWarning({ bun }, '1.3.14', '0.10.2') }).toEqual({ bun, warning: null });
     }
   });
@@ -52,10 +54,9 @@ describe('the start-up warning for a Bun below the floor', () => {
 
   test('the host imports the check before anything else runs', () => {
     const index = readFileSync(new URL('../src/index.ts', import.meta.url), 'utf-8');
-    const at = index.indexOf("import './bun-floor-check.js';");
-    expect(at).toBeGreaterThan(0);
-    // Only comments come before it.
-    expect(index.slice(0, at).replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '').trim()).toBe('');
+    // Only whitespace and comments come before it. A `//` comment is taken
+    // whole, to its line's end, so an import commented out doesn't count.
+    expect(index).toMatch(/^(?:\s|\/\/[^\n]*\n|\/\*[\s\S]*?\*\/)*import '\.\/bun-floor-check\.js';/);
   });
 });
 
@@ -84,4 +85,35 @@ describe('the check at start', () => {
     expect(checkBunFloor(pkgAt('null.json', 'null'), warn)).toBeNull();
     expect(lines).toEqual([]);
   });
+});
+
+describe('a TUI start under a Bun below the floor', () => {
+  // test/mock-tui-bun-floor-child.ts gives the check Bun 1.3.14 before it
+  // loads, and starts runTui with a saved session longer than its view.
+  test("prints the warning once as the check loads, and the TUI's first view shows it below the history", async () => {
+    const pkg = JSON.parse(readFileSync(HOST_PACKAGE_JSON, 'utf-8'));
+    const expected = bunFloorWarning(pkg.engines, '1.3.14', pkg.version)!;
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), 'bun-floor-tui-')));
+    try {
+      const child = Bun.spawn([process.execPath, join(import.meta.dir, 'mock-tui-bun-floor-child.ts'), '1.3.14'], {
+        cwd: dir, env: { ...process.env, DATA_DIR: dir }, stdout: 'pipe', stderr: 'pipe',
+      });
+      const [stdout, stderr, code] = await Promise.all([
+        new Response(child.stdout).text(), new Response(child.stderr).text(), child.exited,
+      ]);
+      expect(stdout).not.toContain('TUI_ERROR');
+      expect(code).toBe(0);
+      // The check's own call at load, with its defaults: the host's
+      // package.json, and console.warn to stderr.
+      expect(stderr.split('\n').filter(line => line.startsWith('[host] '))).toEqual([expected]);
+      const frame: string = JSON.parse(stdout.match(/TUI_FRAME ([^\n]*)/)![1]!);
+      // The view keeps to its bottom: the history's start is out of sight,
+      // and the warning, wrapped, is in it.
+      expect(frame).not.toContain('history 01');
+      expect(frame).toContain(`[host] connectome-host ${pkg.version} needs Bun ${pkg.engines.bun} (engines.bun`);
+      expect(frame).toContain('start the host again.');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30000);
 });

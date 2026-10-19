@@ -15,8 +15,9 @@ const FLOOR = /^\s*>=\s*(\d+)\.(\d+)\.(\d+)\s*$/;
 const VERSION = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
 
 export function bunFloorWarning(engines: unknown, bun: string | undefined, hostVersion: string | undefined): string | null {
-  const floor = FLOOR.exec(String((engines as { bun?: unknown } | null | undefined)?.bun));
-  const running = VERSION.exec(String(bun));
+  const declared = (engines as { bun?: unknown } | null | undefined)?.bun;
+  const floor = typeof declared === 'string' ? FLOOR.exec(declared) : null;
+  const running = VERSION.exec(bun ?? '');
   if (!floor || !running) return null;
   for (let i = 1; i <= 3; i++) {
     const diff = Number(running[i]) - Number(floor[i]);

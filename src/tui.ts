@@ -2959,10 +2959,12 @@ export async function runTui(app: AppContext): Promise<void> {
   addLine(`${recipeName}. Type /help for commands.`, GRAY);
   if (session) addLine(`Session: ${session.name}`, DIM_GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
-  // Printed at start too, but the alternate screen hides that line.
-  if (bunFloorNotice) addLine(bunFloorNotice, YELLOW);
   rootTraces.follow(app.framework);
   loadSessionHistory();
+  // Printed at start too, but the alternate screen hides that line. After the
+  // history, since the view keeps to its bottom and would scroll a line above
+  // a long history out of sight.
+  if (bunFloorNotice) addLine(bunFloorNotice, YELLOW);
 
   // ── Cleanup ────────────────────────────────────────────────────────
 
