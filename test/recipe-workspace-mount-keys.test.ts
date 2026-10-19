@@ -9,9 +9,10 @@ import { validateRecipe } from '../src/recipe.js';
 import { buildWorkspaceMounts } from '../src/workspace-mounts.js';
 
 /**
- * A workspace mount takes every key the framework's MountConfig has, and a
- * recipe that names a key or value the host doesn't read stops loading with
- * an error that names it (#275). Before, `walkCap`, `followSymlinks`,
+ * A workspace mount takes every key the framework's MountConfig has but
+ * those recipe.ts names in MountKeyNotPassedOn, and a recipe that names a key
+ * or value the host doesn't read stops loading with an error that names it
+ * (#275). Before, `walkCap`, `followSymlinks`,
  * `watchDebounceMs` and `watchRootPollMs`, which the host's list didn't
  * have, were dropped without a word, and a misspelt key such as `readOnly: true` left the mount
  * as it would have been without it.
@@ -38,6 +39,11 @@ describe('workspace mount keys', () => {
       .toThrow(/^workspace\.mounts\[0\] has unknown key "readOnly" \(mode: "read-only" makes a mount read-only, and a mount is read-write without it\); known: name, path, mode, watch, /);
     expect(() => validateRecipe(recipe({ mounts: [mount(), mount({ name: 'tickets', wakeOnChnage: true })] })))
       .toThrow(/^workspace\.mounts\[1\] has unknown key "wakeOnChnage" \(did you mean "wakeOnChange"\?\)/);
+  });
+
+  test("refuses include, which this host doesn't pass on to the framework yet, as a key a mount doesn't have", () => {
+    expect(() => validateRecipe(recipe({ mounts: [mount({ include: ['*.json'] })] })))
+      .toThrow(/^workspace\.mounts\[0\] has unknown key "include"; known: name, path, mode, watch, watchDebounceMs, watchRootPollMs, ignore, followSymlinks, maxFileSize, walkCap, wakeOnChange, autoMaterialize$/);
   });
 
   test('refuses a key the workspace does not have', () => {
