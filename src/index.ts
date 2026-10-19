@@ -23,6 +23,8 @@
  *   DATA_DIR            - Data directory for sessions (default: ./data)
  */
 
+// First, so its warning about an old Bun prints before the modules below run.
+import './bun-floor-check.js';
 import {
   BedrockAdapter,
   Membrane,
