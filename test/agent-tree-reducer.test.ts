@@ -103,6 +103,29 @@ describe('AgentTreeReducer', () => {
     expect(r.getNode('a')!.completedAt).toBe(ts(2));
   });
 
+  test('an inference:exhausted after inference:aborted leaves the stop cancelled until the next start', () => {
+    // Before agent-framework 0.22.3 a stop through abortInference sent
+    // inference:aborted and then inference:exhausted. A fleet child this host
+    // adopted may still run such a version, and the fleet tree folds its
+    // events through this reducer.
+    const r = new AgentTreeReducer();
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
+    r.applyEvent({ type: 'inference:aborted', agentName: 'a', reason: 'user', timestamp: ts(1) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'stream cancelled', timestamp: ts(2) });
+    let node = r.getNode('a')!;
+    expect(node.phase).toBe('cancelled');
+    expect(node.status).toBe('cancelled');
+    expect(node.completedAt).toBe(ts(1));
+    expect(node.lastEventAt).toBe(ts(2));
+    // The next turn starts afresh, so an exhausted there fails it.
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(3) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'overloaded', timestamp: ts(4) });
+    node = r.getNode('a')!;
+    expect(node.phase).toBe('failed');
+    expect(node.status).toBe('failed');
+    expect(node.completedAt).toBe(ts(4));
+  });
+
   test('inference:turn_ended is terminal in its own right (AF PR #55: no trailing exhausted)', () => {
     // endTurn = the agent deliberately ended its turn — a successful
     // terminal. Before AF PR #55 the terminal state of endTurn'd agents came

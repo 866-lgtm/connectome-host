@@ -229,12 +229,22 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
 
   // inference:exhausted = the turn failed for good: its retries were spent,
   // or its stream was aborted for a reason other than a stop. Before
-  // agent-framework 0.22.3 a stop and a shutdown sent it after their
-  // `inference:aborted`, so it ended a node as 'cancelled' (Postmortem
-  // 2026-05-28 P1 #3). From 0.22.3 they don't, so a node it ends has failed.
+  // agent-framework 0.22.3 a stop sent it too: after its `inference:aborted`
+  // when the stop came through `abortInference`, and alone when it came
+  // through `Agent.cancelStream`. So it ended a node as 'cancelled'
+  // (Postmortem 2026-05-28 P1 #3). From 0.22.3 a stop sends
+  // `inference:aborted` alone, so a node it ends has failed, unless its turn
+  // was already stopped: a fleet child this host adopted may still run an
+  // older agent-framework, and its events come through here. A stopped turn
+  // stays stopped until its next inference:started. Such a child's
+  // `cancelStream` stop, as a subagent's, still ends its node as failed.
   'inference:exhausted': (r, e, ts) => {
     if (!e.agentName) return;
     const node = r._ensureNode(e.agentName);
+    if (node.status === 'cancelled') {
+      node.lastEventAt = ts;
+      return;
+    }
     node.phase = 'failed';
     node.status = 'failed';
     node.completedAt = ts;
