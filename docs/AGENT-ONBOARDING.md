@@ -765,8 +765,8 @@ blocks; expect folds to interact with this on the next model generation.
   on every call with `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
   whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
   newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
-  raw bodies first, then its summaries, keeping at least its type, kind, timing and error
-  classification, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
+  raw request first, its raw response only if the line still doesn't fit, then its summaries, keeping at least its type, kind,
+  timing and error classification, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
   complete copy of any payload.
 - **Topology audit / repair (context-manager ≥ 0.12, §11.8):**
   `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json`

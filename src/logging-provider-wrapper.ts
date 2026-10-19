@@ -16,10 +16,11 @@
 // llm-logs sync job's problem — this file just writes lines.
 //
 // OOM note (learned on the Anthropic path, which once logged raw+normalized+
-// summary and contributed to production OOMs): we serialize the record ONCE,
-// and the shared size guard (logging-record.ts) drops the raw bodies for
-// pathological payloads (giant image batches) rather than buffering
-// multi-hundred-MB lines.
+// summary and contributed to production OOMs): the shared size guard
+// (logging-record.ts) drops the raw bodies of pathological payloads (giant
+// image batches), so the line written stays bounded. It serializes the record
+// whole before it knows the line's size, so it bounds what's written, not
+// what's built in memory.
 //
 // Decorator safety: adapters whose complete() internally delegates to their
 // own stream() (codex does) self-call the INNER method, not the wrapper —
@@ -133,8 +134,10 @@ export class LoggingProviderAdapter implements ProviderAdapter {
   /**
    * Append one record, serialized by the shared size guard
    * (logging-record.ts): when it can't be serialized whole (a cycle or a
-   * BigInt in a raw body), or it's over the guard, the raw bodies are
-   * dropped and the rest kept, so the error text survives either way.
+   * BigInt in a raw body), or it's over the guard, it drops the raw request,
+   * keeping the raw response if the line then fits, then both raw bodies,
+   * then all but the head and the error, until the line fits, so the error
+   * text survives either way.
    */
   private log(record: Record<string, unknown>): void {
     try {

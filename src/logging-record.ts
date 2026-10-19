@@ -7,10 +7,13 @@
 // A record that fits is written exactly as JSON.stringify gives it. One over
 // the cap, or one that can't be serialized (a cycle or a BigInt), loses parts
 // in a fixed order, each step checked against the cap again: first the raw
-// bodies, then everything but the head and the error, and last everything
-// but the head's and the classification's scalar values, each text cut to a
-// bound. `truncated` states which step the line came from. The record itself
-// is never changed: observers and the call ledger read it, not the line.
+// request, where there's a raw response to keep, then both raw bodies, then
+// everything but the head and the error, and last everything but the head's
+// and the classification's scalar values and the error's name and message,
+// each text cut to a bound.
+// `truncated` states which step the line came from. The record itself is
+// never changed: observers read it, while the call ledger's restore reads
+// the line, so a restored call has only what its line kept.
 //
 // Serializing never throws; each writer still guards its own append.
 
@@ -53,14 +56,37 @@ function pick(record: Record<string, unknown>, keys: readonly string[]): Record<
   return kept;
 }
 
-/** The head's and the classification's strings, numbers and booleans, each
- *  text cut to MAX_LAST_RESORT_CHARS. At most a few dozen KB, so it always
- *  fits, and building it can't throw. */
+/** The record's line without `keys`, marked with why they went; undefined
+ *  where that can't be serialized or a field can't be read. */
+function without(record: Record<string, unknown>, keys: readonly string[], truncated: string): string | undefined {
+  try {
+    const rest: Record<string, unknown> = { ...record };
+    for (const key of keys) delete rest[key];
+    return stringify({ ...rest, truncated });
+  } catch {
+    return undefined;
+  }
+}
+
+/** The head's and the classification's strings, numbers and booleans, and
+ *  an error object's name and message, each text cut to
+ *  MAX_LAST_RESORT_CHARS. At most a few dozen KB, so it always fits, and
+ *  building it can't throw. */
 function lastResort(record: Record<string, unknown>): string {
   const kept: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(pick(record, HEAD_AND_ERROR))) {
     if (typeof value === 'string') kept[key] = boundText(value, MAX_LAST_RESORT_CHARS);
     else if (typeof value === 'number' || typeof value === 'boolean') kept[key] = value;
+    else if (key === 'error' && typeof value === 'object' && value !== null) {
+      // The Anthropic and Bedrock writers keep a failure's error as an
+      // object; its name and message are what the doctor reads. This line
+      // keeps no request summary, so the call ledger's restore skips it.
+      const error: Record<string, string> = {};
+      for (const [field, text] of Object.entries(pick(value as Record<string, unknown>, ['name', 'message']))) {
+        if (typeof text === 'string') error[field] = boundText(text, MAX_LAST_RESORT_CHARS);
+      }
+      if (Object.keys(error).length > 0) kept.error = error;
+    }
   }
   kept.truncated = 'only bounded head and classification kept (record exceeded size guard or could not be serialized)';
   return JSON.stringify(kept);
@@ -68,23 +94,27 @@ function lastResort(record: Record<string, unknown>): string {
 
 /**
  * The record's JSONL line, its newline included, within MAX_RECORD_BYTES of
- * UTF-8. The fallbacks keep the generic writer's existing `truncated` markers.
+ * UTF-8. Each fallback's `truncated` marker says what it dropped: the
+ * generic writer's existing markers, and "raw request dropped" for a line
+ * that keeps its raw response.
  */
 export function serializeRecord(record: Record<string, unknown>): string {
   const whole = stringify(record);
   if (whole !== undefined && fits(whole)) return whole + '\n';
-  let withoutRaw: string | undefined;
-  try {
-    const { rawRequest: _rq, rawResponse: _rr, ...rest } = record;
-    withoutRaw = stringify({
-      ...rest,
-      truncated: whole === undefined
-        ? 'raw bodies dropped (they could not be serialized)'
-        : 'raw bodies dropped (record exceeded size guard)',
-    });
-  } catch {
-    withoutRaw = undefined;
+  // A record with a raw response loses its raw request first, and the
+  // response only when the line still doesn't fit: a request is the usual
+  // oversized part, and the response holds the usage, cache writes and stop
+  // reason that the call ledger's restore and the doctor read from the line.
+  const response = pick(record, ['rawResponse']).rawResponse;
+  if (response !== undefined && response !== null) {
+    const withoutRequest = without(record, ['rawRequest'], whole === undefined
+      ? 'raw request dropped (the record could not be serialized)'
+      : 'raw request dropped (record exceeded size guard)');
+    if (withoutRequest !== undefined && fits(withoutRequest)) return withoutRequest + '\n';
   }
+  const withoutRaw = without(record, ['rawRequest', 'rawResponse'], whole === undefined
+    ? 'raw bodies dropped (they could not be serialized)'
+    : 'raw bodies dropped (record exceeded size guard)');
   if (withoutRaw !== undefined && fits(withoutRaw)) return withoutRaw + '\n';
   const headAndError = stringify({
     ...pick(record, HEAD_AND_ERROR),
