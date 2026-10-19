@@ -21,6 +21,7 @@ import type { CallLedgerRow } from '@conhost/web/protocol';
 import { callOriginLabel, callOriginTone } from './call-origin';
 import { healthEntry } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
+import { debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -129,23 +130,11 @@ export interface HealthSnapshot {
 
    * entry = the stack predates the reduction — render that as
 
-   * "not reported", never as zero (misread twice on 2026-08-29). */
+   * "not reported", never as zero (misread twice on 2026-08-29). A count
 
-  compressionDebt?: Record<string, {
+   * the report couldn't compute is null: render that as unknown, too. */
 
-    state?: 'healthy' | 'degraded' | 'critical';
-
-    pendingChunks?: number;
-
-    oldestPendingAgeMs?: number | null;
-
-    mergeQueueDepth?: number;
-
-    mergeQuarantineCount?: number;
-
-    compressionQuarantineCount?: number;
-
-  }>;
+  compressionDebt?: Record<string, CompressionDebt>;
   runtimeSettings?: Record<string, {
     contextBudgetTokens?: number;
     tailTokens?: number;
@@ -194,6 +183,15 @@ const alertTone = (kind: string): { row: string; dot: string } =>
   HARD_DOWN_KINDS.has(kind)
     ? { row: 'bg-rose-950/60 border-rose-900 text-rose-200', dot: 'bg-rose-500 animate-pulse' }
     : { row: 'bg-amber-950/60 border-amber-900 text-amber-200', dot: 'bg-amber-500' };
+
+/** A debt line's class by its tone: an unknown debt takes the rose of a
+ *  section that couldn't be read. */
+const DEBT_TONE_CLASS: Record<DebtTone, string> = {
+  alarm: 'text-rose-300',
+  unread: 'text-rose-300/90',
+  warn: 'text-amber-300/90',
+  quiet: 'text-neutral-500',
+};
 
 /** Action buttons on an alert row / the credential section. The host runs
  *  the action; nothing here is automatic. */
@@ -585,30 +583,21 @@ export function HealthPanel(props: {
             {/* Compression debt: the organ's QUEUE, not the render composition.
                 An old stack that reports nothing must say so — absence
                 rendered as zero invites misreads. A failed read is listed
-                above instead. */}
+                above instead. A report that couldn't read something says
+                what under its line. */}
             <Show when={debt(a.name)} fallback={
               <Show when={healthEntry(failures(a.name), 'compressionDebt') === undefined}>
                 <div class="text-neutral-600">compression debt: not reported by this stack</div>
               </Show>
             }>
-              <div class={
-                debt(a.name)!.state === 'critical' ? 'text-rose-300'
-                : debt(a.name)!.state === 'degraded' ? 'text-amber-300/90'
-                : 'text-neutral-500'
-              }>
-                compression debt: {debt(a.name)!.state ?? '?'}
-                {' · '}{debt(a.name)!.pendingChunks ?? 0} chunk(s) pending
-                <Show when={(debt(a.name)!.pendingChunks ?? 0) > 0}>
-                  <span>
-                    {debt(a.name)!.oldestPendingAgeMs != null
-                      ? ` · oldest ${Math.round(debt(a.name)!.oldestPendingAgeMs! / 60000)}m`
-                      : ' · age unknown'}
-                  </span>
-                </Show>
-                <Show when={(debt(a.name)!.mergeQueueDepth ?? 0) > 0}>
-                  <span> · merge queue {debt(a.name)!.mergeQueueDepth}</span>
-                </Show>
-              </div>
+              {(d) => (
+                <div class={DEBT_TONE_CLASS[debtTone(d())]}>
+                  {debtSummary(d())}
+                  <Show when={d().error}>
+                    {(error) => <div class="text-rose-300/90 truncate" title={error()}>{error()}</div>}
+                  </Show>
+                </div>
+              )}
             </Show>
 
             <Show when={a.refusalStats && (a.refusalStats.total ?? 0) > 0}>
