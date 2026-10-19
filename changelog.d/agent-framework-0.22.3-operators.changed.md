@@ -1,4 +1,11 @@
-- **More from agent-framework 0.22.3 that operators and residents may notice:**
+- **More from agent-framework 0.22.3 and 0.22.4 that operators and residents
+  may notice:**
+  - A resident whose context holds a `redacted_thinking` block that
+    agent-framework stamped with its token estimate is no longer refused at
+    every request until that turn leaves its context (0.22.4). The framework
+    stamps a thinking block it stores when the reply's output tokens exceed
+    what its visible blocks account for, and the stamp went out with a
+    `redacted_thinking` block, which the Messages API refuses.
   - Tool definitions change. The workspace `read` tool's `offset` and
     `limit`, and `grep`'s `contextBefore` and `contextAfter`, take integers,
     the channel and history tools' descriptions are reworded, and a resident
