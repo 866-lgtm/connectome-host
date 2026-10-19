@@ -205,7 +205,8 @@ export interface JournalLine {
   /** The id of the mark a launcher's line acts on: every step of the switch
    *  it asks for, its fallback included, and a Go back's. */
   mark?: string;
-  /** On a `go-back` line: whether it kept the newer data rather than restoring the copy. */
+  /** On a `go-back` line: whether it kept the newer data rather than restoring
+   *  the copy, as its mark's `keepData` asked. */
   keptData?: boolean;
 }
 
@@ -239,8 +240,9 @@ export interface CopyLabel {
   /** Each item the copy holds, one at least: where it lives, as an absolute
    *  path, and its name in the copy, which copyItemName gives from its
    *  position in this list and that path. A reader checks that the name is one
-   *  path segment starting with that position, and nothing after it, so a
-   *  later release can change what follows the position. */
+   *  path segment starting with that position and a `-`, and nothing after
+   *  that, so a later release can change what follows the `-`. The `-` keeps
+   *  position 1 from taking position 10's name. */
   items: Array<{ path: string; name: string }>;
 }
 
@@ -417,9 +419,13 @@ export function moveCurrent(root: string, version: string): void {
   const { current } = installPaths(root);
   const target = join('releases', segment(version, 'release'));
   // Fixed, since there is one writer at a time. A link can't be made over one
-  // a crash left, so that one is removed first.
+  // a crash left, so that one is removed first; only its absence is no error.
   const tmp = `${current}.tmp`;
-  try { unlinkSync(tmp); } catch { /* none left from an earlier attempt */ }
+  try {
+    unlinkSync(tmp);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
   symlinkSync(target, tmp);
   renameSync(tmp, current);
   syncDir(root);

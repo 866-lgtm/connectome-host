@@ -69,6 +69,15 @@ describe('the update contract', () => {
     expect(readdirSync(root).sort()).toEqual(['current', 'mark.json']);
   });
 
+  test("a link a crash left that can't be removed is the filesystem's own error, and current stays", () => {
+    const { current } = installPaths(root);
+    moveCurrent(root, '0.10.2');
+    // A directory where the link was: no unlink removes it.
+    mkdirSync(`${current}.tmp`);
+    expect(() => moveCurrent(root, '0.11.0')).toThrow(expect.objectContaining({ syscall: 'unlink' }));
+    expect(readCurrent(root)).toBe('0.10.2');
+  });
+
   test('a record with another version, or not JSON, or not an object, is refused with a sentence naming the file', () => {
     const { mark } = installPaths(root);
     writeFileSync(mark, JSON.stringify({ v: 2, to: '0.12.0' }));
@@ -191,7 +200,9 @@ describe('the update contract', () => {
     }
   });
 
-  test('the journal reads back its lines whole, and a last line cut off as it was written counts as not recorded', () => {
+  test('the journal reads back its lines whole, none when there is no journal, and a last line cut off as it was written counts as not recorded', () => {
+    // A fresh install's first start: no journal, so no history.
+    expect(readJournal(root)).toEqual([]);
     appendJournal(root, { at: '2026-10-19T16:00:00Z', step: 'lock', from: '0.10.2', to: '0.11.0', outcome: 'ok' });
     appendJournal(root, { at: '2026-10-19T16:00:01Z', step: 'copy', from: '0.10.2', to: '0.11.0', outcome: 'failed', reason: 'ENOSPC' });
     appendJournal(root, { at: '2026-10-19T16:00:02Z', step: 'go-back', from: '0.11.0', to: '0.10.2', outcome: 'ok', mark: 'm9', keptData: true });
@@ -287,6 +298,18 @@ describe('the update contract', () => {
     moveCurrent(root, '0.11.0');
     expect(readMark(root)).toBeNull();
     expect(existsSync(paths.mark)).toBe(false);
+
+    // A spent mark that can't be removed is the filesystem's own error, so no
+    // start takes it as gone while it stays.
+    writeJsonAtomic(paths.mark, { ...mark, id: 'm3' });
+    const denied = Object.assign(new Error('EACCES: permission denied'), { code: 'EACCES' });
+    const unlink = spyOn(fs, 'unlinkSync').mockImplementation(() => { throw denied; });
+    try {
+      expect(() => readMark(root)).toThrow(denied);
+    } finally {
+      unlink.mockRestore();
+    }
+    expect(existsSync(paths.mark)).toBe(true);
   });
 
   test('a mark this release can not use is refused and kept, spent or not: its id and its release each name a directory', () => {
@@ -425,6 +448,8 @@ describe('the update contract', () => {
       // Each name is its own position's, so two items can't share an entry, nor one be the label.
       [item('data')], [item('copy.json')], [item('0-data'), item('0-data', '/srv/host/child/data')],
       [item('0-a/b')], [item('0-a\0b')], [item(`0-${'a'.repeat(254)}`)], [item(`0-${'\u00e9'.repeat(127)}`)],
+      // The position and its "-": position 1 can't take position 10's name.
+      [item('0data')], [item('0-data'), item('10-data', '/srv/host/child/data')],
     ]) {
       writeFileSync(path, JSON.stringify({ v: 1, from: '0.10.2', at: 'T1', items }));
       expect(() => lastCopy(root)).toThrow(unreadable);
