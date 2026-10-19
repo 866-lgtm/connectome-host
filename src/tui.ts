@@ -2199,8 +2199,10 @@ export async function runTui(app: AppContext): Promise<void> {
     treeAggregator?.dispose();
     treeAggregator = fleetMod ? new FleetTreeAggregator(fleetMod) : null;
     if (treeAggregator && fleetMod) {
-      // Register any fleet children that already exist (e.g. autoStart entries
-      // brought up before TUI init, or reattached survivors after parent restart).
+      // Register any fleet children that already exist, such as survivors
+      // reattached after a parent restart. AutoStart children launch as the
+      // agents start and usually register after this; the status tick below
+      // registers each child it finds in the fleet that isn't here yet.
       for (const childName of fleetMod.getChildren().keys()) {
         treeAggregator.registerChild(childName);
       }
