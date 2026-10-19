@@ -5,22 +5,30 @@
  * call, so the warning names it first. It warns rather than refuses, and
  * nothing else depends on it.
  *
- * Pure, for its test: `engines` is the package.json's field, `bun` the running
- * Bun's version, and `satisfies` Bun's own semver check.
+ * The floor is read only in the form the host's package.json gives it,
+ * `>=X.Y.Z` (its test checks that it does), and the running version is
+ * compared with it by its release numbers. A prerelease, such as a canary,
+ * comes before its own release: so a prerelease of the floor's release is
+ * below the floor, and one of a later release isn't. Pure, for its test.
  */
-export function bunFloorWarning(
-  engines: unknown,
-  bun: string | undefined,
-  hostVersion: string | undefined,
-  satisfies: ((version: string, range: string) => boolean) | undefined,
-): string | null {
-  const range = engines !== null && typeof engines === 'object' ? (engines as { bun?: unknown }).bun : undefined;
-  if (typeof range !== 'string' || !bun || !satisfies) return null;
-  // A canary build compares by its release numbers: semver puts a
-  // prerelease such as 1.5.0-canary.1 below >=1.4.3.
-  const release = bun.split(/[-+]/)[0]!;
-  if (satisfies(release, range)) return null;
+const FLOOR = /^\s*>=\s*(\d+)\.(\d+)\.(\d+)\s*$/;
+const VERSION = /^(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+
+export function bunFloorWarning(engines: unknown, bun: string | undefined, hostVersion: string | undefined): string | null {
+  const floor = FLOOR.exec(String((engines as { bun?: unknown } | null | undefined)?.bun));
+  const running = VERSION.exec(String(bun));
+  if (!floor || !running) return null;
+  for (let i = 1; i <= 3; i++) {
+    const diff = Number(running[i]) - Number(floor[i]);
+    if (diff > 0) return null;
+    if (diff < 0) return warning(floor[0].trim(), bun!, hostVersion);
+  }
+  return running[4] ? warning(floor[0].trim(), bun!, hostVersion) : null;
+}
+
+function warning(floor: string, bun: string, hostVersion: string | undefined): string {
   const host = hostVersion ? `connectome-host ${hostVersion}` : 'connectome-host';
-  return `[host] ${host} needs Bun ${range} (engines.bun in its package.json), and this is Bun ${bun}. ` +
-    'Below that it can fail in ways that don\'t name Bun. Upgrade Bun (`bun upgrade`) and start the host again.';
+  return `[host] ${host} needs Bun ${floor} (engines.bun in its package.json), and this is Bun ${bun}. ` +
+    "Below that it can fail in ways that don't name Bun. Whoever runs this host can upgrade Bun, " +
+    'with `bun upgrade` or the package manager that installed it, and start the host again.';
 }

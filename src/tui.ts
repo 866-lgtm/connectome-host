@@ -46,6 +46,7 @@ import { parseFleetRoute } from './modules/fleet-types.js';
 import { handleCommand, resetBranchState } from './commands.js';
 import { formatQuotaReadout } from './quota-meter.js';
 import { takeRecipeWarnings } from './recipe.js';
+import { bunFloorNotice } from './bun-floor-check.js';
 import { effectiveContextBudgetTokens } from './framework-agent-config.js';
 
 /** Format a token count compactly: 1.2M / 3.5k / 42. */
@@ -2958,6 +2959,8 @@ export async function runTui(app: AppContext): Promise<void> {
   addLine(`${recipeName}. Type /help for commands.`, GRAY);
   if (session) addLine(`Session: ${session.name}`, DIM_GRAY);
   addLine(`Error log: ${logPath}`, DIM_GRAY);
+  // Printed at start too, but the alternate screen hides that line.
+  if (bunFloorNotice) addLine(bunFloorNotice, YELLOW);
   rootTraces.follow(app.framework);
   loadSessionHistory();
 
