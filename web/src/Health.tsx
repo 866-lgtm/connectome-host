@@ -132,7 +132,7 @@ export interface HealthSnapshot {
 
    * "not reported", never as zero (misread twice on 2026-08-29). A count
 
-   * the report couldn't compute is null: render that as unknown, too. */
+   * the report couldn't compute is null: leave it out, never show 0. */
 
   compressionDebt?: Record<string, CompressionDebt>;
   runtimeSettings?: Record<string, {
@@ -184,8 +184,9 @@ const alertTone = (kind: string): { row: string; dot: string } =>
     ? { row: 'bg-rose-950/60 border-rose-900 text-rose-200', dot: 'bg-rose-500 animate-pulse' }
     : { row: 'bg-amber-950/60 border-amber-900 text-amber-200', dot: 'bg-amber-500' };
 
-/** A debt line's class by its tone: an unknown debt takes the rose of a
- *  section that couldn't be read. */
+/** A debt line's class by its tone: a report that names a failed read, or an
+ *  unknown debt, takes the rose of a section that couldn't be read, unless
+ *  it is critical, which keeps the alarm's. */
 const DEBT_TONE_CLASS: Record<DebtTone, string> = {
   alarm: 'text-rose-300',
   unread: 'text-rose-300/90',

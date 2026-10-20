@@ -3,7 +3,7 @@
  * anima-research/context-manager#272, a report that couldn't read something
  * names which read failed (`failure`), says in `error` what happened, what it
  * means and what to do, and gives `null` for each count it couldn't compute.
- * A report from a context-manager before it reads as the tab wrote it, but
+ * A report from a context-manager before #272 reads as the tab wrote it, but
  * for an age past two hours, now in hours.
  */
 import { describe, expect, test } from 'bun:test';
@@ -12,17 +12,23 @@ import { debtAge, debtNextStep, debtSummary, debtTone, type CompressionDebt } fr
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
 
+/** context-manager #272's message for a ledger the store couldn't read. */
 const ledgerError = [
-  "Compression can't run.",
-  "Cause: the store couldn't read a record compression needs, this agent's compression quarantine ledger (EACCES: permission denied).",
-  "Effect: no new conversation is summarized while this lasts. Once the conversation it hasn't summarized no longer fits in its context budget, its turns fail until compression catches up.",
-  'Fix: fix what the cause names. Compression resumes by itself once the ledger reads.',
+  'Compression of new conversation has stalled.',
+  "Cause: the store couldn't read this agent's compression quarantine ledger (EACCES: permission denied).",
+  'Effect: chunks that need the model go unsummarized, so in time its context fills and its turns fail until compression catches up.',
+  'Fix: fix what the cause names; compression then resumes by itself.',
 ].join('\n');
 
 /** A report that failed outright, as the new getCompressionDebt() gives it. */
 const failed: CompressionDebt = {
   state: 'unknown',
-  error: 'The compression debt report failed.\nCause: store closed\nEffect: …\nFix: …',
+  error: [
+    'The compression debt report failed.',
+    'Cause: store closed',
+    "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
+  ].join('\n'),
   failure: 'report',
   pendingChunks: null,
   oldestPendingAgeMs: null,
@@ -54,26 +60,40 @@ describe('debtSummary', () => {
       .toBe('compression debt: degraded · 2 chunk(s) pending · oldest 91m');
     expect(debtSummary({ state: 'degraded', pendingChunks: 1, oldestPendingAgeMs: null, mergeQueueDepth: 0 }))
       .toBe('compression debt: degraded · 1 chunk(s) pending · age unknown');
-  });
-
-  test('when the ledger compression needs can\'t be read, the head says compression has stopped, with the counts it read', () => {
-    expect(debtSummary(ledger({}))).toBe('compression has stopped · 1 chunk(s) pending · oldest 20m');
-    expect(debtSummary(ledger({ state: 'degraded', pendingChunks: 4, oldestPendingAgeMs: 3 * HOUR })))
-      .toBe('compression has stopped · 4 chunk(s) pending · oldest 3h');
-    expect(debtSummary(ledger({ state: 'critical', pendingChunks: 5, oldestPendingAgeMs: 7 * HOUR })))
-      .toBe('compression has stopped · critical · 5 chunk(s) pending · oldest 7h');
-  });
-
-  test('when the report itself failed, the head says the debt can\'t be checked, and no count it couldn\'t compute is shown', () => {
-    expect(debtSummary(failed)).toBe("compression debt can't be checked");
-    expect(debtSummary({ state: 'unknown' })).toBe("compression debt can't be checked");
     expect(debtSummary({ state: 'healthy' })).toBe('compression debt: healthy');
     expect(debtSummary({})).toBe('compression debt: ?');
+  });
+
+  test('an age shows only while chunks are pending', () => {
+    expect(debtSummary({ state: 'healthy', pendingChunks: 0, oldestPendingAgeMs: 45 * MINUTE, mergeQueueDepth: 0 }))
+      .toBe('compression debt: healthy · 0 chunk(s) pending');
+  });
+
+  test("a value the report didn't give as a number or text isn't shown as one", () => {
+    expect(debtSummary({ state: 'degraded', pendingChunks: 1, oldestPendingAgeMs: 'soon' as never, mergeQueueDepth: '2' as never }))
+      .toBe('compression debt: degraded · 1 chunk(s) pending · age unknown');
+    expect(debtSummary({ state: 'degraded', pendingChunks: 1, oldestPendingAgeMs: false as never }))
+      .toBe('compression debt: degraded · 1 chunk(s) pending · age unknown');
+    expect(debtSummary({ state: {} as never })).toBe('compression debt: ?');
+  });
+
+  test("when the ledger compression needs can't be read, the head says compression has stalled, with the counts it read", () => {
+    expect(debtSummary(ledger({}))).toBe('compression has stalled · 1 chunk(s) pending · oldest 20m');
+    expect(debtSummary(ledger({ state: 'degraded', pendingChunks: 4, oldestPendingAgeMs: 3 * HOUR })))
+      .toBe('compression has stalled · 4 chunk(s) pending · oldest 3h');
+    expect(debtSummary(ledger({ state: 'critical', pendingChunks: 5, oldestPendingAgeMs: 7 * HOUR })))
+      .toBe('compression has stalled · critical · 5 chunk(s) pending · oldest 7h');
+  });
+
+  test("when the report itself failed, the head says the debt can't be checked, and no count it couldn't compute is shown", () => {
+    expect(debtSummary(failed)).toBe("compression debt can't be checked");
+    expect(debtSummary({ failure: 'report', error: failed.error })).toBe("compression debt can't be checked");
+    expect(debtSummary({ state: 'unknown' })).toBe("compression debt can't be checked");
   });
 });
 
 describe('debtAge', () => {
-  test('whole minutes under two hours, whole hours from there', () => {
+  test('rounded: minutes under two hours, hours from there', () => {
     expect(debtAge(119 * MINUTE + 29_000)).toBe('119m');
     expect(debtAge(119 * MINUTE + 31_000)).toBe('2h');
     expect(debtAge(150 * MINUTE)).toBe('3h');
@@ -82,16 +102,18 @@ describe('debtAge', () => {
 });
 
 describe('debtNextStep', () => {
-  test("the host's own next step: /bug for a fault in the report, and for a ledger whose cause is the store", () => {
+  test("the host's own next step under a message: /bug for a fault in the report, and for a ledger whose data is damaged", () => {
     expect(debtNextStep(failed)).toBe('To report it, run /bug with this message as its text.');
-    expect(debtNextStep(ledger({}))).toBe('If the cause names the store itself, run /bug with this message as its text.');
+    expect(debtNextStep(ledger({})))
+      .toBe("If the store's error says its data is damaged, nothing here repairs it: run /bug with this message as its text.");
+    expect(debtNextStep({ state: 'unknown', failure: 'report' })).toBeUndefined();
     expect(debtNextStep({ state: 'unknown' })).toBeUndefined();
     expect(debtNextStep({ state: 'critical', pendingChunks: 5 })).toBeUndefined();
   });
 });
 
 describe('debtTone', () => {
-  test('critical is an alarm, a report that couldn\'t read something is toned as a read that failed, and degraded warns', () => {
+  test("critical is an alarm, a report that couldn't read something is toned as a read that failed, and degraded warns", () => {
     expect(debtTone({ state: 'critical' })).toBe('alarm');
     expect(debtTone(ledger({ state: 'critical' }))).toBe('alarm');
     expect(debtTone(failed)).toBe('unread');
@@ -99,6 +121,7 @@ describe('debtTone', () => {
     expect(debtTone({ state: 'unknown' })).toBe('unread');
     expect(debtTone({ state: 'degraded' })).toBe('warn');
     expect(debtTone({ state: 'healthy' })).toBe('quiet');
+    expect(debtTone({ state: 'healthy', failure: null as never })).toBe('quiet');
     expect(debtTone({})).toBe('quiet');
   });
 });
