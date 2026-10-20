@@ -13,7 +13,7 @@
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
@@ -651,9 +651,11 @@ describe('scope filters', () => {
   });
 
   test("every trace type the installed agent-framework defines has an entry in the table", () => {
-    // Read where Node resolves the package from this repository's root, as the host loads it.
-    const pkg = join(import.meta.dir, '..', 'node_modules', '@animalabs', 'agent-framework');
-    const source = readFileSync(join(pkg, 'src', 'types', 'trace.ts'), 'utf-8');
+    // Read the source the runtime resolves the package to from here, as the host loads it, wherever
+    // it's installed: in this repository's node_modules, or in one above it, as a hoisted install or a
+    // linked checkout leaves it. Its exports give Bun the index of that source.
+    const index = Bun.resolveSync('@animalabs/agent-framework', import.meta.dir);
+    const source = readFileSync(join(dirname(index), 'types', 'trace.ts'), 'utf-8');
     const types = [...new Set([...source.matchAll(/\btype: '([^']+)'/g)].map((m) => m[1]!))].sort();
     expect(types.length).toBeGreaterThan(50);
     expect(types.filter((type) => !Object.hasOwn(TRACE_SCOPES, type))).toEqual([]);
