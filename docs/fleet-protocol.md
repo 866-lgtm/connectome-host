@@ -30,7 +30,7 @@ bun src/index.ts <recipe> --headless [--exit-when-idle] [--socket-path <path>]
 | Flag | Effect |
 |---|---|
 | `--headless` | Start the framework as usual, then run the headless runtime instead of the TUI or the piped loop. Takes precedence over `--no-tui`. |
-| `--exit-when-idle` | One-shot: after the first work→quiet transition (see `lifecycle:idle` below), shut down gracefully with exit code 0. FleetModule never passes this flag. |
+| `--exit-when-idle` | One-shot: after the first work→quiet transition (see `lifecycle:idle` below), shut down gracefully with exit code 0. An armed self-restart (`modules.selfRestart`) takes its place and exits 75 instead; if it is cancelled, the next quiet poll exits 0. FleetModule never passes this flag. |
 | `--socket-path <p>` | Override the socket location. FleetModule never passes this either; it always expects `{dataDir}/ipc.sock`. |
 
 **Put the recipe first.** The recipe argument is the *first argument that does
@@ -55,7 +55,9 @@ Events emitted while no client is connected are dropped, not buffered.
 **Shutdown.** Triggered by `{"type":"shutdown"}`, by `/quit` sent as a
 `command`, by SIGTERM or SIGINT, by `--exit-when-idle`, or by an agent's
 armed self-restart (`modules.selfRestart`), which goes at the first quiet
-poll after its turn (the `lifecycle:idle` test below). The child emits
+poll after its turn (the `lifecycle:idle` test below) once nothing is in
+flight: no turn, gated wake or background script in the framework, and no
+subagent run. The child emits
 `lifecycle:exiting`, waits ~50 ms for it to flush, calls `framework.stop()`
 (which cancels in-flight streams rather than letting them finish), closes the
 server, unlinks the socket and pid file, and exits once `headless.log` has
@@ -343,7 +345,13 @@ ones it wants. `command-output` needs no entry: it bypasses the child's filter
 Restarts only on a **non-zero exit code** (signal deaths don't count), and
 never when the child was asked to stop or the parent is shutting down. Backoff
 is roughly 1 s, 3 s, 10 s plus jitter; after 3 attempts within 60 s,
-restarting is disabled for that child.
+restarting is disabled for that child. A child's self-restart (exit 75) is a
+non-zero exit like any other: the parent restarts it only with `autoRestart`
+set, and counts it toward the cap. A child the parent adopted (§4.5) has no
+exit the parent sees, so it stays down after a self-restart. A parent's own
+self-restart stops its children as any shutdown does: the restarted parent
+starts its `autoStart` entries again, and any other child stays down until
+it is launched again.
 
 Attempt history carries across automatic replacements, so a crash loop advances the backoff and reaches the cap. When the cap stops automatic restarts, `fleet--status` says so in `autoRestartStopped`, beside `autoRestart`. `fleet--kill`, `fleet--restart`, a `fleet--launch` of the same name and parent shutdown cancel a pending restart, and `fleet--restart` and `fleet--launch` start a fresh budget. A manual launch or restart also cancels an automatic replacement that is under way but hasn't spawned; once one has spawned, a launch answers that the child is already starting, and a restart replaces it. A manual launch takes over before its own checks, so one that is then refused leaves the child down, and `autoRestartStopped` says a manual launch took over. `autoRestartStopped` also names a kill, a signal exit (§4.3), and an automatic replacement that was refused or failed before it spawned. The history and `autoRestartStopped` are kept in the parent's memory, not persisted, so a child adopted by a new parent process starts with a fresh budget.
 
