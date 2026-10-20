@@ -921,8 +921,10 @@ export class WebUiModule implements Module {
 
   /** Send `frame` to every welcomed client that may have it: every full
    *  client, and each observer holding what the frame needs (frameScopes).
-   *  Every frame that goes to more than one client goes this way, so the
-   *  live stream refuses an observer what its welcome and its requests do. */
+   *  Every frame that goes whole to more than one client goes this way, so
+   *  the live stream refuses an observer what its welcome and its requests
+   *  do. `message-appended` goes to each observer projected through
+   *  filterEntryForScopes instead. */
   private broadcast(frame: WebUiServerMessage): void {
     if (!sharedServer) return;
     const scopes = frameScopes(frame);
@@ -2722,7 +2724,8 @@ export class WebUiModule implements Module {
    * forward each event as a `peek` message scoped to the subagent name.
    *
    * For fleet children we don't need a separate subscription — child events
-   * already flow to all welcomed clients via handleFleetEvent. Returning
+   * already flow to every welcomed client whose scopes allow them, via
+   * handleFleetEvent (only operators may peek). Returning
    * "fleet child" here is enough to confirm the panel can rely on the
    * existing stream.
    */

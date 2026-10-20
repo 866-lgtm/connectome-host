@@ -11,7 +11,7 @@
  *   observer is read-only (user-message → forbidden)
  */
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ModuleContext } from '@animalabs/agent-framework';
@@ -27,7 +27,8 @@ import {
   saveObserversFile,
   loadObserversFile,
   filterEntryForScopes,
-  traceRequiredScope,
+  traceScopes,
+  TRACE_SCOPES,
   childEventScopes,
   frameScopes,
   clientHolds,
@@ -612,34 +613,51 @@ describe('scope filters', () => {
     expect(f).toEqual(entry);
   });
 
-  test('trace scope mapping', () => {
-    expect(traceRequiredScope({ type: 'ops:alert' })).toBe('ops');
-    expect(traceRequiredScope({ type: 'mcpl:server-closed' })).toBe('ops');
-    expect(traceRequiredScope({ type: 'usage:updated' })).toBe('health');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'thinking' } as never)).toBe('thinking');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'tool_call' } as never)).toBe('tools');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'text' } as never)).toBe('messages');
-    expect(traceRequiredScope({ type: 'tool:started' })).toBe('tools');
-    expect(traceRequiredScope({ type: 'inference:completed' })).toBe('messages');
+  test("a trace needs every scope whose data it carries, a token or block its block's too, and any type not in the table goes to full clients alone", () => {
+    expect(traceScopes({ type: 'message:added' })).toEqual(['messages']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'text' })).toEqual(['messages']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'thinking' })).toEqual(['messages', 'thinking']);
+    expect(traceScopes({ type: 'inference:content_block', blockType: 'tool_call' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'a-block-added-later' })).toBe(FULL_CLIENTS_ONLY);
+    expect(traceScopes({ type: 'inference:tool_calls_yielded' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'process:received' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'inference:completed' })).toEqual(['messages', 'health']);
+    expect(traceScopes({ type: 'inference:usage' })).toEqual(['health']);
+    expect(traceScopes({ type: 'host:quiesce' })).toEqual(['health']);
+    expect(traceScopes({ type: 'inference:failed' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
+    expect(traceScopes({ type: 'a-trace-added-later' })).toBe(FULL_CLIENTS_ONLY);
+    expect(traceScopes({ type: 'toString' })).toBe(FULL_CLIENTS_ONLY);
   });
 
-  test("a child's trace needs what the parent's would, its lifecycle health, its snapshot a whole tree's scopes, and any other kind a full client", () => {
+  test("every trace type the installed agent-framework defines has an entry in the table", () => {
+    // Read where Node resolves the package from this repository's root, as the host loads it.
+    const pkg = join(import.meta.dir, '..', 'node_modules', '@animalabs', 'agent-framework');
+    const source = readFileSync(join(pkg, 'src', 'types', 'trace.ts'), 'utf-8');
+    const types = [...new Set([...source.matchAll(/\btype: '([^']+)'/g)].map((m) => m[1]!))].sort();
+    expect(types.length).toBeGreaterThan(50);
+    expect(types.filter((type) => !Object.hasOwn(TRACE_SCOPES, type))).toEqual([]);
+  });
+
+  test("a child's events go by the host's trace table, its lifecycle needs health, its snapshot a tree's scopes, its speech thinking, and any other kind a full client", () => {
     expect(childEventScopes({ type: 'message:added' })).toEqual(['messages']);
-    expect(childEventScopes({ type: 'inference:tokens', blockType: 'thinking' } as never)).toEqual(['thinking']);
-    expect(childEventScopes({ type: 'tool:started' })).toEqual(['tools']);
+    expect(childEventScopes({ type: 'inference:tokens', blockType: 'thinking' } as never)).toEqual(['messages', 'thinking']);
+    expect(childEventScopes({ type: 'tool:started' })).toEqual(['messages', 'tools']);
     expect(childEventScopes({ type: 'usage:updated' })).toEqual(['health']);
     expect(childEventScopes({ type: 'ops:alert' })).toEqual(['ops']);
-    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages']);
+    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages', 'thinking']);
     expect(childEventScopes({ type: 'lifecycle', phase: 'ready' } as never)).toEqual(['health']);
-    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools']);
-    for (const type of ['command-output', 'a-kind-added-later', '', undefined, 7]) {
+    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools', 'health']);
+    for (const type of ['command-output', 'a-kind-added-later', 'private:new-kind', '', undefined, 7]) {
       expect(childEventScopes({ type })).toBe(FULL_CLIENTS_ONLY);
     }
   });
 
   test('a frame sent to more than one client needs what its welcome field or request needs, and any other goes to full clients alone', () => {
     const scopesOf = (frame: Record<string, unknown>) => frameScopes(frame as never);
-    expect(scopesOf({ type: 'trace', event: { type: 'tool:started' } })).toEqual(['tools']);
+    expect(scopesOf({ type: 'trace', event: { type: 'tool:started' } })).toEqual(['messages', 'tools']);
     expect(scopesOf({ type: 'child-event', childName: 'kid', event: { type: 'lifecycle' } })).toEqual(['health']);
     for (const type of ['usage', 'call-ledger', 'credential-state', 'host-mode']) expect(scopesOf({ type })).toEqual(['health']);
     for (const type of ['inbound-trigger', 'branch-changed']) expect(scopesOf({ type })).toEqual(['messages']);
@@ -662,6 +680,7 @@ describe('scope filters', () => {
   test("scopeWelcome without messages empties conversation payload, and the session's and branch's names", () => {
     const welcome = {
       type: 'welcome', protocolVersion: 1,
+      agents: [{ name: 'main', model: 'claude-x' }],
       session: { id: 's1', name: 'Debugging the bridge', autoNamed: true },
       branch: { id: 'b1', name: 'experiment' },
       messages: [entry],
@@ -702,9 +721,11 @@ describe('scope filters', () => {
         calls: [{ model: 'secret-model', error: 'raw provider error', costUsd: 0.42 }],
       },
       hostMode: { mode: 'quiesced', detail: {} },
+      agents: [{ name: 'main', model: 'secret-model' }],
     } as unknown as WelcomeMessage;
 
     const w = scopeWelcome(welcome, new Set<ObserverScope>(['messages']));
+    expect(w.agents).toEqual([{ name: 'main', model: '' }]);
     expect(w.callLedger).toBeUndefined();
     expect(w.perAgentCost).toBeUndefined();
     expect(w.hostMode).toBeUndefined();
@@ -726,12 +747,31 @@ describe('scope filters', () => {
     expect(h.callLedger).toEqual(welcome.callLedger);
     expect(h.perAgentCost).toEqual(welcome.perAgentCost);
     expect(h.hostMode).toEqual(welcome.hostMode);
+    expect(h.agents).toEqual(welcome.agents);
     expect(h.usage).toEqual(welcome.usage);
 
     // Input welcome is never mutated (shared across clients in sendWelcome).
     expect(welcome.callLedger).toBeDefined();
     expect(welcome.hostMode).toBeDefined();
     expect(welcome.usage.input).toBe(1);
+  });
+
+  test('the agent trees go only with messages, thinking, tools and health, since their nodes carry token counts', () => {
+    const tree = { asOfTs: 1, nodes: [{ name: 'main', tokens: { input: 5 } }], callIdIndex: {} };
+    const welcome = {
+      type: 'welcome', protocolVersion: 1, agents: [], messages: [],
+      session: { id: 's', name: 's', autoNamed: false }, branch: { id: 'b', name: 'b' },
+      history: { startIndex: 0, totalCount: 0 },
+      localTree: tree,
+      childTrees: [{ name: 'kid', ...tree, recipe: { name: 'kid', agentModel: 'a-model' } }],
+      usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    } as unknown as WelcomeMessage;
+    const interior = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools']));
+    expect(interior.localTree.nodes).toEqual([]);
+    expect(interior.childTrees).toEqual([]);
+    const all = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health']));
+    expect(all.localTree).toEqual(tree);
+    expect(all.childTrees).toEqual(welcome.childTrees);
   });
 });
 

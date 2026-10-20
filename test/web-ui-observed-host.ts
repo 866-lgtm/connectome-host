@@ -58,6 +58,12 @@ export interface ObservedHost {
   /** A connection signed in with the key of the grant labelled `label`, once
    *  its welcome has come. */
   observer(label: string): Promise<Connection>;
+  /** Bind the same app again, as a session switch does: every client is
+   *  welcomed again once the bind's waits are over. */
+  rebind(): void;
+  /** A connection with the password, once it's open, without waiting for
+   *  its welcome. */
+  operatorOpen(): Promise<Connection>;
   /** Welcome every client again and wait for each of `connections` to have
    *  it: a frame sent before this has reached them by its end, since a
    *  socket keeps its frames in order. */
@@ -92,7 +98,7 @@ export async function startObservedHost(options: {
   await module.start({} as ModuleContext);
   const port = __getSharedServerPortForTests()!;
   let listener: ((event: Record<string, unknown>) => void) | undefined;
-  module.setApp({
+  const app = {
     framework: {
       getAllAgents: () => [],
       getAllModules: () => [],
@@ -108,7 +114,8 @@ export async function startObservedHost(options: {
       ...options.sessionManager,
     },
     recipe: { name: 'recipe', agent: {} },
-  } as never);
+  };
+  module.setApp(app as never);
 
   async function connect(headers?: Record<string, string>): Promise<Connection> {
     const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, (headers ? { headers } : undefined) as never);
@@ -134,6 +141,16 @@ export async function startObservedHost(options: {
     module,
     port,
     emitTrace: (event) => listener!(event),
+    rebind: () => module.setApp(app as never),
+    operatorOpen: async () => {
+      const c = await connect({ origin: `http://127.0.0.1:${port}`, authorization: BASIC });
+      await new Promise<void>((done, fail) => {
+        if (c.ws.readyState === WebSocket.OPEN) return done();
+        c.ws.addEventListener('open', () => done());
+        c.ws.addEventListener('error', () => fail(new Error('the connection failed to open')));
+      });
+      return c;
+    },
     operator: async () => {
       const c = await connect({ origin: `http://127.0.0.1:${port}`, authorization: BASIC });
       await c.until('welcome');

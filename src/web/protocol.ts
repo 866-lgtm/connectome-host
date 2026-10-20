@@ -653,8 +653,9 @@ export interface HostModeMessage {
 }
 
 /** Outcome of a `rollback` / `suppress` request. On success the server also
- *  broadcasts `branch-changed` and re-welcomes every client with the new
- *  branch's messages. */
+ *  sends `branch-changed` to every client whose scopes hold 'messages' and
+ *  re-welcomes every client with the new branch's messages, as its scopes
+ *  allow. */
 export interface SurgeryResultMessage {
   type: 'surgery-result';
   corrId?: string;
