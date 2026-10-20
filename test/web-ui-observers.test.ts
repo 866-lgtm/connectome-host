@@ -14,7 +14,6 @@ import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
 import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
 import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
@@ -25,38 +24,20 @@ import {
   ObserverRegistry,
   ObserverSessions,
   closeConnectionsWithoutGrant,
-  observerStatement,
   saveObserversFile,
   loadObserversFile,
   filterEntryForScopes,
   traceRequiredScope,
+  childEventScopes,
+  frameScopes,
+  clientHolds,
+  FULL_CLIENTS_ONLY,
   scopeWelcome,
   type ObserverScope,
   type ObserversFile,
 } from '../src/modules/web-ui-observers.js';
 import type { WelcomeMessage, WelcomeMessageEntry } from '../src/web/protocol.js';
-
-// ---------------------------------------------------------------------------
-// Key helpers — raw ed25519 via node:crypto
-// ---------------------------------------------------------------------------
-
-function makeKeypair() {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const spki = publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
-  const raw = spki.subarray(spki.length - 32);
-  const id = `ed25519:${raw.toString('base64url')}`;
-  return { id, privateKey };
-}
-
-function helloFor(kp: ReturnType<typeof makeKeypair>, host: string, timestamp = new Date().toISOString()) {
-  const proof = cryptoSign(null, Buffer.from(observerStatement(host, timestamp), 'utf8'), kp.privateKey);
-  return {
-    scheme: 'ed25519' as const,
-    id: kp.id,
-    proof: proof.toString('base64url'),
-    timestamp,
-  };
-}
+import { BASIC, helloFor, makeKeypair } from './web-ui-observed-host.js';
 
 // ---------------------------------------------------------------------------
 // Unit: registry verification
@@ -642,9 +623,47 @@ describe('scope filters', () => {
     expect(traceRequiredScope({ type: 'inference:completed' })).toBe('messages');
   });
 
-  test('scopeWelcome without messages empties conversation payload', () => {
+  test("a child's trace needs what the parent's would, its lifecycle health, its snapshot a whole tree's scopes, and any other kind a full client", () => {
+    expect(childEventScopes({ type: 'message:added' })).toEqual(['messages']);
+    expect(childEventScopes({ type: 'inference:tokens', blockType: 'thinking' } as never)).toEqual(['thinking']);
+    expect(childEventScopes({ type: 'tool:started' })).toEqual(['tools']);
+    expect(childEventScopes({ type: 'usage:updated' })).toEqual(['health']);
+    expect(childEventScopes({ type: 'ops:alert' })).toEqual(['ops']);
+    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages']);
+    expect(childEventScopes({ type: 'lifecycle', phase: 'ready' } as never)).toEqual(['health']);
+    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools']);
+    for (const type of ['command-output', 'a-kind-added-later', '', undefined, 7]) {
+      expect(childEventScopes({ type })).toBe(FULL_CLIENTS_ONLY);
+    }
+  });
+
+  test('a frame sent to more than one client needs what its welcome field or request needs, and any other goes to full clients alone', () => {
+    const scopesOf = (frame: Record<string, unknown>) => frameScopes(frame as never);
+    expect(scopesOf({ type: 'trace', event: { type: 'tool:started' } })).toEqual(['tools']);
+    expect(scopesOf({ type: 'child-event', childName: 'kid', event: { type: 'lifecycle' } })).toEqual(['health']);
+    for (const type of ['usage', 'call-ledger', 'credential-state', 'host-mode']) expect(scopesOf({ type })).toEqual(['health']);
+    for (const type of ['inbound-trigger', 'branch-changed']) expect(scopesOf({ type })).toEqual(['messages']);
+    for (const type of ['pins-list', 'settings-state', 'a-frame-added-later']) expect(scopesOf({ type })).toBe(FULL_CLIENTS_ONLY);
+  });
+
+  test('a full client holds every frame, an observer what its scopes cover, and a connection waiting for its hello nothing', () => {
+    const full = { auth: 'full', scopes: null };
+    const waiting = { auth: 'pending', scopes: null };
+    const observer = { auth: 'observer', scopes: new Set<ObserverScope>(['messages', 'health']) };
+    expect(clientHolds(full, FULL_CLIENTS_ONLY)).toBe(true);
+    expect(clientHolds(full, ['thinking'])).toBe(true);
+    expect(clientHolds(waiting, ['health'])).toBe(false);
+    expect(clientHolds(observer, ['health'])).toBe(true);
+    expect(clientHolds(observer, ['messages', 'health'])).toBe(true);
+    expect(clientHolds(observer, ['messages', 'thinking'])).toBe(false);
+    expect(clientHolds(observer, FULL_CLIENTS_ONLY)).toBe(false);
+  });
+
+  test("scopeWelcome without messages empties conversation payload, and the session's and branch's names", () => {
     const welcome = {
       type: 'welcome', protocolVersion: 1,
+      session: { id: 's1', name: 'Debugging the bridge', autoNamed: true },
+      branch: { id: 'b1', name: 'experiment' },
       messages: [entry],
       history: { startIndex: 40, totalCount: 240 },
       localTree: { asOfTs: 1, nodes: [{ secret: true }], callIdIndex: { a: 'b' } },
@@ -657,12 +676,20 @@ describe('scope filters', () => {
     expect(w.childTrees).toEqual([]);
     expect(w.history.startIndex).toBe(240);
     expect(w.usage.input).toBe(1); // structure/usage survive
+    // An auto-named session's name summarizes the conversation, and branch
+    // names are request-branches' tier; the ids stay, as the client's key.
+    expect(w.session).toEqual({ id: 's1', name: '', autoNamed: true });
+    expect(w.branch).toEqual({ id: 'b1', name: '' });
+    const reader = scopeWelcome(welcome, new Set<ObserverScope>(['messages']));
+    expect(reader.session).toEqual(welcome.session);
+    expect(reader.branch).toEqual(welcome.branch);
+    expect(welcome.session.name).toBe('Debugging the bridge'); // never mutated
   });
 
   // Health-gated telemetry must be masked exactly like its live frames:
-  // `usage` and `call-ledger` pushes require the 'health' scope, so the
-  // welcome cannot hand the same data to a messages-only observer.
-  test('scopeWelcome without health strips callLedger/perAgentCost and zeroes usage', () => {
+  // `usage`, `call-ledger` and `host-mode` pushes require the 'health' scope,
+  // so the welcome cannot hand the same data to a messages-only observer.
+  test('scopeWelcome without health strips callLedger/perAgentCost/hostMode and zeroes usage', () => {
     const welcome = {
       type: 'welcome', protocolVersion: 1,
       messages: [entry],
@@ -674,11 +701,13 @@ describe('scope filters', () => {
       callLedger: {
         calls: [{ model: 'secret-model', error: 'raw provider error', costUsd: 0.42 }],
       },
+      hostMode: { mode: 'quiesced', detail: {} },
     } as unknown as WelcomeMessage;
 
     const w = scopeWelcome(welcome, new Set<ObserverScope>(['messages']));
     expect(w.callLedger).toBeUndefined();
     expect(w.perAgentCost).toBeUndefined();
+    expect(w.hostMode).toBeUndefined();
     expect(w.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     expect(w.messages.length).toBe(1); // messages scope still gets content
     // No trace of the ledger anywhere in the serialized frame.
@@ -689,16 +718,19 @@ describe('scope filters', () => {
     const opsOnly = scopeWelcome(welcome, new Set<ObserverScope>(['ops']));
     expect(opsOnly.callLedger).toBeUndefined();
     expect(opsOnly.perAgentCost).toBeUndefined();
+    expect(opsOnly.hostMode).toBeUndefined();
     expect(opsOnly.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
     // A health-scoped observer keeps the telemetry verbatim.
     const h = scopeWelcome(welcome, new Set<ObserverScope>(['health']));
     expect(h.callLedger).toEqual(welcome.callLedger);
     expect(h.perAgentCost).toEqual(welcome.perAgentCost);
+    expect(h.hostMode).toEqual(welcome.hostMode);
     expect(h.usage).toEqual(welcome.usage);
 
     // Input welcome is never mutated (shared across clients in sendWelcome).
     expect(welcome.callLedger).toBeDefined();
+    expect(welcome.hostMode).toBeDefined();
     expect(welcome.usage.input).toBe(1);
   });
 });
@@ -730,8 +762,6 @@ describe('ObserverSessions', () => {
 // End-to-end over a live module: empty grants → historical behavior; grant
 // hot-appears → observer flow works.
 // ---------------------------------------------------------------------------
-
-const BASIC = `Basic ${Buffer.from('admin:pw').toString('base64')}`;
 
 describe('WebUiModule observer flow (e2e)', () => {
   let tmp: string;

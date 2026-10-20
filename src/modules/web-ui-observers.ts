@@ -611,7 +611,7 @@ export function sessionTokenFromRequest(req: Request): string | null {
 // unit-testable without the webui's process-level server singleton.
 // ---------------------------------------------------------------------------
 
-import type { WelcomeMessage, WelcomeMessageEntry } from '../web/protocol.js';
+import type { WebUiServerMessage, WelcomeMessage, WelcomeMessageEntry } from '../web/protocol.js';
 
 /** Which scope a trace event requires. Token deltas map by blockType;
  *  ops/mcpl lifecycle → 'ops'; usage → 'health'; the rest is conversation
@@ -628,6 +628,72 @@ export function traceRequiredScope(event: { type: string }): ObserverScope {
   }
   if (t.startsWith('tool:')) return 'tools';
   return 'messages';
+}
+
+/** What a frame needs to go to full clients alone: what no grant covers. */
+export const FULL_CLIENTS_ONLY = 'full-clients-only';
+
+/** What a frame needs before it may go to an observer: each scope listed, or
+ *  FULL_CLIENTS_ONLY. A full client gets every frame. */
+export type FrameScopes = readonly ObserverScope[] | typeof FULL_CLIENTS_ONLY;
+
+/** What a fleet child's event needs, by the rules the parent's own frames go
+ *  by. A trace, whose type names its family before a colon, as every
+ *  agent-framework trace type does, needs what the parent's trace of that
+ *  type needs. `lifecycle` is the child's liveness. A `snapshot` is a whole
+ *  agent tree, which the welcome gives only with messages, thinking and tools
+ *  (scopeWelcome). Any other kind goes to full clients alone: `command-output`
+ *  is an operator's command run in the child, and the parent's command
+ *  results go only to the client that asked. So does a kind added later,
+ *  until it's given a scope here. */
+export function childEventScopes(event: { type?: unknown }): FrameScopes {
+  const type = typeof event.type === 'string' ? event.type : '';
+  if (type.includes(':')) return [traceRequiredScope(event as { type: string })];
+  if (type === 'lifecycle') return ['health'];
+  if (type === 'snapshot') return ['messages', 'thinking', 'tools'];
+  return FULL_CLIENTS_ONLY;
+}
+
+/** What a frame needs before it may go to an observer, so the live stream
+ *  refuses what the welcome and an observer's requests refuse. The Web UI
+ *  module sends every frame that goes to more than one client through it.
+ *  A frame type not named here goes to full clients alone, so one added later
+ *  reaches no observer until it's given a scope: today that's `pins-list` and
+ *  `settings-state`, which no observer may request. `message-appended` isn't
+ *  sent this way: each observer gets it projected through
+ *  filterEntryForScopes. */
+export function frameScopes(frame: WebUiServerMessage): FrameScopes {
+  switch (frame.type) {
+    case 'trace':
+      return [traceRequiredScope(frame.event)];
+    case 'child-event':
+      return childEventScopes(frame.event);
+    // Usage and liveness, as `/healthz`, `/quota` and request-host-mode.
+    case 'usage':
+    case 'call-ledger':
+    case 'credential-state':
+    case 'host-mode':
+      return ['health'];
+    // An incoming message's excerpt, as the `message:added` trace it comes
+    // from, and a branch's name, as request-branches.
+    case 'inbound-trigger':
+    case 'branch-changed':
+      return ['messages'];
+    default:
+      return FULL_CLIENTS_ONLY;
+  }
+}
+
+/** Whether a client may be sent a frame that needs `scopes`: a full client
+ *  always, an observer when it holds each scope, and a connection still
+ *  waiting for its hello never. */
+export function clientHolds(
+  client: { auth: string; scopes: Set<ObserverScope> | null },
+  scopes: FrameScopes,
+): boolean {
+  if (client.auth === 'full') return true;
+  if (client.auth !== 'observer' || client.scopes === null || scopes === FULL_CLIENTS_ONLY) return false;
+  return scopes.every((scope) => client.scopes!.has(scope));
 }
 
 /** Project a wire entry through a scope mask: null when the observer may not
@@ -650,9 +716,12 @@ export function filterEntryForScopes(
 /** Project a welcome through an observer's scope mask. Without 'messages'
  *  the entire conversation payload (entries + agent trees, which carry
  *  streaming buffers) is emptied — a health/ops observer like the fleet hub
- *  gets structure and usage, never content. Without 'health' the telemetry
- *  fields (usage / perAgentCost / callLedger) are masked too: their live
- *  frames (`usage`, `call-ledger`) are gated on 'health', and the welcome
+ *  gets structure and usage, never content — and so are the session's and
+ *  the branch's names, which keep their ids: an auto-named session's name is
+ *  a model's summary of the conversation, and request-branches needs
+ *  'messages'. Without 'health' the telemetry fields (usage / perAgentCost /
+ *  callLedger / hostMode) are masked too: their live frames (`usage`,
+ *  `call-ledger`, `host-mode`) are gated on 'health', and the welcome
  *  must refuse exactly what the stream refuses — otherwise a messages-only
  *  observer reads model IDs, per-call costs, and raw provider errors on
  *  connect that it is denied a second later. */
@@ -662,6 +731,7 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
   if (!scopes.has('health')) {
     delete scoped.callLedger;
     delete scoped.perAgentCost;
+    delete scoped.hostMode;
     // `usage` is required by the wire type, so it is zeroed rather than
     // dropped (matches the emptied-not-deleted style of the fields below).
     scoped.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -669,6 +739,8 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
   if (!scopes.has('messages')) {
     return {
       ...scoped,
+      session: { ...welcome.session, name: '' },
+      branch: { ...welcome.branch, name: '' },
       messages: [],
       history: { startIndex: welcome.history.totalCount, totalCount: welcome.history.totalCount },
       localTree: emptyTree,

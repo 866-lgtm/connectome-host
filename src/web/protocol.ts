@@ -468,8 +468,9 @@ export interface McplListMessage {
 /**
  * Protected ranges (pins / documents) for one agent.
  *
- * BROADCAST on change: pins alter what the next compile folds, so two operators
- * must not hold divergent views of them.
+ * BROADCAST to full clients on change: pins alter what the next compile folds,
+ * so two operators must not hold divergent views of them. No observer gets
+ * them, as none may request them.
  */
 export interface PinsListMessage {
   type: 'pins-list';
@@ -504,9 +505,9 @@ export interface PinsListMessage {
 /**
  * Runtime context-settings snapshot.
  *
- * BROADCAST to every welcomed client on change — unlike `mcpl-list`, these are
+ * BROADCAST to every full client on change — unlike `mcpl-list`, these are
  * live process state, not a config file, so two operators must not see
- * divergent values.
+ * divergent values. No observer gets them, as none may request them.
  */
 /** Credential state of one process (see src/credential-state.ts). The
  *  `credential` fields are absent on an API-key host (`subscription: false`). */
