@@ -309,8 +309,9 @@ describe('a spawn\'s or fork\'s failure says whether anything ran, and what to d
       ));
       expect((await h.subagent.handleToolCall(fork('probe', { sync: true }))).error).toMatch(new RegExp(
         "^Fork 'probe' didn't start, so nothing ran: it would begin at about \\d+ tokens, over this host's limit of 10, because a " +
-        'fork carries your whole conversation\\. Use subagent--spawn instead, with a name, a systemPrompt, and a task that says ' +
-        'what it needs to know\\.$',
+        'fork carries your whole conversation\\. Launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools ' +
+        'list and a task that fits one message \\(10,000 tokens\\) and says what it needs to know, though a spawn inherits none ' +
+        'of it\\.$',
       ));
     } finally { await h.cleanup(); }
   });

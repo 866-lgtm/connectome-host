@@ -23,6 +23,8 @@
  *   DATA_DIR            - Data directory for sessions (default: ./data)
  */
 
+// First, so its warning about an old Bun prints before the modules below run.
+import './bun-floor-check.js';
 import {
   BedrockAdapter,
   Membrane,
@@ -70,6 +72,7 @@ import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL
 import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
+import { startFramework } from './start-framework.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
 import {
@@ -84,6 +87,7 @@ import {
   clearSavedRecipe,
   parseRecipeArg,
   deprecatedConversationsNotices,
+  resolveProvider,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
 import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
@@ -282,6 +286,7 @@ async function createFramework(
     const subagentConfig = typeof modules.subagents === 'object' ? modules.subagents : {};
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
+      provider: resolveProvider(recipe),
       defaultModel: subagentConfig.defaultModel || model,
       defaultMaxTokens: subagentConfig.defaultMaxTokens,
     });
@@ -959,7 +964,7 @@ let beforeFatalExit: (() => Promise<void>) | undefined;
 
 async function main() {
   const recipe = await resolveRecipe();
-  const provider = recipe.agent.provider ?? 'anthropic';
+  const provider = resolveProvider(recipe);
 
   if (provider === 'openrouter' && !config.openrouterApiKey) {
     console.error('Missing OPENROUTER_API_KEY for recipe provider "openrouter".');
@@ -1340,7 +1345,7 @@ async function main() {
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
       this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
-      this.framework.start();
+      startFramework(this.framework);
       this.userMessageCount = 0;
       resetBranchState(this.branchState);
       setupSynesthete(this);
@@ -1369,7 +1374,7 @@ async function main() {
     };
   }
 
-  framework.start();
+  startFramework(framework);
   setupSynesthete(app);
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);

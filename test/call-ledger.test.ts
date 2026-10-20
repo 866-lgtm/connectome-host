@@ -78,6 +78,28 @@ describe('CallLedger cache verdicts', () => {
     });
   });
 
+  test('a Haiku 5.5 call read back from its log row is priced by its whole prompt, its 1h cache writes included', () => {
+    const logged = (writes1h: number) => parseLoggedCall({
+      kind: 'stream', timestamp: at(0), durationMs: 1000,
+      requestSummary: { model: 'claude-haiku-5-5', messages: 3, cacheBreakpoints: 1, cacheTtls: ['1h'] },
+      rawResponse: { stop_reason: 'end_turn', usage: {
+        input_tokens: 1, output_tokens: 10, cache_read_input_tokens: 0,
+        cache_creation_input_tokens: writes1h,
+        cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: writes1h },
+      } },
+    })!;
+    const ledger = new CallLedger({ hydrate: false });
+    ledger.record(logged(99_999));
+    ledger.record(logged(100_000));
+    const [under, over] = ledger.snapshot().rows;
+    // A prompt of 100,000 tokens takes the lower tier: 1h writes at $0.20 a million.
+    expect(under!.cost?.rates.inputPerMillion).toBe(0.1);
+    expect(under!.cost?.cacheWrite1h).toBeCloseTo(99_999 * 0.2 / 1_000_000, 12);
+    // One of 100,001 takes the higher: 1h writes at $1 a million.
+    expect(over!.cost?.rates.inputPerMillion).toBe(0.5);
+    expect(over!.cost?.cacheWrite1h).toBeCloseTo(0.1, 12);
+  });
+
   test('does not guess a cache-write TTL bucket from request flags', () => {
     const ledger = new CallLedger({ hydrate: false });
     ledger.record(call({ cacheWriteTokens: 100_000, cacheTtls: ['1h'] }));
