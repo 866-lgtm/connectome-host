@@ -634,6 +634,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     const primaryAgentName = app.recipe.agent.name ?? 'agent';
     let hadAtLeastOneInference = false;
     let idleSince = 0;
+    // Whether the quiet window now running was measured with a restart armed:
+    // only such a window checked that nothing was in flight.
+    let windowArmed = false;
     let idleEmitted = false;
 
     // Speech accumulator for the primary agent.  Reset on inference:started
@@ -671,6 +674,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
       // listener was attached.
       const armed = selfRestart.isArmed();
       if (armed) hadAtLeastOneInference = true;
+      // Arming (or a cancel) starts the window again, so a restart armed with
+      // no turn of its own, as by /puppet, still waits out the confirm.
+      if (armed !== windowArmed) { windowArmed = armed; idleSince = 0; }
       if (!hadAtLeastOneInference || !allIdle || (armed && !nothingInFlight())) {
         idleSince = 0;
         return;

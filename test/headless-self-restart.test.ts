@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SELF_RESTART_EXIT_CODE, SELF_RESTART_FILE } from '../src/self-restart.js';
 
-type Mode = 'self-restart' | 'sigterm-first' | 'exit-when-idle' | 'held' | 'cancel-in-wait' | 'arm-after-idle' | 'unseen-turn';
+type Mode = 'self-restart' | 'sigterm-first' | 'exit-when-idle' | 'held' | 'cancel-in-wait' | 'arm-after-idle' | 'late-arm-gap' | 'unseen-turn';
 
 async function runFixture(mode: Mode, hold?: string) {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), 'headless-self-restart-')));
@@ -91,6 +91,11 @@ test('under --exit-when-idle, a restart cancelled while it waits gives the exit 
 
 test('a restart armed after the host has gone quiet still goes', async () => {
   const { dir, result, output } = await runFixture('arm-after-idle');
+  expectSelfRestart(dir, result, output);
+}, 15_000);
+
+test('a restart armed while already quiet waits out its own confirm, so work that starts just after holds it', async () => {
+  const { dir, result, output } = await runFixture('late-arm-gap');
   expectSelfRestart(dir, result, output);
 }, 15_000);
 

@@ -16,6 +16,9 @@
 //   (as /puppet would), so the host should exit 0 as --exit-when-idle asks.
 // - `arm-after-idle`: a first turn ends without arming; the restart is
 //   armed only after the host has gone quiet.
+// - `late-arm-gap`: as `arm-after-idle`, but the restart is armed in a
+//   150 ms gap with nothing in flight, after which a turn holds a token
+//   until 800 ms, as when a subagent has just ended and its wake waits.
 // - `unseen-turn`: the arming turn's inference:started never reaches the
 //   host, as when it ran before runHeadless attached its listener.
 // Only `held` with a subagent hold has a subagent module.
@@ -25,7 +28,7 @@ import { selfRestart } from '../src/self-restart.ts';
 import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
-const MODES = ['self-restart', 'sigterm-first', 'exit-when-idle', 'held', 'cancel-in-wait', 'arm-after-idle', 'unseen-turn'];
+const MODES = ['self-restart', 'sigterm-first', 'exit-when-idle', 'held', 'cancel-in-wait', 'arm-after-idle', 'late-arm-gap', 'unseen-turn'];
 const HOLDS = ['turn', 'gated', 'script', 'queue', 'subagent-active', 'subagent-queued', 'wake-gap'];
 const mode = process.argv[2];
 if (!MODES.includes(mode)) throw new Error('Unknown self-restart fixture mode');
@@ -41,6 +44,7 @@ let heldUntil = 0;
 const holding = (kind: string): boolean => {
   const t = Date.now() - heldFrom;
   if (hold === 'wake-gap') return kind === 'subagent-active' ? t < 1000 : kind === 'turn' && t >= 1150 && t < 1800;
+  if (mode === 'late-arm-gap') return heldFrom > 0 && kind === 'turn' && t >= 150 && t < 800;
   return hold === kind && Date.now() < heldUntil;
 };
 
@@ -54,13 +58,14 @@ setTimeout(() => {
   // sigterm-first mode) the turn ends 300 ms later.
   agent.state.status = 'inferring';
   if (mode !== 'unseen-turn') trace?.({ type: 'inference:started', agentName: 'fixture' });
-  if (mode !== 'arm-after-idle') arm();
+  if (mode !== 'arm-after-idle' && mode !== 'late-arm-gap') arm();
   if (mode === 'sigterm-first') return;
   setTimeout(() => {
     agent.state.status = 'idle';
     if (hold) { heldFrom = Date.now(); heldUntil = heldFrom + (hold === 'wake-gap' ? 1800 : 1500); }
     if (mode === 'cancel-in-wait') setTimeout(() => selfRestart.cancel(), 800);
     if (mode === 'arm-after-idle') setTimeout(arm, 1500);
+    if (mode === 'late-arm-gap') setTimeout(() => { heldFrom = Date.now(); heldUntil = heldFrom + 800; arm(); }, 1500);
   }, 300);
 }, 200);
 
