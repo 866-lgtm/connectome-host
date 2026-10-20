@@ -1655,7 +1655,7 @@ const RECIPE_KEYS = [
   'sessionNaming', 'codeExecution', 'conversations', 'subconscious', 'toolClassOverrides',
 ] as const;
 const RECIPE_AGENT_KEYS = [
-  'allowedTools',
+  'allowedTools', 'toolPresentation',
   'name', 'model', 'timezone', 'provider', 'baseUrl', 'formatter', 'retry', 'prefillUserMessage',
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',

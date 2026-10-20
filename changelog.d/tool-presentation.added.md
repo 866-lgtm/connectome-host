@@ -1,1 +1,1 @@
-- Accept opt-in tool-presentation configuration and expose matching description/visibility metadata in context previews; requires the companion framework release.
+- Accept opt-in tool-presentation configuration (`agent.toolPresentation`) and expose matching description/visibility metadata in context previews.
