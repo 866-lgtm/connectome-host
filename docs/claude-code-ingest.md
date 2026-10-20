@@ -122,7 +122,7 @@ const deref = (x) => Array.isArray(x) ? x.map(deref)
     ? (x.type === 'tool_reference' ? { type: 'text', text: `[tool loaded: ${x.tool_name}]` }
        : Object.fromEntries(Object.entries(x).map(([k, v]) => [k, deref(v)])))
     : x;
-for (const m of msgs) m.content = deref(m.content);
+for (const m of msgs) if (m.role === 'user') m.content = deref(m.content);
 
 // 3. Invariants the API will enforce later — fail here instead.
 const open = new Set();
@@ -263,16 +263,25 @@ strategy config chunks its frontier under *that* config):
    the compiled output for `unavailable`, `omitted`, `[tool call`. There should be
    none for a fresh seed.
 2. Compare exact `count_tokens` against the estimate. A real/estimate ratio far from
-   ~1.0–1.3 means blocks are missing or doubled. This call is also the cheapest proof
-   that the API accepts the seed's *shape* (signed thinking, tool pairing, no stray
-   `tool_reference`): a 400 here is the same 400 the first real turn would get, at zero
-   spend — read its body before booting.
+   ~1.0–1.3 means blocks are missing or doubled. Made with a real key, this call is
+   also the cheapest proof that the API accepts the seed's *shape* (signed thinking,
+   tool pairing, no stray `tool_reference`): a 400 here is the same 400 the first real
+   turn would get, at zero spend — read its body before booting. A 400 about a tool
+   whose `input_schema` has a root `oneOf`/`anyOf`/`allOf` is the exception: inference
+   through membrane's Anthropic provider flattens that schema, and the count sends it
+   as it is.
 3. Confirm the last message is the seam you intend and the first message is the
    human's.
 
 The host's `GET /debug/context` and `/debug/context/makeup` (basic-auth webui) give
 you 1–2 on a running instance; for a pre-boot check, run the host against a copy of
 the install dir with `--headless` and a mock or real key, then hit the endpoints.
+`/debug/context/makeup` shows a count the API refused only by its status, such as
+`countSource: "count_tokens_failed_400"`, without the body. To read the body, send
+that request yourself: `buildContextMakeup` (`src/web/panel-data.ts`) builds it by
+formatting the same `request` that `/debug/context` returns, and posts it, with the
+`countModel` the route reports, to `/v1/messages/count_tokens` at
+`ANTHROPIC_BASE_URL` (or `https://api.anthropic.com`), with the host's credentials.
 
 ### Stage 4 — Recipe, first boot, seam
 
