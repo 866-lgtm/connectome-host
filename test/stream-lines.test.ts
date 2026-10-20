@@ -16,6 +16,8 @@ describe('formatStreamEvent', () => {
     expect(text({ type: 'inference:aborted', reason: '' })).toBe('✗ turn aborted');
     expect(text({ type: 'inference:exhausted', error: 'Stream aborted: user' })).toBe('✗ turn ended: Stream aborted: user');
     expect(text({ type: 'inference:failed', error: 'overloaded' })).toBe('✗ inference failed: overloaded');
+    // What a client gets in place of an end whose trace its scopes don't cover.
+    expect(text({ type: 'stream-ended', agentName: 'clerk' })).toBe('── stream ended ──');
   });
 
   test("an end whose error is missing or empty says 'Unknown error', as every other surface does", () => {

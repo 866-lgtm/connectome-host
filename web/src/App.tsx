@@ -41,7 +41,9 @@ import {
   type SurgeryResultMessage,
   type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
-import { applyStreamEnded, applyTrace, conversationAgentOf, streamEventFor } from '@conhost/web/agent-streams';
+import {
+  applyStreamEnded, applyTrace, conversationAgentOf, streamEventFor, toolCallState, treesShownFor,
+} from '@conhost/web/agent-streams';
 import {
   Lightbox,
   MediaView,
@@ -118,15 +120,8 @@ function entryToMessage(e: WelcomeMessageEntry): Message {
 export function App() {
   const wire = createWireClient();
   const treeStore = createTreeStore();
-  /** Whether this page builds and shows the agent trees: an operator's page
-   *  does, and an observer's when its grant holds what a tree carries
-   *  (AGENT_TREE_SCOPES). Otherwise the traces it gets would build nodes it
-   *  never sees end, and an empty tree would read as no agents running. */
-  const treesShown = (): boolean => {
-    const info = wire.observer();
-    return wire.observerState() !== 'observer' || !info
-      || AGENT_TREE_SCOPES.every((scope) => info.scopes.includes(scope));
-  };
+  /** Whether this page builds and shows the agent trees (treesShownFor). */
+  const treesShown = (): boolean => treesShownFor(wire.observerState(), wire.observer()?.scopes ?? null);
 
   // Use a store rather than a signal so the streaming token append can
   // mutate the last message's `text` in place. Replacing the message object
@@ -2467,15 +2462,12 @@ function ToolBlockView(props: {
   const kind = (): string => `tool:${props.block.name}`;
   const open = (): boolean => isBlockOpen(props.blockKey, kind());
   const allOpen = (): boolean => expandedKinds().has(kind());
-  const dot = (): string => {
-    // A loaded result says how the call ended, whatever status traces this
-    // page got: a page without 'ops' never gets tool:failed.
-    if (props.result) return props.result.isError ? 'bg-rose-500' : 'bg-emerald-500';
-    if (props.block.status === 'running') return 'bg-amber-400 animate-pulse';
-    if (props.block.status === 'failed') return 'bg-rose-500';
-    if (props.block.status === 'done') return 'bg-emerald-500';
-    return 'bg-neutral-600';
-  };
+  const dot = (): string => ({
+    running: 'bg-amber-400 animate-pulse',
+    failed: 'bg-rose-500',
+    done: 'bg-emerald-500',
+    unknown: 'bg-neutral-600',
+  })[toolCallState(props.block.status, props.result)];
   const duration = (): string => {
     const ms = props.block.durationMs;
     if (ms === undefined) return '';

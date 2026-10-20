@@ -144,7 +144,7 @@ describe('what each client is sent', () => {
     const c = await everyone();
     host.emitTrace({ type: 'inference:failed', agentName: 'main', error: 'provider said no', stack: 'at somewhere' });
     host.emitTrace({ type: 'inference:completed', agentName: 'main', tokenUsage: { input: 1, output: 1 } });
-    host.emitTrace({ type: 'inference:aborted', agentName: 'main', reason: 'user' });
+    host.emitTrace({ type: 'inference:aborted', agentName: 'main', reason: 'interrupted from the Web UI' });
     await host.fence(Object.values(c));
     const ends = (conn: Connection) => conn.frames
       .filter((f) => f.type === 'trace' || f.type === 'stream-ended')
@@ -152,13 +152,14 @@ describe('what each client is sent', () => {
     for (const conn of [c.operator, c.everything]) {
       expect(ends(conn)).toEqual(['inference:failed', 'inference:completed', 'inference:aborted']);
     }
-    // Without ops the failure's error and stack stay back, and without
-    // health the completion's usage; that the stream ended still arrives.
+    // Without ops the failure's error and stack stay back, and why the turn
+    // was stopped; without health the completion's usage. That the stream
+    // ended still arrives.
     for (const conn of [c.reader, c.interior]) {
       expect(ends(conn)).toEqual([
         { type: 'stream-ended', agentName: 'main' },
         { type: 'stream-ended', agentName: 'main' },
-        'inference:aborted',
+        { type: 'stream-ended', agentName: 'main' },
       ]);
     }
     expect(ends(c.dashboard)).toEqual([]);

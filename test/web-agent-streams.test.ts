@@ -3,10 +3,14 @@
  * the main view's streaming message follows the conversation agent alone and
  * ends at every stream end, a turn a tool ended included, while the quiesce
  * re-pull runs at any agent's end. Each other agent's stream has a panel of
- * its own, the host's other framework agents' included.
+ * its own, the host's other framework agents' included. What a page builds
+ * from frames follows its grant: the tree, and a tool call's state.
  */
 import { describe, expect, test } from 'bun:test';
-import { applyStreamEnded, applyTrace, conversationAgentOf, pickStreamSource, streamEventFor, type TraceViewHooks } from '../src/web/agent-streams.js';
+import {
+  applyStreamEnded, applyTrace, conversationAgentOf, pickStreamSource, streamEventFor, toolCallState, treesShownFor,
+  type TraceViewHooks,
+} from '../src/web/agent-streams.js';
 import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
 
 function recorder() {
@@ -146,5 +150,37 @@ describe('the other traces the page reads', () => {
     applyTrace({ type: 'host:quiesce' }, hooks, 'clerk');
     applyTrace({ type: 'inference:started', agentName: 'clerk' }, hooks, 'clerk');
     expect(calls).toEqual(['alert', 'operator', 'host-mode']);
+  });
+});
+
+describe('what a page builds from frames follows its grant', () => {
+  const trees = ['messages', 'thinking', 'tools', 'health', 'ops'];
+
+  test("an operator's page shows the trees, and an observer's only when its grant holds every scope a tree needs", () => {
+    expect(treesShownFor('none', null)).toBe(true);
+    expect(treesShownFor('observer', trees)).toBe(true);
+    expect(treesShownFor('observer', [...trees, 'debug'])).toBe(true);
+    for (const missing of trees) {
+      expect(treesShownFor('observer', trees.filter((scope) => scope !== missing))).toBe(false);
+    }
+    expect(treesShownFor('observer', ['messages'])).toBe(false);
+  });
+
+  test('a page signing in as an observer shows no trees before its grant is known, and keeps its grant\'s answer while it signs in again', () => {
+    for (const state of ['authing', 'denied', 'unavailable']) expect(treesShownFor(state, null)).toBe(false);
+    expect(treesShownFor('authing', ['messages'])).toBe(false);
+    expect(treesShownFor('authing', trees)).toBe(true);
+  });
+
+  test("a tool call shows how its loaded result ended, whatever status the stream gave it, and the stream's status until then", () => {
+    for (const status of ['running', 'done', 'failed', undefined] as const) {
+      expect(toolCallState(status, { isError: true })).toBe('failed');
+      expect(toolCallState(status, {})).toBe('done');
+      expect(toolCallState(status, { isError: false })).toBe('done');
+    }
+    expect(toolCallState('running', undefined)).toBe('running');
+    expect(toolCallState('failed', undefined)).toBe('failed');
+    expect(toolCallState('done', undefined)).toBe('done');
+    expect(toolCallState(undefined, undefined)).toBe('unknown');
   });
 });

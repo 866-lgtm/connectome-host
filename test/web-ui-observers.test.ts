@@ -637,7 +637,13 @@ describe('scope filters', () => {
     expect(traceScopes({ type: 'host:quiesce' })).toEqual(['health']);
     expect(traceScopes({ type: 'inference:failed' })).toEqual(['ops']);
     expect(traceScopes({ type: 'inference:exhausted' })).toEqual(['ops']);
-    expect(traceScopes({ type: 'operator:action' })).toEqual(['messages', 'health', 'ops']);
+    // Why a turn was stopped is ops; that it ended reaches messages as stream-ended.
+    expect(traceScopes({ type: 'inference:aborted' })).toEqual(['messages', 'ops']);
+    for (const type of ['inbound:observer-failed', 'mcpl:request-handler-error', 'prose:drafts-held', 'prose:draft-resent', 'prose:drafts-dismissed']) {
+      expect(traceScopes({ type })).toEqual(['ops']);
+    }
+    // The operator log's entry, as request-operator-log gives ops.
+    expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
     expect(traceScopes({ type: 'a-trace-added-later' })).toBe(FULL_CLIENTS_ONLY);

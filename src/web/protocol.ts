@@ -5,18 +5,23 @@
  * deliberately mirrors the fleet IPC (`fleet-types.ts`) so a future external
  * aggregator can reuse the same parsers.
  *
- * Versioning: v1. Breaking changes bump `WEB_PROTOCOL_VERSION` and clients
+ * Versioning: v2. Breaking changes bump `WEB_PROTOCOL_VERSION` and clients
  * refuse to connect on mismatch.
  *
  * v1 (2026-07): windowed history (welcome carries only a tail window plus
  * `history` metadata; older pages via request-history/history-page), ordered
  * `blocks` on message entries (thinking / tool_use / tool_result / media
  * surface in full), and `message-appended` live pushes of stored messages.
+ *
+ * v2 (2026-10): an observer gets only the frames its grant's scopes cover,
+ * live as well as in its welcome, and a `stream-ended` frame in place of a
+ * stream-end trace its scopes don't cover, which a page has to handle to end
+ * a streamed turn.
  */
 
 import type { Line } from '../output-line.js';
 
-export const WEB_PROTOCOL_VERSION = 1;
+export const WEB_PROTOCOL_VERSION = 2;
 
 /** What an observer needs to be sent the agent trees, and so what a page
  *  needs to build and show them: every scope but 'debug'. A tree's nodes carry

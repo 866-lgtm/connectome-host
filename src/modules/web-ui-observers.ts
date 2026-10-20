@@ -647,7 +647,6 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'message:added': MESSAGES,
   'message:removed': MESSAGES,
   'inference:started': MESSAGES,
-  'inference:aborted': MESSAGES,
   'inference:turn_ended': MESSAGES,
   // The messages injected into a turn.
   'inference:stream_resumed': MESSAGES,
@@ -671,7 +670,8 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'tool:result_dropped': TOOLS_AND_OPS,
   'puppet:tool-call': TOOLS_AND_OPS,
   // Whole process events and module responses: messages, thinking blocks,
-  // tool results and their errors.
+  // tool results and their errors, and a module's own payload and response,
+  // which are opaque and so can hold health and ops data too.
   'process:received': ALL_BUT_DEBUG,
   'process:completed': ALL_BUT_DEBUG,
   // Usage and serving state.
@@ -683,10 +683,16 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   // Alerts: failures and refusals, the gate's decisions, modules coming and
   // going, MCPL servers and conversations, and what operators did.
   'ops:alert': OPS,
-  // Its result can carry branch names and the serving mode.
-  'operator:action': ['messages', 'health', 'ops'],
+  // The operator log's own entry, which request-operator-log gives ops
+  // whole: the branch an operator acted on and the mode they set come with
+  // it.
+  'operator:action': OPS,
   'inference:failed': OPS,
   'inference:exhausted': OPS,
+  // Why a turn was stopped: the surface an operator stopped it from, or the
+  // host's drain. A client without ops gets stream-ended in its place.
+  'inference:aborted': ['messages', 'ops'],
+  'inbound:observer-failed': OPS,
   'inference:request_dropped': OPS,
   'inference:request_stale': OPS,
   'tool:spill_failed': OPS,
@@ -702,6 +708,7 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'mcpl:channel-incoming-rejected': OPS,
   'mcpl:empty-content-dropped': OPS,
   'mcpl:coalescing': OPS,
+  'mcpl:request-handler-error': OPS,
   'mcpl:server-stderr': OPS,
   'mcpl:server-connect-failed': OPS,
   'mcpl:server-reconnected': OPS,
@@ -719,6 +726,10 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'mcpl:conversation-closed': OPS,
   'mcpl:conversation-disposed': OPS,
   'mcpl:speech-route-failed': OPS,
+  // Held speech's delivery: held, resent, dismissed, with no text.
+  'prose:drafts-held': OPS,
+  'prose:draft-resent': OPS,
+  'prose:drafts-dismissed': OPS,
   // The routed prose, verbatim.
   'mcpl:speech-routed': ['messages', 'ops'],
 };
@@ -870,7 +881,7 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
       .map((e) => filterEntryForScopes(e, scopes))
       .filter((e): e is WelcomeMessageEntry => e !== null),
     // A tree's nodes carry a subagent's task, each run's phase and how it
-    // ended, counters, token counts, and each child's model.
+    // ended, counters and token counts, and a child's entry names its model.
     ...(TREES.every((scope) => scopes.has(scope))
       ? {}
       : { localTree: emptyTree, childTrees: [] }),

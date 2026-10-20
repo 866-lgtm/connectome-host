@@ -20,10 +20,16 @@
  * STREAM_END_TRACES (state/turn-trace.ts), a turn a tool ended included.
  * The quiesce re-pull runs at any agent's end, since a quiesce drains when
  * the last turn in flight ends, whoever's it is.
+ *
+ * An observer's page gets only the frames its grant covers, so what the page
+ * builds from frames follows the grant too: the tree only with the trees'
+ * scopes (treesShownFor), and a tool call's state from its stored result once
+ * that has loaded (toolCallState).
  */
 
 import { STREAM_END_TRACES } from '../state/turn-trace.js';
 import type { AgentNode } from '../state/agent-tree-reducer.js';
+import { AGENT_TREE_SCOPES } from './protocol.js';
 
 export interface TraceViewHooks {
   appendStreamToken(token: string, blockType?: string): void;
@@ -185,4 +191,28 @@ export function streamEventFor(
         ? event
         : null;
   }
+}
+
+/** Whether the page builds and shows the agent trees, given its observer
+ *  sign-in state and the scopes its grant's observer-ack gave, or null before
+ *  any. An observer's page does when its grant holds what a tree carries
+ *  (AGENT_TREE_SCOPES), and keeps that answer while it signs in again after a
+ *  reconnect. A page that hasn't been asked to sign in as an observer
+ *  ('none') is an operator's, and does. Otherwise its traces would build
+ *  nodes whose failed or exhausted end (ops) or completion (health) it never
+ *  gets, and an empty tree would read as no agents running. */
+export function treesShownFor(state: string, scopes: readonly string[] | null): boolean {
+  if (scopes !== null) return AGENT_TREE_SCOPES.every((scope) => scopes.includes(scope));
+  return state === 'none';
+}
+
+/** How a tool call shows. A loaded result says how the call ended, whatever
+ *  status traces the page got: a page without 'ops' never gets tool:failed.
+ *  Until it loads, the stream's status says. */
+export function toolCallState(
+  status: 'running' | 'done' | 'failed' | undefined,
+  result: { isError?: boolean } | undefined,
+): 'running' | 'done' | 'failed' | 'unknown' {
+  if (result) return result.isError ? 'failed' : 'done';
+  return status ?? 'unknown';
 }
