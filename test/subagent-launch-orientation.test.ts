@@ -1571,7 +1571,7 @@ describe('what a stream first reads is what its launch promises', () => {
         const cm = h.framework.getAgent('parent')!.getContextManager();
         cm.addMessage('user', [{ type: 'text', text: 'begin' }]);
         if (path === 'structural') {
-          // As agent-framework 0.22.2 stores an XML round: each call carries
+          // As agent-framework 0.22.3 stores an XML round: each call carries
           // the round's raw text, a sibling fork's included, and each result
           // is named, in call order.
           const sibling = { name: 'sibling', task: 'SIBLING-TASK' };

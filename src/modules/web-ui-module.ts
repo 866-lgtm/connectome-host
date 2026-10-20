@@ -1545,7 +1545,7 @@ export class WebUiModule implements Module {
       // (`mount_unavailable`) is the server's fault, as no workspace is, and
       // says nothing about the file. Anything else the read can't give is not
       // found, such as a file that changed while it was read. A mount whose
-      // directory has gone is not found on agent-framework 0.22.2, whose read
+      // directory has gone is not found on agent-framework 0.22.3, whose read
       // finds no file in it, and unavailable from the release with
       // anima-research/agent-framework#533, whose read checks the mount's
       // root. The body is the read's message, which says why, names no host
