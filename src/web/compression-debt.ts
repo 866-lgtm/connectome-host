@@ -8,7 +8,7 @@
  * happened, what it means and what to do, a line each, and each count it
  * couldn't compute is `null`. So the line shows only the counts the report
  * gives, never a 0 it couldn't compute, and the tab shows `error` whole, with
- * its line breaks, beside the host's own next step.
+ * its line breaks, and the host's own next step under it.
  */
 export interface CompressionDebt {
   state?: 'healthy' | 'degraded' | 'critical' | 'unknown';
@@ -78,13 +78,15 @@ export function debtAge(ms: number): string {
 /** The host's own next step, under the report's message, which it refers to:
  *  for a report that failed, how this host reports a problem; for the
  *  ledger, the same when the store's data is damaged, since nothing in
- *  context-manager repairs that. None without a message. */
+ *  context-manager repairs that. The reporter describes the message in their
+ *  own words, as /bug's rule keeps error text and paths out of its public
+ *  issues (src/bug-report.ts). None without a message. */
 export function debtNextStep(debt: CompressionDebt): string | undefined {
   if (!debt.error) return undefined;
   const failed = failedRead(debt);
-  if (failed === 'report') return 'To report it, run /bug with this message as its text.';
+  if (failed === 'report') return 'To report it, run /bug, saying in your own words what this message shows.';
   if (failed === 'quarantine-ledger') {
-    return "If the store's error says its data is damaged, nothing here repairs it: run /bug with this message as its text.";
+    return "If the store's error says its data is damaged, nothing here repairs it: run /bug, saying in your own words what this message shows.";
   }
   return undefined;
 }

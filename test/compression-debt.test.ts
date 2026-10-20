@@ -27,7 +27,7 @@ const failed: CompressionDebt = {
     'The compression debt report failed.',
     'Cause: store closed',
     "Effect: the report can't say whether compression is keeping up. Compression itself may be running normally.",
-    'Fix: this points to a fault in context-manager or in the options it was given. Report it, with this text.',
+    'Fix: this points to a fault in context-manager or in the options it was given. Report it.',
   ].join('\n'),
   failure: 'report',
   pendingChunks: null,
@@ -102,10 +102,10 @@ describe('debtAge', () => {
 });
 
 describe('debtNextStep', () => {
-  test("the host's own next step under a message: /bug for a fault in the report, and for a ledger whose data is damaged", () => {
-    expect(debtNextStep(failed)).toBe('To report it, run /bug with this message as its text.');
+  test("the host's own next step under a message: /bug for a fault in the report, and, as a condition the reader judges, for any ledger failure", () => {
+    expect(debtNextStep(failed)).toBe('To report it, run /bug, saying in your own words what this message shows.');
     expect(debtNextStep(ledger({})))
-      .toBe("If the store's error says its data is damaged, nothing here repairs it: run /bug with this message as its text.");
+      .toBe("If the store's error says its data is damaged, nothing here repairs it: run /bug, saying in your own words what this message shows.");
     expect(debtNextStep({ state: 'unknown', failure: 'report' })).toBeUndefined();
     expect(debtNextStep({ state: 'unknown' })).toBeUndefined();
     expect(debtNextStep({ state: 'critical', pendingChunks: 5 })).toBeUndefined();
