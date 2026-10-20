@@ -781,10 +781,19 @@ blocks; expect folds to interact with this on the next model generation.
 - **Reach loopback webui:** `ssh -L <port>:localhost:<port> <login-user>@<box>` → `http://localhost:<port>`
 - **Live makeup:** `GET /debug/context/makeup` (basic auth) — segments + exact total tokens
 - **Compiled context:** `GET /debug/context`
-- **Per-call logs:** `data/llm-calls.<iso>.jsonl` (request summary + response + error; whether a
-  call's raw request is kept depends on the provider and on `LLM_CALLS_FULL_PAYLOADS`) — rotates to
-  a new file on every restart; re-list by mtime after a bounce. Counts *attempts*; `failures.log`
-  counts *turns*.
+- **Per-call logs:** `data/llm-calls.<iso>.jsonl`, one JSON line per provider call attempt — rotates
+  to a new file on every restart; re-list by mtime after a bounce. Counts *attempts*;
+  `failures.log` counts *turns*. A line normally carries timing and a request summary; a failure
+  adds the bounded error and its classification, and a call that got a response adds its summary
+  (Bedrock, generic wrapper) or raw response (Anthropic, generic wrapper). A summary can be
+  missing (`summaryUnavailable: true`, or dropped by the size cap below). Raw requests are kept
+  only where the writer's policy keeps them: Anthropic complete/stream on errors and refusals, or
+  on every call with `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
+  whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
+  newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
+  raw request first, its raw response only if the line still doesn't fit, then its summaries, keeping at least its type, kind,
+  timing and error classification, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
+  complete copy of any payload.
 - **Topology audit / repair (context-manager ≥ 0.12, §11.8):**
   `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json`
   (exit 2 = crossed), `node …/repair-topology.js <store-copy> --namespace agents/<agent> --mode lossless [--apply]`

@@ -25,7 +25,7 @@
 // JSON object with shape:
 //   { type: 'call'|'error', kind: 'complete'|'stream'|'keepalive', timestamp, durationMs,
 //     requestSummary, rawRequest?, rawResponse, error?, errorType?,
-//     httpStatus?, providerErrorCode?, retryable?, errorChars? }
+//     httpStatus?, providerErrorCode?, retryable?, errorChars?, truncated? }
 // A failure's `error` is { name, message, stack } with its text bounded, or
 // a non-Error's text (logging-error-fields.ts). The request summary leaves
 // out only the parts it can't read; a record whose response can't be read
@@ -36,6 +36,10 @@
 // A keepalive row also carries `keepalive: { key, lane, startedAt }`: the
 // lineage it refreshed, its lane, and when its send began. It keeps the
 // replayed request only with full payloads on, whatever its outcome.
+// Every line, newline included, stays within the shared 16 MiB UTF-8 cap
+// (logging-record.ts): an oversized or unserializable record drops its raw
+// request first, its raw response only if the line still doesn't fit, then
+// its summaries, and `truncated` says what was dropped.
 
 import { AnthropicAdapter, cacheLineageKey } from '@animalabs/membrane';
 import type {
@@ -48,6 +52,7 @@ import type {
 import { appendFileSync } from 'node:fs';
 import { parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from './call-ledger.js';
 import { describeErrorObject } from './logging-error-fields.js';
+import { serializeRecord } from './logging-record.js';
 
 /** Live read of the current reasoning setting. The host wires this to
  *  `SettingsModule.getReasoning()` so toggles via the `agent_settings` tool's
@@ -153,12 +158,15 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  key; requests then need the identity block prepended (see above). */
   private readonly oauthMode: boolean;
   /** LLM_CALLS_FULL_PAYLOADS=1: retain the full raw request on EVERY call,
-   *  not just refusals/errors. Purpose: pass/refusal contrast corpora — a
+   *  not just refusals/errors, within the 16 MiB a log line may take
+   *  (logging-record.ts). Purpose: pass/refusal contrast corpora — a
    *  refusal's payload is only interpretable next to the passing payloads
    *  around it (classifier-forensics finding, 2026-07-27: verdicts are a
    *  near-deterministic function of the payload, so adjacent pairs isolate
-   *  the differentiator). Costs disk, not memory (the raw request is already
-   *  captured per-call for the summary); pair with llm-calls rotation. */
+   *  the differentiator). Costs disk, and at each write a string the size of
+   *  the whole record, serialized before the cap applies (the raw request
+   *  itself is already captured per-call for the summary); pair with
+   *  llm-calls rotation. */
   private readonly fullPayloads: boolean = envFlag(process.env.LLM_CALLS_FULL_PAYLOADS);
 
   constructor(
@@ -293,7 +301,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
 
   private log(record: Record<string, unknown>): void {
     try {
-      appendFileSync(this.logPath, JSON.stringify(record) + '\n');
+      appendFileSync(this.logPath, serializeRecord(record));
     } catch {
       // never throw from logging
     }
