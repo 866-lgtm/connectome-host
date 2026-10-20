@@ -1,8 +1,9 @@
 import { describe, expect, test } from 'bun:test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CallLedger, parseLoggedCall, summarizeCacheControls, type ProviderCallRecord } from '../src/call-ledger.js';
+import { MAX_RECORD_BYTES } from '../src/logging-record.js';
 
 const at = (seconds: number): string => new Date(Date.UTC(2026, 0, 1, 0, 0, seconds)).toISOString();
 
@@ -264,6 +265,83 @@ describe('CallLedger cache gaps by lineage', () => {
     const row = { kind: 'stream', timestamp: at(0), requestSummary: { model: 'claude-fable-5', messages: 3, lineage: '0123456789abcdef' } };
     expect(parseLoggedCall(row)?.lineage).toBe('0123456789abcdef');
     expect(parseLoggedCall({ ...row, requestSummary: { model: 'claude-fable-5', messages: 3 } })?.lineage).toBeUndefined();
+  });
+});
+
+describe("the ledger's restore reads whole lines within the call logs' budget", () => {
+  // A call row; with `bytes`, padded so its line, newline included, is that long.
+  const row = (seconds: number, bytes?: number, durationMs = 1000): string => {
+    const fields = {
+      type: 'call', kind: 'stream', timestamp: at(seconds), durationMs,
+      requestSummary: { model: 'claude-fable-5', messages: 10, cacheBreakpoints: 4, cacheTtls: ['1h', '1h', '1h', '1h'], lineage: 'a' },
+      rawResponse: { stop_reason: 'end_turn', usage: { input_tokens: 2, output_tokens: 100, cache_read_input_tokens: 80_000, cache_creation_input_tokens: 0 } },
+      pad: '',
+    };
+    const plain = JSON.stringify(fields);
+    return bytes === undefined ? plain : JSON.stringify({ ...fields, pad: 'x'.repeat(bytes - 1 - plain.length) });
+  };
+
+  test("a line of the writers' full length at a file's end leaves the calls before it", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'call-ledger-budget-'));
+    try {
+      const small = Array.from({ length: 10 }, (_, i) => row(i * 10));
+      writeFileSync(join(dir, 'llm-calls.test.jsonl'), [...small, row(200, MAX_RECORD_BYTES)].join('\n') + '\n');
+      const rows = new CallLedger({ dataDir: dir, defaultTtl: '1h' }).snapshot().rows;
+      expect(rows.length).toBe(11);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('the newest file is read first, so the budget goes to the newest calls', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'call-ledger-budget-'));
+    try {
+      const oldest = join(dir, 'llm-calls.oldest.jsonl');
+      const older = join(dir, 'llm-calls.older.jsonl');
+      const newer = join(dir, 'llm-calls.newer.jsonl');
+      writeFileSync(oldest, row(-100) + '\n');
+      // Read first, the older file's four long lines would take the whole budget.
+      writeFileSync(older, [row(0), ...[10, 20, 30, 40].map((s) => row(s, MAX_RECORD_BYTES))].join('\n') + '\n');
+      writeFileSync(newer, [row(100), row(110), row(120)].join('\n') + '\n');
+      utimesSync(oldest, new Date(500_000), new Date(500_000));
+      utimesSync(older, new Date(1_000_000), new Date(1_000_000));
+      utimesSync(newer, new Date(2_000_000), new Date(2_000_000));
+      const times = new CallLedger({ dataDir: dir, defaultTtl: '1h' }).snapshot().rows.map((r) => r.timestamp);
+      // The newer file's three calls, then the older file's long lines the
+      // rest of the budget holds whole: three of its four. The line longer
+      // than what's left ends the restore, so the oldest file goes unread.
+      expect(times).toEqual([at(20), at(30), at(40), at(100), at(110), at(120)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('calls that share a time keep the order their log holds them in', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'call-ledger-budget-'));
+    try {
+      writeFileSync(join(dir, 'llm-calls.test.jsonl'), [row(0, undefined, 1), row(10, undefined, 2), row(10, undefined, 3)].join('\n') + '\n');
+      const durations = new CallLedger({ dataDir: dir, defaultTtl: '1h' }).snapshot().rows.map((r) => r.durationMs);
+      expect(durations).toEqual([1, 2, 3]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test("a file or a line that can't be read costs only itself", () => {
+    const dir = mkdtempSync(join(tmpdir(), 'call-ledger-budget-'));
+    try {
+      const older = join(dir, 'llm-calls.older.jsonl');
+      // A directory where the newest log should be: listed, and unreadable.
+      const newest = join(dir, 'llm-calls.newest.jsonl');
+      writeFileSync(older, [row(0), 'not a call record', row(10)].join('\n') + '\n');
+      mkdirSync(newest);
+      utimesSync(older, new Date(1_000_000), new Date(1_000_000));
+      utimesSync(newest, new Date(2_000_000), new Date(2_000_000));
+      const times = new CallLedger({ dataDir: dir, defaultTtl: '1h' }).snapshot().rows.map((r) => r.timestamp);
+      expect(times).toEqual([at(0), at(10)]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
