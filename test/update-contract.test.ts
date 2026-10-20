@@ -10,8 +10,8 @@ import { join, resolve } from 'node:path';
 import {
   ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, PLACE_KINDS, RESTART_EXIT_CODE, appendJournal, childrenFilePath,
   copyItemName, copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent,
-  moveCurrent, readCurrent, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir, trialPlaces,
-  unfinishedTrial, writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
+  moveCurrent, pendingGoBack, readCurrent, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir,
+  trialPlaces, unfinishedTrial, writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
 } from '../src/update/contract.js';
 
 let root: string;
@@ -34,7 +34,7 @@ describe('the update contract', () => {
   test('the names are the contract: an older release reads them, so none changes', () => {
     expect(installPaths('/r')).toEqual({
       root: '/r', releases: '/r/releases', current: '/r/current', install: '/r/install.json', mark: '/r/mark.json',
-      journal: '/r/journal.jsonl', lock: '/r/lock.json', copy: '/r/copy', copyTmp: '/r/copy.tmp',
+      journal: '/r/journal.jsonl', lock: '/r/lock.json', copy: '/r/copy', copyTmp: '/r/copy.tmp', copyPrev: '/r/copy.prev',
       setAside: '/r/set-aside', midTurn: '/r/midturn.json',
     });
     expect(releaseDir('/r', '0.11.0')).toBe('/r/releases/0.11.0');
@@ -426,7 +426,7 @@ describe('the update contract', () => {
     } finally {
       unreadable.mockRestore();
     }
-    // A copy that goes loses its label first, so what is left of it is no copy either.
+    // A copy that has lost its label, as only damage leaves one, is no copy.
     unlinkSync(copyLabelPath(copy));
     expect(lastCopy(root)).toBeNull();
   });
@@ -611,5 +611,23 @@ describe('the update contract', () => {
     writeJsonAtomic(copyLabelPath(copy), { v: 1, from: '0.11.0', at: 'T3', mark: 'm3', items: [{ path: data, name: '0-data' }] } satisfies CopyLabel);
     appendJournal(root, trial('m3'));
     expect(trialPlaces(root)).toEqual([data]);
+  });
+
+  test('the Go back a start goes on with: the last ok go-back with no ok trial-start, commit or fallback after it', () => {
+    const goBack = (mark: string, outcome: JournalLine['outcome'] = 'ok'): JournalLine => ({ ...line('go-back', outcome, '0.10.2'), mark });
+    expect(pendingGoBack([])).toBeNull();
+    expect(pendingGoBack([goBack('g1')])).toEqual(goBack('g1'));
+    // A refused or failed go-back left the data untouched.
+    expect(pendingGoBack([goBack('g1', 'refused')])).toBeNull();
+    expect(pendingGoBack([goBack('g1', 'failed')])).toBeNull();
+    // Each ok line after it ends it; a refused trial-start or a failed
+    // fallback leaves the data as it may be, so the Go back goes on.
+    for (const step of ['trial-start', 'commit', 'fallback'] as const) {
+      expect(pendingGoBack([goBack('g1'), line(step)])).toBeNull();
+      expect(pendingGoBack([goBack('g1'), line(step, step === 'fallback' ? 'failed' : 'refused')])).toEqual(goBack('g1'));
+    }
+    // The last one counts.
+    expect(pendingGoBack([goBack('g1'), line('fallback'), goBack('g2')])).toEqual(goBack('g2'));
+    expect(pendingGoBack([goBack('g1'), goBack('g2'), line('trial-start')])).toBeNull();
   });
 });
