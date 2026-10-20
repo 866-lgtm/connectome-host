@@ -5,8 +5,9 @@
  * deliberately mirrors the fleet IPC (`fleet-types.ts`) so a future external
  * aggregator can reuse the same parsers.
  *
- * Versioning: v2. Breaking changes bump `WEB_PROTOCOL_VERSION` and clients
- * refuse to connect on mismatch.
+ * Versioning: v2. Breaking changes bump `WEB_PROTOCOL_VERSION`. On a
+ * mismatch the Web UI page doesn't apply the welcome and shows a banner
+ * asking for a reload; its socket stays open.
  *
  * v1 (2026-07): windowed history (welcome carries only a tail window plus
  * `history` metadata; older pages via request-history/history-page), ordered

@@ -172,6 +172,10 @@ describe('what a page builds from frames follows its grant', () => {
     expect(treesShownFor('authing', trees)).toBe(true);
   });
 
+  test("a page that can't sign in shows no trees, whatever grant it held before", () => {
+    for (const state of ['denied', 'unavailable']) expect(treesShownFor(state, trees)).toBe(false);
+  });
+
   test("a tool call shows how its loaded result ended, whatever status the stream gave it, and the stream's status until then", () => {
     for (const status of ['running', 'done', 'failed', undefined] as const) {
       expect(toolCallState(status, { isError: true })).toBe('failed');

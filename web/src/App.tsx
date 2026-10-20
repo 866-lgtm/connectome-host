@@ -1642,7 +1642,7 @@ export function App() {
             onChange={changePanelScope}
           />
           <div class="flex-1 min-h-0">
-            <Show when={sidebarTab() === 'tree' && !treesShown()}>
+            <Show when={sidebarTab() === 'tree' && !treesShown() && wire.observer() !== null}>
               <div class="p-4 text-xs text-neutral-500">
                 The agent tree shows for a grant with every scope but debug ({AGENT_TREE_SCOPES.join(', ')}).
               </div>

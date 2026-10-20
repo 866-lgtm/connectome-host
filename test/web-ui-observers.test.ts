@@ -38,7 +38,7 @@ import {
   type ObserverScope,
   type ObserversFile,
 } from '../src/modules/web-ui-observers.js';
-import type { WelcomeMessage, WelcomeMessageEntry } from '../src/web/protocol.js';
+import { WEB_PROTOCOL_VERSION, type WelcomeMessage, type WelcomeMessageEntry } from '../src/web/protocol.js';
 import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
 import { BASIC, helloFor, makeKeypair } from './web-ui-observed-host.js';
 
@@ -709,7 +709,7 @@ describe('scope filters', () => {
 
   test("scopeWelcome without messages empties conversation payload, and the session's and branch's names", () => {
     const welcome = {
-      type: 'welcome', protocolVersion: 1,
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION,
       agents: [{ name: 'main', model: 'claude-x' }],
       session: { id: 's1', name: 'Debugging the bridge', autoNamed: true },
       branch: { id: 'b1', name: 'experiment' },
@@ -740,7 +740,7 @@ describe('scope filters', () => {
   // so the welcome cannot hand the same data to a messages-only observer.
   test('scopeWelcome without health strips callLedger/perAgentCost/hostMode and zeroes usage', () => {
     const welcome = {
-      type: 'welcome', protocolVersion: 1,
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION,
       messages: [entry],
       history: { startIndex: 40, totalCount: 240 },
       localTree: { asOfTs: 1, nodes: [], callIdIndex: {} },
@@ -789,7 +789,7 @@ describe('scope filters', () => {
   test('the agent trees go only with every scope but debug, since their nodes carry token counts and how each run ended', () => {
     const tree = { asOfTs: 1, nodes: [{ name: 'main', tokens: { input: 5 } }], callIdIndex: {} };
     const welcome = {
-      type: 'welcome', protocolVersion: 1, agents: [], messages: [],
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION, agents: [], messages: [],
       session: { id: 's', name: 's', autoNamed: false }, branch: { id: 'b', name: 'b' },
       history: { startIndex: 0, totalCount: 0 },
       localTree: tree,

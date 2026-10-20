@@ -194,16 +194,19 @@ export function streamEventFor(
 }
 
 /** Whether the page builds and shows the agent trees, given its observer
- *  sign-in state and the scopes its grant's observer-ack gave, or null before
- *  any. An observer's page does when its grant holds what a tree carries
- *  (AGENT_TREE_SCOPES), and keeps that answer while it signs in again after a
- *  reconnect. A page that hasn't been asked to sign in as an observer
- *  ('none') is an operator's, and does. Otherwise its traces would build
- *  nodes whose failed or exhausted end (ops) or completion (health) it never
- *  gets, and an empty tree would read as no agents running. */
+ *  sign-in state on this connection and the scopes its grant's observer-ack
+ *  gave, or null before any. An operator's connection ('none': the host never
+ *  asked it to sign in) does. An observer's does when its grant holds what a
+ *  tree carries (AGENT_TREE_SCOPES), and keeps that answer while it signs in
+ *  again after a reconnect. Before its first grant, and once it can't sign
+ *  in ('denied', 'unavailable', where the page shows its sign-in screen), it
+ *  doesn't. Otherwise its traces would build nodes whose failed or exhausted
+ *  end (ops) or completion (health) it never gets, and an empty tree would
+ *  read as no agents running. */
 export function treesShownFor(state: string, scopes: readonly string[] | null): boolean {
-  if (scopes !== null) return AGENT_TREE_SCOPES.every((scope) => scopes.includes(scope));
-  return state === 'none';
+  if (state === 'none') return true;
+  if (state !== 'observer' && state !== 'authing') return false;
+  return scopes !== null && AGENT_TREE_SCOPES.every((scope) => scopes.includes(scope));
 }
 
 /** How a tool call shows. A loaded result says how the call ended, whatever
