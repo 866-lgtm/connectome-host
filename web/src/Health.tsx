@@ -21,7 +21,7 @@ import type { CallLedgerRow } from '@conhost/web/protocol';
 import { callOriginLabel, callOriginTone } from './call-origin';
 import { healthEntry } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
-import { debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
+import { debtNextStep, debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
 
 /** One active operator alert, keyed `${agent}:${kind}`. `count` increments on
  *  every re-fire of the same key so a repeating klaxon reads as one row. */
@@ -594,7 +594,10 @@ export function HealthPanel(props: {
                 <div class={DEBT_TONE_CLASS[debtTone(d())]}>
                   {debtSummary(d())}
                   <Show when={d().error}>
-                    {(error) => <div class="text-rose-300/90 truncate" title={error()}>{error()}</div>}
+                    {(error) => <div class="text-rose-300/90 whitespace-pre-line break-words">{error()}</div>}
+                  </Show>
+                  <Show when={debtNextStep(d())}>
+                    {(step) => <div class="text-neutral-300 whitespace-normal break-words">{step()}</div>}
                   </Show>
                 </div>
               )}
