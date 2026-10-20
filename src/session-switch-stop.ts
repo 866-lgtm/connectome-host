@@ -18,7 +18,7 @@ export async function stopForSessionSwitch(
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     log(
-      `[session] switching to session ${targetSessionId}: the current session's framework stopped, ` +
+      `[framework] switching to session ${targetSessionId}: the current session's framework stopped, ` +
       `but its teardown failed: ${reason}. The switch goes on; a child named here may still be running.`,
     );
   }
