@@ -870,7 +870,8 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
     // Health reads never throw.
   }
   // Compression DEBT per agent — the single-authority reduction from cm
-  // (healthy / degraded / critical + the numbers behind it). Every wedge of
+  // (healthy / degraded / critical, or unknown when it couldn't read what it
+  // reports, + the numbers behind it). Every wedge of
   // the 2026-08-06 five-resident day was weeks of silently-failing
   // compression surfacing as a sudden budget crisis; this block is what
   // lets fleet-watch (and later the resident notice, af #99) catch the
