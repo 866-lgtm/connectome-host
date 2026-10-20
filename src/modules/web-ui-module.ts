@@ -827,12 +827,14 @@ export class WebUiModule implements Module {
 
     if (sharedServer!.clients.size === 0) return;
     // Forward the verbatim event so the SPA can fold it into its own
-    // per-child AgentTreeReducer for live updates.
+    // per-child AgentTreeReducer for live updates. A client that may not
+    // have a child's stream-end trace learns that the stream ended.
+    const ended = streamEndedFor(event as unknown as { type: string; agentName?: unknown });
     this.broadcast({
       type: 'child-event',
       childName,
       event: event as unknown as { type: string; [k: string]: unknown },
-    });
+    }, ended ? { type: 'child-event', childName, event: { ...ended } } : null);
     if (usageMsg) this.broadcast(usageMsg);
   }
 
@@ -1777,7 +1779,7 @@ export class WebUiModule implements Module {
         messagesRemoved: r.messagesRemoved, lastVisible: r.lastVisible ?? null,
       });
       // Same follow-through as a /checkout: config mount, branch chip,
-      // fresh tail for every welcomed client.
+      // fresh tail for every welcomed client, as its scopes allow.
       await this.materializeConfigMount();
       this.broadcastBranchChanged();
       this.refreshAllWelcomes();
@@ -2732,7 +2734,7 @@ export class WebUiModule implements Module {
    *
    * For fleet children we don't need a separate subscription — child events
    * already flow to every welcomed client whose scopes allow them, via
-   * handleFleetEvent (only operators may peek). Returning
+   * handleFleetEvent; an observer may not subscribe to a peek. Returning
    * "fleet child" here is enough to confirm the panel can rely on the
    * existing stream.
    */

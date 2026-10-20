@@ -116,6 +116,19 @@ describe('the panel for an agent\'s node', () => {
     expect(streamEventFor({ kind: 'child-event-agent', childName: 'miner', agentName: 'other' }, child)).toBeNull();
     expect(streamEventFor({ kind: 'child-event-all', childName: 'other' }, child)).toBeNull();
   });
+
+  // What a client without the scopes of a host agent's stream-end trace
+  // gets in its place (streamEndedFor), so the panel's last line shows.
+  test("a stream-ended frame is its agent's panel's, as the stream-end trace would be", () => {
+    const ended = { type: 'stream-ended', agentName: 'clerk-subconscious' };
+    expect(streamEventFor({ kind: 'trace-agent', agentName: 'clerk-subconscious' }, ended)).toEqual(ended);
+    expect(streamEventFor({ kind: 'trace-agent', agentName: 'clerk' }, ended)).toBeNull();
+    expect(streamEventFor({ kind: 'child-event-all', childName: 'miner' }, ended)).toBeNull();
+    expect(streamEventFor({ kind: 'peek', scope: 'research' }, ended)).toBeNull();
+    // A child's comes as a child-event, which its panels take like any other.
+    const child = { type: 'child-event', childName: 'miner', event: { type: 'stream-ended', agentName: 'clerk' } };
+    expect(streamEventFor({ kind: 'child-event-agent', childName: 'miner', agentName: 'clerk' }, child)).toBe(child.event);
+  });
 });
 
 describe('the other traces the page reads', () => {

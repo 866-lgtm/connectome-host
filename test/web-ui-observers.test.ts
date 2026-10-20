@@ -620,14 +620,24 @@ describe('scope filters', () => {
     expect(traceScopes({ type: 'inference:tokens', blockType: 'text' })).toEqual(['messages']);
     expect(traceScopes({ type: 'inference:tokens', blockType: 'thinking' })).toEqual(['messages', 'thinking']);
     expect(traceScopes({ type: 'inference:content_block', blockType: 'tool_call' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'tool_result' })).toEqual(['messages', 'tools']);
     expect(traceScopes({ type: 'inference:tokens', blockType: 'a-block-added-later' })).toBe(FULL_CLIENTS_ONLY);
     expect(traceScopes({ type: 'inference:tool_calls_yielded' })).toEqual(['messages', 'tools']);
-    expect(traceScopes({ type: 'process:received' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'tool:completed' })).toEqual(['messages', 'tools']);
+    // A failed or dropped call's error, and an operator's call for the agent.
+    for (const type of ['tool:failed', 'tool:result_dropped', 'puppet:tool-call']) {
+      expect(traceScopes({ type })).toEqual(['messages', 'tools', 'ops']);
+    }
+    // Whole process events and module responses.
+    for (const type of ['process:received', 'process:completed']) {
+      expect(traceScopes({ type })).toEqual(['messages', 'thinking', 'tools', 'health', 'ops']);
+    }
     expect(traceScopes({ type: 'inference:completed' })).toEqual(['messages', 'health']);
     expect(traceScopes({ type: 'inference:usage' })).toEqual(['health']);
     expect(traceScopes({ type: 'host:quiesce' })).toEqual(['health']);
     expect(traceScopes({ type: 'inference:failed' })).toEqual(['ops']);
-    expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'inference:exhausted' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'operator:action' })).toEqual(['messages', 'health', 'ops']);
     expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
     expect(traceScopes({ type: 'a-trace-added-later' })).toBe(FULL_CLIENTS_ONLY);
@@ -643,13 +653,14 @@ describe('scope filters', () => {
     expect(types.filter((type) => !Object.hasOwn(TRACE_SCOPES, type))).toEqual([]);
   });
 
-  test("a child's events go by the host's trace table, its lifecycle needs health, its snapshot a tree's scopes, its speech thinking, and any other kind a full client", () => {
+  test("a child's events go by the host's trace table, its lifecycle needs health, its snapshot a tree's scopes, its speech thinking and tools, a stream end's stand-in messages, and any other kind a full client", () => {
     expect(childEventScopes({ type: 'message:added' })).toEqual(['messages']);
     expect(childEventScopes({ type: 'inference:tokens', blockType: 'thinking' } as never)).toEqual(['messages', 'thinking']);
     expect(childEventScopes({ type: 'tool:started' })).toEqual(['messages', 'tools']);
     expect(childEventScopes({ type: 'usage:updated' })).toEqual(['health']);
     expect(childEventScopes({ type: 'ops:alert' })).toEqual(['ops']);
-    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages', 'thinking']);
+    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages', 'thinking', 'tools']);
+    expect(childEventScopes({ type: 'stream-ended', agentName: 'kid' } as never)).toEqual(['messages']);
     expect(childEventScopes({ type: 'lifecycle', phase: 'ready' } as never)).toEqual(['health']);
     expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools', 'health', 'ops']);
     for (const type of ['command-output', 'a-kind-added-later', 'private:new-kind', '', undefined, 7]) {

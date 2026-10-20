@@ -25,6 +25,7 @@ import { BranchPanel } from './Branches';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
 import { planHealthAlerts } from './health-alerts';
 import {
+  AGENT_TREE_SCOPES,
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
   type WelcomeMessage,
@@ -117,6 +118,15 @@ function entryToMessage(e: WelcomeMessageEntry): Message {
 export function App() {
   const wire = createWireClient();
   const treeStore = createTreeStore();
+  /** Whether this page builds and shows the agent trees: an operator's page
+   *  does, and an observer's when its grant holds what a tree carries
+   *  (AGENT_TREE_SCOPES). Otherwise the traces it gets would build nodes it
+   *  never sees end, and an empty tree would read as no agents running. */
+  const treesShown = (): boolean => {
+    const info = wire.observer();
+    return wire.observerState() !== 'observer' || !info
+      || AGENT_TREE_SCOPES.every((scope) => info.scopes.includes(scope));
+  };
 
   // Use a store rather than a signal so the streaming token append can
   // mutate the last message's `text` in place. Replacing the message object
@@ -670,8 +680,8 @@ export function App() {
 
   /** Per-childName ring buffer of recent child-event payloads. Used to
    *  backfill the stream pane when an operator opens a fleet child / agent
-   *  view — events fan out to every connected client regardless of focus, so
-   *  we capture them as they pass through. */
+   *  view — events fan out to every connected client whose scopes allow
+   *  them, regardless of focus, so we capture them as they pass through. */
   const FLEET_BACKFILL_LIMIT = 80;
   const childEventBuffers = new Map<string, Array<{ type: string; [k: string]: unknown }>>();
   const recordChildEvent = (childName: string, event: { type: string; [k: string]: unknown }): void => {
@@ -1194,7 +1204,7 @@ export function App() {
 
   onMount(() => {
     const detach = wire.onMessage((msg) => {
-      treeStore.ingest(msg);
+      if (treesShown()) treeStore.ingest(msg);
       autoExpandNewFleetChildren();
       // Capture child-events into the per-childName ring buffer so a future
       // openStream() can backfill the panel from local history.
@@ -1637,7 +1647,12 @@ export function App() {
             onChange={changePanelScope}
           />
           <div class="flex-1 min-h-0">
-            <Show when={sidebarTab() === 'tree'}>
+            <Show when={sidebarTab() === 'tree' && !treesShown()}>
+              <div class="p-4 text-xs text-neutral-500">
+                The agent tree shows for a grant with every scope but debug ({AGENT_TREE_SCOPES.join(', ')}).
+              </div>
+            </Show>
+            <Show when={sidebarTab() === 'tree' && treesShown()}>
               <TreeSidebar
                 roots={treeStore.build()}
                 selectedId={focusedId()}
@@ -2453,9 +2468,12 @@ function ToolBlockView(props: {
   const open = (): boolean => isBlockOpen(props.blockKey, kind());
   const allOpen = (): boolean => expandedKinds().has(kind());
   const dot = (): string => {
+    // A loaded result says how the call ended, whatever status traces this
+    // page got: a page without 'ops' never gets tool:failed.
+    if (props.result) return props.result.isError ? 'bg-rose-500' : 'bg-emerald-500';
     if (props.block.status === 'running') return 'bg-amber-400 animate-pulse';
-    if (props.block.status === 'failed' || props.result?.isError) return 'bg-rose-500';
-    if (props.block.status === 'done' || props.result) return 'bg-emerald-500';
+    if (props.block.status === 'failed') return 'bg-rose-500';
+    if (props.block.status === 'done') return 'bg-emerald-500';
     return 'bg-neutral-600';
   };
   const duration = (): string => {

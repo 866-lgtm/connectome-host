@@ -18,6 +18,13 @@ import type { Line } from '../output-line.js';
 
 export const WEB_PROTOCOL_VERSION = 1;
 
+/** What an observer needs to be sent the agent trees, and so what a page
+ *  needs to build and show them: every scope but 'debug'. A tree's nodes carry
+ *  a subagent's task, each run's phase and how it ended, failures included,
+ *  its counters and its token counts, so the tree is the whole operational
+ *  view, and goes only with the whole grant. */
+export const AGENT_TREE_SCOPES = ['messages', 'thinking', 'tools', 'health', 'ops'] as const;
+
 // ---------------------------------------------------------------------------
 // Server → Client
 // ---------------------------------------------------------------------------

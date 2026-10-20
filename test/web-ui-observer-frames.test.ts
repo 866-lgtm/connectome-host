@@ -27,13 +27,10 @@ describe('what each client is sent', () => {
     'settings-update': { agent: 'main', settings: { contextBudgetTokens: 1000, transition: 'stable' }, overrides: [], hotKeys: [], hotConfigurable: true, previewAvailable: false },
     'credential-action': { subscription: false },
   };
-  // A fleet whose one autoStart child is still launching, so each bind holds
-  // the welcomes for its second.
   const fleet = {
     name: 'fleet',
     getChildren: () => new Map(),
-    autoStartLaunching: () => new Set(['kid']),
-    autoStartRecorded: () => new Promise<void>(() => {}),
+    autoStartLaunching: () => new Set(),
     onChildEvent: () => () => {},
     requestPanel: async (_child: string, op: string) => ({ ok: true, data: panels[op] }),
   };
@@ -63,6 +60,7 @@ describe('what each client is sent', () => {
             return () => {};
           },
         },
+        credentials: { runAction: async () => ({ state: 'ok' }) },
       },
     });
   });
@@ -98,23 +96,24 @@ describe('what each client is sent', () => {
       { type: 'inference:failed', agentName: 'kid', error: 'provider said no' },
       { type: 'usage:updated', totals: { inputTokens: 1, outputTokens: 1 } },
     ];
+    const ended = { type: 'stream-ended', agentName: 'kid' };
     const fleetEvents = host.module as unknown as { handleFleetEvent(name: string, event: unknown): void };
     for (const event of events) fleetEvents.handleFleetEvent('kid', event);
     await host.fence(Object.values(c));
     const kinds = (conn: Connection) => conn.framesOf('child-event').map((f) => (f.event as { type: string }).type);
-    expect(kinds(c.operator)).toEqual(events.map((e) => e.type));
+    // An operator gets each event as the child sent it, named for the child.
+    expect(c.operator.framesOf('child-event')).toEqual(events.map((event) => ({ type: 'child-event', childName: 'kid', event })));
     expect(kinds(c.dashboard)).toEqual(['lifecycle', 'usage:updated']);
-    expect(kinds(c.reader)).toEqual(['message:added']);
-    expect(kinds(c.interior)).toEqual(['message:added', 'inference:tokens', 'inference:speech']);
+    // A client that holds messages gets the stand-in for the failure, as a child event.
+    expect(kinds(c.reader)).toEqual(['message:added', 'stream-ended']);
+    expect(kinds(c.interior)).toEqual(['message:added', 'inference:tokens', 'inference:speech', 'stream-ended']);
+    for (const conn of [c.reader, c.interior]) {
+      expect(conn.framesOf('child-event').at(-1)).toEqual({ type: 'child-event', childName: 'kid', event: ended });
+    }
     expect(kinds(c.everything)).toEqual([
       'message:added', 'inference:tokens', 'inference:speech', 'lifecycle', 'snapshot', 'inference:failed', 'usage:updated',
     ]);
-    // A child's stream ends only in the stream panel, which keeps no
-    // streaming state, so a child's stream-end trace has no stand-in.
     for (const conn of Object.values(c)) expect(conn.framesOf('stream-ended')).toEqual([]);
-    // Each goes as the child sent it, named for the child.
-    const lifecycle = c.operator.framesOf('child-event').find((f) => (f.event as { type: string }).type === 'lifecycle')!;
-    expect(lifecycle).toEqual({ type: 'child-event', childName: 'kid', event: events[3] });
     // The fleet's total that the child's usage updated is usage, which needs health.
     for (const conn of [c.operator, c.dashboard, c.everything]) expect(conn.framesOf('usage').length).toBe(1);
     for (const conn of [c.reader, c.interior]) expect(conn.framesOf('usage')).toEqual([]);
@@ -217,7 +216,7 @@ describe('what each client is sent', () => {
     expect(read.session).toEqual({ id: 's1', name: 'Debugging the bridge', autoNamed: true });
   });
 
-  test("pins and context settings reach full clients alone, a child's as well as the host's, and a child's credential state reaches clients that hold health", async () => {
+  test("pins and context settings reach full clients alone, a child's as well as the host's, and credential state, the host's and a child's, reaches clients that hold health", async () => {
     const c = await everyone();
     const panelsHere = host.module as unknown as { broadcastPinsList(agent: string): void; broadcastSettingsState(agent: string): void };
     panelsHere.broadcastPinsList('main');
@@ -225,7 +224,9 @@ describe('what each client is sent', () => {
     c.operator.ws.send(JSON.stringify({ type: 'pin-add', scope: 'kid', firstMessageId: 'm1' }));
     c.operator.ws.send(JSON.stringify({ type: 'settings-update', scope: 'kid', contextBudgetTokens: 1000 }));
     c.operator.ws.send(JSON.stringify({ type: 'credential-action', scope: 'kid', action: 'recheck' }));
-    await c.operator.until('credential-state');
+    c.operator.ws.send(JSON.stringify({ type: 'credential-action', scope: 'local', action: 'recheck' }));
+    await c.operator.until('credential-state', (f) => f.scope === 'kid');
+    await c.operator.until('credential-state', (f) => f.scope === 'local');
     await c.operator.until('pins-list', (f) => f.scope === 'kid');
     await c.operator.until('settings-state', (f) => f.scope === 'kid');
     await host.fence(Object.values(c));
@@ -235,21 +236,20 @@ describe('what each client is sent', () => {
       expect(conn.framesOf('pins-list')).toEqual([]);
       expect(conn.framesOf('settings-state')).toEqual([]);
     }
-    for (const conn of [c.dashboard, c.everything]) expect(conn.framesOf('credential-state').map((f) => f.scope)).toEqual(['kid']);
+    for (const conn of [c.dashboard, c.everything]) expect(conn.framesOf('credential-state').map((f) => f.scope).sort()).toEqual(['kid', 'local']);
     for (const conn of [c.reader, c.interior]) expect(conn.framesOf('credential-state')).toEqual([]);
   });
 
-  test('a connection gets no live frame before its welcome', async () => {
+  test('a connection gets no live frame between a bind and its new welcome', async () => {
+    const c = await host.operator();
+    open.push(c);
+    // A bind clears every client's welcome at once and sends each a new one
+    // later, so a trace emitted in the same turn finds this one unwelcomed.
     host.rebind();
-    // The bind holds every welcome for up to a second, waiting on the child's launch.
-    const waiting = await host.operatorOpen();
-    open.push(waiting);
-    await new Promise((r) => setTimeout(r, 100));
-    host.emitTrace({ type: 'message:added', messageId: 'before', source: 'mcpl:channel-incoming' });
-    await waiting.until('welcome');
-    host.emitTrace({ type: 'message:added', messageId: 'after', source: 'mcpl:channel-incoming' });
-    await host.fence([waiting]);
-    expect(waiting.frames.findIndex((f) => f.type === 'welcome')).toBe(0);
-    expect(waiting.framesOf('trace').map((f) => (f.event as { messageId: string }).messageId)).toEqual(['after']);
+    host.emitTrace({ type: 'message:added', messageId: 'before', source: 'agent' });
+    await host.fence([c]);
+    host.emitTrace({ type: 'message:added', messageId: 'after', source: 'agent' });
+    await host.fence([c]);
+    expect(c.framesOf('trace').map((f) => (f.event as { messageId: string }).messageId)).toEqual(['after']);
   });
 });

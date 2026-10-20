@@ -611,7 +611,7 @@ export function sessionTokenFromRequest(req: Request): string | null {
 // unit-testable without the webui's process-level server singleton.
 // ---------------------------------------------------------------------------
 
-import type { StreamEndedMessage, WebUiServerMessage, WelcomeMessage, WelcomeMessageEntry } from '../web/protocol.js';
+import { AGENT_TREE_SCOPES, type StreamEndedMessage, type WebUiServerMessage, type WelcomeMessage, type WelcomeMessageEntry } from '../web/protocol.js';
 import { STREAM_END_TRACES } from '../state/turn-trace.js';
 
 /** What a frame needs to go to full clients alone: what no grant covers. */
@@ -626,6 +626,9 @@ const TOOLS: FrameScopes = ['messages', 'tools'];
 const THINKING: FrameScopes = ['messages', 'thinking'];
 const HEALTH: FrameScopes = ['health'];
 const OPS: FrameScopes = ['ops'];
+const TOOLS_AND_OPS: FrameScopes = ['messages', 'tools', 'ops'];
+/** Every scope but 'debug', for what can hold anything an agent works with. */
+const ALL_BUT_DEBUG: FrameScopes = AGENT_TREE_SCOPES;
 
 /**
  * What each trace type agent-framework defines carries, as the scopes an
@@ -662,12 +665,15 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'inference:tool_calls_yielded': TOOLS,
   'tool:started': TOOLS,
   'tool:completed': TOOLS,
-  'tool:failed': TOOLS,
-  'tool:result_dropped': TOOLS,
-  'puppet:tool-call': TOOLS,
-  // What reaches an agent and what its modules answer, tool results among them.
-  'process:received': TOOLS,
-  'process:completed': TOOLS,
+  // A failed or dropped call's error, and a call an operator made for the
+  // agent, are ops besides.
+  'tool:failed': TOOLS_AND_OPS,
+  'tool:result_dropped': TOOLS_AND_OPS,
+  'puppet:tool-call': TOOLS_AND_OPS,
+  // Whole process events and module responses: messages, thinking blocks,
+  // tool results and their errors.
+  'process:received': ALL_BUT_DEBUG,
+  'process:completed': ALL_BUT_DEBUG,
   // Usage and serving state.
   'usage:updated': HEALTH,
   'inference:usage': HEALTH,
@@ -677,7 +683,8 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   // Alerts: failures and refusals, the gate's decisions, modules coming and
   // going, MCPL servers and conversations, and what operators did.
   'ops:alert': OPS,
-  'operator:action': OPS,
+  // Its result can carry branch names and the serving mode.
+  'operator:action': ['messages', 'health', 'ops'],
   'inference:failed': OPS,
   'inference:exhausted': OPS,
   'inference:request_dropped': OPS,
@@ -729,24 +736,24 @@ export function traceScopes(event: { type: string; blockType?: unknown }): Frame
   return Object.hasOwn(TRACE_SCOPES, event.type) ? TRACE_SCOPES[event.type]! : FULL_CLIENTS_ONLY;
 }
 
-/** What an agent tree needs: every scope but 'debug'. A node carries a
- *  subagent's task, the run's tool calls and thinking, its token counts, and
- *  how its run ended, failures included, so the tree is the whole
- *  operational view. */
-const TREES: readonly ObserverScope[] = ['messages', 'thinking', 'tools', 'health', 'ops'];
+/** What an agent tree needs (AGENT_TREE_SCOPES): every scope but 'debug'. */
+const TREES: readonly ObserverScope[] = AGENT_TREE_SCOPES;
 
 /** What a fleet child's event needs. Its traces go by the parent's table
  *  (traceScopes). `lifecycle` is the child's liveness. A `snapshot` is a whole
  *  agent tree, which the welcome gives only with what its nodes carry
  *  (scopeWelcome). `inference:speech`, which the child adds, is every token of
- *  its final round, thinking included. Any other kind goes to full clients
+ *  its final round: thinking, and in XML mode the tool results after a tool
+ *  call. `stream-ended` is the stand-in the module sends in place of a child's
+ *  stream-end trace (streamEndedFor). Any other kind goes to full clients
  *  alone: `command-output` is an operator's command run in the child, and the
  *  parent's command results go only to the client that asked. */
 export function childEventScopes(event: { type?: unknown }): FrameScopes {
   const type = typeof event.type === 'string' ? event.type : '';
   if (type === 'lifecycle') return HEALTH;
   if (type === 'snapshot') return TREES;
-  if (type === 'inference:speech') return THINKING;
+  if (type === 'inference:speech') return ['messages', 'thinking', 'tools'];
+  if (type === 'stream-ended') return MESSAGES;
   return traceScopes({ ...(event as Record<string, unknown>), type });
 }
 
@@ -823,9 +830,8 @@ export function filterEntryForScopes(
 }
 
 /** Project a welcome through an observer's scope mask. Without 'messages'
- *  the entire conversation payload (entries + agent trees, which carry
- *  streaming buffers) is emptied — a health/ops observer like the fleet hub
- *  gets structure and usage, never content — and so are the session's and
+ *  the conversation's entries are emptied — a health/ops observer like the
+ *  fleet hub gets structure and usage, never content — and so are the session's and
  *  the branch's names, which keep their ids: an auto-named session's name is
  *  a model's summary of the conversation, and request-branches needs
  *  'messages'. Without 'health' the telemetry fields (usage / perAgentCost /
@@ -863,8 +869,8 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
     messages: welcome.messages
       .map((e) => filterEntryForScopes(e, scopes))
       .filter((e): e is WelcomeMessageEntry => e !== null),
-    // Agent trees replay tool calls and streaming thinking, and carry token
-    // counts, each child's model and how each run ended.
+    // A tree's nodes carry a subagent's task, each run's phase and how it
+    // ended, counters, token counts, and each child's model.
     ...(TREES.every((scope) => scopes.has(scope))
       ? {}
       : { localTree: emptyTree, childTrees: [] }),

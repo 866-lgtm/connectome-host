@@ -156,11 +156,19 @@ export function pickStreamSource(
 }
 
 /** The event a server message carries for the stream panel showing `src`,
- *  or null when the message isn't that panel's. */
+ *  or null when the message isn't that panel's. A `stream-ended` frame, which
+ *  a client gets in place of a host agent's stream-end trace its scopes don't
+ *  cover, is that agent's panel's, as the trace would be; a child's comes as
+ *  a `child-event`. */
 export function streamEventFor(
   src: StreamSource,
-  msg: { type: string; scope?: unknown; childName?: unknown; event?: { type: string; [k: string]: unknown } },
+  msg: { type: string; scope?: unknown; childName?: unknown; agentName?: unknown; event?: { type: string; [k: string]: unknown } },
 ): { type: string; [k: string]: unknown } | null {
+  if (msg.type === 'stream-ended') {
+    return src.kind === 'trace-agent' && msg.agentName === src.agentName
+      ? { type: 'stream-ended', agentName: src.agentName }
+      : null;
+  }
   const event = msg.event;
   if (!event) return null;
   switch (src.kind) {
