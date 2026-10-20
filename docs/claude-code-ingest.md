@@ -267,7 +267,10 @@ and verification. Claude-Code-specific choices:
 
 - **`agent.model`**: the transcript's model, exactly. Signatures verify only there.
 - **`agent.thinking`**: `{ "enabled": true, "type": "adaptive", "display": "summarized" }`
-  — the resident continues to think the way the session did.
+  — the resident continues to think the way the session did. Optional `"effort": "medium"`
+  sets the Anthropic streaming baseline. Explicit agent effort overrides it until
+  reset; compression calls are unaffected. Other providers ignore this field;
+  OpenAI recipes use `agent.responses.reasoningEffort`.
 - **`systemPrompt`**: minimal or empty. Claude Code's system prompt is not in the
   transcript and re-supplying a different one on top of 300k of history is a seam.
   Put the continuation note in the recipe `description` (operator-visible) rather
@@ -278,8 +281,9 @@ and verification. Claude-Code-specific choices:
   (300k) and accept that the early conversation folds into first-person summaries
   before the first wake. Both are fine; decide deliberately. See §11.1 of the
   onboarding runbook for the window arithmetic.
-- **Strategy**: mirror what the ingest used (§2). If you want kv-unified, see
-  onboarding §5b — configure it *before* first boot; switching later is a surgery.
+- **Strategy**: mirror what the ingest used (§2) for chunking. New residents fold with
+  kv-unified, the host default (onboarding §5b). Decide *before* first boot, since
+  switching later is a layout change.
 - **Tools the seed references** (`Bash`, `Read`, `Edit`, …) need not exist in the
   recipe. The resident will notice it no longer has them; that's part of the
   continuation, not an error.
@@ -357,7 +361,7 @@ a typo fails at boot rather than silently disabling the rung.
 
 3. **`agent.refusalHandling`** — fleet values:
    ```jsonc
-   "refusalHandling": { "retries": 2, "autoRewind": false, "maxRewinds": 15, "announceHumanTurns": true }
+   "refusalHandling": { "retries": 2, "autoRewind": false, "maxRewinds": 15 }
    ```
    `retries` re-sends the identical request (near-threshold refusals are
    nondeterministic; two extra draws clear most of them for free). `autoRewind`

@@ -3,6 +3,17 @@ import type { Recipe } from './recipe.js';
 
 type AgentConfig = Parameters<typeof AgentFramework.create>[0]['agents'][number];
 
+/** Compile budget for a recipe that omits `agent.contextBudgetTokens`. Sized
+ *  for the 1M-window models; a recipe on a smaller window must set its own
+ *  (budget + maxTokens has to fit under the window). */
+export const DEFAULT_CONTEXT_BUDGET_TOKENS = 300_000;
+
+/** The compile budget the recipe configures: its own, else the default. A
+ *  runtime override (agent settings) can still move the live budget. */
+export function effectiveContextBudgetTokens(recipe: Recipe): number {
+  return recipe.agent.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+}
+
 export type FrameworkAgentConfig = AgentConfig & {
   // Forward recipe fields that newer Agent Framework releases understand
   // while remaining structurally compatible with older installs.
@@ -64,14 +75,28 @@ export function buildFrameworkAgentConfig(
   strategy: FrameworkAgentConfig['strategy'],
 ): FrameworkAgentConfig {
   const promptCaching = resolvePromptCaching(recipe, model);
+  let thinking: FrameworkAgentConfig['thinking'];
+  if (recipe.agent.thinking) {
+    // Effort is a host setting sent as output_config.effort, never as thinking.effort.
+    const { effort: _hostEffort, ...providerThinking } = recipe.agent.thinking;
+    thinking = providerThinking;
+  }
   return {
     name: agentName,
     ...(recipe.agent.toolPresentation ? {toolPresentation: recipe.agent.toolPresentation} : {}),
     model,
     systemPrompt: recipe.agent.systemPrompt,
+    ...(recipe.agent.allowedTools !== undefined
+      ? { allowedTools: recipe.agent.allowedTools }
+      : {}),
     maxTokens: recipe.agent.maxTokens ?? 16384,
-    maxStreamTokens: recipe.agent.maxStreamTokens ?? 150000,
-    contextBudgetTokens: recipe.agent.contextBudgetTokens,
+    // An omitted maxStreamTokens follows the budget (+20k) only when the
+    // budget is the host default too. A recipe that sets its own budget may be
+    // on a 200k-window model, where budget + 20k would let a stream grow past
+    // the window; it keeps the framework's historical 150k.
+    maxStreamTokens: recipe.agent.maxStreamTokens
+      ?? (recipe.agent.contextBudgetTokens === undefined ? DEFAULT_CONTEXT_BUDGET_TOKENS + 20_000 : 150_000),
+    contextBudgetTokens: effectiveContextBudgetTokens(recipe),
     // cacheTtl is withheld at the HOST layer on bedrock: the transport
     // only has the default 5m cache, and older membrane releases forward
     // the ttl field Bedrock rejects. Note this is not the whole story —
@@ -106,7 +131,7 @@ export function buildFrameworkAgentConfig(
       },
     }),
     strategy,
-    ...(recipe.agent.thinking && { thinking: recipe.agent.thinking }),
+    ...(thinking && { thinking }),
     ...(recipe.agent.refusalHandling && { refusalHandling: recipe.agent.refusalHandling }),
     ...(recipe.agent.sameRoundThinkTextPolicy !== undefined
       ? { sameRoundThinkTextPolicy: recipe.agent.sameRoundThinkTextPolicy }

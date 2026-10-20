@@ -176,6 +176,21 @@ describe('WebUiModule HTTP', () => {
     expect(sessionViewer.headers.get('cache-control')).toBe('no-store');
   });
 
+  // Before the tests below that bind an app: each app a test binds stays
+  // bound for the tests after it, the WebSocket tests' included.
+  test('setApp follows the newest framework alone: it unsubscribes from the one it followed before', () => {
+    const log: string[] = [];
+    const frameworkNamed = (name: string) => ({
+      getAllAgents: () => [],
+      getAllModules: () => [],
+      getSessionUsage: () => { throw new Error('no usage in HTTP harness'); },
+      onTrace: () => { log.push(`follow ${name}`); return () => { log.push(`unfollow ${name}`); }; },
+    });
+    webUiModule.setApp({ framework: frameworkNamed('old') } as never);
+    webUiModule.setApp({ framework: frameworkNamed('new') } as never);
+    expect(log.slice(-3)).toEqual(['follow old', 'unfollow old', 'follow new']);
+  });
+
   test('bound retrieval JSON is no-store, redacted by default, and inputs require exact 1', async () => {
     let observedOptions: { limit?: number; includeInputs?: boolean } | undefined;
     const malicious = '</script><img src=x onerror="globalThis.pwned=true">';
@@ -306,6 +321,61 @@ describe('WebUiModule HTTP', () => {
       expect(res.status).toBe(500);
       expect(res.headers.get('cache-control')).toBe('no-store');
       expect(await res.json()).toEqual({ error: 'trace listing failed' });
+    } finally {
+      await webUiModule.stop();
+    }
+  });
+
+  test('GET /debug/tool-classes: effective classes and sources, ?agent=, 404, 501', async () => {
+    const rows = [
+      { tool: 'shell--run', class: ['shell'], source: 'host' },
+      { tool: 'chat--say', class: ['comms'], source: 'server', serverId: 'chat' },
+      { tool: 'cua--click', class: [], source: 'none', serverId: 'cua' },
+    ];
+    const asked: Array<string | undefined> = [];
+    const framework = {
+      getAllAgents: () => [],
+      getAllModules: () => [],
+      getAgent: (name: string) => (name === 'resident' ? { name } : undefined),
+      listToolClasses: (agent?: string) => { asked.push(agent); return agent ? rows.slice(0, 1) : rows; },
+      onTrace: () => {},
+    };
+    const url = (q = ''): string => `http://127.0.0.1:${handle.port}/debug/tool-classes${q}`;
+    const headers = { authorization: basicAuthHeader(BASIC_USER, BASIC_PASS) };
+
+    expect((await fetch(url())).status).toBe(401);
+
+    webUiModule.setApp({ framework, recipe: { name: 't', agent: { name: 'resident' } } } as never);
+    try {
+      const all = await fetch(url(), { headers });
+      expect(all.status).toBe(200);
+      expect(await all.json()).toEqual({
+        agent: null,
+        counts: { override: 0, host: 1, server: 1, none: 1 },
+        // Sorted by tool name.
+        tools: [
+          { tool: 'chat--say', class: ['comms'], source: 'server', serverId: 'chat' },
+          { tool: 'cua--click', class: [], source: 'none', serverId: 'cua' },
+          { tool: 'shell--run', class: ['shell'], source: 'host' },
+        ],
+      });
+
+      const scoped = await fetch(url('?agent=resident'), { headers });
+      expect(scoped.status).toBe(200);
+      expect((await scoped.json() as { agent: string; tools: unknown[] })).toMatchObject({ agent: 'resident', tools: [rows[0]] });
+      expect(asked).toEqual([undefined, 'resident']);
+
+      expect((await fetch(url('?agent=nobody'), { headers })).status).toBe(404);
+    } finally {
+      await webUiModule.stop();
+    }
+
+    // A framework build without the listing: an honest 501, not an empty list.
+    webUiModule.setApp({ framework: { ...framework, listToolClasses: undefined }, recipe: { name: 't', agent: {} } } as never);
+    try {
+      const res = await fetch(url(), { headers });
+      expect(res.status).toBe(501);
+      expect(((await res.json()) as { error: string }).error).toContain('tool classes');
     } finally {
       await webUiModule.stop();
     }

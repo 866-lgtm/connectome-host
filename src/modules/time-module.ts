@@ -15,6 +15,7 @@ import type {
   ToolCall,
   ToolResult,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 import { formatZonedDateTime, resolveTimeZone } from '@animalabs/agent-framework';
 
 interface TimeState {
@@ -86,6 +87,6 @@ export class TimeModule implements Module {
     if (call.name === 'now') {
       return { success: true, data: formatNow(new Date(), this.timeZone) };
     }
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 }

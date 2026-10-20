@@ -5,10 +5,11 @@ import DOMPurify from 'dompurify';
 import { createWireClient, type WireClient } from './wire';
 import { createTreeStore, type StreamSource, type UiNode } from './tree';
 import { TreeSidebar } from './TreeSidebar';
-import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
+import { StreamPanel } from './Stream';
+import { formatStreamEvent, withStreamLines, type StreamLine } from '@conhost/web/stream-lines';
 import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
-import { McplPanel, type McplServerRow, type McplLiveRow } from './Mcpl';
+import { McplPanel, type McplServerRow, type McplLiveRow, type ToolClassRow } from './Mcpl';
 import { SettingsPanel, type SettingsState } from './Settings';
 import { DryContext, type DryContextData } from './DryContext';
 import { PinsPanel, type PinsState, type PinCandidate } from './Pins';
@@ -16,9 +17,13 @@ import { FilesPanel, FileViewerModal, type Mount, type FlatEntry, type FileViewe
 import { ContextPanel } from './Context';
 import { ContextDocument } from './ContextDocument';
 import { ObserverGateScreen } from './ObserverGate';
-import { OpsAlertStrip, HealthPanel, type OpsAlert, type HealthSnapshot } from './Health';
+import {
+  OpsAlertStrip, HealthPanel, CREDENTIAL_ALERT_KINDS,
+  type OpsAlert, type HealthSnapshot, type CredentialInfo, type CredentialAction,
+} from './Health';
 import { BranchPanel } from './Branches';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
+import { planHealthAlerts } from './health-alerts';
 import {
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
@@ -35,6 +40,7 @@ import {
   type SurgeryResultMessage,
   type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
+import { applyTrace, conversationAgentOf, streamEventFor } from '@conhost/web/agent-streams';
 import {
   Lightbox,
   MediaView,
@@ -132,6 +138,9 @@ export function App() {
   /** session.id + '/' + branch.id of the last welcome; same key → soft
    *  merge (keep paged-in scrollback), changed key → hard reset. */
   let welcomeKey: string | null = null;
+  /** session.id of the last welcome, to tell a session switch apart from a
+   *  first connect or a reconnect. */
+  let welcomeSessionId: string | null = null;
   /** Whether the operator is pinned to the bottom of the scroll pane.
    *  Autoscroll only fires when true, so reading history isn't yanked. */
   let atBottom = true;
@@ -180,7 +189,7 @@ export function App() {
   const alertList = createMemo(() =>
     [...opsAlerts().values()].sort((a, b) => b.at - a.at));
 
-  const upsertOpsAlert = (kind: string, agent: string, message: string, bump = true): void => {
+  const upsertOpsAlert = (kind: string, agent: string, message: string, bump = true, actions?: CredentialAction[]): void => {
     const key = `${agent}:${kind}`;
     setOpsAlerts((prev) => {
       const next = new Map(prev);
@@ -192,6 +201,10 @@ export function App() {
         message,
         at: Date.now(),
         count: existing ? existing.count + (bump ? 1 : 0) : 1,
+        // The strip is a host-level (local) surface: its actions always
+        // target the local process, whatever the sidebar is inspecting.
+        scope: 'local',
+        ...(actions ? { actions } : existing?.actions ? { actions: existing.actions } : {}),
       });
       return next;
     });
@@ -216,45 +229,90 @@ export function App() {
       removeOpsAlert(`${agent}:${kind.slice(0, -'-clear'.length)}`);
       return;
     }
-    upsertOpsAlert(kind, agent, message);
+    upsertOpsAlert(kind, agent, message, true, readActions((e.data as { actions?: unknown } | undefined)?.actions));
+  };
+
+  /** `data.actions` on a credential alert, defensively typed. */
+  const readActions = (raw: unknown): CredentialAction[] | undefined => {
+    if (!Array.isArray(raw)) return undefined;
+    const out: CredentialAction[] = [];
+    for (const a of raw) {
+      const id = (a as { id?: unknown })?.id;
+      const label = (a as { label?: unknown })?.label;
+      if (typeof id !== 'string' || typeof label !== 'string') continue;
+      const hint = (a as { hint?: unknown })?.hint;
+      out.push({ id, label, ...(typeof hint === 'string' ? { hint } : {}) });
+    }
+    return out.length > 0 ? out : undefined;
+  };
+
+  // ---------------------------------------------------------------------------
+  // Credential state — the host's one named verdict on its provider
+  // credential (spent quota, expired token, pending login) and the actions
+  // it can run. Arrives as `credential-state` frames (after an action) and
+  // inside /healthz; both reconcile the alert strip so a page opened
+  // mid-incident alarms with its buttons.
+  // ---------------------------------------------------------------------------
+  /** Last credential-state frame, tagged with the process it describes; the
+   *  Health tab uses it only while inspecting that same scope. */
+  const [credentialState, setCredentialState] = createSignal<{ scope: string; info: CredentialInfo } | null>(null);
+  const credentialForScope = (): CredentialInfo | null => {
+    const c = credentialState();
+    return c && c.scope === panelScope() ? c.info : null;
+  };
+
+  /** Bumped by every credential-state FRAME (an action's answer); a health
+   *  read that started before the latest frame must not replace it. */
+  let credentialFrameSeq = 0;
+  const applyCredentialState = (c: CredentialInfo | undefined, scope: string, from: 'frame' | 'health' = 'frame'): void => {
+    if (!c || c.subscription === false) return;
+    if (from === 'frame') credentialFrameSeq++;
+    setCredentialState({ scope, info: c });
+    // The alert strip is local-only; a child's state must not key into it.
+    if (scope !== 'local') return;
+    const agent = c.agent ?? '?';
+    const kind = c.kind ?? 'ok';
+    for (const k of CREDENTIAL_ALERT_KINDS) {
+      const key = `${agent}:${k}`;
+      if (k === kind) {
+        if (opsAlerts().get(key)?.message !== c.message) {
+          upsertOpsAlert(kind, agent, c.message ?? kind, false, c.actions);
+        }
+      } else {
+        removeOpsAlert(key);
+      }
+    }
+  };
+
+  /** A button on an alert row / the Health tab. `scope` is the process the
+   *  button belongs to (the alert's, or the Health tab's), never inferred.
+   *  `set-token` asks for the paste here; the token goes to the host once
+   *  and is never echoed. */
+  const runCredentialAction = (actionId: string, scope: string): void => {
+    if (actionId === 'set-token') {
+      const who = scope === 'local' ? 'this host' : `fleet child "${scope}"`;
+      const token = window.prompt(`Paste the replacement token for ${who} (kept in memory; written to the credentials file only when that process loaded one):`);
+      if (!token || !token.trim()) return;
+      wire.send({ type: 'credential-action', scope, action: 'set-token', token: token.trim() });
+      return;
+    }
+    if (actionId !== 'refresh' && actionId !== 'login' && actionId !== 'recheck') return;
+    wire.send({ type: 'credential-action', scope, action: actionId });
   };
 
   /** /healthz snapshot — feeds the Health tab and reconciles durable-state
-   *  alerts (quarantine, hard-down) so a page opened mid-incident alarms
+   *  alerts (quarantine, inference-exhausted) so a page opened mid-incident alarms
    *  without waiting for the next klaxon re-fire. */
   const [health, setHealth] = createSignal<HealthSnapshot | null>(null);
   const [healthErr, setHealthErr] = createSignal<string | null>(null);
   let healthDenied = false;
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
-    const quarantine = h.compressionQuarantine ?? {};
-    for (const [agent, q] of Object.entries(quarantine)) {
-      const key = `${agent}:compression-quarantine`;
-      if ((q.count ?? 0) > 0) {
-        if (!opsAlerts().has(key)) {
-          upsertOpsAlert('compression-quarantine', agent,
-            `${q.count} chunk(s) in compression quarantine — spans stay raw and will eventually exhaust the context budget.`,
-            false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
-    }
-    for (const a of h.agents ?? []) {
-      const key = `${a.name}:inference-exhausted`;
-      const streak = a.consecutiveInferenceFailures ?? 0;
-      if (streak >= 3) {
-        const message = `${streak} consecutive inference failures — agent is down.`
-          + (a.lastInference?.lastError ? ` Last: ${a.lastInference.lastError}` : '');
-        // Only touch the entry when the condition actually changed —
-        // rewriting `at` every poll would show a perpetual "5s ago" and
-        // re-sort the strip on every cycle.
-        if (opsAlerts().get(key)?.message !== message) {
-          upsertOpsAlert('inference-exhausted', a.name, message, false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
+    applyCredentialState(h.credential, 'local');
+    const plan = planHealthAlerts(h, opsAlerts());
+    for (const key of plan.remove) removeOpsAlert(key);
+    for (const u of plan.upsert) {
+      upsertOpsAlert(u.kind, u.agent, u.message, false);
     }
   };
 
@@ -268,6 +326,7 @@ export function App() {
     if (healthDenied && !force) return;
     if (force) healthDenied = false;
     const scope = panelScope();
+    const frameSeqAtStart = credentialFrameSeq;
     try {
       const res = await fetch(`/healthz${scopeQuery()}`, { credentials: 'same-origin' });
       if (!res.ok) {
@@ -284,6 +343,12 @@ export function App() {
       setHealth(h);
       setHealthErr(null);
       if (scope === 'local') reconcileHealthAlerts(h);
+      // A child's health read is the freshest word on its credential: it
+      // must replace the frame saved from an earlier child action, or the
+      // Health tab keeps the old state and buttons (an API-key parent's own
+      // polls carry no credential block to displace it) — unless a newer
+      // frame arrived while this read was in flight.
+      else if (h.credential && credentialFrameSeq === frameSeqAtStart) applyCredentialState(h.credential, scope, 'health');
     } catch (e) {
       if (scope !== panelScope()) return;
       setHealthErr(e instanceof Error ? e.message : String(e));
@@ -291,7 +356,7 @@ export function App() {
   };
 
   /** Local-alert reconciliation when the panel scope is parked on a child:
-   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  the strip's durable-state alerts (quarantine, inference-exhausted) are host-level
    *  and must keep reconciling regardless of what the Health tab inspects. */
   const reconcileLocalAlerts = async (): Promise<void> => {
     if (healthDenied) return;
@@ -345,7 +410,7 @@ export function App() {
   const [opLogLoading, setOpLogLoading] = createSignal(false);
 
   const previewOf = (m: Message): string => {
-    const who = m.participant === 'assistant' ? (welcome()?.agents[0]?.name ?? 'assistant') : m.participant;
+    const who = m.participant === 'assistant' ? (conversationAgentOf(welcome()) ?? 'assistant') : m.participant;
     const body = (m.text || (m.blocks ?? []).map((b) => b.kind === 'tool_use' ? `⚙ ${b.name}` : b.kind === 'media' ? `📎 ${b.mediaType}` : '').filter(Boolean).join(' ')).replace(/\s+/g, ' ').trim();
     return `${who}: ${body.slice(0, 90)}${body.length > 90 ? '…' : ''}`;
   };
@@ -499,11 +564,19 @@ export function App() {
    *  registry file can't express. */
   const [mcplServers, setMcplServers] = createSignal<McplServerRow[]>([]);
   const [mcplLive, setMcplLive] = createSignal<McplLiveRow[]>([]);
+  /** Every tool's effective MCPL class (RFC-008); undefined = older host. */
+  const [mcplToolClasses, setMcplToolClasses] = createSignal<ToolClassRow[] | undefined>(undefined);
   const [mcplLoaded, setMcplLoaded] = createSignal(false);
   const [mcplConfigPath, setMcplConfigPath] = createSignal('');
   const refreshMcpl = (): void => {
     setMcplLoaded(false);
     wire.send({ type: 'request-mcpl', scope: panelScope() });
+  };
+  const clearMcpl = (): void => {
+    setMcplLoaded(false);
+    setMcplServers([]);
+    setMcplLive([]);
+    setMcplToolClasses(undefined);
   };
 
   /** Context-settings panel state. The server BROADCASTS `settings-state` after
@@ -577,9 +650,7 @@ export function App() {
     setExpandedMounts(new Set<string>());
     setOpenFile(null);
     setFileLoading(false);
-    setMcplLoaded(false);
-    setMcplServers([]);
-    setMcplLive([]);
+    clearMcpl();
     setSettingsLoaded(false);
     setSettingsState(null);
     setPinsLoaded(false);
@@ -759,6 +830,17 @@ export function App() {
     if (panelScope() !== 'local' && !msg.childTrees.some((c) => c.name === panelScope())) {
       changePanelScope('local');
     }
+    // A session switch recreates the framework: MCPL servers reconnect and
+    // may offer other tools or classes, so the MCP tab's snapshot is stale.
+    if (welcomeSessionId !== null && msg.session.id !== welcomeSessionId) {
+      clearMcpl();
+      if (sidebarTab() === 'mcp') refreshMcpl();
+      // An open panel shows the old session: a node of its tree, or its
+      // branches. A node of the new tree can carry an old node's name, and
+      // its stream would join the old lines. So the panel closes.
+      closePanel();
+    }
+    welcomeSessionId = msg.session.id;
     const key = `${msg.session.id}/${msg.branch.id}`;
     const entries = msg.messages.map(entryToMessage);
 
@@ -869,7 +951,7 @@ export function App() {
     setBulkRemaining(want);
     requestOlder(Math.min(want, HISTORY_PAGE_CAP));
   };
-  const stopLoadOlder = (): void => setBulkRemaining(0);
+  const stopLoadOlder = (): void => { setBulkRemaining(0); };
 
   const applyHistoryPage = (msg: HistoryPageMessage): void => {
     if (msg.corrId !== pendingHistoryCorr) return;
@@ -940,12 +1022,12 @@ export function App() {
     streamTokenBuffer = streamTokenBuffer.slice(newlineIdx + 1);
     if (completed) {
       const lines = completed.split('\n').filter(s => s.length > 0);
-      setStreamLines((prev) => [...prev, ...lines.map(s => ({
+      setStreamLines((prev) => withStreamLines(prev, lines.map(s => ({
         id: streamLineId(),
         kind: 'token' as const,
         text: s,
         color: 'text-cyan-200',
-      }))]);
+      }))));
     }
   };
 
@@ -953,12 +1035,12 @@ export function App() {
     if (streamTokenBuffer.length === 0) return;
     const text = streamTokenBuffer;
     streamTokenBuffer = '';
-    setStreamLines((prev) => [...prev, {
+    setStreamLines((prev) => withStreamLines(prev, [{
       id: streamLineId(),
       kind: 'token' as const,
       text,
       color: 'text-cyan-200',
-    }]);
+    }]));
   };
 
   /** Tear down any peek subscription tied to the currently focused node.
@@ -1141,11 +1223,12 @@ export function App() {
           setLessonsModuleLoaded(moduleLoaded);
           setLessons(list);
         },
-        setMcpl: (configPath, servers, live) => {
+        setMcpl: (configPath, servers, live, toolClasses) => {
           setMcplLoaded(true);
           setMcplConfigPath(configPath);
           setMcplServers(servers);
           setMcplLive(live);
+          setMcplToolClasses(toolClasses);
         },
         setSettings: (state) => {
           setSettingsLoaded(true);
@@ -1172,6 +1255,7 @@ export function App() {
           setFileLoading(false);
         },
         onOpsAlert: applyOpsAlertTrace,
+        onCredentialState: (state, scope) => applyCredentialState(state, scope),
         setBranchesList: (list, currentId) => {
           setBranches(list);
           setBranchesCurrentId(currentId);
@@ -1189,6 +1273,7 @@ export function App() {
         onTurnSettled: () => {
           if (features().has('quiesce') && hostMode()?.mode === 'quiescing') wire.send({ type: 'request-host-mode' });
         },
+        conversationAgent: () => conversationAgentOf(welcome()),
         onSurgeryResult,
         setOperatorLog: (entries, path) => { setOpLog(entries); setOpLogPath(path); setOpLogLoading(false); },
         onOperatorAction: () => { if (panelMode() === 'branches') refreshOpLog(); },
@@ -1199,7 +1284,7 @@ export function App() {
       wire.close();
     });
 
-    // Health poll: durable-state alerts (quarantine, hard-down) must not
+    // Health poll: durable-state alerts (quarantine, inference-exhausted) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
     // honest without meaningful load (counts-only JSON). With the scope on a
     // fleet child, loadHealth feeds the Health tab from that child and a
@@ -1213,34 +1298,13 @@ export function App() {
   });
 
   /** Route a server message into the stream pane *if* it matches the focused
-   *  node's StreamSource. Each kind has its own match rule. */
+   *  node's StreamSource (streamEventFor holds each kind's match rule). */
   const handleStreamMessage = (msg: WebUiServerMessage): void => {
     if (panelMode() !== 'stream') return;
     const node = focusedNode();
     if (!node) return;
-    const src = node.streamSource;
-    if (src.kind === 'none') return;
-
-    if (src.kind === 'peek' && msg.type === 'peek' && msg.scope === src.scope) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
-
-    if (msg.type !== 'child-event') return;
-
-    if (src.kind === 'child-event-all' && msg.childName === src.childName) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
-
-    if (
-      src.kind === 'child-event-agent'
-      && msg.childName === src.childName
-      && (msg.event as { agentName?: string }).agentName === src.agentName
-    ) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
+    const event = streamEventFor(node.streamSource, msg as Parameters<typeof streamEventFor>[1]);
+    if (event) ingestStreamEvent(event);
   };
 
   const ingestStreamEvent = (event: { type: string; [k: string]: unknown }): void => {
@@ -1250,7 +1314,7 @@ export function App() {
     }
     flushStreamBuffer();
     const line = formatStreamEvent(event);
-    if (line) setStreamLines((prev) => [...prev, line]);
+    if (line) setStreamLines((prev) => withStreamLines(prev, [line]));
   };
 
   const submit = (): void => {
@@ -1339,7 +1403,11 @@ export function App() {
         )}
       </Show>
       <ReconnectBanner status={wire.status()} />
-      <OpsAlertStrip alerts={alertList()} onDismiss={removeOpsAlert} />
+      <OpsAlertStrip
+        alerts={alertList()}
+        onDismiss={removeOpsAlert}
+        onAction={(alert, id) => runCredentialAction(id, alert.scope ?? 'local')}
+      />
       <Show when={wire.observerState() === 'observer' && wire.observer()}>
         {(info) => (
           <div class="bg-violet-950/60 border-b border-violet-900 px-4 py-1.5 text-xs text-violet-200 flex items-center gap-2">
@@ -1596,6 +1664,7 @@ export function App() {
                 configPath={mcplConfigPath()}
                 servers={mcplServers()}
                 live={mcplLive()}
+                toolClasses={mcplToolClasses()}
                 readOnly={panelScope() !== 'local'}
                 onRefresh={refreshMcpl}
                 onAdd={(input) => wire.send({ type: 'mcpl-add', ...input })}
@@ -1655,6 +1724,8 @@ export function App() {
                 error={healthErr()}
                 ledger={callLedger()?.rows}
                 onRefresh={() => void loadHealth(true)}
+                credential={credentialForScope()}
+                onCredentialAction={(id) => runCredentialAction(id, panelScope())}
               />
             </Show>
           </div>
@@ -1668,6 +1739,7 @@ export function App() {
 function streamHint(src: StreamSource): string | undefined {
   switch (src.kind) {
     case 'peek': return 'subagent';
+    case 'trace-agent': return 'agent';
     case 'child-event-all': return 'fleet child';
     case 'child-event-agent': return `agent in ${src.childName}`;
     default: return undefined;
@@ -1704,9 +1776,11 @@ interface HandlerHooks {
   /** Apply a lessons-list response from the server. */
   setLessons: (loaded: boolean, moduleLoaded: boolean, lessons: LessonRow[]) => void;
   /** Apply an mcpl-list response from the server. */
-  setMcpl: (configPath: string, servers: McplServerRow[], live: McplLiveRow[]) => void;
+  setMcpl: (configPath: string, servers: McplServerRow[], live: McplLiveRow[], toolClasses?: ToolClassRow[]) => void;
   /** Apply a settings-state broadcast. */
   setSettings: (state: SettingsState) => void;
+  /** Apply a credential-state frame (answer to request-credential / an action). */
+  onCredentialState: (state: CredentialInfo, scope: string) => void;
   /** Apply a pins-list broadcast. */
   setPins: (state: PinsState) => void;
   /** Apply a workspace-mounts response. */
@@ -1727,6 +1801,9 @@ interface HandlerHooks {
   requestHostMode: () => void;
   /** A turn ended — refresh host mode if a quiesce was still draining. */
   onTurnSettled: () => void;
+  /** The agent whose conversation the main view shows: the welcome's first
+   *  (conversationAgentOf, src/web/agent-streams.ts). */
+  conversationAgent: () => string | undefined;
   onSurgeryResult: (result: SurgeryResultMessage) => void;
   setOperatorLog: (entries: OperatorLogEntryWire[], path?: string) => void;
   /** An operator:action trace landed — refresh the log if it is on screen. */
@@ -1775,61 +1852,9 @@ function handleServerMessage(
     case 'call-ledger':
       hooks.setCallLedger(msg.ledger);
       return;
-    case 'trace': {
-      const e = msg.event;
-      switch (e.type) {
-        case 'inference:tokens': {
-          const content = e.content;
-          if (typeof content === 'string') {
-            hooks.appendStreamToken(content, typeof e.blockType === 'string' ? e.blockType : undefined);
-          }
-          return;
-        }
-        case 'inference:content_block': {
-          if (typeof e.phase === 'string') hooks.handleContentBlock(e.phase);
-          return;
-        }
-        case 'inference:completed':
-        case 'inference:failed':
-          hooks.finishStream();
-          // A quiesce that was still draining may have just settled; the
-          // framework emits no trace for "drained", so re-pull the snapshot.
-          hooks.onTurnSettled();
-          return;
-        case 'inference:tool_calls_yielded': {
-          const calls = (e.calls as Array<{ id: string; name: string; input?: unknown }> | undefined) ?? [];
-          if (calls.length === 0) return;
-          hooks.appendToolUseBlocks(calls);
-          return;
-        }
-        case 'tool:completed': {
-          if (typeof e.callId === 'string') {
-            hooks.updateToolStatus(e.callId, 'done',
-              typeof e.durationMs === 'number' ? e.durationMs : undefined);
-          }
-          return;
-        }
-        case 'tool:failed': {
-          if (typeof e.callId === 'string') {
-            hooks.updateToolStatus(e.callId, 'failed',
-              typeof e.durationMs === 'number' ? e.durationMs : undefined);
-          }
-          return;
-        }
-        case 'ops:alert':
-          hooks.onOpsAlert(e);
-          return;
-        case 'operator:action':
-          hooks.onOperatorAction();
-          return;
-        default:
-          // Host serving-state transitions (host:quiesce / host:resume /
-          // host:quiesced_boot) may originate elsewhere (Discord host
-          // command, API) — pull a fresh snapshot rather than parsing them.
-          if (typeof e.type === 'string' && e.type.startsWith('host:')) hooks.requestHostMode();
-          return;
-      }
-    }
+    case 'trace':
+      if (typeof msg.event.type === 'string') applyTrace(msg.event, hooks, hooks.conversationAgent());
+      return;
     case 'command-result': {
       hooks.appendMessage({
         id: nextMessageId(),
@@ -1875,11 +1900,17 @@ function handleServerMessage(
       return;
     case 'mcpl-list':
       if (staleScope(msg.scope, hooks.currentScope())) return;
-      hooks.setMcpl(msg.configPath, msg.servers, msg.live ?? []);
+      hooks.setMcpl(msg.configPath, msg.servers, msg.live ?? [], msg.toolClasses);
       return;
     case 'settings-state':
       if (staleScope(msg.scope, hooks.currentScope())) return;
       hooks.setSettings(msg as unknown as SettingsState);
+      return;
+    case 'credential-state':
+      // Not scope-filtered here: a local frame must reconcile the (local)
+      // alert strip even while the sidebar inspects a child. The hook keys
+      // the Health tab's copy by scope itself.
+      hooks.onCredentialState(msg as unknown as CredentialInfo, msg.scope ?? 'local');
       return;
     case 'pins-list':
       if (staleScope(msg.scope, hooks.currentScope())) return;
@@ -1984,6 +2015,13 @@ function Header(props: {
         <Show when={props.quota?.subscription && props.quota.windows.length > 0}>
           <span class={`ml-3 ${quotaTone(props.quota!)}`} title={quotaTitle(props.quota!)}>
             {quotaReadout(props.quota!)}
+          </span>
+        </Show>
+        {/* A subscription meter that has never read (inference-only token,
+            gateway without the usage path) must say so, not render nothing. */}
+        <Show when={props.quota?.subscription && props.quota.windows.length === 0 && props.quota.error}>
+          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable: ${props.quota!.error}`}>
+            quota: unreadable
           </span>
         </Show>
         <Show when={!props.quota?.subscription && props.usage.cost && props.usage.cost.total > 0}>
@@ -2497,6 +2535,7 @@ const COMMANDS: CommandHint[] = [
   { name: '/session', blurb: 'list/new/switch/rename/delete sessions' },
   { name: '/newtopic', blurb: 'reset head window with summary' },
   { name: '/mcp', blurb: 'list/add/remove/env MCPL servers' },
+  { name: '/tools', blurb: 'each tool\'s effective class and its source' },
   { name: '/fleet', blurb: 'list/peek/stop/restart fleet children' },
   { name: '/clear', blurb: 'clear conversation display' },
   { name: '/quit', blurb: 'export lessons + exit' },
