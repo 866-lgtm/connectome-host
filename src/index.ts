@@ -97,6 +97,7 @@ import { quarantineAlarm, type QuarantineStatus } from './web/quarantine-alert.j
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
 import { loadExtensions } from './extensions.js';
 import { QuotaMeter, AnthropicOAuthQuotaSource, CodexQuotaSource, quotaProviderHold } from './quota-meter.js';
+import { stopForSessionSwitch } from './session-switch-stop.js';
 
 export type { AppContext };
 
@@ -1337,7 +1338,7 @@ async function main() {
 
     async switchSession(id: string) {
       handleExport(this);
-      await this.framework.stop();
+      await stopForSessionSwitch(this.framework, id);
       sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);
       // Note: agentName stays as resolved at startup. A per-session
