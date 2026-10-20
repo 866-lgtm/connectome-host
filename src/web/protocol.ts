@@ -315,6 +315,17 @@ export interface BranchChangedMessage {
   branch: { id: string; name: string };
 }
 
+/** That an agent's stream ended, with nothing of how or why: sent in place
+ *  of a stream-end trace (STREAM_END_TRACES, state/turn-trace.ts) to a client
+ *  whose scopes hold 'messages' but not what that trace carries, such as
+ *  `inference:failed`'s error to an observer without 'ops'. A client ends
+ *  the agent's streamed turn on it, as on the trace. */
+export interface StreamEndedMessage {
+  type: 'stream-ended';
+  /** The agent whose stream ended, as the trace named it. */
+  agentName?: string;
+}
+
 /** One Chronicle branch with its lineage. `parentId`/`branchPoint` are
  *  undefined for the root branch; together they place the fork in the
  *  parent's sequence so the SPA can render a lineage tree. */
@@ -695,6 +706,7 @@ export interface OperatorLogMessage {
 export type WebUiServerMessage =
   | WelcomeMessage
   | TraceMessage
+  | StreamEndedMessage
   | ChildEventMessage
   | CommandResultMessage
   | UsageMessage

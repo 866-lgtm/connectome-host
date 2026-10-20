@@ -54,6 +54,23 @@ export function conversationAgentOf(
   return welcome?.agents[0]?.name;
 }
 
+/** An agent's stream ended: from a stream-end trace, or from the
+ *  `stream-ended` frame a client gets in place of one whose payload its
+ *  scopes don't cover. The main view's streaming message ends when the
+ *  agent is the conversation's, and the quiesce re-pull runs at any agent's
+ *  end. */
+export function applyStreamEnded(
+  agentName: unknown,
+  hooks: Pick<TraceViewHooks, 'finishStream' | 'onTurnSettled'>,
+  conversationAgent: string | undefined,
+): void {
+  if (conversationAgent === undefined || typeof agentName !== 'string' || agentName === conversationAgent) {
+    hooks.finishStream();
+  }
+  // The framework emits no trace for "drained", so re-pull the snapshot.
+  hooks.onTurnSettled();
+}
+
 /** Apply one trace to the main view and the page's state. `conversationAgent`
  *  is the agent the main view shows (conversationAgentOf); before a welcome
  *  names one, every trace is the view's, as is one that names no agent. */
@@ -102,9 +119,7 @@ export function applyTrace(
       return;
   }
   if (STREAM_END_TRACES.has(e.type)) {
-    if (inView) hooks.finishStream();
-    // The framework emits no trace for "drained", so re-pull the snapshot.
-    hooks.onTurnSettled();
+    applyStreamEnded(e.agentName, hooks, conversationAgent);
     return;
   }
   // Host serving-state transitions (host:quiesce / host:resume /

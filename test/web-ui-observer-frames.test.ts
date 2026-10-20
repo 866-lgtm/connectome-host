@@ -95,6 +95,7 @@ describe('what each client is sent', () => {
       { type: 'command-output', text: 'status of kid', style: null },
       { type: 'a-kind-added-later' },
       { type: 'private:new-kind', detail: 'its own' },
+      { type: 'inference:failed', agentName: 'kid', error: 'provider said no' },
       { type: 'usage:updated', totals: { inputTokens: 1, outputTokens: 1 } },
     ];
     const fleetEvents = host.module as unknown as { handleFleetEvent(name: string, event: unknown): void };
@@ -106,8 +107,11 @@ describe('what each client is sent', () => {
     expect(kinds(c.reader)).toEqual(['message:added']);
     expect(kinds(c.interior)).toEqual(['message:added', 'inference:tokens', 'inference:speech']);
     expect(kinds(c.everything)).toEqual([
-      'message:added', 'inference:tokens', 'inference:speech', 'lifecycle', 'snapshot', 'usage:updated',
+      'message:added', 'inference:tokens', 'inference:speech', 'lifecycle', 'snapshot', 'inference:failed', 'usage:updated',
     ]);
+    // A child's stream ends only in the stream panel, which keeps no
+    // streaming state, so a child's stream-end trace has no stand-in.
+    for (const conn of Object.values(c)) expect(conn.framesOf('stream-ended')).toEqual([]);
     // Each goes as the child sent it, named for the child.
     const lifecycle = c.operator.framesOf('child-event').find((f) => (f.event as { type: string }).type === 'lifecycle')!;
     expect(lifecycle).toEqual({ type: 'child-event', childName: 'kid', event: events[3] });
@@ -135,6 +139,30 @@ describe('what each client is sent', () => {
     expect(kinds(c.everything)).toEqual(['tool:started', 'inference:failed', 'host:quiesce', 'usage:updated']);
     for (const conn of [c.operator, c.dashboard, c.everything]) expect(conn.framesOf('usage').length).toBe(1);
     for (const conn of [c.reader, c.interior]) expect(conn.framesOf('usage')).toEqual([]);
+  });
+
+  test("a client that holds messages but may not have a stream-end trace gets a stream-ended frame in its place, naming only the agent", async () => {
+    const c = await everyone();
+    host.emitTrace({ type: 'inference:failed', agentName: 'main', error: 'provider said no', stack: 'at somewhere' });
+    host.emitTrace({ type: 'inference:completed', agentName: 'main', tokenUsage: { input: 1, output: 1 } });
+    host.emitTrace({ type: 'inference:aborted', agentName: 'main', reason: 'user' });
+    await host.fence(Object.values(c));
+    const ends = (conn: Connection) => conn.frames
+      .filter((f) => f.type === 'trace' || f.type === 'stream-ended')
+      .map((f) => (f.type === 'trace' ? (f.event as { type: string }).type : f));
+    for (const conn of [c.operator, c.everything]) {
+      expect(ends(conn)).toEqual(['inference:failed', 'inference:completed', 'inference:aborted']);
+    }
+    // Without ops the failure's error and stack stay back, and without
+    // health the completion's usage; that the stream ended still arrives.
+    for (const conn of [c.reader, c.interior]) {
+      expect(ends(conn)).toEqual([
+        { type: 'stream-ended', agentName: 'main' },
+        { type: 'stream-ended', agentName: 'main' },
+        'inference:aborted',
+      ]);
+    }
+    expect(ends(c.dashboard)).toEqual([]);
   });
 
   test("an incoming message's excerpt reaches only clients that hold messages", async () => {

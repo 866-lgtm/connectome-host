@@ -31,6 +31,7 @@ import {
   TRACE_SCOPES,
   childEventScopes,
   frameScopes,
+  streamEndedFor,
   clientHolds,
   FULL_CLIENTS_ONLY,
   scopeWelcome,
@@ -38,6 +39,7 @@ import {
   type ObserversFile,
 } from '../src/modules/web-ui-observers.js';
 import type { WelcomeMessage, WelcomeMessageEntry } from '../src/web/protocol.js';
+import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
 import { BASIC, helloFor, makeKeypair } from './web-ui-observed-host.js';
 
 // ---------------------------------------------------------------------------
@@ -649,7 +651,7 @@ describe('scope filters', () => {
     expect(childEventScopes({ type: 'ops:alert' })).toEqual(['ops']);
     expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages', 'thinking']);
     expect(childEventScopes({ type: 'lifecycle', phase: 'ready' } as never)).toEqual(['health']);
-    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools', 'health']);
+    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools', 'health', 'ops']);
     for (const type of ['command-output', 'a-kind-added-later', 'private:new-kind', '', undefined, 7]) {
       expect(childEventScopes({ type })).toBe(FULL_CLIENTS_ONLY);
     }
@@ -660,8 +662,19 @@ describe('scope filters', () => {
     expect(scopesOf({ type: 'trace', event: { type: 'tool:started' } })).toEqual(['messages', 'tools']);
     expect(scopesOf({ type: 'child-event', childName: 'kid', event: { type: 'lifecycle' } })).toEqual(['health']);
     for (const type of ['usage', 'call-ledger', 'credential-state', 'host-mode']) expect(scopesOf({ type })).toEqual(['health']);
-    for (const type of ['inbound-trigger', 'branch-changed']) expect(scopesOf({ type })).toEqual(['messages']);
+    for (const type of ['inbound-trigger', 'branch-changed', 'stream-ended']) expect(scopesOf({ type })).toEqual(['messages']);
     for (const type of ['pins-list', 'settings-state', 'a-frame-added-later']) expect(scopesOf({ type })).toBe(FULL_CLIENTS_ONLY);
+  });
+
+  test('a stream-end trace has a stand-in that says only whose stream ended, and no other trace has one', () => {
+    for (const type of STREAM_END_TRACES) {
+      expect(streamEndedFor({ type, agentName: 'main', error: 'provider said no', stack: 'at x' } as never))
+        .toEqual({ type: 'stream-ended', agentName: 'main' });
+    }
+    expect(streamEndedFor({ type: 'inference:failed' })).toEqual({ type: 'stream-ended' });
+    for (const type of ['inference:started', 'inference:tokens', 'tool:failed', 'ops:alert']) {
+      expect(streamEndedFor({ type, agentName: 'main' })).toBeNull();
+    }
   });
 
   test('a full client holds every frame, an observer what its scopes cover, and a connection waiting for its hello nothing', () => {
@@ -756,7 +769,7 @@ describe('scope filters', () => {
     expect(welcome.usage.input).toBe(1);
   });
 
-  test('the agent trees go only with messages, thinking, tools and health, since their nodes carry token counts', () => {
+  test('the agent trees go only with every scope but debug, since their nodes carry token counts and how each run ended', () => {
     const tree = { asOfTs: 1, nodes: [{ name: 'main', tokens: { input: 5 } }], callIdIndex: {} };
     const welcome = {
       type: 'welcome', protocolVersion: 1, agents: [], messages: [],
@@ -766,10 +779,14 @@ describe('scope filters', () => {
       childTrees: [{ name: 'kid', ...tree, recipe: { name: 'kid', agentModel: 'a-model' } }],
       usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
     } as unknown as WelcomeMessage;
-    const interior = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools']));
-    expect(interior.localTree.nodes).toEqual([]);
-    expect(interior.childTrees).toEqual([]);
-    const all = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health']));
+    for (const missing of ['messages', 'thinking', 'tools', 'health', 'ops'] as const) {
+      const scopes = new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health', 'ops']);
+      scopes.delete(missing);
+      const w = scopeWelcome(welcome, scopes);
+      expect(w.localTree.nodes).toEqual([]);
+      expect(w.childTrees).toEqual([]);
+    }
+    const all = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health', 'ops']));
     expect(all.localTree).toEqual(tree);
     expect(all.childTrees).toEqual(welcome.childTrees);
   });

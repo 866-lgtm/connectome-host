@@ -124,6 +124,7 @@ import {
   scopeWelcome,
   type ObserverScope,
   type ObserverHelloIdentity,
+  streamEndedFor,
 } from './web-ui-observers.js';
 
 /**
@@ -924,12 +925,16 @@ export class WebUiModule implements Module {
    *  Every frame that goes whole to more than one client goes this way, so
    *  the live stream refuses an observer what its welcome and its requests
    *  do. `message-appended` goes to each observer projected through
-   *  filterEntryForScopes instead. */
-  private broadcast(frame: WebUiServerMessage): void {
+   *  filterEntryForScopes instead. A client that may not have `frame` gets
+   *  `standIn` in its place, if it may have that. */
+  private broadcast(frame: WebUiServerMessage, standIn?: WebUiServerMessage | null): void {
     if (!sharedServer) return;
     const scopes = frameScopes(frame);
+    const fallback = standIn ? { frame: standIn, scopes: frameScopes(standIn) } : null;
     for (const client of sharedServer.clients.values()) {
-      if (client.welcomed && clientHolds(client, scopes)) this.send(client, frame);
+      if (!client.welcomed) continue;
+      if (clientHolds(client, scopes)) this.send(client, frame);
+      else if (fallback && clientHolds(client, fallback.scopes)) this.send(client, fallback.frame);
     }
   }
 
@@ -957,10 +962,12 @@ export class WebUiModule implements Module {
     }
 
     if (sharedServer!.clients.size === 0) return;
+    // A page that holds the conversation but not what a stream-end trace
+    // carries still learns that the stream ended.
     this.broadcast({
       type: 'trace',
       event: event as unknown as { type: string; [k: string]: unknown },
-    });
+    }, streamEndedFor(event as unknown as { type: string; agentName?: unknown }));
     if (event.type === 'usage:updated') {
       this.broadcast({
         type: 'usage',

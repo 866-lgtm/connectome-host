@@ -6,7 +6,7 @@
  * its own, the host's other framework agents' included.
  */
 import { describe, expect, test } from 'bun:test';
-import { applyTrace, conversationAgentOf, pickStreamSource, streamEventFor, type TraceViewHooks } from '../src/web/agent-streams.js';
+import { applyStreamEnded, applyTrace, conversationAgentOf, pickStreamSource, streamEventFor, type TraceViewHooks } from '../src/web/agent-streams.js';
 import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
 
 function recorder() {
@@ -48,6 +48,16 @@ describe('the main view', () => {
       expect(calls).toEqual(['settled']);
     });
   }
+
+  // The frame an observer without the scopes a stream-end trace needs gets
+  // in its place (src/modules/web-ui-observers.ts, streamEndedFor).
+  test('a stream-ended frame ends the stream as its trace would: the conversation agent\'s message, another agent\'s re-pull only, and one naming no agent the view\'s', () => {
+    const { calls, hooks } = recorder();
+    applyStreamEnded('clerk', hooks, 'clerk');
+    applyStreamEnded('spawn-research-1', hooks, 'clerk');
+    applyStreamEnded(undefined, hooks, 'clerk');
+    expect(calls).toEqual(['finish', 'settled', 'settled', 'finish', 'settled']);
+  });
 
   test('another agent\'s stream stays out of the conversation\'s message', () => {
     const { calls, hooks } = recorder();

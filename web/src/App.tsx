@@ -40,7 +40,7 @@ import {
   type SurgeryResultMessage,
   type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
-import { applyTrace, conversationAgentOf, streamEventFor } from '@conhost/web/agent-streams';
+import { applyStreamEnded, applyTrace, conversationAgentOf, streamEventFor } from '@conhost/web/agent-streams';
 import {
   Lightbox,
   MediaView,
@@ -1854,6 +1854,9 @@ function handleServerMessage(
       return;
     case 'trace':
       if (typeof msg.event.type === 'string') applyTrace(msg.event, hooks, hooks.conversationAgent());
+      return;
+    case 'stream-ended':
+      applyStreamEnded(msg.agentName, hooks, hooks.conversationAgent());
       return;
     case 'command-result': {
       hooks.appendMessage({

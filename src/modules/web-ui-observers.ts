@@ -611,7 +611,8 @@ export function sessionTokenFromRequest(req: Request): string | null {
 // unit-testable without the webui's process-level server singleton.
 // ---------------------------------------------------------------------------
 
-import type { WebUiServerMessage, WelcomeMessage, WelcomeMessageEntry } from '../web/protocol.js';
+import type { StreamEndedMessage, WebUiServerMessage, WelcomeMessage, WelcomeMessageEntry } from '../web/protocol.js';
+import { STREAM_END_TRACES } from '../state/turn-trace.js';
 
 /** What a frame needs to go to full clients alone: what no grant covers. */
 export const FULL_CLIENTS_ONLY = 'full-clients-only';
@@ -728,9 +729,11 @@ export function traceScopes(event: { type: string; blockType?: unknown }): Frame
   return Object.hasOwn(TRACE_SCOPES, event.type) ? TRACE_SCOPES[event.type]! : FULL_CLIENTS_ONLY;
 }
 
-/** What an agent tree needs: its nodes carry the conversation's tool calls and
- *  thinking, and token counts. */
-const TREES: readonly ObserverScope[] = ['messages', 'thinking', 'tools', 'health'];
+/** What an agent tree needs: every scope but 'debug'. A node carries a
+ *  subagent's task, the run's tool calls and thinking, its token counts, and
+ *  how its run ended, failures included, so the tree is the whole
+ *  operational view. */
+const TREES: readonly ObserverScope[] = ['messages', 'thinking', 'tools', 'health', 'ops'];
 
 /** What a fleet child's event needs. Its traces go by the parent's table
  *  (traceScopes). `lifecycle` is the child's liveness. A `snapshot` is a whole
@@ -768,13 +771,26 @@ export function frameScopes(frame: WebUiServerMessage): FrameScopes {
     case 'host-mode':
       return ['health'];
     // An incoming message's excerpt, as the `message:added` trace it comes
-    // from, and a branch's name, as request-branches.
+    // from, a branch's name, as request-branches, and that a streamed turn
+    // ended, which is the conversation's shape.
     case 'inbound-trigger':
     case 'branch-changed':
+    case 'stream-ended':
       return ['messages'];
     default:
       return FULL_CLIENTS_ONLY;
   }
+}
+
+/** What a client that may not have a stream-end trace gets in its place,
+ *  if it holds what this needs: that the agent's stream ended, so its page
+ *  ends the streamed turn as an operator's does, without the trace's error,
+ *  stack or usage. Null for any other trace. */
+export function streamEndedFor(event: { type: string; agentName?: unknown }): StreamEndedMessage | null {
+  if (!STREAM_END_TRACES.has(event.type)) return null;
+  return typeof event.agentName === 'string'
+    ? { type: 'stream-ended', agentName: event.agentName }
+    : { type: 'stream-ended' };
 }
 
 /** Whether a client may be sent a frame that needs `scopes`: a full client
@@ -848,7 +864,7 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
       .map((e) => filterEntryForScopes(e, scopes))
       .filter((e): e is WelcomeMessageEntry => e !== null),
     // Agent trees replay tool calls and streaming thinking, and carry token
-    // counts and each child's model.
+    // counts, each child's model and how each run ended.
     ...(TREES.every((scope) => scopes.has(scope))
       ? {}
       : { localTree: emptyTree, childTrees: [] }),
