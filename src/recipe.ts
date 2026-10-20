@@ -989,6 +989,27 @@ export interface RecipeModules {
   channelMode?:
     | boolean
     | { serverId?: string; toolPrefix?: string; gcModuleName?: string; defaultDebounceMs?: number };
+
+  /**
+   * Self-restart (`lifecycle--restart`). Off by default. The agent can ask
+   * its own host to restart: to pick up an edited recipe or rebuilt code, or
+   * to get out of a wedged state. The restart waits for the asking turn to
+   * end and every agent to be idle, then the host exits with code 75 and
+   * its supervisor must start it again — launchd `KeepAlive`, systemd
+   * `Restart=on-failure` or `always`, or a fleet parent's `autoRestart`. Only
+   * headless mode arms it; elsewhere the tool refuses. After the restart the
+   * agent gets one context line saying when it asked, why, and when it came
+   * back.
+   *
+   * `cooldownMinutes` (default 10) is the least time from one completed
+   * self-restart to the next request; 0 turns the cooldown off. The request
+   * and the last completed restart live in `DATA_DIR` as `self-restart.json`
+   * and `self-restart.last.json`.
+   *
+   * Enable it only where a supervisor really restarts the host: without one,
+   * the agent stays down after its own request.
+   */
+  selfRestart?: boolean | { cooldownMinutes?: number };
 }
 
 export interface RecipeWebUi {
@@ -1667,7 +1688,7 @@ const RECIPE_AGENT_MOCK_KEYS = [
 const RECIPE_MODULE_KEYS = [
   'subagents', 'lessons', 'retrieval', 'wake', 'workspace', 'instructions', 'activity', 'notices',
   'mcplAdmin', 'history', 'identity', 'fleet', 'webui', 'ttsRelay', 'subscriptionGc',
-  'channelMode',
+  'channelMode', 'selfRestart',
 ] as const;
 type ListsExactly<K extends string, L extends readonly string[]> =
   [Exclude<K, L[number]>] extends [never] ? ([Exclude<L[number], K>] extends [never] ? true : false) : false;
@@ -2818,6 +2839,24 @@ export function validateRecipe(raw: unknown): Recipe {
         if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) {
           throw new Error(`modules.notices.${key} must be a non-negative number`);
         }
+      }
+    }
+
+    // Validate selfRestart if present: a typo'd cooldown would otherwise
+    // let an agent restart in a loop, or never.
+    if (mods.selfRestart !== undefined && mods.selfRestart !== false && mods.selfRestart !== true) {
+      if (mods.selfRestart === null || typeof mods.selfRestart !== 'object' || Array.isArray(mods.selfRestart)) {
+        throw new Error('modules.selfRestart must be true, false or an object ({ cooldownMinutes? })');
+      }
+      const sr = mods.selfRestart as Record<string, unknown>;
+      for (const key of Object.keys(sr)) {
+        if (key !== 'cooldownMinutes') {
+          throw new Error(`modules.selfRestart has unknown field ${JSON.stringify(key)}`);
+        }
+      }
+      const cd = sr.cooldownMinutes;
+      if (cd !== undefined && (typeof cd !== 'number' || !Number.isFinite(cd) || cd < 0)) {
+        throw new Error('modules.selfRestart.cooldownMinutes must be a non-negative number of minutes');
       }
     }
 

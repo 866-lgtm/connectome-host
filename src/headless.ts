@@ -32,6 +32,7 @@ import { type IncomingCommand, matchesSubscription } from './modules/fleet-types
 import { AgentTreeReducer } from './state/agent-tree-reducer.js';
 import { takeRecipeWarnings } from './recipe.js';
 import { workspaceReadFields } from './workspace-read-result.js';
+import { SELF_RESTART_EXIT_CODE, selfRestart } from './self-restart.js';
 
 // ---------------------------------------------------------------------------
 // Local types
@@ -108,6 +109,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   const pidPath = join(dataDir, 'headless.pid');
 
   mkdirSync(dataDir, { recursive: true });
+  // This process now has an exit path its supervisor restarts: the
+  // lifecycle module's self-restart may arm (src/self-restart.ts).
+  selfRestart.attachHeadless();
 
   // -- Redirect stdout/stderr writes BEFORE anything else here may log --
   // The IPC socket is the only structured output channel; direct
@@ -564,7 +568,10 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   });
 
   // -- Shutdown --
-  async function gracefulShutdown(reason: string): Promise<void> {
+  // `cleanExitCode` is what a clean stop exits with: 0, or
+  // SELF_RESTART_EXIT_CODE for an agent's self-restart. A failed
+  // framework.stop() exits 1 either way.
+  async function gracefulShutdown(reason: string, cleanExitCode = 0): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`shutdown: ${reason}`);
@@ -573,7 +580,7 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     // Give the exiting event a tick to flush onto the socket.
     await new Promise((r) => setTimeout(r, 50));
 
-    let exitCode = 0;
+    let exitCode = cleanExitCode;
     try { await app.framework.stop(); } catch (err) {
       exitCode = 1;
       log(`framework.stop() failed: ${String(err)}`);
@@ -581,6 +588,9 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
     try { server.close(); } catch (err) { log(`server.close() failed: ${String(err)}`); }
     try { if (existsSync(socketPath)) unlinkSync(socketPath); } catch (err) { log(`socket unlink failed: ${String(err)}`); }
     try { if (existsSync(pidPath)) unlinkSync(pidPath); } catch (err) { log(`pid unlink failed: ${String(err)}`); }
+    // An armed self-restart learns how this process ended, whichever
+    // shutdown ended it (src/self-restart.ts); a no-op otherwise.
+    selfRestart.recordExit(reason, exitCode);
 
     // Exit once the log holds its last lines, a failed stop's included.
     void endHeadlessLog().then(() => process.exit(exitCode));
@@ -645,14 +655,24 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
         return;
       }
       if (idleSince === 0) { idleSince = Date.now(); return; }
-      if (Date.now() - idleSince >= IDLE_CONFIRM_MS && !idleEmitted) {
+      if (Date.now() - idleSince < IDLE_CONFIRM_MS) return;
+      if (!idleEmitted) {
         idleEmitted = true;
         log('quiescent — emitting lifecycle:idle');
         emit({ type: 'lifecycle', phase: 'idle' });
         if (opts.exitWhenIdle) {
           clearInterval(idlePoll);
           void gracefulShutdown('exit-when-idle');
+          return;
         }
+      }
+      // An agent asked to restart (lifecycle--restart): its turn has ended
+      // and everything is quiet, so exit for the supervisor to start us
+      // again. Checked on every quiet poll, not just the transition, so a
+      // restart armed while already quiet still goes.
+      if (selfRestart.isArmed()) {
+        clearInterval(idlePoll);
+        void gracefulShutdown('self-restart', SELF_RESTART_EXIT_CODE);
       }
     }, 100);
   }

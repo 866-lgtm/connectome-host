@@ -224,6 +224,7 @@ Built in `createFramework()`. Tools are exposed as `<module>--<tool>`.
 | `FleetModule` | `fleet` | off | `fleet--launch/list/status/send/command/peek/kill/restart/relay/await`: supervises headless children. |
 | `ActivityModule` | `activity` | off | `activity--show_in/hide_in`: typing indicators. |
 | `McplAdminModule` | `mcplAdmin` | off | `mcpl_list/deploy/restart/unload`: the agent manages its own MCPL servers. |
+| `LifecycleModule` | `selfRestart` | off | `lifecycle--restart`: the agent restarts its own host once its turn ends; headless only, exit code 75 for the supervisor, cooldown between restarts (`src/self-restart.ts`). |
 | `IdentityModule` | `identity` | off | The agent's own archipelago identity key; exchanges key-proofs for access tokens so credentials never enter the agent's context. |
 | `WebUiModule` + `ObserversModule` | `webui` | off | Browser console (below); `observers--get/grant/revoke` let the agent manage who may watch. |
 | `TtsRelayModule` | `ttsRelay` | off | Streams live generation to a TTS relay; trims posted messages when a voice client is interrupted. |

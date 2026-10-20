@@ -64,6 +64,7 @@ import { WebUiModule } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
+import { LifecycleModule } from './modules/lifecycle-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
 import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
@@ -475,6 +476,18 @@ async function createFramework(
     const surface = typeof modules.mcplAdmin === 'object' ? modules.mcplAdmin.surface : undefined;
     mcplAdminModule = new McplAdminModule({ timeZone, ...(surface ? { surface } : {}) });
     moduleInstances.push(mcplAdminModule);
+  }
+
+  // Self-restart (`lifecycle--restart`) — opt-in per recipe. The request and
+  // the last completed restart live in the data dir; only headless mode arms
+  // it (src/self-restart.ts).
+  if (modules.selfRestart !== undefined && modules.selfRestart !== false) {
+    const srCfg = typeof modules.selfRestart === 'object' ? modules.selfRestart : {};
+    moduleInstances.push(new LifecycleModule({
+      dataDir: resolve(config.dataDir),
+      timeZone,
+      ...(srCfg.cooldownMinutes !== undefined ? { cooldownMinutes: srCfg.cooldownMinutes } : {}),
+    }));
   }
 
   // Archipelago identity — opt-in per recipe. Utilities-only: enrollment is

@@ -44,6 +44,7 @@ the recipe.
 | `ipc.sock` | The Unix socket. A leftover socket is unlinked unconditionally at startup (no liveness check), so run one instance per data dir. A fleet parent won't launch into a dataDir that still has one, or that another of its children is starting or ready in (§4.3). |
 | `headless.log` | Append-only. Once the child has loaded its recipe and built its framework, the headless runtime redirects `process.stdout.write` and `process.stderr.write` here, before it logs anything itself, so **nothing structured goes to stdout** — the socket is the only protocol channel. It holds the runtime's own lines (its start, recipe warnings, socket events, shutdown), written through a stream that a fast exit can cut short. Bun's `console.*` doesn't go through those methods, so a fleet child's console lines go to `startup.log` instead. |
 | `headless.pid` | The child's PID; removed on graceful shutdown. Adoption uses the PID persisted in the parent's own state; the parent reads this file only to confirm a leftover belongs to the dead child it tracks before removing it (§4.3). |
+| `self-restart.json`, `self-restart.last.json` | With `modules.selfRestart`: a pending `lifecycle--restart` request (stamped with how the process exited), and the last completed one, which the cooldown is measured from. The next process's lifecycle module moves the first to the second at start. |
 | `startup.log` | Opened by the *parent's* FleetModule as a fleet child's stdout and stderr, after a `--- launch …` line per launch. Bun's `console.*` writes to those descriptors directly (Bun 1.3.14 and 1.4.3), not through the redirected methods, so every console line the child prints goes to the file the parent opened here, for the child's whole life: a bad recipe, a missing key, an import error, and a fatal error after the redirect. The parent opens it without waiting for a FIFO's reader, and hands it on only as a regular file that took the launch's header; otherwise the child's console output goes nowhere, and the host's log says why. A link there is followed, when the parent opens the file and when it reads it. A launch that fails after the spawn quotes the end of what the child wrote here during it, or says why it can't, unless the parent is detaching and leaves the child running (§4.3). |
 
 **Connection model.** One client at a time; a new connection closes the
@@ -52,11 +53,13 @@ child emits `lifecycle:ready`. A client disconnecting does not stop the child.
 Events emitted while no client is connected are dropped, not buffered.
 
 **Shutdown.** Triggered by `{"type":"shutdown"}`, by `/quit` sent as a
-`command`, by SIGTERM or SIGINT, or by `--exit-when-idle`. The child emits
+`command`, by SIGTERM or SIGINT, by `--exit-when-idle`, or by an agent's
+armed self-restart (`modules.selfRestart`), which goes at the first quiet
+poll after its turn (the `lifecycle:idle` test below). The child emits
 `lifecycle:exiting`, waits ~50 ms for it to flush, calls `framework.stop()`
 (which cancels in-flight streams rather than letting them finish), closes the
 server, unlinks the socket and pid file, and exits once `headless.log` has
-taken its last lines: 0, or 1 if `framework.stop()` failed. It waits at
+taken its last lines: 0 (75 for a self-restart), or 1 if `framework.stop()` failed. It waits at
 most 2 s, then exits anyway with a line on its stderr. What it writes
 through `process.stdout.write` and `process.stderr.write` once the log has
 ended goes to its stderr too; Bun's `console.*` writes to its stdout and
@@ -106,7 +109,7 @@ subject to the subscription filter: `inference:*`, `tool:*`, `usage:updated`,
 |---|---|---|
 | `lifecycle` (`phase: "ready"`) | `pid, dataDir, recipe` | On every socket accept, sent before the parent's `subscribe` can arrive. `recipe` is the recipe's display name, not a path. |
 | `lifecycle` (`phase: "idle"`) | — | When every framework agent has been idle for ≥500 ms after at least one `inference:started`. Fires once per work→quiet transition. |
-| `lifecycle` (`phase: "exiting"`) | `reason` | `shutdown:graceful`, `shutdown:immediate`, `command:/quit`, `SIGTERM`, `SIGINT`, `exit-when-idle`. A crash emits nothing. |
+| `lifecycle` (`phase: "exiting"`) | `reason` | `shutdown:graceful`, `shutdown:immediate`, `command:/quit`, `SIGTERM`, `SIGINT`, `exit-when-idle`, `self-restart`. A crash emits nothing. |
 | `inference:speech` | `agentName, content` | Primary agent only: the text of an inference round that ended without tool calls. Used by `fleet--relay`. |
 | `command-output` | `text, style` | One per line of a `command` reply. A response, not telemetry (see below). |
 
