@@ -81,6 +81,8 @@ export function createWireClient(opts: WireOptions = {}): WireClient {
   async function respondToAuthRequired(sock: WebSocket, host: string): Promise<void> {
     setObserverState('authing');
     const identity = await buildHelloIdentity(host);
+    // A later connection's state is its own.
+    if (sock !== socket) return;
     if (!identity) {
       setObserverState('unavailable');
       return;
@@ -144,6 +146,8 @@ export function createWireClient(opts: WireOptions = {}): WireClient {
         // don't overwrite 'unavailable' (no WebCrypto — a hello was never
         // possible) with 'denied' (a key exists but holds no grant).
         if (observerState() !== 'unavailable') setObserverState('denied');
+        // A refused connection holds no grant, whatever an earlier one held.
+        setObserver(null);
         setStatus('closed');
         return;
       }

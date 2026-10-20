@@ -6,8 +6,9 @@
  * aggregator can reuse the same parsers.
  *
  * Versioning: v2. Breaking changes bump `WEB_PROTOCOL_VERSION`. On a
- * mismatch the Web UI page doesn't apply the welcome and shows a banner
- * asking for a reload; its socket stays open.
+ * mismatch the Web UI page shows a banner asking for a reload and keeps the
+ * conversation it had; its socket stays open, and the welcome's other fields
+ * and later frames still apply.
  *
  * v1 (2026-07): windowed history (welcome carries only a tail window plus
  * `history` metadata; older pages via request-history/history-page), ordered

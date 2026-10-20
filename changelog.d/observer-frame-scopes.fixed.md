@@ -40,6 +40,7 @@
     observer granted every scope but `debug`, and tells another observer
     so in the tree tab. A tool call whose result has loaded shows failed or
     done by that result, so a page that doesn't get `tool:failed` still
-    shows a failed call as failed.
+    shows a failed call as failed. A page that signed in as an observer and
+    later reconnects as a full client shows the operator's view again.
 
   An operator's connection is unchanged.

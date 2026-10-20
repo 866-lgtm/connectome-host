@@ -195,8 +195,9 @@ export function streamEventFor(
 
 /** Whether the page builds and shows the agent trees, given its observer
  *  sign-in state on this connection and the scopes its grant's observer-ack
- *  gave, or null before any. An operator's connection ('none': the host never
- *  asked it to sign in) does. An observer's does when its grant holds what a
+ *  gave, or null before any. An operator's connection ('none': not signed in
+ *  as an observer, either never asked to or welcomed as a full client since)
+ *  does. An observer's does when its grant holds what a
  *  tree carries (AGENT_TREE_SCOPES), and keeps that answer while it signs in
  *  again after a reconnect. Before its first grant, and once it can't sign
  *  in ('denied', 'unavailable', where the page shows its sign-in screen), it
