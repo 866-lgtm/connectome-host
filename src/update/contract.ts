@@ -152,8 +152,13 @@ export function setAsideDir(root: string, markId: string): string {
  *  here too, before the older release's trial, so that trial's fallback can
  *  put it back. The launcher's copy of an item leaves that directory out. */
 export function itemSetAsideDir(item: string, markId: string): string {
-  return join(item, '.connectome-update', 'set-aside', segment(markId, 'mark id'));
+  return join(item, ITEM_UPDATE_DIR, 'set-aside', segment(markId, 'mark id'));
 }
+
+/** The directory inside a directory item where an update keeps what it works
+ *  with (itemSetAsideDir). No copy of an item holds it, and nothing that puts
+ *  an item's contents in place of others moves it. */
+export const ITEM_UPDATE_DIR = '.connectome-update';
 
 /** The fleet's children file, in the parent's data directory: each child of
  *  the host's fleet, in any of its sessions, with its process, boot and data
