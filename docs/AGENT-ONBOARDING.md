@@ -787,12 +787,14 @@ blocks; expect folds to interact with this on the next model generation.
   adds the bounded error and its classification, and a call that got a response adds its summary
   (Bedrock, generic wrapper) or raw response (Anthropic, generic wrapper). A summary can be
   missing (`summaryUnavailable: true`, or dropped by the size cap below). Raw requests are kept
-  only where the writer's policy keeps them: Anthropic complete/stream on errors and refusals, or
-  on every call with `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
+  only where the writer's policy keeps them: Anthropic complete/stream on errors, refusals and
+  anomalous responses (a client `tool_use` under any stop reason but `tool_use`, flagged by an
+  `anomaly` field and one `[llm-calls] … ANOMALY …` stderr line), or on every call with
+  `LLM_CALLS_FULL_PAYLOADS=1`; Anthropic keepalive pokes only with that opt-in,
   whatever their outcome; Bedrock on errors; the generic wrapper on every call. Every line,
   newline included, is capped at 16 MiB of UTF-8: an oversized or unserializable record drops its
   raw request first, its raw response only if the line still doesn't fit, then its summaries, keeping at least its type, kind,
-  timing and error classification, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
+  timing, error classification, `anomaly`, `messageId` and `requestId`, and `truncated` says what was dropped. Treat the log as diagnostics, not as a
   complete copy of any payload.
 - **Topology audit / repair (context-manager ≥ 0.12, §11.8):**
   `node node_modules/@animalabs/context-manager/dist/scripts/audit-topology.js <store-copy> --namespace agents/<agent> --json`
