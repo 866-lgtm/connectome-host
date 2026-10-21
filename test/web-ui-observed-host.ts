@@ -12,7 +12,7 @@ import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
   __getSharedServerPortForTests,
-  __resetSharedServerForTests,
+  stopWebUiServer,
 } from '../src/modules/web-ui-module.js';
 import { observerStatement, saveObserversFile, type ObserverScope } from '../src/modules/web-ui-observers.js';
 
@@ -164,7 +164,7 @@ export async function startObservedHost(options: {
     },
     stop: async () => {
       await module.stop();
-      await __resetSharedServerForTests();
+      await stopWebUiServer();
       rmSync(tmp, { recursive: true, force: true });
     },
   };

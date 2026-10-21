@@ -2659,9 +2659,10 @@ export class WebUiModule implements Module {
     return out;
   }
 
-  /** Defer SIGTERM so the WS frame flushes, then trigger the existing
-   *  graceful-shutdown handler. process.exit fallback covers the case where
-   *  no SIGTERM listener is registered (e.g. TUI mode). */
+  /** Defer SIGTERM so the WS frame flushes. The signal runs the host's own
+   *  stop: headless mode's graceful shutdown, or in TUI mode the TUI's quit,
+   *  since OpenTUI ends the TUI on it. Readline and batch mode register no
+   *  SIGTERM listener. The exit covers a kill that throws. */
   private scheduleShutdown(): void {
     setTimeout(() => {
       try { process.kill(process.pid, 'SIGTERM'); }
@@ -3884,23 +3885,25 @@ function mimeFor(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// The server's end, and a test helper
 // ---------------------------------------------------------------------------
 //
-// The HTTP server lives at module scope (process-level singleton). Tests need
-// to read the actual bound port when they pass `port: 0`, and they need to
-// shut the server down between files even though normal lifecycle keeps it
-// running across session switches. These helpers exist solely for tests; they
-// are not part of the public module API.
+// The HTTP server lives at module scope (process-level singleton), and normal
+// lifecycle keeps it running across session switches. stopWebUiServer ends
+// it: the host calls it once its TUI has ended, a session switch may call it
+// once the TUI's stop has begun (switchSessionSteps), and tests call it
+// between files. Tests also need to read the actual bound port when they pass
+// `port: 0`; that helper exists solely for tests and is not part of the
+// public module API.
 
 /** Return the bound listener port, or null if the singleton hasn't started. */
 export function __getSharedServerPortForTests(): number | null {
   return sharedServer?.port ?? null;
 }
 
-/** Forcibly tear down the shared HTTP server and clear the singleton, so a
- *  subsequent `start()` boots a fresh one. Tests only. */
-export async function __resetSharedServerForTests(): Promise<void> {
+/** Tear down the shared HTTP server and clear the singleton, so the process
+ *  can end and a later `start()` boots a fresh one. */
+export async function stopWebUiServer(): Promise<void> {
   if (!sharedServer) return;
   try { sharedServer.server.stop(true); } catch { /* ignore */ }
   // The grants file's checks, and the sweep that runs after each, end too.
