@@ -46,7 +46,7 @@ beforeEach(() => {
   setup({
     cwd: install, dataDir: data, root, extraState: [],
     hostRoot: join(install, 'node_modules', '@animalabs', 'connectome-host'),
-    say: () => {}, units: () => ({ found: [], unasked: [] }),
+    say: () => {}, units: () => ({ found: [], unasked: [], unresolved: [] }),
   });
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
@@ -74,6 +74,18 @@ describe('a start, end to end', () => {
     expect(run.stderr.toString()).toContain('[update] Nothing started: this runtime has no process.execve');
     expect(existsSync(marker)).toBe(false);
     expect(readJournal(root)).toEqual([]);
+  });
+
+  test("a --preload the service gives runs in the launcher and again in the host, once each, in the one process", () => {
+    const preload = join(dir, 'preload.js');
+    const seen = join(dir, 'preloaded.txt');
+    writeFileSync(preload, `require('node:fs').appendFileSync(${JSON.stringify(seen)}, process.pid + '\\n');`);
+    const run = Bun.spawnSync([process.execPath, '--preload', preload, join(root, ENTRY_POINT), '--recipe', 'r.json'], {
+      cwd: install, env: { ...process.env, DATA_DIR: data, MARKER: marker }, stderr: 'pipe',
+    });
+    expect(run.exitCode).toBe(0);
+    expect(readFileSync(seen, 'utf-8').trim().split('\n')).toEqual([String(run.pid), String(run.pid)]);
+    expect(JSON.parse(readFileSync(marker, 'utf-8')).execArgv).toEqual(['--preload', preload]);
   });
 
   test("the runtime's own flags, as the service gave them, reach the host", () => {

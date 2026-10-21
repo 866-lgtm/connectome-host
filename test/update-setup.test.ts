@@ -18,14 +18,14 @@ import {
   type InstallRecord,
 } from '../src/update/contract.js';
 import { HOST_ENTRY, LAUNCHER } from '../src/update/launcher.js';
-import { ENTRY_POINT, parseArgs, setup, systemdUnits, type ServiceUnit, type SetupOptions } from '../src/update/setup.js';
+import { ENTRY_POINT, parseArgs, setup, systemdUnits, type ServiceUnits, type SetupOptions } from '../src/update/setup.js';
 
 let dir: string;
 let install: string;
 let data: string;
 let root: string;
 let said: string[];
-let units: { found: ServiceUnit[]; unasked: string[] };
+let units: ServiceUnits;
 
 const options = (over: Partial<SetupOptions> = {}): SetupOptions => ({
   cwd: install,
@@ -65,7 +65,7 @@ beforeEach(() => {
   writeFileSync(join(install, 'package-lock.json'), '{"lockfileVersion":3}');
   mkdirSync(join(data, 'sessions'), { recursive: true });
   said = [];
-  units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [] };
+  units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [] };
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -86,19 +86,19 @@ describe('setup', () => {
 
   test("says when the service wouldn't restart the host, and when it couldn't check", () => {
     const unit = { id: 'connectome.service', settings: 'Restart=on-failure, SuccessExitStatus includes 75', restarts: false };
-    units = { found: [unit], unasked: [] };
+    units = { found: [unit], unasked: [], unresolved: [] };
     setup(options());
     expect(said.some((l) => l.includes("won't restart the host on both 75 and 1 (Restart=on-failure, SuccessExitStatus includes 75)"))).toBe(true);
     for (const [unasked, says] of [[[], 'No systemd service that this user can see runs from this directory'],
       [['user', 'system'], "Setup couldn't ask systemd's user manager or systemd's system manager"]] as const) {
       said = [];
-      units = { found: [], unasked: [...unasked] };
+      units = { found: [], unasked: [...unasked], unresolved: [] };
       setup(options());
       expect(said.some((l) => l.includes(says) && l.includes("couldn't check that"))).toBe(true);
     }
     // One manager couldn't be asked, and the other found a unit: both are said.
     said = [];
-    units = { found: [unit], unasked: ['user'] };
+    units = { found: [unit], unasked: ['user'], unresolved: [] };
     setup(options());
     expect(said.some((l) => l.includes("Setup couldn't ask systemd's user manager, so a service of its that runs from this directory isn't checked"))).toBe(true);
     expect(said.some((l) => l.includes("connectome.service won't restart the host"))).toBe(true);
@@ -425,10 +425,42 @@ describe('setup', () => {
     expect(() => setup(options())).toThrow(/current names 0\.10\.2, and there's no host at /);
   });
 
+  test("a host that's a loop of links can't be looked at, and gets a repair, not a permission", () => {
+    setup(options());
+    const host = join(releaseDir(root, '0.10.2'), HOST_ENTRY);
+    rmSync(host);
+    symlinkSync(host, host);
+    expect(() => setup(options())).toThrow(/its host at .* can't be looked at: .*ELOOP.*Repair what that path runs through, and run setup again/);
+  });
+
+  test("extra state that can't be looked at is refused with its error, not taken for absent", () => {
+    const shut = join(dir, 'shut');
+    mkdirSync(shut);
+    writeFileSync(join(shut, 'state.json'), '{}');
+    chmodSync(shut, 0o600);
+    try {
+      expect(() => setup(options({ extraState: [join(shut, 'state.json')] }))).toThrow(/The extra state .*state\.json can't be looked at: .*EACCES.*Give this user search on each directory on the way to it/);
+    } finally {
+      chmodSync(shut, 0o755);
+    }
+  });
+
+  test("units whose directory this user can't resolve are named beside those found, and beside none", () => {
+    units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: ['a.service', 'b.service'] };
+    setup(options());
+    expect(said.some((l) => l.includes("Setup couldn't resolve, as this user, the working directory of a.service, b.service, so it can't tell whether they run from this directory reached another way. Any such service isn't checked."))).toBe(true);
+    said = [];
+    units = { found: [], unasked: [], unresolved: ['1', '2', '3', '4', '5', '6', '7'] };
+    setup(options());
+    expect(said.some((l) => l.includes('No systemd service that this user can see runs from this directory') &&
+      l.includes('the working directory of 1, 2, 3, 4, 5 and 2 more'))).toBe(true);
+  });
+
   test("a current that can't be looked at says what to do for its error: search for a permission, a repair for anything else", () => {
     setup(options());
     const real = fs.readlinkSync;
-    for (const [code, advice] of [['EACCES', /can't be looked at: .*EACCES.*Give this user search on .*, and run setup again\./],
+    for (const [code, advice] of [['EACCES', /can't be looked at: .*EACCES.*Give this user search on each directory on the way to .*, and run setup again\./],
+      ['EPERM', /can't be looked at: .*EPERM.*Give this user search on each directory on the way to .*, and run setup again\./],
       ['EIO', /can't be looked at: .*EIO.*Repair what that path runs through, and run setup again\./]] as const) {
       const spy = spyOn(fs, 'readlinkSync').mockImplementation(((path: fs.PathLike, options?: unknown) => {
         if (String(path) === installPaths(root).current) throw Object.assign(new Error(code), { code });
@@ -446,7 +478,7 @@ describe('setup', () => {
     setup(options());
     chmodSync(releaseDir(root, '0.10.2'), 0o600);
     try {
-      expect(() => setup(options())).toThrow(/current names 0\.10\.2, and its host at .* can't be looked at: .*EACCES/);
+      expect(() => setup(options())).toThrow(/current names 0\.10\.2, and its host at .* can't be looked at: .*EACCES.*Give this user search on each directory on the way, and run setup again/);
     } finally {
       chmodSync(releaseDir(root, '0.10.2'), 0o755);
     }
@@ -639,6 +671,12 @@ describe('the entry point', () => {
     expect(run.exitCode).toBe(1);
     expect(run.stderr.toString()).toContain("doesn't load");
     expect(run.stderr.toString()).toContain('run setup again');
+    // One that's there and isn't a link is named the same way, and setup says which.
+    writeFileSync(installPaths(root).current, '');
+    const file = Bun.spawnSync([process.execPath, join(root, ENTRY_POINT)], { cwd: install, stderr: 'pipe' });
+    expect(file.exitCode).toBe(1);
+    expect(file.stderr.toString()).toMatch(/isn't there, or isn't a link to a release, run setup again .*how to put it right/);
+    expect(() => setup(options())).toThrow(/current is there and isn't a link/);
   });
 });
 
@@ -694,12 +732,12 @@ describe('the service check', () => {
     const shown = `Id=connectome.service\nWorkingDirectory=${install}\nRestart=always`;
     const systemOnly = (args: string[]) => ({ exitCode: args[0] === '--user' ? 1 : 0, stdout: Buffer.from(shown) });
     expect(systemdUnits(install, systemOnly)).toEqual({
-      found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['user'],
+      found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['user'], unresolved: [],
     });
     const elsewhere = `Id=other.service\nWorkingDirectory=/elsewhere\nRestart=always`;
     expect(systemdUnits(install, (args) => ({ exitCode: args[0] === '--user' ? 0 : 1, stdout: Buffer.from(elsewhere) })))
-      .toEqual({ found: [], unasked: ['system'] });
-    expect(systemdUnits(install, () => ({ exitCode: 0, stdout: Buffer.from(elsewhere) }))).toEqual({ found: [], unasked: [] });
+      .toEqual({ found: [], unasked: ['system'], unresolved: [] });
+    expect(systemdUnits(install, () => ({ exitCode: 0, stdout: Buffer.from(elsewhere) }))).toEqual({ found: [], unasked: [], unresolved: [] });
   });
 
   test("a unit whose directory this user can't resolve is another's, and the rest are still read", () => {
@@ -713,6 +751,7 @@ describe('the service check', () => {
     try {
       expect(systemdUnits(install, (args) => ({ exitCode: args[0] === '--user' ? 0 : 1, stdout: Buffer.from(shown) }))).toEqual({
         found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['system'],
+        unresolved: ['private.service'],
       });
     } finally {
       chmodSync(shut, 0o755);
@@ -720,7 +759,7 @@ describe('the service check', () => {
   });
 
   test("names both managers when neither of systemd's queries answers", () => {
-    const neither = { found: [], unasked: ['user', 'system'] };
+    const neither = { found: [], unasked: ['user', 'system'], unresolved: [] };
     expect(systemdUnits(install, () => ({ exitCode: 1, stdout: Buffer.from('') }))).toEqual(neither);
     expect(systemdUnits(install, () => { throw new Error('no systemctl'); })).toEqual(neither);
   });

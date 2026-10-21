@@ -60,8 +60,8 @@ export function entryPointText(): string {
     '  ({ launch } = await import(launcher));',
     '} catch (error) {',
     "  console.error(`connectome-host: the launcher of the release this install runs doesn't load (${launcher}): ` +",
-    "    `${error instanceof Error ? error.message : error}. If ${join(root, 'current')} isn't there, run setup again in ` +",
-    "    'the directory the service runs the host in: it says how to put it back.');",
+    "    `${error instanceof Error ? error.message : error}. If ${join(root, 'current')} isn't there, or isn't a link to a ` +",
+    "    'release, run setup again in the directory the service runs the host in: it says how to put it right.');",
     '  process.exit(1);',
     '}',
     'await launch(root, process.argv.slice(2));',
@@ -127,26 +127,27 @@ export interface ServiceUnit {
   restarts: boolean;
 }
 
+/** What setup learns of the service units: see systemdUnits. */
+export interface ServiceUnits {
+  found: ServiceUnit[];
+  unasked: string[];
+  unresolved: string[];
+}
+
 /** The exit statuses an update needs the service to restart on: a switch's,
  *  and a failed trial's. */
 const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
 
-/** What systemd says of the service units run from `cwd`, from its user and
- *  its system manager, and which of the two couldn't be asked. */
+/** What systemd's user and system managers say of their service units: those
+ *  run from `cwd`, which manager couldn't be asked, and the units whose
+ *  working directory this user can't resolve, such as one under /root or
+ *  /var/lib/private, which may or may not be `cwd` reached another way. */
 export function systemdUnits(cwd: string, run = (args: string[]) =>
-  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' })): { found: ServiceUnit[]; unasked: string[] } {
+  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' })): ServiceUnits {
   const found: ServiceUnit[] = [];
   const unasked: string[] = [];
+  const unresolved: string[] = [];
   const here = realOrResolved(cwd);
-  // A unit's directory this user can't resolve, such as one under /root or
-  // /var/lib/private, isn't the one this user runs setup in.
-  const isHere = (dir: string) => {
-    try {
-      return realOrResolved(dir) === here;
-    } catch {
-      return false;
-    }
-  };
   for (const scope of [['--user'], []]) {
     const unanswered = () => unasked.push(scope.length > 0 ? 'user' : 'system');
     let result: { exitCode: number | null; stdout: Uint8Array | Buffer };
@@ -165,7 +166,15 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
     for (const block of Buffer.from(result.stdout).toString('utf-8').split(/\n\s*\n/)) {
       const fields = new Map(block.split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
       const dir = (fields.get('WorkingDirectory') ?? '').replace(/^[-!+@:]+/, '');
-      if (!dir || !isHere(dir)) continue;
+      if (!dir) continue;
+      let real: string;
+      try {
+        real = realOrResolved(dir);
+      } catch {
+        unresolved.push(fields.get('Id') ?? dir);
+        continue;
+      }
+      if (real !== here) continue;
       const restart = fields.get('Restart') || 'no';
       const statusesOf = (key: string) => (fields.get(key) ?? '').split(/\s+/).filter(Boolean);
       // systemd's rules for an exit with `code`: a prevented status never
@@ -187,7 +196,7 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
       found.push({ id: fields.get('Id') ?? '?', settings, restarts: RESTART_ON.every(restartsOn) });
     }
   }
-  return { found, unasked };
+  return { found, unasked, unresolved };
 }
 
 export interface SetupOptions {
@@ -203,7 +212,7 @@ export interface SetupOptions {
   hostRoot: string;
   say(line: string): void;
   /** The service units run from a directory (systemdUnits). */
-  units(cwd: string): { found: ServiceUnit[]; unasked: string[] };
+  units(cwd: string): ServiceUnits;
 }
 
 /** Whether `root` holds nothing, or nothing but what setup itself writes, as
@@ -223,7 +232,6 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** `path` as a shell reads it, quoted when it holds anything but plain characters. */
 /** What to do about `error`, met looking at a path: what `permission` says
  *  for one a permission causes, which permissions mend; for any other, such
  *  as a file where a directory should be or a loop of links, the path itself
@@ -234,6 +242,7 @@ function lookAdvice(error: unknown, permission: string): string {
     : 'Repair what that path runs through, and run setup again.';
 }
 
+/** `path` as a shell reads it, quoted when it holds anything but plain characters. */
 function shellWord(path: string): string {
   return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
 }
@@ -254,7 +263,13 @@ export function setup(options: SetupOptions): void {
   }
   const dataDir = realpathSync(options.dataDir);
   const given = options.extraState?.map((path) => {
-    if (!existsSync(path)) throw new ContractError(`The extra state ${path} isn't there.`);
+    try {
+      statSync(path);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new ContractError(`The extra state ${path} isn't there.`);
+      throw new ContractError(`The extra state ${path} can't be looked at: ${errorText(error)}. ` +
+        lookAdvice(error, 'Give this user search on each directory on the way to it'));
+    }
     const real = realpathSync(path);
     const stat = lstatSync(real);
     if (!stat.isFile() && !stat.isDirectory()) {
@@ -315,7 +330,7 @@ export function setup(options: SetupOptions): void {
       const isLink = error instanceof ContractError;
       if (!isLink && (error as NodeJS.ErrnoException).code !== 'EINVAL') {
         throw new ContractError(`${paths.current} can't be looked at: ${errorText(error)}. ` +
-          lookAdvice(error, `Give this user search on ${root}`));
+          lookAdvice(error, `Give this user search on each directory on the way to ${root}`));
       }
       throw new ContractError(`${paths.current} ${isLink ? `is a link to ${readlinkSync(paths.current)}, which names no ` +
         'release' : 'is there and isn\'t a link'}, so it can't say which release this install runs. ` +
@@ -527,22 +542,33 @@ export function setup(options: SetupOptions): void {
     `it gives the host${settingUp ? ' now; set that, and restart it' : ''}.`);
   const units = options.units(options.cwd);
   const needed = `The service must restart the host when it exits with ${RESTART_EXIT_CODE}, as a switch's restart does, ` +
-    'and with 1, as a trial that ends before its commit does, so its fallback runs: systemd\'s Restart=on-failure or ' +
-    'Restart=always, without either status in SuccessExitStatus= or RestartPreventExitStatus=, or launchd\'s KeepAlive.';
+    'and with 1, as a trial that ends before its commit does, so its fallback runs: systemd\'s Restart=always without ' +
+    'either status in RestartPreventExitStatus=, Restart=on-failure without either in SuccessExitStatus= or ' +
+    'RestartPreventExitStatus=, or either in RestartForceExitStatus=; or launchd\'s KeepAlive.';
+  const shown = units.unresolved.slice(0, 5).join(', ') +
+    (units.unresolved.length > 5 ? ` and ${units.unresolved.length - 5} more` : '');
+  const unresolvedNote = units.unresolved.length === 0 ? '' : ` Setup couldn't resolve, as this user, the working ` +
+    `directory of ${shown}, so it can't tell whether ${units.unresolved.length === 1 ? 'it runs' : 'they run'} from this ` +
+    'directory reached another way.';
   const managers = units.unasked.map((scope) => `systemd's ${scope} manager`).join(' or ');
   if (units.found.length === 0) {
     say(units.unasked.length > 0
       ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.`
-      : `${needed} No systemd service that this user can see runs from this directory, so setup couldn't check that.`);
+      : `${needed} No systemd service that this user can see runs from this directory, so setup couldn't check that.` +
+        unresolvedNote);
   } else if (units.unasked.length > 0) {
-    say(`Setup couldn't ask ${managers}, so a service of its that runs from this directory isn't checked. ${needed}`);
+    say(`Setup couldn't ask ${managers}, so a service of its that runs from this directory isn't checked.` +
+      `${unresolvedNote} ${needed}`);
+  } else if (units.unresolved.length > 0) {
+    say(`${unresolvedNote.trim()} Any such service isn't checked. ${needed}`);
   }
   for (const unit of units.found) {
     say(unit.restarts
       ? `${unit.id} restarts the host when it exits with ${RESTART_EXIT_CODE} or 1 (${unit.settings}).`
       : `${unit.id} won't restart the host on both ${RESTART_EXIT_CODE} and 1 (${unit.settings}), so a switch's ` +
-        'restart, or a failed trial\'s fallback, would leave the host stopped. Set Restart=on-failure or Restart=always, ' +
-        'without either status in SuccessExitStatus= or RestartPreventExitStatus=, before you update.');
+        'restart, or a failed trial\'s fallback, would leave the host stopped. Set Restart=always without either status ' +
+        'in RestartPreventExitStatus=, or Restart=on-failure without either in SuccessExitStatus= or ' +
+        'RestartPreventExitStatus=, before you update.');
   }
 }
 
