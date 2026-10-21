@@ -806,10 +806,12 @@ describe('the service check', () => {
         'Id=elsewhere.service\nWorkingDirectory=/elsewhere\nRestart=always',
       ].join('\n\n');
       const system = 'Id=system-none.service\nWorkingDirectory=\nRestart=always\n\nId=system-tilde.service\nWorkingDirectory=!~\nRestart=always';
-      expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : system) }), install)).toEqual({
-        found: [{ id: 'tilde.service', settings: 'Restart=always', restarts: true }], unasked: [],
-        unresolved: ['system-tilde.service'], defaulted: ['sets-none.service'],
-      });
+      for (const home of [install, `${install}/`]) {
+        expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : system) }), home)).toEqual({
+          found: [{ id: 'tilde.service', settings: 'Restart=always', restarts: true }], unasked: [],
+          unresolved: ['system-tilde.service'], defaulted: ['sets-none.service'],
+        });
+      }
     }
     // Run elsewhere, a unit that sets none is neither found nor named.
     const none = `Id=sets-none.service\nWorkingDirectory=!${dir}\nRestart=no`;

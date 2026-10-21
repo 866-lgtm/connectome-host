@@ -160,6 +160,16 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
   const unresolved: string[] = [];
   const defaulted: string[] = [];
   const here = realOrResolved(cwd);
+  // The home as a path to compare, so one given with a trailing slash or
+  // through a link still matches what systemctl shows.
+  const realOrNull = (path: string) => {
+    try {
+      return realOrResolved(path);
+    } catch {
+      return null;
+    }
+  };
+  const homeReal = realOrNull(home);
   for (const scope of [['--user'], []]) {
     const user = scope.length > 0;
     const unanswered = () => unasked.push(scope.length > 0 ? 'user' : 'system');
@@ -181,7 +191,7 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
       const shown = fields.get('WorkingDirectory') ?? '';
       const set = shown.replace(/^[-!+@:]+/, '');
       const id = fields.get('Id') ?? '?';
-      if (set === '' || (user && shown.startsWith('!') && set === home)) {
+      if (set === '' || (user && shown.startsWith('!') && homeReal !== null && realOrNull(set) === homeReal)) {
         let runsIn: string;
         try {
           runsIn = realOrResolved(set === '' ? '/' : set);
