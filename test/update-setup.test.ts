@@ -89,7 +89,7 @@ describe('setup', () => {
     units = { found: [unit], unasked: [] };
     setup(options());
     expect(said.some((l) => l.includes("won't restart the host on both 75 and 1 (Restart=on-failure, SuccessExitStatus includes 75)"))).toBe(true);
-    for (const [unasked, says] of [[[], 'No systemd service runs from this directory'],
+    for (const [unasked, says] of [[[], 'No systemd service that this user can see runs from this directory'],
       [['user', 'system'], "Setup couldn't ask systemd's user manager or systemd's system manager"]] as const) {
       said = [];
       units = { found: [], unasked: [...unasked] };

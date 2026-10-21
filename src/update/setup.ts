@@ -515,7 +515,7 @@ export function setup(options: SetupOptions): void {
   if (units.found.length === 0) {
     say(units.unasked.length > 0
       ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.`
-      : `${needed} No systemd service runs from this directory, so setup couldn't check that.`);
+      : `${needed} No systemd service that this user can see runs from this directory, so setup couldn't check that.`);
   } else if (units.unasked.length > 0) {
     say(`Setup couldn't ask ${managers}, so a service of its that runs from this directory isn't checked. ${needed}`);
   }
