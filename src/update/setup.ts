@@ -137,6 +137,16 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
   Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' })): { found: ServiceUnit[]; unasked: string[] } {
   const found: ServiceUnit[] = [];
   const unasked: string[] = [];
+  const here = realOrResolved(cwd);
+  // A unit's directory this user can't resolve, such as one under /root or
+  // /var/lib/private, isn't the one this user runs setup in.
+  const isHere = (dir: string) => {
+    try {
+      return realOrResolved(dir) === here;
+    } catch {
+      return false;
+    }
+  };
   for (const scope of [['--user'], []]) {
     const unanswered = () => unasked.push(scope.length > 0 ? 'user' : 'system');
     let result: { exitCode: number | null; stdout: Uint8Array | Buffer };
@@ -155,7 +165,7 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
     for (const block of Buffer.from(result.stdout).toString('utf-8').split(/\n\s*\n/)) {
       const fields = new Map(block.split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
       const dir = (fields.get('WorkingDirectory') ?? '').replace(/^[-!+@:]+/, '');
-      if (!dir || realOrResolved(dir) !== realOrResolved(cwd)) continue;
+      if (!dir || !isHere(dir)) continue;
       const restart = fields.get('Restart') || 'no';
       const statusesOf = (key: string) => (fields.get(key) ?? '').split(/\s+/).filter(Boolean);
       // systemd's rules for an exit with `code`: a prevented status never

@@ -671,6 +671,23 @@ describe('the service check', () => {
     expect(systemdUnits(install, () => ({ exitCode: 0, stdout: Buffer.from(elsewhere) }))).toEqual({ found: [], unasked: [] });
   });
 
+  test("a unit whose directory this user can't resolve is another's, and the rest are still read", () => {
+    const shut = join(dir, 'shut');
+    mkdirSync(join(shut, 'svc'), { recursive: true });
+    chmodSync(shut, 0o600);
+    const shown = [
+      `Id=private.service\nWorkingDirectory=${join(shut, 'svc')}\nRestart=always`,
+      `Id=connectome.service\nWorkingDirectory=${install}\nRestart=always`,
+    ].join('\n\n');
+    try {
+      expect(systemdUnits(install, (args) => ({ exitCode: args[0] === '--user' ? 0 : 1, stdout: Buffer.from(shown) }))).toEqual({
+        found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['system'],
+      });
+    } finally {
+      chmodSync(shut, 0o755);
+    }
+  });
+
   test("names both managers when neither of systemd's queries answers", () => {
     const neither = { found: [], unasked: ['user', 'system'] };
     expect(systemdUnits(install, () => ({ exitCode: 1, stdout: Buffer.from('') }))).toEqual(neither);

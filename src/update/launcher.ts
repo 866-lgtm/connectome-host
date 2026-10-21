@@ -814,14 +814,15 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
   const children = childrenProblem(record, ops);
   if (children !== null) return { step: 'children-check', reason: children };
   // A start's cleanup removes an earlier attempt's preparation, unless the
-  // list that says where its areas are can't be read. Its keeps would then
-  // stand for what the data holds now, so the Go back waits for them to go.
+  // list that says where its areas are can't be read, or a removal fails,
+  // which that start reports. Its keeps would then stand for what the data
+  // holds now, so the Go back waits for them to go.
   const earlier = setAsideDir(root, mark.id);
   if (exists(earlier)) {
     return {
       step: 'go-back',
       reason: `an earlier attempt's preparation under mark ${mark.id} is still at ${earlier}, since its list of places ` +
-        `can't be read. Remove it, and its areas inside each directory the update copies, in ${ITEM_UPDATE_DIR} under that mark`,
+        `can't be read, or removing it failed (each start that tried says why). Remove it, and its areas inside each directory the update copies, in ${ITEM_UPDATE_DIR} under that mark`,
     };
   }
   let places: GoBackList['places'];
