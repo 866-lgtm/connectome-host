@@ -351,7 +351,11 @@ export function realOrResolved(path: string): string {
   for (let at = resolve(path); ; at = dirname(at)) {
     try {
       return join(realpathSync(at), ...rest);
-    } catch {
+    } catch (error) {
+      // A path that isn't there, or that runs through a file, resolves by
+      // its nearest ancestor that is; any other error is the path's own.
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
       if (dirname(at) === at) return resolve(path);
       rest.unshift(basename(at));
     }

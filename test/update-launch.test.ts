@@ -27,7 +27,7 @@ function hostPackage(hostDir: string, version: string): void {
   cpSync(join(import.meta.dir, '..', 'src', 'update'), join(hostDir, 'src', 'update'), { recursive: true });
   writeFileSync(join(hostDir, 'src', 'index.ts'), [
     "import { writeFileSync } from 'node:fs';",
-    `writeFileSync(process.env.MARKER!, JSON.stringify({ version: ${JSON.stringify(version)}, argv: process.argv.slice(2), root: process.env.${INSTALL_ROOT_ENV}, cwd: process.cwd(), pid: process.pid }));`,
+    `writeFileSync(process.env.MARKER!, JSON.stringify({ version: ${JSON.stringify(version)}, argv: process.argv.slice(2), execArgv: process.execArgv, root: process.env.${INSTALL_ROOT_ENV}, cwd: process.cwd(), pid: process.pid }));`,
     '',
   ].join('\n'));
 }
@@ -76,11 +76,21 @@ describe('a start, end to end', () => {
     expect(readJournal(root)).toEqual([]);
   });
 
+  test("the runtime's own flags, as the service gave them, reach the host", () => {
+    const run = Bun.spawnSync([process.execPath, '--smol', join(root, ENTRY_POINT), '--recipe', 'r.json'], {
+      cwd: install, env: { ...process.env, DATA_DIR: data, MARKER: marker }, stderr: 'pipe',
+    });
+    expect(run.exitCode).toBe(0);
+    const host = JSON.parse(readFileSync(marker, 'utf-8'));
+    expect(host.execArgv).toEqual(['--smol']);
+    expect(host.argv).toEqual(['--recipe', 'r.json']);
+  });
+
   test('the entry point starts the release current names, which becomes its host in the same process, with the install root and the service\'s arguments', () => {
     const run = start('--recipe', 'r.json');
     expect(run.exitCode).toBe(0);
     expect(JSON.parse(readFileSync(marker, 'utf-8'))).toEqual({
-      version: '0.10.2', argv: ['--recipe', 'r.json'], root, cwd: install, pid: run.pid,
+      version: '0.10.2', argv: ['--recipe', 'r.json'], execArgv: [], root, cwd: install, pid: run.pid,
     });
   });
 

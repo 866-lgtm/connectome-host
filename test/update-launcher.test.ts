@@ -1752,6 +1752,39 @@ describe('leftovers', () => {
     expect(reports.find((l) => l.includes('under mark stale kept stays where it is'))).toContain(ITEM_UPDATE_DIR);
   });
 
+  test("a leftover that can't be removed is said, and the start goes on with the release current names", async () => {
+    await committedSwitch();
+    mkdirSync(setAsideDir(root, 'stale'), { recursive: true });
+    writeJsonAtomic(join(setAsideDir(root, 'stale'), 'places.json'), { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
+    mkdirSync(join(installPaths(root).copyTmp, 'x'), { recursive: true });
+    chmodSync(installPaths(root).setAside, 0o555);
+    const realRm = fs.rmSync;
+    const rm = spyOn(fs, 'rmSync').mockImplementation(((path: fs.PathLike, options?: fs.RmOptions) => {
+      if (String(path).startsWith(installPaths(root).copyTmp)) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return realRm(path, options);
+    }) as typeof fs.rmSync);
+    const realRmdir = fs.rmdirSync;
+    const rmdir = spyOn(fs, 'rmdirSync').mockImplementation(((path: fs.PathLike, options?: fs.RmDirOptions) => {
+      if (String(path).startsWith(installPaths(root).copyTmp)) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return realRmdir(path, options);
+    }) as typeof fs.rmdirSync);
+    try {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      rm.mockRestore();
+      rmdir.mockRestore();
+      chmodSync(installPaths(root).setAside, 0o755);
+    }
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('a later start tries again');
+    expect(reports.find((l) => l.includes('Removing a copy a switch left unfinished'))).toContain('a later start tries again');
+    expect(existsSync(setAsideDir(root, 'stale'))).toBe(true);
+    // The next start, with nothing in the way, removes both.
+    reports = [];
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(existsSync(setAsideDir(root, 'stale'))).toBe(false);
+    expect(existsSync(installPaths(root).copyTmp)).toBe(false);
+  });
+
   test("one whose directory the system won't search stays too, and the start says so", async () => {
     await committedSwitch();
     mkdirSync(setAsideDir(root, 'stale'), { recursive: true });

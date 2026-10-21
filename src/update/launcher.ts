@@ -80,7 +80,8 @@ export interface LauncherOps {
 }
 
 /** What a start decided to run: a release, on trial when it hasn't committed
- *  on this install's data yet. */
+ *  on this install's data yet. The host isn't told `trial`: it tells its own
+ *  trial from `current`, which a trial doesn't name (host.ts). */
 export interface Start {
   release: string;
   trial: boolean;
@@ -550,6 +551,18 @@ function dropCopyPrev(root: string, ops: LauncherOps): void {
   }
 }
 
+/** Remove copy.tmp, a copy a switch didn't finish. Nothing needs it, so a
+ *  removal that fails is said, and a later start tries again. */
+function dropUnfinishedCopy(root: string, ops: LauncherOps): void {
+  const { copyTmp } = installPaths(root);
+  try {
+    removeTree(copyTmp);
+  } catch (error) {
+    ops.report(`[update] Removing a copy a switch left unfinished (${copyTmp}) failed, so it stays for now, and a ` +
+      `later start tries again: ${errorText(error)}`);
+  }
+}
+
 /** Finish or undo a replacement of the copy that a start cut off: with the
  *  new copy in place, the one before it goes; without, it comes back. */
 function settleCopy(root: string, ops: LauncherOps): void {
@@ -638,12 +651,20 @@ function clearGoBack(root: string, markId: string, ops: LauncherOps): void {
       `${setAsideDir(root, markId)} when nothing there is wanted.`);
     return;
   }
-  for (const place of places.filter((p) => kindOf(p.path) === 'dir')) {
-    for (const area of [itemSetAsideDir(place.path, markId), itemStagingDir(place.path, markId)]) {
-      for (const suffix of ['', '.tmp', '.filling', '.emptying']) removeTree(area + suffix);
+  // Nothing needs what's removed here, so a removal that fails is said and
+  // left for a later start, which tries again; the list goes last, so it
+  // still says where the rest is.
+  try {
+    for (const place of places.filter((p) => kindOf(p.path) === 'dir')) {
+      for (const area of [itemSetAsideDir(place.path, markId), itemStagingDir(place.path, markId)]) {
+        for (const suffix of ['', '.tmp', '.filling', '.emptying']) removeTree(area + suffix);
+      }
     }
+    removeTree(setAsideDir(root, markId));
+  } catch (error) {
+    ops.report(`[update] Removing what the Go back under mark ${markId} kept failed, so it stays for now, and a ` +
+      `later start tries again: ${errorText(error)}`);
   }
-  removeTree(setAsideDir(root, markId));
 }
 
 /** Put back what a Go back under `markId` replaced, keeping what each place
@@ -773,7 +794,7 @@ async function switchTo(root: string, record: InstallRecord, mark: Mark, current
     takeCopy(root, checked.present, checked.absent, current, mark, ops);
   } catch (error) {
     settleCopy(root, ops);
-    removeTree(installPaths(root).copyTmp);
+    dropUnfinishedCopy(root, ops);
     return refuse(root, ops, 'copy', current, mark, `the copy failed: ${errorText(error)}`, 'failed');
   }
   appendJournal(root, line(ops, { step: 'copy', from: current, to: mark.to, outcome: 'ok', mark: mark.id }));
@@ -1040,14 +1061,17 @@ function fallBackTrial(root: string, record: InstallRecord, trial: JournalLine, 
  *  copy a Go back that kept the newer data took for its trial, once that
  *  trial committed. Only a start with no request under way calls it. */
 function clearLeftovers(root: string, lines: JournalLine[], ops: LauncherOps): void {
-  const { copyTmp, setAside } = installPaths(root);
-  removeTree(copyTmp);
+  const { setAside } = installPaths(root);
+  dropUnfinishedCopy(root, ops);
   const named = new Set(lines.filter((l) => l.outcome === 'ok' && typeof l.mark === 'string').map((l) => l.mark));
   let ids: string[] = [];
   try {
     ids = readdirSync(setAside);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      ops.report(`[update] What earlier requests kept in ${setAside} can't be listed, so it stays for now: ` +
+        `${errorText(error)}`);
+    }
   }
   for (const id of ids) {
     if (!named.has(id)) clearGoBack(root, id, ops);
@@ -1197,7 +1221,9 @@ export async function launch(root: string, argv: string[]): Promise<never> {
     process.exit(1);
   }
   try {
-    process.execve(process.execPath, [process.execPath, entry, ...argv], { ...process.env, [INSTALL_ROOT_ENV]: root });
+    // The runtime's own flags, as the service gave them, go to the host too.
+    process.execve(process.execPath, [process.execPath, ...process.execArgv, entry, ...argv],
+      { ...process.env, [INSTALL_ROOT_ENV]: root });
   } catch (error) {
     ops.report(`[update] Nothing started: ${entry} couldn't run: ${errorText(error)}`);
   }

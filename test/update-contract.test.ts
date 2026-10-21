@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'node:fs';
 import {
-  mkdtempSync, rmSync, writeFileSync, readlinkSync, appendFileSync, existsSync, readdirSync, mkdirSync, symlinkSync,
+  chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync, readlinkSync, appendFileSync, existsSync, readdirSync, mkdirSync, symlinkSync,
   renameSync, unlinkSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -10,7 +10,7 @@ import { join, resolve } from 'node:path';
 import {
   ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, PLACE_KINDS, RESTART_EXIT_CODE, appendJournal, childrenFilePath,
   copyItemName, copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent,
-  moveCurrent, pendingGoBack, readCurrent, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir,
+  moveCurrent, pendingGoBack, readCurrent, realOrResolved, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir,
   trialPlaces, unfinishedTrial, writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
 } from '../src/update/contract.js';
 
@@ -29,6 +29,23 @@ describe('the update contract', () => {
     expect(installRootFromEnv({ CONNECTOME_INSTALL_ROOT: '' })).toBeNull();
     expect(installRootFromEnv({ CONNECTOME_INSTALL_ROOT: root })).toBe(root);
     expect(installRootFromEnv({ CONNECTOME_INSTALL_ROOT: 'install' })).toBe(resolve('install'));
+  });
+
+  test("realOrResolved resolves a path that isn't there, or runs through a file, by its nearest ancestor, and names any other error", () => {
+    const real = realpathSync(root);
+    mkdirSync(join(root, 'real'));
+    symlinkSync(join(root, 'real'), join(root, 'link'));
+    expect(realOrResolved(join(root, 'link'))).toBe(join(real, 'real'));
+    expect(realOrResolved(join(root, 'link', 'not', 'there'))).toBe(join(real, 'real', 'not', 'there'));
+    writeFileSync(join(root, 'file'), '');
+    expect(realOrResolved(join(root, 'file', 'under'))).toBe(join(real, 'file', 'under'));
+    mkdirSync(join(root, 'shut', 'inner'), { recursive: true });
+    chmodSync(join(root, 'shut'), 0o600);
+    try {
+      expect(() => realOrResolved(join(root, 'shut', 'inner'))).toThrow(expect.objectContaining({ code: 'EACCES' }));
+    } finally {
+      chmodSync(join(root, 'shut'), 0o755);
+    }
   });
 
   test('the names are the contract: an older release reads them, so none changes', () => {
