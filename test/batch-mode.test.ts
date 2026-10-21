@@ -52,8 +52,10 @@ describe('batch-mode notices', () => {
     expect(batchEchoLine('/auth token sk-ant-oat01-secret')).toBe('/auth token <hidden>');
     expect(batchEchoLine('  /auth TOKEN  two words  ')).toBe('/auth TOKEN <hidden>');
     expect(batchEchoLine('/AUTH token sk-ant-oat01-secret')).toBe('/AUTH token <hidden>');
-    // Split on any whitespace, as handleCommand splits it.
+    // Split on any whitespace, as handleCommand splits it, which runs a line
+    // with spaces after its slash as the command they precede.
     expect(batchEchoLine('/auth\ttoken\tsk-ant-oat01-secret')).toBe('/auth token <hidden>');
+    expect(batchEchoLine('/ auth token sk-ant-oat01-secret')).toBe('/auth token <hidden>');
     // Words after another subcommand /auth knows run nothing, but are hidden too.
     expect(batchEchoLine('/auth recheck now')).toBe('/auth recheck <hidden>');
     // A word /auth doesn't know may itself be the credential, so it's hidden
