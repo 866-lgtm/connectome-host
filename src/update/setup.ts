@@ -142,11 +142,12 @@ export interface ServiceUnits {
  *  and a failed trial's. */
 const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
 
-/** The home /etc/passwd gives the user `name`, or null where it names none
- *  or can't be read, as for a user another source of accounts serves. */
-export function passwdHome(name: string): string | null {
+/** The home `file`, /etc/passwd, gives the user `name`, or null where it
+ *  names none or can't be read, as for a user another source of accounts
+ *  serves. */
+export function passwdHome(name: string, file = '/etc/passwd'): string | null {
   try {
-    const line = readFileSync('/etc/passwd', 'utf-8').split('\n').map((entry) => entry.split(':')).find((f) => f[0] === name);
+    const line = readFileSync(file, 'utf-8').split('\n').map((entry) => entry.split(':')).find((f) => f[0] === name);
     return line?.[5] || null;
   } catch {
     return null;
@@ -598,10 +599,11 @@ export function setup(options: SetupOptions): void {
     'restarted, by Restart=always, by Restart=on-failure while it isn\'t in SuccessExitStatus=, or by ' +
     'RestartForceExitStatus=, and neither in RestartPreventExitStatus=; or launchd\'s KeepAlive.';
   const one = units.unresolved.length === 1;
-  const unresolvedNote = units.unresolved.length === 0 ? '' : ` Setup couldn't resolve, as this user, the working ` +
-    `directory of ${units.unresolved.join(', ')}, so it can't tell whether ${one ? 'it runs' : 'they run'} from this ` +
-    `directory reached another way, and doesn't check ${one ? 'it' : 'them'}. If ${one ? 'it runs' : 'one of them runs'} ` +
-    'the host, check its restart settings by hand, or run setup as a user who can reach its working directory.';
+  const unresolvedNote = units.unresolved.length === 0 ? '' : ` Setup couldn't resolve the working directory of ` +
+    `${units.unresolved.join(', ')} (one under a directory this user can't search, or a system unit's ~ whose User= ` +
+    `/etc/passwd doesn't name), so it can't tell whether ${one ? 'it runs' : 'they run'} from this directory, and doesn't ` +
+    `check ${one ? 'it' : 'them'}. If ${one ? 'it runs' : 'one of them runs'} the host, check its restart settings by ` +
+    'hand, or run setup as a user who can reach its working directory.';
   const few = units.defaulted.length === 1;
   const defaultedNote = units.defaulted.length === 0 ? '' : ` ${units.defaulted.join(', ')} ${few ? 'sets' : 'set'} no ` +
     `working directory, so ${few ? 'it runs' : 'they run'} in ${few ? 'its' : 'their'} systemd manager's default, which ` +

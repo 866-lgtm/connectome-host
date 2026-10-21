@@ -451,10 +451,11 @@ describe('setup', () => {
 
   test("units whose directory this user can't resolve are named, each, beside those found, beside none, and beside a manager not asked", () => {
     const unit = { id: 'connectome.service', settings: 'Restart=on-failure', restarts: true };
-    const note = (names: string, they: boolean) => `Setup couldn't resolve, as this user, the working directory of ${names}, so ` +
-      `it can't tell whether ${they ? 'they run' : 'it runs'} from this directory reached another way, and doesn't check ` +
-      `${they ? 'them' : 'it'}. If ${they ? 'one of them runs' : 'it runs'} the host, check its restart settings by hand, or ` +
-      'run setup as a user who can reach its working directory.';
+    const note = (names: string, they: boolean) => `Setup couldn't resolve the working directory of ${names} (one under a ` +
+      "directory this user can't search, or a system unit's ~ whose User= /etc/passwd doesn't name), so it can't tell whether " +
+      `${they ? 'they run' : 'it runs'} from this directory, and doesn't check ${they ? 'them' : 'it'}. If ` +
+      `${they ? 'one of them runs' : 'it runs'} the host, check its restart settings by hand, or run setup as a user who can ` +
+      'reach its working directory.';
     units = { found: [unit], unasked: [], unresolved: ['a.service', 'b.service'], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.startsWith(note('a.service, b.service', true)))).toBe(true);
@@ -488,6 +489,13 @@ describe('setup', () => {
     units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [], defaulted: ['a.service', 'b.service'] };
     setup(options());
     expect(said.some((l) => l.startsWith(note('a.service, b.service', false)))).toBe(true);
+    // A % in the directory is doubled, as a unit file's value needs.
+    const percent = join(dir, '50%h');
+    symlinkSync(install, percent);
+    said = [];
+    units = { found: [], unasked: [], unresolved: [], defaulted: ['a.service'] };
+    setup(options({ cwd: percent }));
+    expect(said.some((l) => l.includes(`give the service WorkingDirectory=${join(dir, '50%%h')} and run setup again`))).toBe(true);
     // Beside a manager it couldn't ask, found or not.
     for (const found of [[], [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }]]) {
       said = [];
@@ -820,6 +828,22 @@ describe('the service check', () => {
           unresolved: ['system-tilde.service'], defaulted: ['sets-none.service'],
         });
       }
+      // A home given through a link is the same home.
+      const linked = join(dir, 'home-link');
+      symlinkSync(install, linked);
+      expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : '') }), linked,
+        () => null).defaulted).toEqual(['sets-none.service']);
+      // A home that can't be resolved leaves the rule off: the unit's directory is read as set, and named as unresolved.
+      const shut = join(dir, 'shut-home');
+      mkdirSync(join(shut, 'home'), { recursive: true });
+      chmodSync(shut, 0o600);
+      try {
+        const behind = `Id=behind.service\nWorkingDirectory=!${join(shut, 'home')}\nRestart=always`;
+        expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? behind : '') }),
+          join(shut, 'home'), () => null)).toEqual({ found: [], unasked: [], unresolved: ['behind.service'], defaulted: [] });
+      } finally {
+        chmodSync(shut, 0o755);
+      }
       // One that sets the home itself, without the `!`, is found.
       const explicit = `Id=explicit.service\nWorkingDirectory=${install}\nRestart=no`;
       expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? explicit : '') }), install).found)
@@ -848,9 +872,14 @@ describe('the service check', () => {
     expect(systemdUnits('/', () => ({ exitCode: 0, stdout: Buffer.from('') }), dir)).toEqual({ found: [], unasked: [], unresolved: [], defaulted: [] });
   });
 
-  test("a user's home from /etc/passwd, and none for a user it doesn't name", () => {
-    expect(passwdHome('root')).toBe('/root');
-    expect(passwdHome('no-such-user-here')).toBe(null);
+  test("a user's home from /etc/passwd, and none for a user it doesn't name, or where it can't be read", () => {
+    const passwd = join(dir, 'passwd');
+    writeFileSync(passwd, 'root:x:0:0:root:/root:/bin/sh\nconnectome:x:1001:1001::/srv/connectome:/usr/sbin/nologin\nnohome:x:1002:1002:::\n');
+    expect(passwdHome('connectome', passwd)).toBe('/srv/connectome');
+    expect(passwdHome('root', passwd)).toBe('/root');
+    expect(passwdHome('nohome', passwd)).toBe(null);
+    expect(passwdHome('no-such-user-here', passwd)).toBe(null);
+    expect(passwdHome('connectome', join(dir, 'nowhere'))).toBe(null);
   });
 
   test("names both managers when neither of systemd's queries answers", () => {

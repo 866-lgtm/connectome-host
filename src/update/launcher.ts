@@ -787,9 +787,9 @@ function putBack(root: string, markId: string, ops: LauncherOps): void {
       // failure, is nobody's. (One that was there was staged before the line.)
       removeTree(`${staging}.tmp`);
       // One the Go back made and never filled holds nothing to keep. It's
-      // left, empty, rather than driven, since a drive would leave an empty
-      // staging area to stand in for the copy's at a later restore; removing
-      // it would want a mount check of its own.
+      // left holding only its update directory rather than driven, since a
+      // drive would leave an empty staging area to stand in for the copy's at
+      // a later restore; removing it would want a mount check of its own.
       if (!any && readdirSync(place.path).every((name) => name === ITEM_UPDATE_DIR)) continue;
       stopForMounts(place.path, ops);
       if (!any) emptyArea(setAside);
@@ -1032,11 +1032,10 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
       ? stuckIn(dirname(place.path), () => [basename(place.path)]).map((path) => ({ path, why: 'sticky' as const }))[0] ?? null
       : place.before === 'dir' ? heldIn(place.path) : null;
     if (held === null) continue;
-    // Going back keeping the newer data takes no file away, but its fallback
-    // drives the same directories, so it's offered only for a file.
-    if (from === null) return { step: 'go-back', reason: heldText(held, `the fallback, if ${mark.to} fails before it commits,`) };
-    return { step: 'go-back', reason: place.before === 'file'
-      ? `${heldText(held, 'the Go back')}, or go back keeping the newer data` : heldText(held, 'the Go back') };
+    // Going back keeping the newer data isn't offered: its fallback drives
+    // the same directories, so whether it could go on depends on every place.
+    return { step: 'go-back', reason: heldText(held, from === null
+      ? `the fallback, if ${mark.to} fails before it commits,` : 'the Go back') };
   }
   const takenAway = places.filter((place) => place.before === 'file' && place.target === 'none');
   if (takenAway.length > 0) {

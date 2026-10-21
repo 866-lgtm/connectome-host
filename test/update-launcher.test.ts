@@ -1734,7 +1734,8 @@ describe('a Go back', () => {
     });
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in ${work}, which has the sticky bit, and ` +
       `this process owns neither, so the Go back couldn't move it. Make this user the owner of ${agent} or of ${work}, or take the ` +
-      `sticky bit off ${work}, or go back keeping the newer data`);
+      `sticky bit off ${work}`);
+    expect(reports.find((l) => l.includes("didn't go ahead"))).not.toContain('go back keeping the newer data');
     expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
     expect(read(agent)).toBe('{"agent":1}');
     // CAP_FOWNER takes it away whatever its owners, so the same Go back goes ahead holding it.
