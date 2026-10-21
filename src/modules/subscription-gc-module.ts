@@ -428,12 +428,13 @@ export class SubscriptionGcModule implements Module {
       }
 
       // The registry refused because the channel was explicitly opened and
-      // we hold no lease: stand down quietly — the janitor doesn't argue
-      // with stated intent. The counter stays cleared, so the next refusal
-      // is at least a full budget away; if the channel's provenance later
-      // changes (reopened by policy), GC self-heals.
+      // we hold no lease, or because it's tuned out, which a close can't
+      // end (only the tune-out's cancel does): stand down quietly — the
+      // janitor doesn't argue with stated intent. The counter stays cleared,
+      // so the next refusal is at least a full budget away; if the channel's
+      // provenance later changes (reopened by policy), GC self-heals.
       const refusal = (result as { data?: { refusal?: string } } | undefined)?.data?.refusal;
-      if (refusal === 'explicit-open') {
+      if (refusal === 'explicit-open' || refusal === 'tuned-out') {
         return {};
       }
 
