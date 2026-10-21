@@ -238,7 +238,7 @@ function shellWord(path: string): string {
   return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
 }
 
-/** Set an install up, or finish a setup a run cut off, or record its server
+/** Set an install up, or finish a setup a run cut off, or record its extra
  *  state again. */
 export function setup(options: SetupOptions): void {
   const { say } = options;

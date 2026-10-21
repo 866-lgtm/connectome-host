@@ -306,7 +306,7 @@ function waitForChildren(record: InstallRecord, ops: LauncherOps, what: string):
 }
 
 /** Everything a switch copies, as real paths: the data directory, each fleet
- *  child's, the MCPL settings files in the working directory, and the server
+ *  child's, the MCPL settings files in the working directory, and the extra
  *  state setup recorded. `present` are those there now, none inside another,
  *  since copying the outer one covers it. `absent` are those that aren't,
  *  none inside a present one or another absent one, which a restore keeps
