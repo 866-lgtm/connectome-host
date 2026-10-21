@@ -141,7 +141,9 @@ const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
 /** What systemd's user and system managers say of their service units: those
  *  run from `cwd`, which manager couldn't be asked, and the units whose
  *  working directory this user can't resolve, such as one under /root or
- *  /var/lib/private, which may or may not be `cwd` reached another way. */
+ *  /var/lib/private, which may or may not be `cwd` reached another way. A
+ *  unit that sets none, and so runs in its manager's default, the user's home
+ *  or /, isn't read as running from there, since in a home most do. */
 export function systemdUnits(cwd: string, run = (args: string[]) =>
   Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' })): ServiceUnits {
   const found: ServiceUnit[] = [];
@@ -545,23 +547,23 @@ export function setup(options: SetupOptions): void {
     'and with 1, as a trial that ends before its commit does, so its fallback runs: under systemd, each of the two ' +
     'restarted, by Restart=always, by Restart=on-failure while it isn\'t in SuccessExitStatus=, or by ' +
     'RestartForceExitStatus=, and neither in RestartPreventExitStatus=; or launchd\'s KeepAlive.';
-  const shown = units.unresolved.slice(0, 5).join(', ') +
-    (units.unresolved.length > 5 ? ` and ${units.unresolved.length - 5} more` : '');
+  const one = units.unresolved.length === 1;
   const unresolvedNote = units.unresolved.length === 0 ? '' : ` Setup couldn't resolve, as this user, the working ` +
-    `directory of ${shown}, so it can't tell whether ${units.unresolved.length === 1 ? 'it runs' : 'they run'} from this ` +
-    'directory reached another way.';
+    `directory of ${units.unresolved.join(', ')}, so it can't tell whether ${one ? 'it runs' : 'they run'} from this ` +
+    `directory reached another way, and doesn't check ${one ? 'it' : 'them'}. If ${one ? 'it runs' : 'one of them runs'} ` +
+    'the host, check its restart settings by hand, or run setup as a user who can reach its working directory.';
   const managers = units.unasked.map((scope) => `systemd's ${scope} manager`).join(' or ');
   if (units.found.length === 0) {
     say(units.unasked.length > 0
       ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.` +
         unresolvedNote
-      : `${needed} No systemd service that this user can see runs from this directory, so setup couldn't check that.` +
-        unresolvedNote);
+      : `${needed} No systemd service ${units.unresolved.length > 0 ? 'whose working directory setup could resolve' :
+        'that this user can see'} is set to run from this directory, so setup couldn't check that.${unresolvedNote}`);
   } else if (units.unasked.length > 0) {
     say(`Setup couldn't ask ${managers}, so a service of its that runs from this directory isn't checked.` +
       `${unresolvedNote} ${needed}`);
   } else if (units.unresolved.length > 0) {
-    say(`${unresolvedNote.trim()} Any such service isn't checked. ${needed}`);
+    say(`${unresolvedNote.trim()} ${needed}`);
   }
   for (const unit of units.found) {
     say(unit.restarts

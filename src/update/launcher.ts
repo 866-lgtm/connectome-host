@@ -111,13 +111,28 @@ function mayWrite(path: string): boolean {
   }
 }
 
-/** Whether the sticky bit on `path`'s directory keeps this process from
- *  removing it: the directory has the bit, and this process owns neither and
- *  isn't root, whose CAP_FOWNER removes it whatever its owners. */
-function stickyFor(path: string): boolean {
-  const dir = statSync(dirname(path));
+/** Whether this process holds CAP_FOWNER, which lets it take an entry out of
+ *  a directory with the sticky bit whatever their owners: bit 3 of the
+ *  effective set in /proc/self/status. Where that can't be read, root is
+ *  taken to hold it, as it does unless something dropped it. */
+function holdsFowner(): boolean {
+  try {
+    const effective = /^CapEff:\s*([0-9a-f]+)$/m.exec(readFileSync('/proc/self/status', 'utf-8'))?.[1];
+    return effective !== undefined && (BigInt(`0x${effective}`) & 8n) !== 0n;
+  } catch {
+    return process.getuid?.() === 0;
+  }
+}
+
+/** The entries of `dir`, named by `names`, that its sticky bit keeps this
+ *  process from taking out of it: when it has the bit, and this process
+ *  neither owns it nor holds CAP_FOWNER, each entry this process doesn't own,
+ *  as a link is owned in its own right; otherwise none. */
+function stuckIn(dir: string, names: () => string[]): string[] {
+  const stat = statSync(dir);
   const uid = process.getuid?.();
-  return uid !== 0 && (dir.mode & 0o1000) !== 0 && dir.uid !== uid && statSync(path).uid !== uid;
+  if ((stat.mode & 0o1000) === 0 || stat.uid === uid || holdsFowner()) return [];
+  return names().map((name) => join(dir, name)).filter((path) => lstatSync(path).uid !== uid);
 }
 
 /** Whether the filesystem holding `path` can be written at all: not when it's
@@ -628,14 +643,15 @@ function restorePlace(root: string, from: string, place: Place, target: Kind, ma
     return;
   }
   // A directory that's there keeps its own mode, as a file item does. One
-  // made here takes the copy's at once, with rwx for its owner, since it
-  // holds its update area, so a replay finds it with that mode; only a cut
-  // between its making and its chmod leaves it its owner's alone, 0700.
+  // made here is made with the copy's, with rwx for its owner, since it holds
+  // its update area, so a replay finds it with that mode. Only when the umask
+  // takes bits from it does the chmod after add them, and a cut between the
+  // two leaves it without them.
   const made = now === 'none';
   if (made) {
     makeDirs(dirname(place.path));
-    mkdirSync(place.path, { mode: 0o700 });
     const mode = (lstatSync(join(from, place.name)).mode & 0o7777) | 0o700;
+    mkdirSync(place.path, { mode });
     if ((lstatSync(place.path).mode & 0o7777) !== mode) chmodSync(place.path, mode);
   } else {
     // One made here holds no mount; one that was there might.
@@ -669,8 +685,8 @@ function clearGoBack(root: string, markId: string, ops: LauncherOps): void {
     if (exists(goBackListPath(root, markId))) places = readGoBackList(root, markId);
   } catch (error) {
     ops.report(`[update] What the Go back under mark ${markId} kept stays where it is. ${errorText(error)} ` +
-      `Its areas are inside each directory the update copies, in ${ITEM_UPDATE_DIR} under that mark; remove them and ` +
-      `${setAsideDir(root, markId)} when nothing there is wanted.`);
+      `Its areas are inside each directory the update copies, in ${ITEM_UPDATE_DIR}, each named for that mark, with ` +
+      `or without a suffix; remove them and ${setAsideDir(root, markId)} when nothing there is wanted.`);
     return;
   }
   // Nothing needs what's removed here, so a removal that fails is said and
@@ -688,8 +704,8 @@ function clearGoBack(root: string, markId: string, ops: LauncherOps): void {
     }
     removeTree(setAsideDir(root, markId));
   } catch (error) {
-    ops.report(`[update] Removing what the Go back under mark ${markId} kept failed, so it stays for now, and a ` +
-      `later start tries again: ${errorText(error)}`);
+    ops.report(`[update] Removing what the Go back under mark ${markId} kept, or syncing its removal, failed, so ` +
+      `its list stays for now, and a later start tries again: ${errorText(error)}`);
   }
 }
 
@@ -727,9 +743,14 @@ function putBack(root: string, markId: string, ops: LauncherOps): void {
       if (existsSync(dirname(place.path))) syncEntries(dirname(place.path));
     } else if (now === 'dir') {
       const { setAside, staging, any } = areas(place.path, markId);
-      // One the Go back made and never filled holds nothing to keep, and an
-      // empty staging area would stand in for the copy's at a later restore.
-      if (!any && readdirSync(place.path).every((name) => name === ITEM_UPDATE_DIR)) continue;
+      // One with nothing set aside or staged holds nothing to keep: at most
+      // the unfinished staging of this Go back, which made it. It goes whole,
+      // as it wasn't there before, rather than left to stand for a place.
+      if (!any && readdirSync(place.path).every((name) => name === ITEM_UPDATE_DIR)) {
+        removeTree(place.path);
+        syncPath(dirname(place.path));
+        continue;
+      }
       stopForMounts(place.path, ops);
       if (!any) emptyArea(setAside);
       drive(place.path, staging, setAside);
@@ -849,7 +870,7 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
     return {
       step: 'go-back',
       reason: `an earlier attempt's preparation under mark ${mark.id} is still at ${earlier}, since a start ` +
-        `couldn't clear it, and each start that tried says why. Remove it, and its areas inside each directory the update copies, in ${ITEM_UPDATE_DIR} under that mark`,
+        `couldn't clear it, and each start that tried says why. Remove it, and its areas inside each directory the update copies, in ${ITEM_UPDATE_DIR}, each named for that mark, with or without a suffix`,
     };
   }
   let places: GoBackList['places'];
@@ -895,9 +916,9 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
       const inner = listed.find((place) => place.path !== outer && isUnder(place.path, outer))!;
       return {
         step: 'go-back',
-        reason: `${outer} is recorded now, and holds ${inner.path}, which the copy of ${mark.to}'s data took on its own, ` +
-          'so the copy can\'t put it back whole. Go back keeping the newer data, or, if it\'s extra state the record ' +
-          'gained since the switch, run setup again with --extra-state for each place it recorded then',
+        reason: `${outer} is recorded now, and ${inner.path}, which the copy of ${mark.to}'s data took on its own, is ` +
+          'inside it, so the copy can\'t put it back whole. Go back keeping the newer data, or, if it\'s extra state ' +
+          `the record gained since the switch, take it out of extraState in ${installPaths(root).install}`,
       };
     }
     // A data item the copy doesn't list, such as a child added since the
@@ -930,8 +951,8 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
   // A file it would change, refused before its line rather than failing
   // after it: on a filesystem no one can write, or, written in place, one
   // this process may neither write nor give itself write on, not being its
-  // owner. Taking one away, or replacing it with a directory, needs only its
-  // directory, which the check after these covers. Whether it would change a
+  // owner. Taking one away, or replacing it with a directory, needs its
+  // directory, which the checks after these cover. Whether it would change a
   // file is asked last, since that reads the copy's content.
   const changes = (place: GoBackList['places'][number]) => (place.before === 'file' || place.target === 'file') &&
     (place.before !== place.target || (from !== null && !sameContent(place.path, join(from, place.name))));
@@ -946,14 +967,6 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
     return { step: 'go-back', reason: `${locked.path} can't be written by this process, which doesn't own it, and the ` +
       'Go back would change it. Give this user write on it, or go back keeping the newer data' };
   }
-  // In a directory with the sticky bit, only a file's owner, or the
-  // directory's, may take the file away, whatever the directory's write.
-  const pinned = places.find((place) => place.before === 'file' && place.target !== 'file' && stickyFor(place.path));
-  if (pinned) {
-    return { step: 'go-back', reason: `${pinned.path} is in a directory with the sticky bit, and neither it nor the ` +
-      'directory is this process\'s, so the Go back couldn\'t take it away. Give this user the file, or go back keeping ' +
-      'the newer data' };
-  }
   // A directory's entries move inside it; a file it makes or takes away, or
   // a directory it makes, is an entry of its parent.
   const unwritable = unwritableDirectory([
@@ -962,6 +975,21 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
       (place.before === 'none' && place.target === 'dir')).map((place) => existingAncestor(dirname(place.path))),
   ]);
   if (unwritable !== null) return { step: 'go-back', reason: unwritable };
+  // In a directory with the sticky bit, only an entry's owner, the
+  // directory's, or a process holding CAP_FOWNER may take the entry out,
+  // whatever the directory's write: a file the Go back takes away, and each
+  // entry of a directory it restores, which moves into its set-aside.
+  const pinned = places.flatMap((place) => {
+    if (place.before === 'file' && place.target !== 'file') return stuckIn(dirname(place.path), () => [basename(place.path)]);
+    if (place.before === 'dir' && from !== null) {
+      return stuckIn(place.path, () => readdirSync(place.path).filter((name) => name !== ITEM_UPDATE_DIR));
+    }
+    return [];
+  })[0];
+  if (pinned !== undefined) {
+    return { step: 'go-back', reason: `${pinned} is in ${dirname(pinned)}, which has the sticky bit, and neither is this ` +
+      'process\'s, so the Go back couldn\'t move it. Give this user its ownership, or go back keeping the newer data' };
+  }
   const mounts = mountProblem(places.filter((place) => place.before === 'dir').map((place) => place.path), ops);
   if (mounts !== null) return { step: 'go-back', reason: mounts };
   const takenAway = places.filter((place) => place.before === 'file' && place.target === 'none');

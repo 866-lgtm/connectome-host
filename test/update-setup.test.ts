@@ -69,6 +69,8 @@ beforeEach(() => {
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
+const NEEDED = "by Restart=always, by Restart=on-failure while it isn't in SuccessExitStatus=, or by RestartForceExitStatus=, and neither in RestartPreventExitStatus=";
+
 describe('setup', () => {
   test("copies the install's code as its first release, records the data it serves, points current at it and writes the entry point", () => {
     setup(options());
@@ -88,13 +90,15 @@ describe('setup', () => {
     const unit = { id: 'connectome.service', settings: 'Restart=on-failure, SuccessExitStatus includes 75', restarts: false };
     units = { found: [unit], unasked: [], unresolved: [] };
     setup(options());
-    expect(said.some((l) => l.includes("won't restart the host on both 75 and 1 (Restart=on-failure, SuccessExitStatus includes 75)"))).toBe(true);
-    for (const [unasked, says] of [[[], 'No systemd service that this user can see runs from this directory'],
+    expect(said.some((l) => l.includes("won't restart the host on both 75 and 1 (Restart=on-failure, SuccessExitStatus includes 75)") &&
+      l.includes(`Before you update, have each of the two restarted, ${NEEDED}.`))).toBe(true);
+    for (const [unasked, says] of [[[], 'No systemd service that this user can see is set to run from this directory'],
       [['user', 'system'], "Setup couldn't ask systemd's user manager or systemd's system manager"]] as const) {
       said = [];
       units = { found: [], unasked: [...unasked], unresolved: [] };
       setup(options());
-      expect(said.some((l) => l.includes(says) && l.includes("couldn't check that"))).toBe(true);
+      expect(said.some((l) => l.includes(says) && l.includes("couldn't check that") &&
+        l.includes(`must restart the host when it exits with 75, as a switch's restart does, and with 1, as a trial that ends before its commit does, so its fallback runs: under systemd, each of the two restarted, ${NEEDED}; or launchd's KeepAlive.`))).toBe(true);
     }
     // One manager couldn't be asked, and the other found a unit: both are said.
     said = [];
@@ -445,15 +449,37 @@ describe('setup', () => {
     }
   });
 
-  test("units whose directory this user can't resolve are named beside those found, and beside none", () => {
-    units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: ['a.service', 'b.service'] };
+  test("units whose directory this user can't resolve are named, each, beside those found, beside none, and beside a manager not asked", () => {
+    const unit = { id: 'connectome.service', settings: 'Restart=on-failure', restarts: true };
+    const note = (names: string, they: boolean) => `Setup couldn't resolve, as this user, the working directory of ${names}, so ` +
+      `it can't tell whether ${they ? 'they run' : 'it runs'} from this directory reached another way, and doesn't check ` +
+      `${they ? 'them' : 'it'}. If ${they ? 'one of them runs' : 'it runs'} the host, check its restart settings by hand, or ` +
+      'run setup as a user who can reach its working directory.';
+    units = { found: [unit], unasked: [], unresolved: ['a.service', 'b.service'] };
     setup(options());
-    expect(said.some((l) => l.includes("Setup couldn't resolve, as this user, the working directory of a.service, b.service, so it can't tell whether they run from this directory reached another way. Any such service isn't checked."))).toBe(true);
+    expect(said.some((l) => l.startsWith(note('a.service, b.service', true)))).toBe(true);
     said = [];
     units = { found: [], unasked: [], unresolved: ['1', '2', '3', '4', '5', '6', '7'] };
     setup(options());
-    expect(said.some((l) => l.includes('No systemd service that this user can see runs from this directory') &&
-      l.includes('the working directory of 1, 2, 3, 4, 5 and 2 more'))).toBe(true);
+    expect(said.some((l) => l.includes('No systemd service whose working directory setup could resolve is set to run from this directory') &&
+      l.includes(note('1, 2, 3, 4, 5, 6, 7', true)))).toBe(true);
+    said = [];
+    units = { found: [], unasked: ['user'], unresolved: ['a.service'] };
+    setup(options());
+    expect(said.some((l) => l.includes("Setup couldn't ask systemd's user manager which service runs from this directory") &&
+      l.includes(note('a.service', false)))).toBe(true);
+    said = [];
+    units = { found: [unit], unasked: ['system'], unresolved: ['a.service'] };
+    setup(options());
+    expect(said.some((l) => l.includes("Setup couldn't ask systemd's system manager, so a service of its that runs from this directory isn't checked.") &&
+      l.includes(note('a.service', false)))).toBe(true);
+  });
+
+  test("extra state that isn't there is said to be absent, and one whose path can't be followed gets a repair, not a permission", () => {
+    expect(() => setup(options({ extraState: [join(dir, 'nowhere.json')] }))).toThrow(/The extra state .*nowhere\.json isn't there\.$/);
+    const loop = join(dir, 'loop');
+    symlinkSync(loop, loop);
+    expect(() => setup(options({ extraState: [loop] }))).toThrow(/The extra state .*loop can't be looked at: .*ELOOP.*Repair what that path runs through, and run setup again\./);
   });
 
   test("a current that can't be looked at says what to do for its error: search for a permission, a repair for anything else", () => {

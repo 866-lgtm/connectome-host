@@ -93,7 +93,7 @@ function readOnlyFilesystem(paths: string[]): { mockRestore(): void } {
 }
 
 /** Record the path each fsync in `body` went to, in order. */
-async function syncedDuring(body: () => Promise<unknown>): Promise<string[]> {
+async function syncedDuring(body: () => Promise<unknown>, seen?: (path: string) => void): Promise<string[]> {
   const paths = new Map<number, string>();
   const synced: string[] = [];
   const realOpen = fs.openSync;
@@ -105,6 +105,7 @@ async function syncedDuring(body: () => Promise<unknown>): Promise<string[]> {
   }) as typeof fs.openSync);
   const syncs = spyOn(fs, 'fsyncSync').mockImplementation(((fd: number) => {
     synced.push(paths.get(fd) ?? `fd ${fd}`);
+    seen?.(paths.get(fd) ?? `fd ${fd}`);
     realFsync(fd);
   }) as typeof fs.fsyncSync);
   try {
@@ -226,6 +227,7 @@ describe('a start with nothing asked', () => {
     ['no request', { to: '0.11.0', why: undefined as unknown as Mark['why'] }, /names no request, which this release doesn't know/],
     ['a long request', { to: '0.11.0', why: 'x'.repeat(100) as Mark['why'] }, new RegExp(`asks for "${'x'.repeat(79)}… \\(cut\\), which`)],
     ['a long request cut by code points', { to: '0.11.0', why: ('x'.repeat(78) + '😀'.repeat(5)) as Mark['why'] }, new RegExp(`asks for "${'x'.repeat(78)}😀… \\(cut\\), which`, 'u')],
+    ['a request of fewer code points than its cut, in more UTF-16 units', { to: '0.11.0', why: '😀'.repeat(50) as Mark['why'] }, new RegExp(`asks for "${'😀'.repeat(50)}", which`, 'u')],
   ] as const) {
     test(`a mark with ${name}: starts the release current names, says why, and keeps the mark`, async () => {
       mark(fields);
@@ -1290,7 +1292,20 @@ describe('a Go back', () => {
       if (madeByLine === null && LINE_OK()) madeByLine = existsSync(kid);
       return boot;
     } };
-    expect(await decide(root, o)).toEqual({ release: '0.10.2', trial: true });
+    // It has the copy's mode before anything is staged or moved in it, so a
+    // cut there leaves it with that mode for the replay.
+    const realRename = fs.renameSync;
+    let modeAtFirstMove: number | null = null;
+    const renames = spyOn(fs, 'renameSync').mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+      if (modeAtFirstMove === null && String(to).startsWith(`${kid}/`)) modeAtFirstMove = statSync(kid).mode & 0o777;
+      return realRename(from, to);
+    }) as typeof fs.renameSync);
+    try {
+      expect(await decide(root, o)).toEqual({ release: '0.10.2', trial: true });
+    } finally {
+      renames.mockRestore();
+    }
+    expect(modeAtFirstMove).toBe(0o777);
     expect(madeByLine).toBe(false);
     expect(read(join(kid, 'store.txt'))).toBe('the child wrote this');
     expect(statSync(kid).mode & 0o777).toBe(0o777);
@@ -1386,6 +1401,8 @@ describe('a Go back', () => {
     chmodSync(copied, 0o644);
     expect(steps().slice(-2)).toEqual(['trial-start refused g1', 'fallback ok g1']);
     expect(existsSync(itemStagingDir(kid, 'g1'))).toBe(false);
+    // It wasn't there before the Go back, which made it, so it goes with its unfinished staging.
+    expect(existsSync(kid)).toBe(false);
     expect(store()).toBe('B wrote this');
   });
 
@@ -1651,61 +1668,115 @@ describe('a Go back', () => {
     expect(read(settings)).toBe('{"a":1}');
   });
 
-  test("a Go back refuses, before its line, to take away a file another owns from a sticky directory another owns", async () => {
+  /** Run `body` as uid `self`, holding the effective capabilities `caps` as
+   *  /proc/self/status gives them (null: no such file), with each path under
+   *  `under` owned by `self`, but those in `others`, which another owns, and
+   *  those in `sticky` given the sticky bit. */
+  async function owned(arrangement: { self?: number; under: string[]; others?: string[]; sticky?: string[]; caps: string | null },
+    body: () => Promise<void>): Promise<void> {
+    const { self = 4242, under, others = [], sticky = [], caps } = arrangement;
+    const realStat = fs.statSync;
+    const realLstat = fs.lstatSync;
+    const realRead = fs.readFileSync;
+    const shape = (path: fs.PathLike, found: fs.Stats | undefined) => {
+      const p = String(path);
+      if (found === undefined || typeof found.mode !== 'number' || !under.some((u) => p === u || p.startsWith(`${u}/`))) return found;
+      return Object.assign(Object.create(Object.getPrototypeOf(found)), found,
+        { uid: others.includes(p) ? self + 1 : self, mode: sticky.includes(p) ? found.mode | 0o1000 : found.mode });
+    };
+    const spies = [
+      spyOn(process, 'getuid').mockImplementation(() => self),
+      spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) =>
+        shape(path, realStat(path, options as never) as fs.Stats)) as typeof fs.statSync),
+      spyOn(fs, 'lstatSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) =>
+        shape(path, realLstat(path, options as never) as fs.Stats)) as typeof fs.lstatSync),
+      spyOn(fs, 'readFileSync').mockImplementation(((path: fs.PathOrFileDescriptor, options?: unknown) => {
+        if (String(path) !== '/proc/self/status') return (realRead as (...args: unknown[]) => unknown)(path, options);
+        if (caps === null) throw Object.assign(new Error("ENOENT: no such file or directory, open '/proc/self/status'"), { code: 'ENOENT' });
+        return `Name:\tbun\nCapEff:\t${caps}\n`;
+      }) as typeof fs.readFileSync),
+    ];
+    try {
+      await body();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+    }
+  }
+  const NO_CAPS = '0000000000000000';
+  const FOWNER = '0000000000000008';
+
+  test("a Go back refuses, before its line, to take away a file another owns from a sticky directory another owns, unless it holds CAP_FOWNER", async () => {
     await committedSwitch();
     const agent = join(work, 'mcpl-servers.agent.json');
     writeFileSync(agent, '{"agent":1}');
-    const realStat = fs.statSync;
-    const stat = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
-      const found = realStat(path, options as never) as fs.Stats;
-      const p = String(path);
-      if (p === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
-      if (p === agent) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1 });
-      return found;
-    }) as typeof fs.statSync);
-    try {
-      mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    await owned({ under: [work], others: [work, agent], sticky: [work], caps: NO_CAPS }, async () => {
       expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
-    } finally {
-      stat.mockRestore();
-    }
-    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in a directory with the sticky bit`);
+    });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in ${work}, which has the sticky bit, and ` +
+      "neither is this process's, so the Go back couldn't move it. Give this user its ownership, or go back keeping the newer data");
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
     expect(read(agent)).toBe('{"agent":1}');
-    // Root may take it away whatever its owners, so the same Go back goes ahead as root.
-    const root0 = spyOn(process, 'getuid').mockImplementation(() => 0);
-    const stat2 = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
-      const found = realStat(path, options as never) as fs.Stats;
-      const p = String(path);
-      if (p === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
-      if (p === agent) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1 });
-      return found;
-    }) as typeof fs.statSync);
-    try {
-      reports = [];
+    // CAP_FOWNER takes it away whatever its owners, so the same Go back goes ahead holding it.
+    reports = [];
+    await owned({ under: [work], others: [work, agent], sticky: [work], caps: FOWNER }, async () => {
       expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
-    } finally {
-      stat2.mockRestore();
-      root0.mockRestore();
-    }
+    });
+    expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
+    expect(existsSync(agent)).toBe(false);
+  });
+
+  test("where the capabilities can't be read, root is taken to hold CAP_FOWNER, and anyone else not to", async () => {
+    await committedSwitch();
+    const agent = join(work, 'mcpl-servers.agent.json');
+    writeFileSync(agent, '{"agent":1}');
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    await owned({ under: [work], others: [work, agent], sticky: [work], caps: null }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in ${work}, which has the sticky bit`);
+    reports = [];
+    await owned({ self: 0, under: [work], others: [work, agent], sticky: [work], caps: null }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    });
     expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
   });
 
-  test("a Go back takes away a file this process owns from a sticky directory another owns", async () => {
-    await committedSwitch();
-    const agent = join(work, 'mcpl-servers.agent.json');
-    writeFileSync(agent, '{"agent":1}');
-    const realStat = fs.statSync;
-    const stat = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
-      const found = realStat(path, options as never) as fs.Stats;
-      if (String(path) === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
-      return found;
-    }) as typeof fs.statSync);
-    try {
+  for (const [name, others] of [
+    ['a file this process owns from a sticky directory another owns', (agent: string) => [work]],
+    ['a file another owns from a sticky directory this process owns', (agent: string) => [agent]],
+    ['a file another owns from a directory another owns without the sticky bit', (agent: string) => [work, agent]],
+  ] as const) {
+    test(`a Go back takes away ${name}`, async () => {
+      await committedSwitch();
+      const agent = join(work, 'mcpl-servers.agent.json');
+      writeFileSync(agent, '{"agent":1}');
       mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+      const sticky = name.includes('without the sticky bit') ? [] : [work];
+      await owned({ under: [work], others: others(agent), sticky, caps: NO_CAPS }, async () => {
+        expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+      });
+      expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
+      expect(existsSync(agent)).toBe(false);
+    });
+  }
+
+  test("a Go back that restores a directory refuses, before its line, when an entry another owns is in it, with the sticky bit, and it's another's", async () => {
+    await committedSwitch();
+    const sessions = join(data, 'sessions');
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    await owned({ under: [data], others: [data, sessions], sticky: [data], caps: NO_CAPS }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${sessions} is in ${data}, which has the sticky bit, and ` +
+      "neither is this process's, so the Go back couldn't move it");
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
+    expect(store()).toBe('B wrote this');
+    // The entries it owns move whatever the bit.
+    reports = [];
+    await owned({ under: [data], others: [data], sticky: [data], caps: NO_CAPS }, async () => {
       expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
-    } finally {
-      stat.mockRestore();
-    }
+    });
     expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
   });
 
@@ -1821,7 +1892,9 @@ describe('a Go back', () => {
     mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
     expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${join(cfg, 'state.json')}, where the copy of ` +
-      `0.10.2's data took a place, leads to ${join(realpathSync(join(dir, 'cfg-moved')), 'state.json')} now, through a link`);
+      `0.10.2's data took a place, leads to ${join(realpathSync(join(dir, 'cfg-moved')), 'state.json')} now, through a link, ` +
+      'and a Go back that restores the copy puts each place back where the copy took it. Put the place back there in place ' +
+      'of the link, or go back keeping the newer data');
     expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
     expect(read(join(dir, 'cfg-moved', 'state.json'))).toBe('{"b":2}');
   });
@@ -1836,7 +1909,9 @@ describe('a Go back', () => {
     writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [stateDir] } satisfies InstallRecord);
     mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
     expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
-    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${stateDir} is recorded now, and holds ${join(stateDir, 'config.json')}`);
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${stateDir} is recorded now, and ${join(stateDir, 'config.json')}, ` +
+      "which the copy of 0.10.2's data took on its own, is inside it, so the copy can't put it back whole. Go back keeping the newer data, " +
+      `or, if it's extra state the record gained since the switch, take it out of extraState in ${installPaths(root).install}`);
   });
 
   test("a Go back is refused while a place recorded since the switch holds one the copy took on its own", async () => {
@@ -1850,9 +1925,13 @@ describe('a Go back', () => {
     mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
     expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(
-      `${stateDir} is recorded now, and holds ${join(stateDir, 'config.json')}, which the copy of 0.10.2's data took on its own`);
+      `${stateDir} is recorded now, and ${join(stateDir, 'config.json')}, which the copy of 0.10.2's data took on its own, is inside it`);
     expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
     expect(read(join(stateDir, 'other.json'))).toBe('newer');
+    // Its remedy: taken out of extraState, the Go back restores the copy's file.
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [] } satisfies InstallRecord);
+    expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    expect(read(join(stateDir, 'config.json'))).toBe('{"a":1}');
   });
 
   test("a restore that fails before a later file place: putting back puts that file back from what the Go back kept before its line", async () => {
@@ -2016,7 +2095,7 @@ describe('leftovers', () => {
       rmdir.mockRestore();
       chmodSync(installPaths(root).setAside, 0o755);
     }
-    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('a later start tries again');
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept, or syncing its removal, failed'))).toContain('a later start tries again');
     expect(reports.find((l) => l.includes('Removing a copy a switch left unfinished'))).toContain('a later start tries again');
     expect(existsSync(setAsideDir(root, 'stale'))).toBe(true);
     // The next start, with nothing in the way, removes both.
@@ -2060,7 +2139,7 @@ describe('leftovers', () => {
       rm.mockRestore();
       rmdir.mockRestore();
     }
-    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('a later start tries again');
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept, or syncing its removal, failed'))).toContain('a later start tries again');
     expect(existsSync(join(setAsideDir(root, 'stale'), 'places.json'))).toBe(true);
     expect(existsSync(area)).toBe(true);
     reports = [];
@@ -2106,17 +2185,28 @@ describe('leftovers', () => {
     } finally {
       chmodSync(parent, 0o755);
     }
-    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('EACCES');
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept, or syncing its removal, failed'))).toContain('EACCES');
     expect(existsSync(join(setAsideDir(root, 'stale'), 'places.json'))).toBe(true);
   });
 
   test("a leftover preparation's areas are removed, and their removal synced, before its list goes", async () => {
     await committedSwitch();
+    const list = join(setAsideDir(root, 'stale'), 'places.json');
     mkdirSync(setAsideDir(root, 'stale'), { recursive: true });
-    writeJsonAtomic(join(setAsideDir(root, 'stale'), 'places.json'), { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
-    mkdirSync(itemSetAsideDir(data, 'stale'), { recursive: true });
-    const synced = await syncedDuring(() => decide(root, ops()));
-    expect(synced).toContain(dirname(itemSetAsideDir(data, 'stale')));
+    writeJsonAtomic(list, { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
+    const aside = itemSetAsideDir(data, 'stale');
+    const staging = itemStagingDir(data, 'stale');
+    mkdirSync(aside, { recursive: true });
+    mkdirSync(`${staging}.filling`, { recursive: true });
+    // At each sync of an area's directory: whether the area is still there, and the list.
+    const seen = new Map<string, { area: boolean; list: boolean }>();
+    const synced = await syncedDuring(() => decide(root, ops()), (path) => {
+      if (path === dirname(aside)) seen.set(path, { area: existsSync(aside), list: existsSync(list) });
+      if (path === dirname(staging)) seen.set(path, { area: existsSync(`${staging}.filling`), list: existsSync(list) });
+    });
+    expect(synced).toContain(dirname(aside));
+    expect(synced).toContain(dirname(staging));
+    expect([...seen.values()]).toEqual([{ area: false, list: true }, { area: false, list: true }]);
     expect(existsSync(setAsideDir(root, 'stale'))).toBe(false);
   });
 
