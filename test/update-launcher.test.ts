@@ -225,6 +225,7 @@ describe('a start with nothing asked', () => {
     ['a request it does not know', { to: '0.11.0', why: 'sideways' as Mark['why'] }, /asks for "sideways", which this release doesn't know/],
     ['no request', { to: '0.11.0', why: undefined as unknown as Mark['why'] }, /names no request, which this release doesn't know/],
     ['a long request', { to: '0.11.0', why: 'x'.repeat(100) as Mark['why'] }, new RegExp(`asks for "${'x'.repeat(79)}… \\(cut\\), which`)],
+    ['a long request cut by code points', { to: '0.11.0', why: ('x'.repeat(78) + '😀'.repeat(5)) as Mark['why'] }, new RegExp(`asks for "${'x'.repeat(78)}😀… \\(cut\\), which`, 'u')],
   ] as const) {
     test(`a mark with ${name}: starts the release current names, says why, and keeps the mark`, async () => {
       mark(fields);
