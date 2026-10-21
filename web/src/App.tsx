@@ -25,6 +25,7 @@ import { BranchPanel } from './Branches';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
 import { planHealthAlerts } from './health-alerts';
 import {
+  AGENT_TREE_SCOPES,
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
   type WelcomeMessage,
@@ -40,7 +41,9 @@ import {
   type SurgeryResultMessage,
   type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
-import { applyTrace, conversationAgentOf, streamEventFor } from '@conhost/web/agent-streams';
+import {
+  applyStreamEnded, applyTrace, conversationAgentOf, streamEventFor, toolCallState, treesShownFor,
+} from '@conhost/web/agent-streams';
 import {
   Lightbox,
   MediaView,
@@ -117,6 +120,8 @@ function entryToMessage(e: WelcomeMessageEntry): Message {
 export function App() {
   const wire = createWireClient();
   const treeStore = createTreeStore();
+  /** Whether this page builds and shows the agent trees (treesShownFor). */
+  const treesShown = (): boolean => treesShownFor(wire.observerState(), wire.observer()?.scopes ?? null);
 
   // Use a store rather than a signal so the streaming token append can
   // mutate the last message's `text` in place. Replacing the message object
@@ -670,8 +675,8 @@ export function App() {
 
   /** Per-childName ring buffer of recent child-event payloads. Used to
    *  backfill the stream pane when an operator opens a fleet child / agent
-   *  view — events fan out to every connected client regardless of focus, so
-   *  we capture them as they pass through. */
+   *  view — events fan out to every connected client whose scopes allow
+   *  them, regardless of focus, so we capture them as they pass through. */
   const FLEET_BACKFILL_LIMIT = 80;
   const childEventBuffers = new Map<string, Array<{ type: string; [k: string]: unknown }>>();
   const recordChildEvent = (childName: string, event: { type: string; [k: string]: unknown }): void => {
@@ -1194,7 +1199,7 @@ export function App() {
 
   onMount(() => {
     const detach = wire.onMessage((msg) => {
-      treeStore.ingest(msg);
+      if (treesShown()) treeStore.ingest(msg);
       autoExpandNewFleetChildren();
       // Capture child-events into the per-childName ring buffer so a future
       // openStream() can backfill the panel from local history.
@@ -1637,7 +1642,12 @@ export function App() {
             onChange={changePanelScope}
           />
           <div class="flex-1 min-h-0">
-            <Show when={sidebarTab() === 'tree'}>
+            <Show when={sidebarTab() === 'tree' && !treesShown() && wire.observer() !== null}>
+              <div class="p-4 text-xs text-neutral-500">
+                The agent tree shows for a grant with every scope but debug ({AGENT_TREE_SCOPES.join(', ')}).
+              </div>
+            </Show>
+            <Show when={sidebarTab() === 'tree' && treesShown()}>
               <TreeSidebar
                 roots={treeStore.build()}
                 selectedId={focusedId()}
@@ -1854,6 +1864,9 @@ function handleServerMessage(
       return;
     case 'trace':
       if (typeof msg.event.type === 'string') applyTrace(msg.event, hooks, hooks.conversationAgent());
+      return;
+    case 'stream-ended':
+      applyStreamEnded(msg.agentName, hooks, hooks.conversationAgent());
       return;
     case 'command-result': {
       hooks.appendMessage({
@@ -2449,12 +2462,12 @@ function ToolBlockView(props: {
   const kind = (): string => `tool:${props.block.name}`;
   const open = (): boolean => isBlockOpen(props.blockKey, kind());
   const allOpen = (): boolean => expandedKinds().has(kind());
-  const dot = (): string => {
-    if (props.block.status === 'running') return 'bg-amber-400 animate-pulse';
-    if (props.block.status === 'failed' || props.result?.isError) return 'bg-rose-500';
-    if (props.block.status === 'done' || props.result) return 'bg-emerald-500';
-    return 'bg-neutral-600';
-  };
+  const dot = (): string => ({
+    running: 'bg-amber-400 animate-pulse',
+    failed: 'bg-rose-500',
+    done: 'bg-emerald-500',
+    unknown: 'bg-neutral-600',
+  })[toolCallState(props.block.status, props.result)];
   const duration = (): string => {
     const ms = props.block.durationMs;
     if (ms === undefined) return '';

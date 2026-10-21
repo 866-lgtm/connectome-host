@@ -118,11 +118,13 @@ import {
   ObserverSessions,
   closeConnectionsWithoutGrant,
   sessionTokenFromRequest,
-  traceRequiredScope,
+  clientHolds,
+  frameScopes,
   filterEntryForScopes,
   scopeWelcome,
   type ObserverScope,
   type ObserverHelloIdentity,
+  streamEndedFor,
 } from './web-ui-observers.js';
 
 /**
@@ -591,11 +593,7 @@ export class WebUiModule implements Module {
     // calls without polling the JSONL log.
     state.callLedgerDetacher = this.config.callLedger?.onUpdate((ledger) => {
       state.latestCallLedger = ledger;
-      const msg: WebUiServerMessage = { type: 'call-ledger', ledger };
-      for (const client of state.clients.values()) {
-        if (!client.welcomed) continue;
-        if (client.scopes === null || client.scopes.has('health')) this.send(client, msg);
-      }
+      this.broadcast({ type: 'call-ledger', ledger });
     }) ?? null;
 
     console.log(`[webui] listening on ${webUiHttpUrl(host, boundPort)}`);
@@ -829,17 +827,15 @@ export class WebUiModule implements Module {
 
     if (sharedServer!.clients.size === 0) return;
     // Forward the verbatim event so the SPA can fold it into its own
-    // per-child AgentTreeReducer for live updates.
-    const msg: WebUiServerMessage = {
+    // per-child AgentTreeReducer for live updates. A client that may not
+    // have a child's stream-end trace learns that the stream ended.
+    const ended = streamEndedFor(event as unknown as { type: string; agentName?: unknown });
+    this.broadcast({
       type: 'child-event',
       childName,
       event: event as unknown as { type: string; [k: string]: unknown },
-    };
-    for (const client of sharedServer!.clients.values()) {
-      if (!client.welcomed) continue;
-      this.send(client, msg);
-      if (usageMsg) this.send(client, usageMsg);
-    }
+    }, ended ? { type: 'child-event', childName, event: { ...ended } } : null);
+    if (usageMsg) this.broadcast(usageMsg);
   }
 
   /** Translate a child snapshot event back into the matching wire message
@@ -922,13 +918,26 @@ export class WebUiModule implements Module {
 
   // -------------------------------------------------------------------------
   // Observer scope filtering — event-family masks (docs/observability.md §4).
-  // Full clients (scopes === null) bypass everything: historical behavior.
+  // Full clients get every frame: historical behavior.
   // Pure projections live in web-ui-observers.ts (unit-tested there).
   // -------------------------------------------------------------------------
 
-  private clientAllowsTrace(client: ClientState, event: { type: string }): boolean {
-    if (client.scopes === null) return true;
-    return client.scopes.has(traceRequiredScope(event));
+  /** Send `frame` to every welcomed client that may have it: every full
+   *  client, and each observer holding what the frame needs (frameScopes).
+   *  Every frame that goes whole to more than one client goes this way, so
+   *  the live stream refuses an observer what its welcome and its requests
+   *  do. `message-appended` goes to each observer projected through
+   *  filterEntryForScopes instead. A client that may not have `frame` gets
+   *  `standIn` in its place, if it may have that. */
+  private broadcast(frame: WebUiServerMessage, standIn?: WebUiServerMessage | null): void {
+    if (!sharedServer) return;
+    const scopes = frameScopes(frame);
+    const fallback = standIn ? { frame: standIn, scopes: frameScopes(standIn) } : null;
+    for (const client of sharedServer.clients.values()) {
+      if (!client.welcomed) continue;
+      if (clientHolds(client, scopes)) this.send(client, frame);
+      else if (fallback && clientHolds(client, fallback.scopes)) this.send(client, fallback.frame);
+    }
   }
 
   private fanOutTrace(event: TraceEvent): void {
@@ -955,25 +964,20 @@ export class WebUiModule implements Module {
     }
 
     if (sharedServer!.clients.size === 0) return;
-    const traceMsg: WebUiServerMessage = {
+    // A page that holds the conversation but not what a stream-end trace
+    // carries still learns that the stream ended.
+    this.broadcast({
       type: 'trace',
       event: event as unknown as { type: string; [k: string]: unknown },
-    };
-    const usageMsg: WebUiServerMessage | null = event.type === 'usage:updated'
-      ? {
-          type: 'usage',
-          usage: sharedServer!.latestUsage,
-          ...(sharedServer!.latestPerAgentCost.length > 0
-            ? { perAgentCost: sharedServer!.latestPerAgentCost }
-            : {}),
-        }
-      : null;
-    for (const client of sharedServer!.clients.values()) {
-      if (!client.welcomed) continue;
-      if (this.clientAllowsTrace(client, event)) this.send(client, traceMsg);
-      if (usageMsg && (client.scopes === null || client.scopes.has('health'))) {
-        this.send(client, usageMsg);
-      }
+    }, streamEndedFor(event as unknown as { type: string; agentName?: unknown }));
+    if (event.type === 'usage:updated') {
+      this.broadcast({
+        type: 'usage',
+        usage: sharedServer!.latestUsage,
+        ...(sharedServer!.latestPerAgentCost.length > 0
+          ? { perAgentCost: sharedServer!.latestPerAgentCost }
+          : {}),
+      });
     }
   }
 
@@ -1077,10 +1081,7 @@ export class WebUiModule implements Module {
       text,
       timestamp: storedMsg.timestamp.getTime(),
     };
-    for (const client of sharedServer.clients.values()) {
-      if (!client.welcomed) continue;
-      this.send(client, msg);
-    }
+    this.broadcast(msg);
   }
 
   // -------------------------------------------------------------------------
@@ -1721,7 +1722,7 @@ export class WebUiModule implements Module {
   private broadcastHostMode(): void {
     const hostMode = this.hostModeSnapshot();
     if (!hostMode) return;
-    this.broadcastToWelcomed({ type: 'host-mode', hostMode });
+    this.broadcast({ type: 'host-mode', hostMode });
   }
 
   /**
@@ -1778,7 +1779,7 @@ export class WebUiModule implements Module {
         messagesRemoved: r.messagesRemoved, lastVisible: r.lastVisible ?? null,
       });
       // Same follow-through as a /checkout: config mount, branch chip,
-      // fresh tail for every welcomed client.
+      // fresh tail for every welcomed client, as its scopes allow.
       await this.materializeConfigMount();
       this.broadcastBranchChanged();
       this.refreshAllWelcomes();
@@ -2296,14 +2297,14 @@ export class WebUiModule implements Module {
         const params = { action: parsed.action, ...(parsed.token !== undefined ? { token: parsed.token } : {}) };
         if (isChildScope(parsed.scope)) {
           void this.requestChildPanel(client, parsed.scope!, 'credential-action', params).then((data) => {
-            if (data !== null) this.broadcastCredentialState({ type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+            if (data !== null) this.broadcast({ type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
           });
           return;
         }
         const app = this.panelApp();
         if (!app) return;
         void applyCredentialAction(app, params)
-          .then((data) => this.broadcastCredentialState({ type: 'credential-state', scope: 'local', ...data } as WebUiServerMessage))
+          .then((data) => this.broadcast({ type: 'credential-state', scope: 'local', ...data } as WebUiServerMessage))
           .catch((err) => this.send(client, {
             type: 'error',
             message: `credential-action failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -2732,7 +2733,8 @@ export class WebUiModule implements Module {
    * forward each event as a `peek` message scoped to the subagent name.
    *
    * For fleet children we don't need a separate subscription — child events
-   * already flow to all welcomed clients via handleFleetEvent. Returning
+   * already flow to every welcomed client whose scopes allow them, via
+   * handleFleetEvent; an observer may not subscribe to a peek. Returning
    * "fleet child" here is enough to confirm the panel can rely on the
    * existing stream.
    */
@@ -3051,10 +3053,10 @@ export class WebUiModule implements Module {
   }
 
   /** Run pin-add / pin-remove in a fleet child; the op returns the fresh
-   *  pins snapshot, which BROADCASTS (pins alter the next compile's fold
-   *  plan — two operators must not hold divergent views, same rule as the
-   *  local path). A `warning` in the data (stale pin-remove) goes back to
-   *  the requester only. */
+   *  pins snapshot, which BROADCASTS to full clients (pins alter the next
+   *  compile's fold plan — two operators must not hold divergent views, same
+   *  rule as the local path; no observer may request pins). A `warning` in
+   *  the data (stale pin-remove) goes back to the requester only. */
   private async applyScopedPinMutation(
     client: ClientState,
     scope: string,
@@ -3067,7 +3069,7 @@ export class WebUiModule implements Module {
     if (typeof warning === 'string') {
       this.send(client, { type: 'error', message: warning });
     }
-    this.broadcastToWelcomed({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
+    this.broadcast({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   private broadcastPinsList(agentName: string): void {
@@ -3075,7 +3077,7 @@ export class WebUiModule implements Module {
     if (!app) return;
     try {
       const snap = buildPinsSnapshot(app, agentName);
-      this.broadcastToWelcomed({ type: 'pins-list', scope: 'local', ...snap });
+      this.broadcast({ type: 'pins-list', scope: 'local', ...snap });
     } catch { /* pins unsupported — nothing to broadcast */ }
   }
 
@@ -3099,7 +3101,7 @@ export class WebUiModule implements Module {
 
   /** Run a settings mutation in a fleet child. The op applies the change AND
    *  returns the fresh state in one round trip; like the local path, the
-   *  result broadcasts to every welcomed client. */
+   *  result broadcasts to every full client. */
   private async applyScopedSettingsMutation(
     client: ClientState,
     scope: string,
@@ -3108,32 +3110,17 @@ export class WebUiModule implements Module {
   ): Promise<void> {
     const data = await this.requestChildPanel(client, scope, op, params);
     if (data === null) return;
-    this.broadcastToWelcomed({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
+    this.broadcast({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
   }
 
-  /** Fan out to every welcomed client — settings are live process state. */
+  /** Fan out to every full client — settings are live process state, and no
+   *  observer may request them. */
   private broadcastSettingsState(agentName: string): void {
     const app = this.panelApp();
     if (!app) return;
     const msg = buildSettingsState(app, agentName);
     if (!msg) return;
-    this.broadcastToWelcomed({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
-  }
-
-  /** Credential state goes to operators and to observers holding the
-   *  'health' scope — the same gate as /healthz and the usage frame. */
-  private broadcastCredentialState(msg: WebUiServerMessage): void {
-    if (!sharedServer) return;
-    for (const c of sharedServer.clients.values()) {
-      if (c.welcomed && (c.scopes === null || c.scopes.has('health'))) this.send(c, msg);
-    }
-  }
-
-  private broadcastToWelcomed(msg: WebUiServerMessage): void {
-    if (!sharedServer) return;
-    for (const c of sharedServer.clients.values()) {
-      if (c.welcomed) this.send(c, msg);
-    }
+    this.broadcast({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
   }
 
   /**
@@ -3169,13 +3156,10 @@ export class WebUiModule implements Module {
     const cm = sharedServer?.app.framework.getAllAgents()[0]?.getContextManager();
     if (!cm) return;
     const branch = cm.currentBranch();
-    const msg: WebUiServerMessage = {
+    this.broadcast({
       type: 'branch-changed',
       branch: { id: branch.id, name: branch.name },
-    };
-    for (const c of sharedServer!.clients.values()) {
-      if (c.welcomed) this.send(c, msg);
-    }
+    });
   }
 
   private refreshAllWelcomes(): void {

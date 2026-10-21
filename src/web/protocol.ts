@@ -5,18 +5,32 @@
  * deliberately mirrors the fleet IPC (`fleet-types.ts`) so a future external
  * aggregator can reuse the same parsers.
  *
- * Versioning: v1. Breaking changes bump `WEB_PROTOCOL_VERSION` and clients
- * refuse to connect on mismatch.
+ * Versioning: v2. Breaking changes bump `WEB_PROTOCOL_VERSION`. On a
+ * mismatch the Web UI page shows a banner asking for a reload and keeps the
+ * conversation it had; its socket stays open, and the welcome's other fields
+ * and later frames still apply.
  *
  * v1 (2026-07): windowed history (welcome carries only a tail window plus
  * `history` metadata; older pages via request-history/history-page), ordered
  * `blocks` on message entries (thinking / tool_use / tool_result / media
  * surface in full), and `message-appended` live pushes of stored messages.
+ *
+ * v2 (2026-10): an observer gets only the frames its grant's scopes cover,
+ * live as well as in its welcome, and a `stream-ended` frame in place of a
+ * stream-end trace its scopes don't cover, which a page has to handle to end
+ * a streamed turn.
  */
 
 import type { Line } from '../output-line.js';
 
-export const WEB_PROTOCOL_VERSION = 1;
+export const WEB_PROTOCOL_VERSION = 2;
+
+/** What an observer needs to be sent the agent trees, and so what a page
+ *  needs to build and show them: every scope but 'debug'. A tree's nodes carry
+ *  a subagent's task, each run's phase and how it ended, failures included,
+ *  its counters and its token counts, so the tree is the whole operational
+ *  view, and goes only with the whole grant. */
+export const AGENT_TREE_SCOPES = ['messages', 'thinking', 'tools', 'health', 'ops'] as const;
 
 // ---------------------------------------------------------------------------
 // Server → Client
@@ -315,6 +329,17 @@ export interface BranchChangedMessage {
   branch: { id: string; name: string };
 }
 
+/** That an agent's stream ended, with nothing of how or why: sent in place
+ *  of a stream-end trace (STREAM_END_TRACES, state/turn-trace.ts) to a client
+ *  whose scopes hold 'messages' but not what that trace carries, such as
+ *  `inference:failed`'s error to an observer without 'ops'. A client ends
+ *  the agent's streamed turn on it, as on the trace. */
+export interface StreamEndedMessage {
+  type: 'stream-ended';
+  /** The agent whose stream ended, as the trace named it. */
+  agentName?: string;
+}
+
 /** One Chronicle branch with its lineage. `parentId`/`branchPoint` are
  *  undefined for the root branch; together they place the fork in the
  *  parent's sequence so the SPA can render a lineage tree. */
@@ -468,8 +493,9 @@ export interface McplListMessage {
 /**
  * Protected ranges (pins / documents) for one agent.
  *
- * BROADCAST on change: pins alter what the next compile folds, so two operators
- * must not hold divergent views of them.
+ * BROADCAST to full clients on change: pins alter what the next compile folds,
+ * so two operators must not hold divergent views of them. No observer gets
+ * them, as none may request them.
  */
 export interface PinsListMessage {
   type: 'pins-list';
@@ -504,9 +530,9 @@ export interface PinsListMessage {
 /**
  * Runtime context-settings snapshot.
  *
- * BROADCAST to every welcomed client on change — unlike `mcpl-list`, these are
+ * BROADCAST to every full client on change — unlike `mcpl-list`, these are
  * live process state, not a config file, so two operators must not see
- * divergent values.
+ * divergent values. No observer gets them, as none may request them.
  */
 /** Credential state of one process (see src/credential-state.ts). The
  *  `credential` fields are absent on an API-key host (`subscription: false`). */
@@ -652,8 +678,9 @@ export interface HostModeMessage {
 }
 
 /** Outcome of a `rollback` / `suppress` request. On success the server also
- *  broadcasts `branch-changed` and re-welcomes every client with the new
- *  branch's messages. */
+ *  sends `branch-changed` to every client whose scopes hold 'messages' and
+ *  re-welcomes every client with the new branch's messages, as its scopes
+ *  allow. */
 export interface SurgeryResultMessage {
   type: 'surgery-result';
   corrId?: string;
@@ -693,6 +720,7 @@ export interface OperatorLogMessage {
 export type WebUiServerMessage =
   | WelcomeMessage
   | TraceMessage
+  | StreamEndedMessage
   | ChildEventMessage
   | CommandResultMessage
   | UsageMessage
