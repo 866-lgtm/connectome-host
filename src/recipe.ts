@@ -994,11 +994,18 @@ export interface RecipeModules {
    * Self-restart (`lifecycle--restart`). Off by default. The agent can ask
    * its own host to restart: to pick up an edited recipe or rebuilt code, or
    * to get out of a wedged state. The restart waits for the asking turn to
-   * end and every agent to be idle, then the host exits with code 75 and
-   * its supervisor must start it again — launchd `KeepAlive`, systemd
-   * `Restart=on-failure` or `always`, or a fleet parent's `autoRestart`. Only
-   * headless mode arms it; elsewhere the tool refuses. After the restart the
-   * agent gets one context line saying when it asked, why, and when it came
+   * end and nothing to be in flight (every agent idle, no turn, subagent run
+   * or background script alive), then the host exits with code 75 and its
+   * supervisor must start it again — launchd `KeepAlive`, systemd
+   * `Restart=on-failure` or `always`, or a fleet parent's `autoRestart`. A
+   * fleet parent restarts a child only when the child's entry sets
+   * `autoRestart`, and counts each restart toward its cap of 3 in 60 s, so
+   * `cooldownMinutes: 0` can leave a fast-restarting child down; a child the
+   * parent adopted has no exit it sees, and stays down. A fleet parent's own
+   * self-restart stops its children as any shutdown does, and the restarted
+   * parent starts again only its `autoStart` children. Only
+   * headless mode arms it; elsewhere the tool refuses. After the restart one
+   * context line says which agent asked, when, why, and when the host came
    * back.
    *
    * `cooldownMinutes` (default 10) is the least time from one completed

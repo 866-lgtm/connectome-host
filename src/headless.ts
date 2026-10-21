@@ -606,7 +606,8 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   // `lifecycle:idle` fires on every work→quiescent transition so the parent
   // can implement fleet--await (block until child finished its task).
   // --exit-when-idle is a strict overlay: same detection, additionally
-  // shuts down on the transition.
+  // shuts down at the first quiet poll with no self-restart armed. While one
+  // is armed, quiet also means nothing in flight, and it exits 75 instead.
   //
   // `inference:speech` fires once per "final" inference round — the round
   // that completed without yielding tool calls.  It carries the accumulated
@@ -614,9 +615,28 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
   // to subscribe to the whole token stream.
   {
     const IDLE_CONFIRM_MS = 500;
+    // An agent's status reads idle while its turn assembles (context, hooks,
+    // the compile) and while a subagent runs, so an armed self-restart also
+    // waits for what the framework and the subagent module count as alive,
+    // and for events not yet taken off the framework's queue: a restart cuts
+    // nothing they hold. The quiet test holds this for IDLE_CONFIRM_MS too,
+    // since a subagent's end frees its slot a loop pass before the wake it
+    // pushes is pending.
+    const nothingInFlight = (): boolean => {
+      const host = app.framework.getHostModeStatus();
+      if (!host.drained || host.gatedRequests > 0 || host.backgroundScripts > 0) return false;
+      if (app.framework.getQueueDepth() > 0) return false;
+      const subagents = (app.framework.getAllModules().find((m) => m.name === 'subagent') as
+        | { getConcurrencyStatus(): { active: number; queued: number } }
+        | undefined)?.getConcurrencyStatus();
+      return !subagents || (subagents.active === 0 && subagents.queued === 0);
+    };
     const primaryAgentName = app.recipe.agent.name ?? 'agent';
     let hadAtLeastOneInference = false;
     let idleSince = 0;
+    // Whether the quiet window now running was measured with a restart armed:
+    // only such a window checked that nothing was in flight.
+    let windowArmed = false;
     let idleEmitted = false;
 
     // Speech accumulator for the primary agent.  Reset on inference:started
@@ -650,7 +670,14 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
       if (shuttingDown) { clearInterval(idlePoll); return; }
       const agents = app.framework.getAllAgents();
       const allIdle = agents.every((a) => a.state.status === 'idle');
-      if (!hadAtLeastOneInference || !allIdle) {
+      // An armed request took a turn to make, even one that ran before this
+      // listener was attached.
+      const armed = selfRestart.isArmed();
+      if (armed) hadAtLeastOneInference = true;
+      // Arming (or a cancel) starts the window again, so a restart armed with
+      // no turn of its own, as by /puppet, still waits out the confirm.
+      if (armed !== windowArmed) { windowArmed = armed; idleSince = 0; }
+      if (!hadAtLeastOneInference || !allIdle || (armed && !nothingInFlight())) {
         idleSince = 0;
         return;
       }
@@ -660,19 +687,20 @@ export async function runHeadless(app: AppContext, argv: string[] = []): Promise
         idleEmitted = true;
         log('quiescent — emitting lifecycle:idle');
         emit({ type: 'lifecycle', phase: 'idle' });
-        if (opts.exitWhenIdle) {
-          clearInterval(idlePoll);
-          void gracefulShutdown('exit-when-idle');
-          return;
-        }
       }
-      // An agent asked to restart (lifecycle--restart): its turn has ended
-      // and everything is quiet, so exit for the supervisor to start us
-      // again. Checked on every quiet poll, not just the transition, so a
-      // restart armed while already quiet still goes.
-      if (selfRestart.isArmed()) {
+      // An agent asked to restart (lifecycle--restart), every agent reads
+      // idle and nothing has been in flight for IDLE_CONFIRM_MS: exit for
+      // the supervisor to start us again. Checked on every quiet poll, so a
+      // restart armed while already quiet still goes. It takes
+      // --exit-when-idle's place, which a cancel gives back at a quiet poll.
+      if (armed) {
         clearInterval(idlePoll);
         void gracefulShutdown('self-restart', SELF_RESTART_EXIT_CODE);
+        return;
+      }
+      if (opts.exitWhenIdle) {
+        clearInterval(idlePoll);
+        void gracefulShutdown('exit-when-idle');
       }
     }, 100);
   }

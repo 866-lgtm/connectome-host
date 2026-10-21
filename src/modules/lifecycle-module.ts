@@ -2,14 +2,15 @@
  * LifecycleModule — the agent restarts its own host (`lifecycle--restart`).
  *
  * Opt-in per recipe (`modules.selfRestart`). The tool arms a restart; the
- * host exits once the turn that asked has ended and every agent is idle, with
- * exit code 75, and its supervisor starts it again (src/self-restart.ts).
+ * host exits once the turn that asked has ended and nothing is in flight,
+ * with exit code 75, for its supervisor to start it again (src/self-restart.ts).
  * Only headless mode has that exit path, so elsewhere the tool refuses: an
  * exit there would stop the agent for good.
  *
- * After the restart, this module's start() tells the agent, in one context
- * line, when it asked, why, when the host stopped and when it came back.
- * It never wakes the agent.
+ * After the restart, this module's start() says in one context line who
+ * asked, when, why, when the host stopped and when it came back. The line
+ * goes where the module's writes go (the primary's window, which ordinary
+ * residents share), so it names the asker. It never wakes anyone.
  */
 
 import { readFileSync } from 'node:fs';
@@ -29,6 +30,7 @@ import {
   SELF_RESTART_EXIT_CODE,
   selfRestart as processSelfRestart,
   type SelfRestartRecord,
+  type SelfRestartRequest,
   type SelfRestartState,
 } from '../self-restart.js';
 
@@ -44,8 +46,6 @@ export interface LifecycleModuleConfig {
   state?: SelfRestartState;
   /** For tests. */
   now?: () => Date;
-  /** For tests; defaults to process.env. */
-  env?: Record<string, string | undefined>;
   /** For tests; defaults to the host package's version. */
   hostVersion?: string;
 }
@@ -59,35 +59,28 @@ function readHostVersion(): string | undefined {
   }
 }
 
-/** What runs this host, as far as its environment says. */
-export function describeSupervisor(env: Record<string, string | undefined>): string {
-  const xpc = env.XPC_SERVICE_NAME;
-  if (xpc && xpc !== '0' && !xpc.startsWith('application.')) return `launchd job ${xpc}`;
-  if (env.INVOCATION_ID) return 'a systemd unit';
-  return 'a supervisor this host cannot name (a fleet parent, or something else)';
-}
-
 const TOOL_DESCRIPTION =
   'Restart your own host process. Use it to pick up something that only takes effect at start: ' +
   'an edited recipe or config, rebuilt host code, or to recover from a state you cannot get out of otherwise. ' +
   'For one MCPL server, mcpl_restart (if you have it) is the lighter option and keeps you running. ' +
-  'The restart does not interrupt you: it happens once this turn has ended and every agent is idle. ' +
-  'The host then exits and its supervisor starts it again, usually within seconds; messages that arrive ' +
+  'The restart does not interrupt you: it happens once this turn has ended and nothing is in flight ' +
+  '(no turn, subagent run or background script still going). ' +
+  'The host then exits with code 75 for whatever supervises it (launchd, systemd, a fleet parent) to start it again, ' +
+  'usually within seconds; if nothing does, it stays down until someone starts it. Messages that arrive ' +
   'while it is down are handled by whatever catch-up each channel does on reconnect. ' +
-  'Your memory and workspace persist; the first turn after the restart rewrites your whole prompt cache once. ' +
-  'After the restart you get one line saying when you asked, why, and when you came back. ' +
-  '`cancel: true` disarms a pending restart. There is a cooldown between restarts.';
+  'Your memory and workspace persist. With prompt caching on, a restart that picks up changed tools or a changed ' +
+  'system prompt writes your prompt cache afresh on your first turn after it. ' +
+  "After the restart, one line in the host's main conversation says who asked, when, why, and when the host came back. " +
+  '`cancel: true` disarms a pending restart, whoever asked for it. There is a cooldown between restarts.';
 
 export class LifecycleModule implements Module {
   readonly name = 'lifecycle';
 
-  private ctx: ModuleContext | null = null;
   private readonly dataDir: string;
   private readonly cooldownMs: number;
   private readonly timeZone: string;
   private readonly state: SelfRestartState;
   private readonly now: () => Date;
-  private readonly env: Record<string, string | undefined>;
   private readonly hostVersion: string | undefined;
 
   constructor(config: LifecycleModuleConfig) {
@@ -96,19 +89,15 @@ export class LifecycleModule implements Module {
     this.timeZone = resolveTimeZone(config.timeZone);
     this.state = config.state ?? processSelfRestart;
     this.now = config.now ?? (() => new Date());
-    this.env = config.env ?? process.env;
     this.hostVersion = 'hostVersion' in config ? config.hostVersion : readHostVersion();
   }
 
   async start(ctx: ModuleContext): Promise<void> {
-    this.ctx = ctx;
     const record = this.state.takeCompleted(this.dataDir, this.now());
     if (record) ctx.addMessage('user', [{ type: 'text', text: this.backNote(record) }]);
   }
 
-  async stop(): Promise<void> {
-    this.ctx = null;
-  }
+  async stop(): Promise<void> {}
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     return {};
@@ -124,14 +113,13 @@ export class LifecycleModule implements Module {
           properties: {
             reason: {
               type: 'string',
-              description: 'Why you are restarting, in a sentence. It is shown back to you after the restart and kept in the host\'s data dir.',
+              description: 'Why you are restarting, in a sentence. The line after the restart shows it, and the host\'s data dir keeps it.',
             },
             cancel: {
               type: 'boolean',
-              description: 'true disarms a pending restart instead of requesting one.',
+              description: 'true disarms a pending restart instead of requesting one; it needs no reason.',
             },
           },
-          required: ['reason'],
         },
       },
     ];
@@ -144,14 +132,26 @@ export class LifecycleModule implements Module {
       return { success: false, error: '`cancel` must be true or false.', isError: true };
     }
 
+    const caller = call.callerAgentName;
+
     if (input.cancel === true) {
       const pending = this.state.armedRequest();
-      if (!this.state.cancel()) {
+      let cancelled: boolean;
+      try {
+        cancelled = this.state.cancel();
+      } catch (err) {
+        return {
+          success: false,
+          isError: true,
+          error: `The restart is still armed: its request in the data dir could not be removed (${err instanceof Error ? err.message : String(err)}).`,
+        };
+      }
+      if (!cancelled) {
         return { success: true, data: 'No restart was pending, so there was nothing to cancel.' };
       }
       return {
         success: true,
-        data: `Cancelled the restart you asked for at ${this.when(pending!.requestedAt)}. The host keeps running.`,
+        data: `Cancelled the restart ${this.asker(pending!, caller)} asked for at ${this.when(pending!.requestedAt)}. The host won't restart for it.`,
       };
     }
 
@@ -175,8 +175,8 @@ export class LifecycleModule implements Module {
       return {
         success: true,
         data:
-          `A restart is already pending, asked for at ${this.when(pending.requestedAt)} ` +
-          `(reason: ${pending.reason}). It happens once this turn ends and every agent is idle. ` +
+          `A restart is already pending, asked for by ${this.asker(pending, caller)} at ${this.when(pending.requestedAt)} ` +
+          `(reason: ${pending.reason}). It happens once this turn ends and nothing is in flight. ` +
           '`cancel: true` disarms it.',
       };
     }
@@ -191,7 +191,7 @@ export class LifecycleModule implements Module {
           success: false,
           isError: true,
           error:
-            `Nothing was armed: your last restart came back at ${this.when(last.backAt)}, and restarts are ` +
+            `Nothing was armed: the host's last self-restart came back at ${this.when(last.backAt)}, and restarts are ` +
             `at least ${this.cooldownMs / 60_000} minutes apart. The next one can be asked for from ${this.when(next.toISOString())}.`,
         };
       }
@@ -202,6 +202,7 @@ export class LifecycleModule implements Module {
       armed = this.state.arm(this.dataDir, {
         requestedAt: now.toISOString(),
         reason,
+        ...(caller ? { requestedBy: caller } : {}),
         ...(this.hostVersion ? { hostVersion: this.hostVersion } : {}),
       });
     } catch (err) {
@@ -215,9 +216,10 @@ export class LifecycleModule implements Module {
     return {
       success: true,
       data:
-        `Restart armed at ${this.when(armed.requestedAt)}. It happens once this turn ends and every agent is idle: ` +
-        `the host exits with code ${SELF_RESTART_EXIT_CODE} and its supervisor (${describeSupervisor(this.env)}) starts it again. ` +
-        'Your first turn after it rewrites your whole prompt cache once. ' +
+        `Restart armed at ${this.when(armed.requestedAt)}. It happens once this turn ends and nothing is in flight: ` +
+        `the host exits with code ${SELF_RESTART_EXIT_CODE} for whatever supervises it to start it again, and if nothing does, ` +
+        'it stays down until someone starts it. With prompt caching on, a restart that picks up changed tools or a ' +
+        'changed system prompt writes your prompt cache afresh on your first turn after it. ' +
         'To disarm it before then, call this again with cancel: true.',
     };
   }
@@ -227,8 +229,15 @@ export class LifecycleModule implements Module {
     return Number.isFinite(d.getTime()) ? formatZonedDateTime(d, this.timeZone) : iso;
   }
 
+  /** Who asked for a request, as `caller` reads it. */
+  private asker(request: SelfRestartRequest, caller?: string): string {
+    if (request.requestedBy === undefined) return 'an agent';
+    return request.requestedBy === caller ? 'you' : request.requestedBy;
+  }
+
   private backNote(record: SelfRestartRecord): string {
-    const asked = `You restarted yourself: you asked at ${this.when(record.requestedAt)} (reason: ${record.reason})`;
+    const who = record.requestedBy ?? 'An agent';
+    const asked = `${who} asked for a host restart at ${this.when(record.requestedAt)} (reason: ${record.reason})`;
     const back = `back at ${this.when(record.backAt)}`;
     if (!record.cleanExit) {
       return `[self-restart] ${asked}. The host's exit wasn't recorded (it may have crashed or been killed first); ${back}.`;

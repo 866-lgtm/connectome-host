@@ -1,8 +1,9 @@
 /**
  * Self-restart: an agent asks its own host to restart (`lifecycle--restart`,
  * src/modules/lifecycle-module.ts). The host exits with
- * SELF_RESTART_EXIT_CODE once the turn that asked has ended and every agent
- * is idle, and its supervisor starts it again: launchd KeepAlive, systemd
+ * SELF_RESTART_EXIT_CODE once the turn that asked has ended and nothing is
+ * in flight: every agent idle, no turn, subagent run or background script
+ * alive. Whatever supervises it starts it again: launchd KeepAlive, systemd
  * `Restart=`, a fleet parent's autoRestart. Only headless mode has that exit
  * path (runHeadless installs it), so the tool refuses anywhere else.
  *
@@ -31,6 +32,8 @@ export const SELF_RESTART_LAST_FILE = 'self-restart.last.json';
 export interface SelfRestartRequest {
   requestedAt: string;
   reason: string;
+  /** The agent whose call armed it, when the call named one. */
+  requestedBy?: string;
   pid: number;
   /** The process that armed it, so a later process knows the file isn't its own. */
   bootId: string;
@@ -99,12 +102,17 @@ export class SelfRestartState {
     return { ...full };
   }
 
-  /** Disarm and remove the request. False when nothing was armed. */
+  /** Disarm and remove the request. False when nothing was armed. Throws,
+   *  still armed, when the request can't be removed: a file left behind
+   *  would read as a completed restart at the next start. */
   cancel(): boolean {
     if (!this.armed) return false;
-    const path = join(this.armed.dataDir, SELF_RESTART_FILE);
+    try {
+      unlinkSync(join(this.armed.dataDir, SELF_RESTART_FILE));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
     this.armed = null;
-    try { unlinkSync(path); } catch { /* already gone */ }
     return true;
   }
 
