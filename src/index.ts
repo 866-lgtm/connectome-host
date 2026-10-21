@@ -69,7 +69,7 @@ import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
 import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
-import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
+import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, batchEchoLine, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
 import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
@@ -925,7 +925,7 @@ async function runPiped(app: AppContext) {
     for await (const line of rl) lines.push(line);
     console.log(`Processing ${lines.length} commands...`);
     for (const line of lines) {
-      console.log(`> ${line}`);
+      console.log(`> ${batchEchoLine(line)}`);
       if (await processLine(line)) break;
     }
     console.log('Done.');
