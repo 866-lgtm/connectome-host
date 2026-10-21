@@ -60,7 +60,7 @@ import { ActivityModule } from './modules/activity-module.js';
 import { NoticesModule } from './modules/notices-module.js';
 import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
-import { WebUiModule } from './modules/web-ui-module.js';
+import { WebUiModule, stopWebUiServer } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
@@ -76,6 +76,7 @@ import { SessionManager } from './session-manager.js';
 import { startFramework } from './start-framework.js';
 import { releaseHere, type ReleaseHere } from './update/host.js';
 import { childrenFilePath } from './update/contract.js';
+import { switchSessionSteps } from './session-switch.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
 import {
@@ -159,6 +160,10 @@ interface AppContext {
    *  (openai-codex through an inference gateway, which tracks them per
    *  login): usage readouts still stay off dollars. */
   subscriptionUnmetered: boolean;
+  /** Set by the TUI's stop once it has begun; the host's other modes don't
+   *  set it. A session switch then makes nothing more, and stops what it has
+   *  already made (switchSessionSteps). */
+  stopping?: boolean;
 
   /** Stop current framework, switch to a different session, start new framework. */
   switchSession(id: string): Promise<void>;
@@ -1366,23 +1371,33 @@ async function main() {
     subscriptionUnmetered: !!codexGate,
 
     async switchSession(id: string) {
-      handleExport(this);
-      await stopForSessionSwitch(this.framework, id);
-      sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);
-      // Note: agentName stays as resolved at startup. A per-session
-      // re-resolution would matter only if recipe.agent.name is absent
-      // AND the user switches between imports that used different
-      // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
-      // No install: a switch can't change the release, which the host's own
-      // start committed before any agent ran, so there is nothing to commit.
-      await startFramework(this.framework, null);
-      this.userMessageCount = 0;
-      resetBranchState(this.branchState);
-      setupSynesthete(this);
-      setupMcplStderrLog(this, newStorePath);
-      getWebUiModule(this.framework)?.setApp(this);
+      await switchSessionSteps(this, {
+        stopOld: async () => {
+          handleExport(this);
+          await stopForSessionSwitch(this.framework, id);
+        },
+        make: () => {
+          sessionManager.setActiveSession(id);
+          // Note: agentName stays as resolved at startup. A per-session
+          // re-resolution would matter only if recipe.agent.name is absent
+          // AND the user switches between imports that used different
+          // --agent values; not the canonical flow.
+          return createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
+        },
+        install: async (next) => {
+          this.framework = next;
+          // No install: a switch can't change the release, which the host's own
+          // start committed before any agent ran, so there is nothing to commit.
+          await startFramework(next, null);
+          this.userMessageCount = 0;
+          resetBranchState(this.branchState);
+          setupSynesthete(this);
+          setupMcplStderrLog(this, newStorePath);
+          getWebUiModule(next)?.setApp(this);
+        },
+        stopServer: stopWebUiServer,
+      }, (line) => console.error(`${line} (switching to session ${id})`));
     },
   };
 
@@ -1424,7 +1439,19 @@ async function main() {
       await runPiped(app);
     } else {
       const { runTui } = await import('./tui.js');
-      await runTui(app);
+      try {
+        await runTui(app);
+      } finally {
+        // WebUiModule.stop() leaves the web server up so it serves across
+        // session switches, and it would keep the process running. Once
+        // runTui settles, whether the TUI quit or its setup failed, the host
+        // is ending, so the server ends too. stopWebUiServer calls the
+        // server's stop first, so a throw in what it detaches after that is
+        // logged rather than failing a host whose stop succeeded.
+        await stopWebUiServer().catch((error: unknown) => {
+          console.error(`[webui] the TUI has ended, and closing the Web UI's server failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
     }
   } finally {
     credentials?.dispose();

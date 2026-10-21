@@ -18,7 +18,7 @@ import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
   __getSharedServerPortForTests,
-  __resetSharedServerForTests,
+  stopWebUiServer,
 } from '../src/modules/web-ui-module.js';
 import {
   ObserverRegistry,
@@ -870,7 +870,7 @@ describe('WebUiModule observer flow (e2e)', () => {
 
   afterAll(async () => {
     await mod.stop();
-    await __resetSharedServerForTests();
+    await stopWebUiServer();
     rmSync(tmp, { recursive: true, force: true });
   });
 
