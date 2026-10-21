@@ -166,7 +166,7 @@ export const HOST_LOG_TAGS = new Set([
   'provider-cooldown', 'puppet', 'push-event-rejected', 'reasoning', 'reasoning-effort', 'refusal-retry',
   'refusal-rewind', 'rfc005', 'routespeech', 'routing', 'section', 'self-wake', 'settings', 'shutdown',
   'sleep', 'spill', 'store-topology', 'subagent', 'subscription-gc', 'thinking', 'tool', 'tool-boundary',
-  'tool-result-guard', 'tool_result', 'tools', 'tts-relay', 'unstick', 'voice', 'webui', 'webui-observers',
+  'tool-result-guard', 'tool_result', 'tools', 'tts-relay', 'unstick', 'update', 'voice', 'webui', 'webui-observers',
   'windowed-passthrough', 'workspace',
 ]);
 
