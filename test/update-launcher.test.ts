@@ -1670,6 +1670,42 @@ describe('a Go back', () => {
     }
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in a directory with the sticky bit`);
     expect(read(agent)).toBe('{"agent":1}');
+    // Root may take it away whatever its owners, so the same Go back goes ahead as root.
+    const root0 = spyOn(process, 'getuid').mockImplementation(() => 0);
+    const stat2 = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const found = realStat(path, options as never) as fs.Stats;
+      const p = String(path);
+      if (p === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
+      if (p === agent) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1 });
+      return found;
+    }) as typeof fs.statSync);
+    try {
+      reports = [];
+      expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    } finally {
+      stat2.mockRestore();
+      root0.mockRestore();
+    }
+    expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
+  });
+
+  test("a Go back takes away a file this process owns from a sticky directory another owns", async () => {
+    await committedSwitch();
+    const agent = join(work, 'mcpl-servers.agent.json');
+    writeFileSync(agent, '{"agent":1}');
+    const realStat = fs.statSync;
+    const stat = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const found = realStat(path, options as never) as fs.Stats;
+      if (String(path) === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
+      return found;
+    }) as typeof fs.statSync);
+    try {
+      mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+      expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    } finally {
+      stat.mockRestore();
+    }
+    expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
   });
 
   for (const [name, arrange, refused] of [

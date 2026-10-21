@@ -112,11 +112,12 @@ function mayWrite(path: string): boolean {
 }
 
 /** Whether the sticky bit on `path`'s directory keeps this process from
- *  removing it: the directory has the bit, and this process owns neither. */
+ *  removing it: the directory has the bit, and this process owns neither and
+ *  isn't root, whose CAP_FOWNER removes it whatever its owners. */
 function stickyFor(path: string): boolean {
   const dir = statSync(dirname(path));
   const uid = process.getuid?.();
-  return (dir.mode & 0o1000) !== 0 && dir.uid !== uid && statSync(path).uid !== uid;
+  return uid !== 0 && (dir.mode & 0o1000) !== 0 && dir.uid !== uid && statSync(path).uid !== uid;
 }
 
 /** Whether the filesystem holding `path` can be written at all: not when it's
