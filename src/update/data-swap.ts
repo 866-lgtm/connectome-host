@@ -123,9 +123,11 @@ function moveEntries(from: string, to: string, item: string): void {
       throw new ContractError(`${target} is already there, so ${source} can't be moved to it without losing one of them.`);
     }
     // Moving a directory to another parent rewrites its `..`, which a
-    // directory this process can't write refuses, so then it gets owner
+    // directory this process can't write refuses, so one it owns gets owner
     // write for the rename and its mode back after, even when the rename
-    // fails. A cut between the two leaves that one bit.
+    // fails; a cut between the two leaves that one bit. One another owns
+    // can't be given write, and the launcher refuses a request that would
+    // move one before it changes anything.
     try {
       renameSync(source, target);
     } catch (error) {

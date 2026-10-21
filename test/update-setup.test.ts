@@ -65,7 +65,7 @@ beforeEach(() => {
   writeFileSync(join(install, 'package-lock.json'), '{"lockfileVersion":3}');
   mkdirSync(join(data, 'sessions'), { recursive: true });
   said = [];
-  units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [] };
+  units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [], defaulted: [] };
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
 
@@ -88,21 +88,21 @@ describe('setup', () => {
 
   test("says when the service wouldn't restart the host, and when it couldn't check", () => {
     const unit = { id: 'connectome.service', settings: 'Restart=on-failure, SuccessExitStatus includes 75', restarts: false };
-    units = { found: [unit], unasked: [], unresolved: [] };
+    units = { found: [unit], unasked: [], unresolved: [], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.includes("won't restart the host on both 75 and 1 (Restart=on-failure, SuccessExitStatus includes 75)") &&
       l.includes(`Before you update, have each of the two restarted, ${NEEDED}.`))).toBe(true);
-    for (const [unasked, says] of [[[], 'No systemd service that this user can see is set to run from this directory'],
+    for (const [unasked, says] of [[[], 'No loaded systemd service that this user can see is set to run from this directory'],
       [['user', 'system'], "Setup couldn't ask systemd's user manager or systemd's system manager"]] as const) {
       said = [];
-      units = { found: [], unasked: [...unasked], unresolved: [] };
+      units = { found: [], unasked: [...unasked], unresolved: [], defaulted: [] };
       setup(options());
       expect(said.some((l) => l.includes(says) && l.includes("couldn't check that") &&
         l.includes(`must restart the host when it exits with 75, as a switch's restart does, and with 1, as a trial that ends before its commit does, so its fallback runs: under systemd, each of the two restarted, ${NEEDED}; or launchd's KeepAlive.`))).toBe(true);
     }
     // One manager couldn't be asked, and the other found a unit: both are said.
     said = [];
-    units = { found: [unit], unasked: ['user'], unresolved: [] };
+    units = { found: [unit], unasked: ['user'], unresolved: [], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.includes("Setup couldn't ask systemd's user manager, so a service of its that runs from this directory isn't checked"))).toBe(true);
     expect(said.some((l) => l.includes("connectome.service won't restart the host"))).toBe(true);
@@ -455,24 +455,38 @@ describe('setup', () => {
       `it can't tell whether ${they ? 'they run' : 'it runs'} from this directory reached another way, and doesn't check ` +
       `${they ? 'them' : 'it'}. If ${they ? 'one of them runs' : 'it runs'} the host, check its restart settings by hand, or ` +
       'run setup as a user who can reach its working directory.';
-    units = { found: [unit], unasked: [], unresolved: ['a.service', 'b.service'] };
+    units = { found: [unit], unasked: [], unresolved: ['a.service', 'b.service'], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.startsWith(note('a.service, b.service', true)))).toBe(true);
     said = [];
-    units = { found: [], unasked: [], unresolved: ['1', '2', '3', '4', '5', '6', '7'] };
+    units = { found: [], unasked: [], unresolved: ['1', '2', '3', '4', '5', '6', '7'], defaulted: [] };
     setup(options());
-    expect(said.some((l) => l.includes('No systemd service whose working directory setup could resolve is set to run from this directory') &&
+    expect(said.some((l) => l.includes('No loaded systemd service whose working directory setup could resolve is set to run from this directory') &&
       l.includes(note('1, 2, 3, 4, 5, 6, 7', true)))).toBe(true);
     said = [];
-    units = { found: [], unasked: ['user'], unresolved: ['a.service'] };
+    units = { found: [], unasked: ['user'], unresolved: ['a.service'], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.includes("Setup couldn't ask systemd's user manager which service runs from this directory") &&
       l.includes(note('a.service', false)))).toBe(true);
     said = [];
-    units = { found: [unit], unasked: ['system'], unresolved: ['a.service'] };
+    units = { found: [unit], unasked: ['system'], unresolved: ['a.service'], defaulted: [] };
     setup(options());
     expect(said.some((l) => l.includes("Setup couldn't ask systemd's system manager, so a service of its that runs from this directory isn't checked.") &&
       l.includes(note('a.service', false)))).toBe(true);
+  });
+
+  test("units that set no working directory and run here by default are named, with what to do, beside those found and beside none", () => {
+    const note = (names: string, few: boolean) => `${names} ${few ? 'sets' : 'set'} no working directory, and so ${few ? 'runs' : 'run'} ` +
+      `in this one, ${few ? 'its' : 'their'} manager's default, as most units there are others'; setup doesn't check ${few ? 'it' : 'them'}. ` +
+      `If ${few ? 'it runs' : 'one of them runs'} the host, give the service WorkingDirectory=`;
+    units = { found: [], unasked: [], unresolved: [], defaulted: ['a.service'] };
+    setup(options());
+    expect(said.some((l) => l.includes("No loaded systemd service that this user can see is set to run from this directory, so setup couldn't check that.") &&
+      l.includes(note('a.service', true)) && l.includes(' and run setup again, or check its restart settings by hand.'))).toBe(true);
+    said = [];
+    units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [], defaulted: ['a.service', 'b.service'] };
+    setup(options());
+    expect(said.some((l) => l.startsWith(note('a.service, b.service', false)))).toBe(true);
   });
 
   test("extra state that isn't there is said to be absent, and one whose path can't be followed gets a repair, not a permission", () => {
@@ -758,15 +772,15 @@ describe('the service check', () => {
     const shown = `Id=connectome.service\nWorkingDirectory=${install}\nRestart=always`;
     const systemOnly = (args: string[]) => ({ exitCode: args[0] === '--user' ? 1 : 0, stdout: Buffer.from(shown) });
     expect(systemdUnits(install, systemOnly)).toEqual({
-      found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['user'], unresolved: [],
+      found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['user'], unresolved: [], defaulted: [],
     });
     const elsewhere = `Id=other.service\nWorkingDirectory=/elsewhere\nRestart=always`;
     expect(systemdUnits(install, (args) => ({ exitCode: args[0] === '--user' ? 0 : 1, stdout: Buffer.from(elsewhere) })))
-      .toEqual({ found: [], unasked: ['system'], unresolved: [] });
-    expect(systemdUnits(install, () => ({ exitCode: 0, stdout: Buffer.from(elsewhere) }))).toEqual({ found: [], unasked: [], unresolved: [] });
+      .toEqual({ found: [], unasked: ['system'], unresolved: [], defaulted: [] });
+    expect(systemdUnits(install, () => ({ exitCode: 0, stdout: Buffer.from(elsewhere) }))).toEqual({ found: [], unasked: [], unresolved: [], defaulted: [] });
   });
 
-  test("a unit whose directory this user can't resolve is another's, and the rest are still read", () => {
+  test("a unit whose directory this user can't resolve is named as such, and the rest are still read", () => {
     const shut = join(dir, 'shut');
     mkdirSync(join(shut, 'svc'), { recursive: true });
     chmodSync(shut, 0o600);
@@ -777,15 +791,35 @@ describe('the service check', () => {
     try {
       expect(systemdUnits(install, (args) => ({ exitCode: args[0] === '--user' ? 0 : 1, stdout: Buffer.from(shown) }))).toEqual({
         found: [{ id: 'connectome.service', settings: 'Restart=always', restarts: true }], unasked: ['system'],
-        unresolved: ['private.service'],
+        unresolved: ['private.service'], defaulted: [],
       });
     } finally {
       chmodSync(shut, 0o755);
     }
   });
 
+  test("a unit that sets no working directory runs in its manager's default, and is named, not checked, when setup runs there; ~ is a home", () => {
+    {
+      const user = [
+        `Id=sets-none.service\nWorkingDirectory=!${install}\nRestart=no`,
+        'Id=tilde.service\nWorkingDirectory=!~\nRestart=always',
+        'Id=elsewhere.service\nWorkingDirectory=/elsewhere\nRestart=always',
+      ].join('\n\n');
+      const system = 'Id=system-none.service\nWorkingDirectory=\nRestart=always\n\nId=system-tilde.service\nWorkingDirectory=!~\nRestart=always';
+      expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : system) }), install)).toEqual({
+        found: [{ id: 'tilde.service', settings: 'Restart=always', restarts: true }], unasked: [],
+        unresolved: ['system-tilde.service'], defaulted: ['sets-none.service'],
+      });
+    }
+    // Run elsewhere, a unit that sets none is neither found nor named.
+    const none = `Id=sets-none.service\nWorkingDirectory=!${dir}\nRestart=no`;
+    expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? none : '') }), dir)).toEqual({
+      found: [], unasked: [], unresolved: [], defaulted: [],
+    });
+  });
+
   test("names both managers when neither of systemd's queries answers", () => {
-    const neither = { found: [], unasked: ['user', 'system'], unresolved: [] };
+    const neither = { found: [], unasked: ['user', 'system'], unresolved: [], defaulted: [] };
     expect(systemdUnits(install, () => ({ exitCode: 1, stdout: Buffer.from('') }))).toEqual(neither);
     expect(systemdUnits(install, () => { throw new Error('no systemctl'); })).toEqual(neither);
   });

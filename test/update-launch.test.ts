@@ -46,7 +46,7 @@ beforeEach(() => {
   setup({
     cwd: install, dataDir: data, root, extraState: [],
     hostRoot: join(install, 'node_modules', '@animalabs', 'connectome-host'),
-    say: () => {}, units: () => ({ found: [], unasked: [], unresolved: [] }),
+    say: () => {}, units: () => ({ found: [], unasked: [], unresolved: [], defaulted: [] }),
   });
 });
 afterEach(() => { rmSync(dir, { recursive: true, force: true }); });

@@ -24,6 +24,7 @@ import {
   existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, statSync,
   writeFileSync,
 } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -132,6 +133,9 @@ export interface ServiceUnits {
   found: ServiceUnit[];
   unasked: string[];
   unresolved: string[];
+  /** Units that set no working directory, when setup's is their manager's
+   *  default, where they run. */
+  defaulted: string[];
 }
 
 /** The exit statuses an update needs the service to restart on: a switch's,
@@ -142,15 +146,22 @@ const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
  *  run from `cwd`, which manager couldn't be asked, and the units whose
  *  working directory this user can't resolve, such as one under /root or
  *  /var/lib/private, which may or may not be `cwd` reached another way. A
- *  unit that sets none, and so runs in its manager's default, the user's home
- *  or /, isn't read as running from there, since in a home most do. */
+ *  unit that sets none runs in its manager's default, which `systemctl show`
+ *  gives as the user's home marked `!` for the user manager, and as nothing
+ *  for the system's, whose default is /. Most units in a home are others',
+ *  so one there is `defaulted` rather than found when `cwd` is that default.
+ *  One that sets ~ runs in its user's home: this user's for the user
+ *  manager, and for the system's, its User='s, which this doesn't ask. Only
+ *  units systemd has loaded are seen. */
 export function systemdUnits(cwd: string, run = (args: string[]) =>
-  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' })): ServiceUnits {
+  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' }), home = homedir()): ServiceUnits {
   const found: ServiceUnit[] = [];
   const unasked: string[] = [];
   const unresolved: string[] = [];
+  const defaulted: string[] = [];
   const here = realOrResolved(cwd);
   for (const scope of [['--user'], []]) {
+    const user = scope.length > 0;
     const unanswered = () => unasked.push(scope.length > 0 ? 'user' : 'system');
     let result: { exitCode: number | null; stdout: Uint8Array | Buffer };
     try {
@@ -167,13 +178,28 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
     }
     for (const block of Buffer.from(result.stdout).toString('utf-8').split(/\n\s*\n/)) {
       const fields = new Map(block.split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
-      const dir = (fields.get('WorkingDirectory') ?? '').replace(/^[-!+@:]+/, '');
-      if (!dir) continue;
+      const shown = fields.get('WorkingDirectory') ?? '';
+      const set = shown.replace(/^[-!+@:]+/, '');
+      const id = fields.get('Id') ?? '?';
+      if (set === '' || (user && shown.startsWith('!') && set === home)) {
+        let runsIn: string;
+        try {
+          runsIn = realOrResolved(set === '' ? '/' : set);
+        } catch {
+          continue;
+        }
+        if (runsIn === here) defaulted.push(id);
+        continue;
+      }
+      if (set === '~' && !user) {
+        unresolved.push(id);
+        continue;
+      }
       let real: string;
       try {
-        real = realOrResolved(dir);
+        real = realOrResolved(set === '~' ? home : set);
       } catch {
-        unresolved.push(fields.get('Id') ?? dir);
+        unresolved.push(id);
         continue;
       }
       if (real !== here) continue;
@@ -195,10 +221,10 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
       };
       const settings = [`Restart=${restart}`, ...listed('SuccessExitStatus'), ...listed('RestartPreventExitStatus'),
         ...listed('RestartForceExitStatus')].join(', ');
-      found.push({ id: fields.get('Id') ?? '?', settings, restarts: RESTART_ON.every(restartsOn) });
+      found.push({ id, settings, restarts: RESTART_ON.every(restartsOn) });
     }
   }
-  return { found, unasked, unresolved };
+  return { found, unasked, unresolved, defaulted };
 }
 
 export interface SetupOptions {
@@ -552,18 +578,25 @@ export function setup(options: SetupOptions): void {
     `directory of ${units.unresolved.join(', ')}, so it can't tell whether ${one ? 'it runs' : 'they run'} from this ` +
     `directory reached another way, and doesn't check ${one ? 'it' : 'them'}. If ${one ? 'it runs' : 'one of them runs'} ` +
     'the host, check its restart settings by hand, or run setup as a user who can reach its working directory.';
+  const few = units.defaulted.length === 1;
+  const defaultedNote = units.defaulted.length === 0 ? '' : ` ${units.defaulted.join(', ')} ${few ? 'sets' : 'set'} no ` +
+    `working directory, and so ${few ? 'runs' : 'run'} in this one, ${few ? 'its' : 'their'} manager's default, as most ` +
+    `units there are others'; setup doesn't check ${few ? 'it' : 'them'}. If ${few ? 'it runs' : 'one of them runs'} the ` +
+    `host, give the service WorkingDirectory=${shellWord(options.cwd)} and run setup again, or check its restart ` +
+    'settings by hand.';
+  const notes = unresolvedNote + defaultedNote;
   const managers = units.unasked.map((scope) => `systemd's ${scope} manager`).join(' or ');
   if (units.found.length === 0) {
     say(units.unasked.length > 0
       ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.` +
-        unresolvedNote
-      : `${needed} No systemd service ${units.unresolved.length > 0 ? 'whose working directory setup could resolve' :
-        'that this user can see'} is set to run from this directory, so setup couldn't check that.${unresolvedNote}`);
+        notes
+      : `${needed} No loaded systemd service ${units.unresolved.length > 0 ? 'whose working directory setup could ' +
+        'resolve' : 'that this user can see'} is set to run from this directory, so setup couldn't check that.${notes}`);
   } else if (units.unasked.length > 0) {
     say(`Setup couldn't ask ${managers}, so a service of its that runs from this directory isn't checked.` +
-      `${unresolvedNote} ${needed}`);
-  } else if (units.unresolved.length > 0) {
-    say(`${unresolvedNote.trim()} ${needed}`);
+      `${notes} ${needed}`);
+  } else if (notes !== '') {
+    say(`${notes.trim()} ${needed}`);
   }
   for (const unit of units.found) {
     say(unit.restarts
