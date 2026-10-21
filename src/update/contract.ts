@@ -7,7 +7,10 @@
  * An install keeps each release side by side under one root, which the entry
  * point passes to the host as CONNECTOME_INSTALL_ROOT. A host started without
  * it, such as a checkout or an install that setup hasn't wrapped, writes none
- * of these files and behaves as it always has.
+ * of these files and behaves as it always has. A fleet child is such a host:
+ * it runs its parent's entry, but the fleet starts it without the variable,
+ * whatever its own environment or its entry's `env` holds, so it finds no
+ * install.
  *
  * The rule for changing it: a field never changes meaning in place. A new
  * meaning is a new field, and the old one keeps being written, so the release
@@ -150,11 +153,11 @@ export function itemSetAsideDir(item: string, markId: string): string {
   return join(item, '.connectome-update', 'set-aside', segment(markId, 'mark id'));
 }
 
-/** The fleet's children file, in the parent's data directory: each child's
- *  process, boot and data directory, which the launcher checks before a
- *  switch. The launcher reads it before anything is copied or restored,
- *  since a restore puts back the data directory's earlier contents, this
- *  file's included. */
+/** The fleet's children file, in the parent's data directory: each child of
+ *  the host's fleet, in any of its sessions, with its process, boot and data
+ *  directory, which the launcher checks before a switch. The launcher reads
+ *  it before anything is copied or restored, since a restore puts back the
+ *  data directory's earlier contents, this file's included. */
 export function childrenFilePath(dataDir: string): string {
   return join(dataDir, 'fleet-children.json');
 }
@@ -258,7 +261,12 @@ export interface CopyLabel {
   items: Array<{ path: string; name: string }>;
 }
 
-/** fleet-children.json, written by the fleet. */
+/** fleet-children.json, written by the fleet. Each write lists the fleet's
+ *  own children as its record has them, and keeps what's already there that
+ *  it doesn't replace, such as another session's child (writeChildrenFile in
+ *  the fleet module). A `pid` is null once the fleet has seen its child
+ *  exit; a child it can't see exit keeps its pid while a process of this
+ *  boot may hold it, which is when the launcher reads it as running. */
 export interface ChildrenFile {
   v: 1;
   children: Array<{ name: string; pid: number | null; bootId: string | null; dataDir: string }>;
@@ -293,7 +301,8 @@ function segment(value: string, what: string): string {
   return value;
 }
 
-function syncDir(dir: string): void {
+/** Sync a directory, so the renames and links made in it are on disk. */
+export function syncDir(dir: string): void {
   const fd = openSync(dir, 'r');
   try { fsyncSync(fd); } finally { closeSync(fd); }
 }

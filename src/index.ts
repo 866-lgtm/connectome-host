@@ -73,6 +73,8 @@ import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
 import { startFramework } from './start-framework.js';
+import { releaseHere, type ReleaseHere } from './update/host.js';
+import { childrenFilePath } from './update/contract.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
 import {
@@ -254,6 +256,9 @@ function resolveModel(recipe: Recipe): string {
 let noticesRef: NoticesModule | null = null;
 /** The host's one InstructionsModule, kept across session switches (see createFramework). */
 let instructionsRef: InstructionsModule | null = null;
+/** The install whose entry point started this host, and its release, or null
+ *  when none did. Set first thing in main(), and the same for the host's life. */
+let installHere: ReleaseHere | null = null;
 
 async function createFramework(
   membrane: Membrane,
@@ -303,13 +308,16 @@ async function createFramework(
     moduleInstances.push(lessonsModule);
   }
 
-  // Fleet (cross-process child orchestration). Opt-in via recipe.
-  if (modules.fleet === true) {
-    moduleInstances.push(new FleetModule({ timeZone }));
-  } else if (modules.fleet && typeof modules.fleet === 'object') {
-    const fleetCfg = modules.fleet;
-    const fleetModuleConfig: FleetModuleConfig = {};
-    fleetModuleConfig.timeZone = timeZone;
+  // Fleet (cross-process child orchestration). Opt-in via recipe, as `true` or
+  // as its settings, which `true` leaves at their defaults. A host an install
+  // started keeps the children file its launcher reads before a switch.
+  let fleetModule: FleetModule | null = null;
+  if (modules.fleet === true || (modules.fleet && typeof modules.fleet === 'object')) {
+    const fleetCfg = modules.fleet === true ? {} : modules.fleet;
+    const fleetModuleConfig: FleetModuleConfig = {
+      timeZone,
+      childrenFile: installHere ? childrenFilePath(resolve(config.dataDir)) : undefined,
+    };
     if (fleetCfg.children) {
       fleetModuleConfig.autoStart = fleetCfg.children.map((c) => {
         const entry: NonNullable<FleetModuleConfig['autoStart']>[number] = {
@@ -330,7 +338,8 @@ async function createFramework(
     if (fleetCfg.readyTimeoutMs !== undefined) fleetModuleConfig.readyTimeoutMs = fleetCfg.readyTimeoutMs;
     if (fleetCfg.gracefulShutdownMs !== undefined) fleetModuleConfig.gracefulShutdownMs = fleetCfg.gracefulShutdownMs;
     if (fleetCfg.sigtermEscalationMs !== undefined) fleetModuleConfig.sigtermEscalationMs = fleetCfg.sigtermEscalationMs;
-    moduleInstances.push(new FleetModule(fleetModuleConfig));
+    fleetModule = new FleetModule(fleetModuleConfig);
+    moduleInstances.push(fleetModule);
   }
 
   // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
@@ -714,6 +723,10 @@ agents: [agentConfig],
     workspaceModule.initStore(framework.getStore());
   }
 
+  if (fleetModule) {
+    fleetModule.setStoreSync(() => framework.getStore().sync());
+  }
+
   // Stash the WebUiModule reference on the framework so main() can call
   // setApp() once the AppContext is built. Using a symbol-keyed property to
   // avoid polluting the public framework API for the sake of one module.
@@ -964,6 +977,9 @@ function countLines(path: string): number {
 let beforeFatalExit: (() => Promise<void>) | undefined;
 
 async function main() {
+  // Before anything else: a host an install's entry point started has to be
+  // one of that install's releases, or it refuses to start (releaseHere).
+  installHere = releaseHere();
   const recipe = await resolveRecipe();
   const provider = resolveProvider(recipe);
 
@@ -1346,7 +1362,9 @@ async function main() {
       // AND the user switches between imports that used different
       // --agent values; not the canonical flow.
       this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
-      startFramework(this.framework);
+      // No install: a switch can't change the release, which the host's own
+      // start committed before any agent ran, so there is nothing to commit.
+      await startFramework(this.framework, null);
       this.userMessageCount = 0;
       resetBranchState(this.branchState);
       setupSynesthete(this);
@@ -1375,7 +1393,7 @@ async function main() {
     };
   }
 
-  startFramework(framework);
+  await startFramework(framework, installHere);
   setupSynesthete(app);
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);
