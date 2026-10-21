@@ -56,9 +56,8 @@ the house default; plain descriptive titles are accepted.
   explicitly labeled as such, with a severity verdict and itemized findings.
 - The reviewer will typically **run your branch** (typecheck, test suite,
   loading a recipe) and paste transcripts. Claims are checked, not trusted.
-- **Greptile** reviews only PRs labelled `greptile` (`.greptile/config.json`).
-  Nothing adds that label automatically, and new PRs aren't meant to get a
-  Greptile review.
+- **Greptile** doesn't review new PRs. It reviews only PRs labelled
+  `greptile` (`.greptile/config.json`), so don't add that label to a new PR.
 - Respond by pushing fix commits and replying per finding — "Addressed in
   `<sha>`" — rather than force-pushing a rewritten branch. A re-review then
   flips the verdict.
