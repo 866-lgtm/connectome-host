@@ -184,6 +184,29 @@ describe('a start with nothing asked', () => {
     await expect(decide(root, o)).rejects.toThrow(ContractError);
   });
 
+  test("refuses a current that's a directory holding a release, copied in place of the link, saying to run setup again", async () => {
+    rmSync(installPaths(root).current);
+    fs.cpSync(join(root, 'releases', '0.10.2'), installPaths(root).current, { recursive: true });
+    const thrown = await decide(root, ops()).catch((error) => error);
+    expect(thrown).toBeInstanceOf(ContractError);
+    expect(thrown.message).toMatch(/current is there and isn't a link\. Run setup again, which says how to put it right/);
+  });
+
+  test("a current that can't be read for another reason gives that error as it is", async () => {
+    const real = fs.readlinkSync;
+    const spy = spyOn(fs, 'readlinkSync').mockImplementation(((path: fs.PathLike, options?: unknown) => {
+      if (String(path) === installPaths(root).current) throw Object.assign(new Error('EIO: i/o error'), { code: 'EIO' });
+      return real(path, options as never);
+    }) as typeof fs.readlinkSync);
+    try {
+      const thrown = await decide(root, ops()).catch((error) => error);
+      expect(thrown).not.toBeInstanceOf(ContractError);
+      expect(thrown.code).toBe('EIO');
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   for (const [name, record] of [
     ['no data directory', { v: 1, dataDir: 5, extraState: [] }],
     ['no list of extra state', { v: 1, dataDir: 'x', extraState: 5 }],
@@ -1627,6 +1650,28 @@ describe('a Go back', () => {
     expect(read(settings)).toBe('{"a":1}');
   });
 
+  test("a Go back refuses, before its line, to take away a file another owns from a sticky directory another owns", async () => {
+    await committedSwitch();
+    const agent = join(work, 'mcpl-servers.agent.json');
+    writeFileSync(agent, '{"agent":1}');
+    const realStat = fs.statSync;
+    const stat = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const found = realStat(path, options as never) as fs.Stats;
+      const p = String(path);
+      if (p === work) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1, mode: found.mode | 0o1000 });
+      if (p === agent) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1 });
+      return found;
+    }) as typeof fs.statSync);
+    try {
+      mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      stat.mockRestore();
+    }
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${agent} is in a directory with the sticky bit`);
+    expect(read(agent)).toBe('{"agent":1}');
+  });
+
   for (const [name, arrange, refused] of [
     ["a file it may write, though another owns it, is restored", () => chmodSync(settings, 0o666), false],
     ["a file it may neither write nor own that already holds the copy's content goes ahead", () => {
@@ -2010,6 +2055,22 @@ describe('leftovers', () => {
     }
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(
       `an earlier attempt's preparation under mark g1 is still at ${setAsideDir(root, 'g1')}, since a start couldn't clear it`);
+  });
+
+  test("a leftover preparation whose areas' removal can't be synced keeps its list, and the start says so", async () => {
+    await committedSwitch();
+    mkdirSync(setAsideDir(root, 'stale'), { recursive: true });
+    writeJsonAtomic(join(setAsideDir(root, 'stale'), 'places.json'), { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
+    mkdirSync(itemSetAsideDir(data, 'stale'), { recursive: true });
+    const parent = dirname(itemSetAsideDir(data, 'stale'));
+    chmodSync(parent, 0o300);
+    try {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      chmodSync(parent, 0o755);
+    }
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('EACCES');
+    expect(existsSync(join(setAsideDir(root, 'stale'), 'places.json'))).toBe(true);
   });
 
   test("a leftover preparation's areas are removed, and their removal synced, before its list goes", async () => {

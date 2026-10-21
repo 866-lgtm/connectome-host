@@ -542,9 +542,9 @@ export function setup(options: SetupOptions): void {
     `it gives the host${settingUp ? ' now; set that, and restart it' : ''}.`);
   const units = options.units(options.cwd);
   const needed = `The service must restart the host when it exits with ${RESTART_EXIT_CODE}, as a switch's restart does, ` +
-    'and with 1, as a trial that ends before its commit does, so its fallback runs: systemd\'s Restart=always without ' +
-    'either status in RestartPreventExitStatus=, Restart=on-failure without either in SuccessExitStatus= or ' +
-    'RestartPreventExitStatus=, or either in RestartForceExitStatus=; or launchd\'s KeepAlive.';
+    'and with 1, as a trial that ends before its commit does, so its fallback runs: under systemd, each of the two ' +
+    'restarted, by Restart=always, by Restart=on-failure while it isn\'t in SuccessExitStatus=, or by ' +
+    'RestartForceExitStatus=, and neither in RestartPreventExitStatus=; or launchd\'s KeepAlive.';
   const shown = units.unresolved.slice(0, 5).join(', ') +
     (units.unresolved.length > 5 ? ` and ${units.unresolved.length - 5} more` : '');
   const unresolvedNote = units.unresolved.length === 0 ? '' : ` Setup couldn't resolve, as this user, the working ` +
@@ -553,7 +553,8 @@ export function setup(options: SetupOptions): void {
   const managers = units.unasked.map((scope) => `systemd's ${scope} manager`).join(' or ');
   if (units.found.length === 0) {
     say(units.unasked.length > 0
-      ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.`
+      ? `${needed} Setup couldn't ask ${managers} which service runs from this directory, so it couldn't check that.` +
+        unresolvedNote
       : `${needed} No systemd service that this user can see runs from this directory, so setup couldn't check that.` +
         unresolvedNote);
   } else if (units.unasked.length > 0) {
@@ -566,9 +567,9 @@ export function setup(options: SetupOptions): void {
     say(unit.restarts
       ? `${unit.id} restarts the host when it exits with ${RESTART_EXIT_CODE} or 1 (${unit.settings}).`
       : `${unit.id} won't restart the host on both ${RESTART_EXIT_CODE} and 1 (${unit.settings}), so a switch's ` +
-        'restart, or a failed trial\'s fallback, would leave the host stopped. Set Restart=always without either status ' +
-        'in RestartPreventExitStatus=, or Restart=on-failure without either in SuccessExitStatus= or ' +
-        'RestartPreventExitStatus=, before you update.');
+        'restart, or a failed trial\'s fallback, would leave the host stopped. Before you update, have each of the two ' +
+        'restarted, by Restart=always, by Restart=on-failure while it isn\'t in SuccessExitStatus=, or by ' +
+        'RestartForceExitStatus=, and neither in RestartPreventExitStatus=.');
   }
 }
 

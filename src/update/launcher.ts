@@ -111,6 +111,14 @@ function mayWrite(path: string): boolean {
   }
 }
 
+/** Whether the sticky bit on `path`'s directory keeps this process from
+ *  removing it: the directory has the bit, and this process owns neither. */
+function stickyFor(path: string): boolean {
+  const dir = statSync(dirname(path));
+  const uid = process.getuid?.();
+  return (dir.mode & 0o1000) !== 0 && dir.uid !== uid && statSync(path).uid !== uid;
+}
+
 /** Whether the filesystem holding `path` can be written at all: not when it's
  *  mounted read-only, as a container's read-only file mount is. */
 function writableFilesystem(path: string): boolean {
@@ -668,12 +676,13 @@ function clearGoBack(root: string, markId: string, ops: LauncherOps): void {
   // left for a later start, which tries again. The areas go first, and the
   // set-aside directory, the list in it, after them, so while an area stays
   // the list still says where it is. The areas' removal is synced before the
-  // list goes, so a power cut can't bring an area back with nothing to name it.
+  // list goes, so a power cut can't bring an area back with nothing to name
+  // it; a sync that can't be made leaves the list, as a failed removal does.
   try {
     for (const place of places.filter((p) => kindOf(p.path) === 'dir')) {
       for (const area of [itemSetAsideDir(place.path, markId), itemStagingDir(place.path, markId)]) {
         for (const suffix of ['', '.tmp', '.filling', '.emptying']) removeTree(area + suffix);
-        if (existsSync(dirname(area))) syncEntries(dirname(area));
+        if (existsSync(dirname(area))) syncPath(dirname(area));
       }
     }
     removeTree(setAsideDir(root, markId));
@@ -936,6 +945,14 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
     return { step: 'go-back', reason: `${locked.path} can't be written by this process, which doesn't own it, and the ` +
       'Go back would change it. Give this user write on it, or go back keeping the newer data' };
   }
+  // In a directory with the sticky bit, only a file's owner, or the
+  // directory's, may take the file away, whatever the directory's write.
+  const pinned = places.find((place) => place.before === 'file' && place.target !== 'file' && stickyFor(place.path));
+  if (pinned) {
+    return { step: 'go-back', reason: `${pinned.path} is in a directory with the sticky bit, and neither it nor the ` +
+      'directory is this process\'s, so the Go back couldn\'t take it away. Give this user the file, or go back keeping ' +
+      'the newer data' };
+  }
   // A directory's entries move inside it; a file it makes or takes away, or
   // a directory it makes, is an entry of its parent.
   const unwritable = unwritableDirectory([
@@ -1162,7 +1179,17 @@ export async function decide(root: string, ops: LauncherOps): Promise<Start> {
   // it: synced first, nothing acts on a line that can be lost after.
   if (exists(installPaths(root).journal)) syncPath(installPaths(root).journal);
   const lines = readJournal(root);
-  const current = readCurrent(root);
+  // The entry point loads the launcher through current, so a current that
+  // isn't a link gets here only as a directory holding a release, copied in
+  // place of the link.
+  let current: string | null;
+  try {
+    current = readCurrent(root);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EINVAL') throw error;
+    throw new ContractError(`This install has no release to start: ${installPaths(root).current} is there and isn't a ` +
+      'link. Run setup again, which says how to put it right.');
+  }
   if (current === null) {
     throw new ContractError(`This install has no release to start: ${installPaths(root).current} isn't there. Run setup again.`);
   }
