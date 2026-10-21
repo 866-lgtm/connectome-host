@@ -264,10 +264,11 @@ export interface CopyLabel {
    *  of the copy keeps aside, and takes away, whatever has appeared at one
    *  since, so the release it restores doesn't meet what the trial made. */
   absent?: Array<{ path: string; name: string }>;
-  /** The id of the mark whose switch took the copy. A switch's fallback
-   *  restores the copy only when this is the mark its `trial-start` names, so
-   *  a copy an earlier switch to the same release left can't stand in for
-   *  this one's. */
+  /** The id of the mark whose switch took the copy, which the launcher
+   *  writes on every label it writes. A switch's fallback restores the copy
+   *  only when this is the mark its `trial-start` names, so a copy an earlier
+   *  switch to the same release left can't stand in for this one's; a label
+   *  without it is no switch's copy a fallback can use. */
   mark?: string;
 }
 
@@ -644,6 +645,9 @@ export function lastCopy(root: string): CopyLabel | null {
       'absolute path and a name in the copy that is one path segment and starts with its position in the list ' +
       'and a "-", as copyItemName gives it, and then any places that weren\'t there the same way, numbered on.',
     );
+  }
+  if (label.mark !== undefined && !pathSegment(label.mark)) {
+    throw new ContractError(`The copy's label at ${path} names a mark this release can't read: a mark's id is one path segment.`);
   }
   for (const item of label.items) {
     try {

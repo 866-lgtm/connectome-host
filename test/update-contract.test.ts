@@ -8,10 +8,10 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
-  ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, RESTART_EXIT_CODE, appendJournal, childrenFilePath, copyItemName,
-  copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent, moveCurrent,
-  readCurrent, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir, trialPlaces, unfinishedTrial,
-  writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
+  ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, PLACE_KINDS, RESTART_EXIT_CODE, appendJournal, childrenFilePath,
+  copyItemName, copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent,
+  moveCurrent, readCurrent, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir, trialPlaces,
+  unfinishedTrial, writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
 } from '../src/update/contract.js';
 
 let root: string;
@@ -45,6 +45,8 @@ describe('the update contract', () => {
     expect(INSTALL_ROOT_ENV).toBe('CONNECTOME_INSTALL_ROOT');
     expect(RESTART_EXIT_CODE).toBe(75);
     expect(JOURNAL_STEPS).toEqual(['lock', 'children-check', 'audit', 'copy', 'trial-start', 'commit', 'fallback', 'go-back', 'notes']);
+    expect(goBackListPath('/r', 'm1')).toBe('/r/set-aside/m1/places.json');
+    expect(PLACE_KINDS).toEqual(['dir', 'file', 'none']);
   });
 
   test('a record written atomically reads back, absent reads as null, and fields it does not know are kept for whoever does', () => {
@@ -471,6 +473,15 @@ describe('the update contract', () => {
       writeFileSync(path, JSON.stringify({ ...later, absent: list }));
       expect(() => lastCopy(root)).toThrow(unreadable);
     }
+    // A mark, when there is one, is a mark's id: one path segment.
+    writeFileSync(path, JSON.stringify({ ...later, mark: 'm1' }));
+    expect(lastCopy(root)).toEqual({ ...later, mark: 'm1' } as CopyLabel);
+    for (const mark of [7, '', '..', 'a/b', null, {}]) {
+      writeFileSync(path, JSON.stringify({ ...later, mark }));
+      expect(() => lastCopy(root)).toThrow(
+        new ContractError(`The copy's label at ${path} names a mark this release can't read: a mark's id is one path segment.`),
+      );
+    }
   });
 
   test("a Go back's list of places reads back, and one that's missing or that this release can't read is refused, naming it", () => {
@@ -499,6 +510,10 @@ describe('the update contract', () => {
       writeFileSync(path, JSON.stringify({ v: 1, places }));
       expect(() => readGoBackList(root, 'g1')).toThrow(unreadable);
     }
+    // A list the filesystem can't read is its own error, not one this release can't read.
+    rmSync(path);
+    mkdirSync(path);
+    expect(() => readGoBackList(root, 'g1')).toThrow(expect.objectContaining({ code: 'EISDIR' }));
   });
 
   test("the places a trial's fallback would undo: none without a trial, a switch's copy's, and a Go back's list", () => {
@@ -535,7 +550,14 @@ describe('the update contract', () => {
     writeJsonAtomic(copyLabelPath(copy), label);
     moveCurrent(root, '0.9.0');
     expect(() => trialPlaces(root)).toThrow(/under mark m1 took from 0\.9\.0, the release current names \(it holds 0\.10\.2's/);
+    // With no current at all, which the launcher refuses to start without, the copy is no one's.
+    unlinkSync(installPaths(root).current);
+    expect(() => trialPlaces(root)).toThrow(/under mark m1 took from no release, the release current names \(it holds 0\.10\.2's/);
+    // A label the filesystem can't read is passed on as its own error.
     moveCurrent(root, '0.10.2');
+    rmSync(copyLabelPath(copy));
+    mkdirSync(copyLabelPath(copy));
+    expect(() => trialPlaces(root)).toThrow(expect.objectContaining({ code: 'EISDIR' }));
     rmSync(copy, { recursive: true });
     expect(() => trialPlaces(root)).toThrow(/isn't the one the switch to 0\.11\.0 under mark m1 took from 0\.10\.2, the release current names, so/);
     // Once current names the release it tried, the trial is over, though the
