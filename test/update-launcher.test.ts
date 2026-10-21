@@ -1410,6 +1410,9 @@ describe('a Go back', () => {
     chmodSync(copied, 0o644);
     expect(steps().slice(-2)).toEqual(['trial-start refused g1', 'fallback ok g1']);
     expect(existsSync(itemStagingDir(kid, 'g1'))).toBe(false);
+    // The unfinished copy goes, and the place it made stays, empty.
+    expect(existsSync(`${itemStagingDir(kid, 'g1')}.tmp`)).toBe(false);
+    expect(readdirSync(kid).filter((name) => name !== ITEM_UPDATE_DIR)).toEqual([]);
     expect(store()).toBe('B wrote this');
   });
 
@@ -1820,7 +1823,9 @@ describe('a Go back', () => {
     });
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${sessions} is a directory another owns that this ` +
       `process can't write, and the Go back moves it out of ${data}, which a directory allows only to a process that may write ` +
-      `it. Give this user write on ${sessions}, or make this user its owner, or go back keeping the newer data`);
+      `it. Give this user write on ${sessions}, or make this user its owner`);
+    // Going back keeping the newer data isn't offered, since its fallback drives the same directory.
+    expect(reports.find((l) => l.includes("didn't go ahead"))).not.toContain('go back keeping the newer data');
     expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
     expect(store()).toBe('B wrote this');
     // One it owns gets owner write for the move, so the same Go back goes ahead.
@@ -1899,12 +1904,30 @@ describe('a Go back', () => {
     });
   }
 
-  test("a switch goes ahead over a sticky data directory another owns while it holds CAP_FOWNER, or owns the entries", async () => {
-    mark({ to: '0.11.0', why: 'update' });
-    await owned({ under: [data], others: [data, join(data, 'sessions')], sticky: [data], caps: FOWNER }, async () => {
-      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: true });
+  for (const [name, others, caps] of [
+    ['while it holds CAP_FOWNER', () => [data, join(data, 'sessions')], FOWNER],
+    ['while it owns the entries', () => [data], NO_CAPS],
+  ] as const) {
+    test(`a switch goes ahead over a sticky data directory another owns ${name}`, async () => {
+      mark({ to: '0.11.0', why: 'update' });
+      await owned({ under: [data], others: others(), sticky: [data], caps }, async () => {
+        expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: true });
+      });
+      expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
     });
-    expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
+  }
+
+  test("a Go back names a mount inside a directory it restores before what it couldn't move there", async () => {
+    await committedSwitch();
+    const sessions = join(data, 'sessions');
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    mounts = ['/', sessions];
+    await owned({ under: [data], others: [sessions], unwritable: [sessions], caps: NO_CAPS }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    });
+    const said = reports.find((l) => l.includes("didn't go ahead"))!;
+    expect(said).toContain(`${sessions} is a mount inside ${data}`);
+    expect(said).not.toContain("can't write");
   });
 
   for (const [name, arrange, refused] of [

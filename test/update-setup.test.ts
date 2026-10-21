@@ -18,7 +18,7 @@ import {
   type InstallRecord,
 } from '../src/update/contract.js';
 import { HOST_ENTRY, LAUNCHER } from '../src/update/launcher.js';
-import { ENTRY_POINT, parseArgs, setup, systemdUnits, type ServiceUnits, type SetupOptions } from '../src/update/setup.js';
+import { ENTRY_POINT, parseArgs, passwdHome, setup, systemdUnits, type ServiceUnits, type SetupOptions } from '../src/update/setup.js';
 
 let dir: string;
 let install: string;
@@ -476,17 +476,25 @@ describe('setup', () => {
   });
 
   test("units that set no working directory and run here by default are named, with what to do, beside those found and beside none", () => {
-    const note = (names: string, few: boolean) => `${names} ${few ? 'sets' : 'set'} no working directory, and so ${few ? 'runs' : 'run'} ` +
-      `in this one, ${few ? 'its' : 'their'} manager's default, as most units there are others'; setup doesn't check ${few ? 'it' : 'them'}. ` +
-      `If ${few ? 'it runs' : 'one of them runs'} the host, give the service WorkingDirectory=`;
+    const note = (names: string, few: boolean) => `${names} ${few ? 'sets' : 'set'} no working directory, so ${few ? 'it runs' : 'they run'} ` +
+      `in ${few ? 'its' : 'their'} systemd manager's default, which is this directory. Most units that do are no host's, so setup doesn't ` +
+      `check ${few ? 'it' : 'them'}. If ${few ? 'it runs' : 'one of them runs'} the host, give the service WorkingDirectory=` +
+      `${options().cwd} and run setup again, or check its restart settings by hand.`;
     units = { found: [], unasked: [], unresolved: [], defaulted: ['a.service'] };
     setup(options());
     expect(said.some((l) => l.includes("No loaded systemd service that this user can see is set to run from this directory, so setup couldn't check that.") &&
-      l.includes(note('a.service', true)) && l.includes(' and run setup again, or check its restart settings by hand.'))).toBe(true);
+      l.includes(note('a.service', true)))).toBe(true);
     said = [];
     units = { found: [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }], unasked: [], unresolved: [], defaulted: ['a.service', 'b.service'] };
     setup(options());
     expect(said.some((l) => l.startsWith(note('a.service, b.service', false)))).toBe(true);
+    // Beside a manager it couldn't ask, found or not.
+    for (const found of [[], [{ id: 'connectome.service', settings: 'Restart=on-failure', restarts: true }]]) {
+      said = [];
+      units = { found, unasked: ['system'], unresolved: [], defaulted: ['a.service'] };
+      setup(options());
+      expect(said.some((l) => l.includes("Setup couldn't ask systemd's system manager") && l.includes(note('a.service', true)))).toBe(true);
+    }
   });
 
   test("extra state that isn't there is said to be absent, and one whose path can't be followed gets a repair, not a permission", () => {
@@ -721,7 +729,7 @@ describe('the entry point', () => {
 });
 
 describe('the service check', () => {
-  const query = ['show', '--property=Id,WorkingDirectory,Restart,SuccessExitStatus,RestartPreventExitStatus,RestartForceExitStatus', '--', '*.service'];
+  const query = ['show', '--property=Id,WorkingDirectory,User,Restart,SuccessExitStatus,RestartPreventExitStatus,RestartForceExitStatus', '--', '*.service'];
 
   test("finds the units whose working directory is the install's, and whether each restarts the host on 75 and on 1", () => {
     const unit = (id: string, restart: string, where: string, success = '', prevent = '', force = '') =>
@@ -807,17 +815,42 @@ describe('the service check', () => {
       ].join('\n\n');
       const system = 'Id=system-none.service\nWorkingDirectory=\nRestart=always\n\nId=system-tilde.service\nWorkingDirectory=!~\nRestart=always';
       for (const home of [install, `${install}/`]) {
-        expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : system) }), home)).toEqual({
+        expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? user : system) }), home, () => null)).toEqual({
           found: [{ id: 'tilde.service', settings: 'Restart=always', restarts: true }], unasked: [],
           unresolved: ['system-tilde.service'], defaulted: ['sets-none.service'],
         });
       }
+      // One that sets the home itself, without the `!`, is found.
+      const explicit = `Id=explicit.service\nWorkingDirectory=${install}\nRestart=no`;
+      expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? explicit : '') }), install).found)
+        .toEqual([{ id: 'explicit.service', settings: 'Restart=no', restarts: false }]);
+      // A system unit's ~ is its User='s home, root's when it names none, found when it's this directory.
+      const homes: Record<string, string> = { connectome: install, root: '/root' };
+      const system2 = 'Id=as-user.service\nWorkingDirectory=!~\nUser=connectome\nRestart=always\n\n' +
+        'Id=as-root.service\nWorkingDirectory=!~\nUser=\nRestart=always';
+      expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? '' : system2) }), dir,
+        (name) => homes[name] ?? null)).toEqual({
+        found: [{ id: 'as-user.service', settings: 'Restart=always', restarts: true }], unasked: [], unresolved: [], defaulted: [],
+      });
     }
     // Run elsewhere, a unit that sets none is neither found nor named.
     const none = `Id=sets-none.service\nWorkingDirectory=!${dir}\nRestart=no`;
     expect(systemdUnits(install, (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? none : '') }), dir)).toEqual({
       found: [], unasked: [], unresolved: [], defaulted: [],
     });
+  });
+
+  test("run from /, a system unit that sets no working directory is named; an empty answer names no unit", () => {
+    const system = 'Id=sets-none.service\nWorkingDirectory=\nRestart=always';
+    expect(systemdUnits('/', (args) => ({ exitCode: 0, stdout: Buffer.from(args[0] === '--user' ? '' : system) }), dir)).toEqual({
+      found: [], unasked: [], unresolved: [], defaulted: ['sets-none.service'],
+    });
+    expect(systemdUnits('/', () => ({ exitCode: 0, stdout: Buffer.from('') }), dir)).toEqual({ found: [], unasked: [], unresolved: [], defaulted: [] });
+  });
+
+  test("a user's home from /etc/passwd, and none for a user it doesn't name", () => {
+    expect(passwdHome('root')).toBe('/root');
+    expect(passwdHome('no-such-user-here')).toBe(null);
   });
 
   test("names both managers when neither of systemd's queries answers", () => {

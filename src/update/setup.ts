@@ -142,6 +142,17 @@ export interface ServiceUnits {
  *  and a failed trial's. */
 const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
 
+/** The home /etc/passwd gives the user `name`, or null where it names none
+ *  or can't be read, as for a user another source of accounts serves. */
+export function passwdHome(name: string): string | null {
+  try {
+    const line = readFileSync('/etc/passwd', 'utf-8').split('\n').map((entry) => entry.split(':')).find((f) => f[0] === name);
+    return line?.[5] || null;
+  } catch {
+    return null;
+  }
+}
+
 /** What systemd's user and system managers say of their service units: those
  *  run from `cwd`, which manager couldn't be asked, and the units whose
  *  working directory this user can't resolve, such as one under /root or
@@ -151,10 +162,11 @@ const RESTART_ON = [String(RESTART_EXIT_CODE), '1'];
  *  for the system's, whose default is /. Most units in a home are others',
  *  so one there is `defaulted` rather than found when `cwd` is that default.
  *  One that sets ~ runs in its user's home: this user's for the user
- *  manager, and for the system's, its User='s, which this doesn't ask. Only
- *  units systemd has loaded are seen. */
+ *  manager, and for the system's, its User='s, root's when it names none,
+ *  as `homeOf` finds it. Only units systemd has loaded are seen. */
 export function systemdUnits(cwd: string, run = (args: string[]) =>
-  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' }), home = homedir()): ServiceUnits {
+  Bun.spawnSync(['systemctl', ...args], { stdout: 'pipe', stderr: 'pipe' }), home = homedir(),
+homeOf = passwdHome): ServiceUnits {
   const found: ServiceUnit[] = [];
   const unasked: string[] = [];
   const unresolved: string[] = [];
@@ -176,7 +188,7 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
     let result: { exitCode: number | null; stdout: Uint8Array | Buffer };
     try {
       result = run([...scope, 'show',
-        '--property=Id,WorkingDirectory,Restart,SuccessExitStatus,RestartPreventExitStatus,RestartForceExitStatus',
+        '--property=Id,WorkingDirectory,User,Restart,SuccessExitStatus,RestartPreventExitStatus,RestartForceExitStatus',
         '--', '*.service']) as never;
     } catch {
       unanswered();
@@ -188,6 +200,7 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
     }
     for (const block of Buffer.from(result.stdout).toString('utf-8').split(/\n\s*\n/)) {
       const fields = new Map(block.split('\n').map((l) => [l.slice(0, l.indexOf('=')), l.slice(l.indexOf('=') + 1)]));
+      if (!fields.has('Id')) continue;
       const shown = fields.get('WorkingDirectory') ?? '';
       const set = shown.replace(/^[-!+@:]+/, '');
       const id = fields.get('Id') ?? '?';
@@ -201,13 +214,14 @@ export function systemdUnits(cwd: string, run = (args: string[]) =>
         if (runsIn === here) defaulted.push(id);
         continue;
       }
-      if (set === '~' && !user) {
+      const tilde = set === '~' && !user ? homeOf(fields.get('User') || 'root') : home;
+      if (tilde === null) {
         unresolved.push(id);
         continue;
       }
       let real: string;
       try {
-        real = realOrResolved(set === '~' ? home : set);
+        real = realOrResolved(set === '~' ? tilde : set);
       } catch {
         unresolved.push(id);
         continue;
@@ -590,10 +604,10 @@ export function setup(options: SetupOptions): void {
     'the host, check its restart settings by hand, or run setup as a user who can reach its working directory.';
   const few = units.defaulted.length === 1;
   const defaultedNote = units.defaulted.length === 0 ? '' : ` ${units.defaulted.join(', ')} ${few ? 'sets' : 'set'} no ` +
-    `working directory, and so ${few ? 'runs' : 'run'} in this one, ${few ? 'its' : 'their'} manager's default, as most ` +
-    `units there are others'; setup doesn't check ${few ? 'it' : 'them'}. If ${few ? 'it runs' : 'one of them runs'} the ` +
-    `host, give the service WorkingDirectory=${shellWord(options.cwd)} and run setup again, or check its restart ` +
-    'settings by hand.';
+    `working directory, so ${few ? 'it runs' : 'they run'} in ${few ? 'its' : 'their'} systemd manager's default, which ` +
+    `is this directory. Most units that do are no host's, so setup doesn't check ${few ? 'it' : 'them'}. If ` +
+    `${few ? 'it runs' : 'one of them runs'} the host, give the service WorkingDirectory=${options.cwd.replace(/%/g, '%%')} ` +
+    'and run setup again, or check its restart settings by hand.';
   const notes = unresolvedNote + defaultedNote;
   const managers = units.unasked.map((scope) => `systemd's ${scope} manager`).join(' or ');
   if (units.found.length === 0) {

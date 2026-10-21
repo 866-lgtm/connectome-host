@@ -683,9 +683,9 @@ function restorePlace(root: string, from: string, place: Place, target: Kind, ma
   // A directory that's there keeps its own mode, as a file item does. One
   // made here is made with the copy's, with rwx for its owner, since it holds
   // its update area, so a replay finds it with that mode. Only when the umask
-  // takes bits from it, or it has setgid, which mkdir takes from the parent
-  // rather than from the mode, does the chmod after add them, and a cut
-  // between the two leaves it without them.
+  // takes bits from it, or setgid, which mkdir takes from the parent rather
+  // than from the mode, differs, does the chmod after set it, and a cut
+  // between the two leaves it with the mode mkdir gave it.
   const made = now === 'none';
   if (made) {
     makeDirs(dirname(place.path));
@@ -783,8 +783,13 @@ function putBack(root: string, markId: string, ops: LauncherOps): void {
       if (existsSync(dirname(place.path))) syncEntries(dirname(place.path));
     } else if (now === 'dir') {
       const { setAside, staging, any } = areas(place.path, markId);
-      // One the Go back made and never filled holds nothing to keep, and an
-      // empty staging area would stand in for the copy's at a later restore.
+      // A copy into the staging of one the restore made, cut off by its
+      // failure, is nobody's. (One that was there was staged before the line.)
+      removeTree(`${staging}.tmp`);
+      // One the Go back made and never filled holds nothing to keep. It's
+      // left, empty, rather than driven, since a drive would leave an empty
+      // staging area to stand in for the copy's at a later restore; removing
+      // it would want a mount check of its own.
       if (!any && readdirSync(place.path).every((name) => name === ITEM_UPDATE_DIR)) continue;
       stopForMounts(place.path, ops);
       if (!any) emptyArea(setAside);
@@ -1027,9 +1032,11 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
       ? stuckIn(dirname(place.path), () => [basename(place.path)]).map((path) => ({ path, why: 'sticky' as const }))[0] ?? null
       : place.before === 'dir' ? heldIn(place.path) : null;
     if (held === null) continue;
-    return { step: 'go-back', reason: from !== null
-      ? `${heldText(held, 'the Go back')}, or go back keeping the newer data`
-      : heldText(held, `the fallback, if ${mark.to} fails before it commits,`) };
+    // Going back keeping the newer data takes no file away, but its fallback
+    // drives the same directories, so it's offered only for a file.
+    if (from === null) return { step: 'go-back', reason: heldText(held, `the fallback, if ${mark.to} fails before it commits,`) };
+    return { step: 'go-back', reason: place.before === 'file'
+      ? `${heldText(held, 'the Go back')}, or go back keeping the newer data` : heldText(held, 'the Go back') };
   }
   const takenAway = places.filter((place) => place.before === 'file' && place.target === 'none');
   if (takenAway.length > 0) {
