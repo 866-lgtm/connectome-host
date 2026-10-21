@@ -135,6 +135,38 @@ function stuckIn(dir: string, names: () => string[]): string[] {
   return names().map((name) => join(dir, name)).filter((path) => lstatSync(path).uid !== uid);
 }
 
+/** What a restore of the directory `dir` couldn't move out of it into its
+ *  set-aside, and why: an entry its sticky bit keeps there (stuckIn), or a
+ *  directory another owns that this process can't write, since moving a
+ *  directory to another parent rewrites its `..` (one it owns gets owner
+ *  write for the move); null when it could move them all. */
+function heldIn(dir: string): { path: string; why: 'sticky' | 'unwritable' } | null {
+  const names = () => readdirSync(dir).filter((name) => name !== ITEM_UPDATE_DIR);
+  const stuck = stuckIn(dir, names)[0];
+  if (stuck !== undefined) return { path: stuck, why: 'sticky' };
+  const uid = process.getuid?.();
+  for (const path of names().map((name) => join(dir, name))) {
+    const stat = lstatSync(path);
+    if (!stat.isDirectory() || stat.uid === uid) continue;
+    try {
+      accessSync(path, constants.W_OK);
+    } catch {
+      return { path, why: 'unwritable' };
+    }
+  }
+  return null;
+}
+
+/** Why `held`, from heldIn or stuckIn, can't be moved, for a refusal that
+ *  goes on with what moves it. */
+function heldText(held: { path: string; why: 'sticky' | 'unwritable' }, moves: string): string {
+  return held.why === 'sticky'
+    ? `${held.path} is in ${dirname(held.path)}, which has the sticky bit, and neither is this process's, so ${moves} ` +
+      'couldn\'t move it. Give this user its ownership'
+    : `${held.path} is a directory another owns that this process can't write, and ${moves} moves it out of ` +
+      `${dirname(held.path)}, which rewrites its \`..\`. Give this user write on it, or its ownership`;
+}
+
 /** Whether the filesystem holding `path` can be written at all: not when it's
  *  mounted read-only, as a container's read-only file mount is. */
 function writableFilesystem(path: string): boolean {
@@ -814,6 +846,11 @@ async function checkSwitch(root: string, record: InstallRecord, mark: Mark, ops:
   if (unwritable !== null) return { step: 'copy', reason: unwritable };
   const mounts = mountProblem(dirs, ops);
   if (mounts !== null) return { step: 'copy', reason: mounts };
+  // A fallback's restore moves each directory's entries into its set-aside.
+  for (const dir of dirs) {
+    const held = heldIn(dir);
+    if (held !== null) return { step: 'copy', reason: heldText(held, `the fallback, if ${mark.to} fails before it commits,`) };
+  }
   const places = placesOf(present);
   // The copy, in the root; and a fallback's restore of it: a directory's
   // staged inside it, a file's present content kept in the root and the
@@ -975,20 +1012,14 @@ async function checkGoBack(root: string, record: InstallRecord, mark: Mark, ops:
       (place.before === 'none' && place.target === 'dir')).map((place) => existingAncestor(dirname(place.path))),
   ]);
   if (unwritable !== null) return { step: 'go-back', reason: unwritable };
-  // In a directory with the sticky bit, only an entry's owner, the
-  // directory's, or a process holding CAP_FOWNER may take the entry out,
-  // whatever the directory's write: a file the Go back takes away, and each
-  // entry of a directory it restores, which moves into its set-aside.
-  const pinned = places.flatMap((place) => {
-    if (place.before === 'file' && place.target !== 'file') return stuckIn(dirname(place.path), () => [basename(place.path)]);
-    if (place.before === 'dir' && from !== null) {
-      return stuckIn(place.path, () => readdirSync(place.path).filter((name) => name !== ITEM_UPDATE_DIR));
-    }
-    return [];
-  })[0];
-  if (pinned !== undefined) {
-    return { step: 'go-back', reason: `${pinned} is in ${dirname(pinned)}, which has the sticky bit, and neither is this ` +
-      'process\'s, so the Go back couldn\'t move it. Give this user its ownership, or go back keeping the newer data' };
+  // What it moves out of a directory, whatever the directory's write: a
+  // file it takes away, which the sticky bit may keep there, and each entry
+  // of a directory it restores, into its set-aside (heldIn).
+  for (const place of places) {
+    const held = place.before === 'file' && place.target !== 'file'
+      ? stuckIn(dirname(place.path), () => [basename(place.path)]).map((path) => ({ path, why: 'sticky' as const }))[0] ?? null
+      : place.before === 'dir' && from !== null ? heldIn(place.path) : null;
+    if (held !== null) return { step: 'go-back', reason: `${heldText(held, 'the Go back')}, or go back keeping the newer data` };
   }
   const mounts = mountProblem(places.filter((place) => place.before === 'dir').map((place) => place.path), ops);
   if (mounts !== null) return { step: 'go-back', reason: mounts };

@@ -1672,9 +1672,10 @@ describe('a Go back', () => {
    *  /proc/self/status gives them (null: no such file), with each path under
    *  `under` owned by `self`, but those in `others`, which another owns, and
    *  those in `sticky` given the sticky bit. */
-  async function owned(arrangement: { self?: number; under: string[]; others?: string[]; sticky?: string[]; caps: string | null },
-    body: () => Promise<void>): Promise<void> {
-    const { self = 4242, under, others = [], sticky = [], caps } = arrangement;
+  async function owned(arrangement: { self?: number; under: string[]; others?: string[]; sticky?: string[]; unwritable?: string[];
+    caps: string | null }, body: () => Promise<void>): Promise<void> {
+    const { self = 4242, under, others = [], sticky = [], unwritable = [], caps } = arrangement;
+    const realAccess = fs.accessSync;
     const realStat = fs.statSync;
     const realLstat = fs.lstatSync;
     const realRead = fs.readFileSync;
@@ -1695,6 +1696,12 @@ describe('a Go back', () => {
         if (caps === null) throw Object.assign(new Error("ENOENT: no such file or directory, open '/proc/self/status'"), { code: 'ENOENT' });
         return `Name:\tbun\nCapEff:\t${caps}\n`;
       }) as typeof fs.readFileSync),
+      spyOn(fs, 'accessSync').mockImplementation(((path: fs.PathLike, mode?: number) => {
+        if (unwritable.includes(String(path)) && ((mode ?? 0) & fs.constants.W_OK) !== 0) {
+          throw Object.assign(new Error(`EACCES: permission denied, access '${String(path)}'`), { code: 'EACCES' });
+        }
+        return realAccess(path, mode);
+      }) as typeof fs.accessSync),
     ];
     try {
       await body();
@@ -1779,6 +1786,47 @@ describe('a Go back', () => {
     });
     expect(reports.some((l) => l.includes('sticky bit'))).toBe(false);
   });
+
+  test("a Go back that restores a directory refuses, before its line, when a directory in it is another's and this process can't write it", async () => {
+    await committedSwitch();
+    const sessions = join(data, 'sessions');
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    await owned({ under: [data], others: [sessions], unwritable: [sessions], caps: FOWNER }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${sessions} is a directory another owns that this ` +
+      `process can't write, and the Go back moves it out of ${data}, which rewrites its \`..\`. Give this user write on it, or ` +
+      'its ownership, or go back keeping the newer data');
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
+    expect(store()).toBe('B wrote this');
+    // One it owns gets owner write for the move, so the same Go back goes ahead.
+    reports = [];
+    await owned({ under: [data], unwritable: [sessions], caps: NO_CAPS }, async () => {
+      expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    });
+    expect(store()).toBe('A wrote this');
+  });
+
+  for (const [name, arrangement, says] of [
+    ['a directory in the data directory that another owns and this process can\'t write',
+      () => ({ under: [data], others: [join(data, 'sessions')], unwritable: [join(data, 'sessions')], caps: NO_CAPS }),
+      () => `${join(data, 'sessions')} is a directory another owns that this process can't write, and the fallback, if 0.11.0 ` +
+        `fails before it commits, moves it out of ${data}, which rewrites its \`..\`. Give this user write on it, or its ownership`],
+    ['an entry another owns in a sticky data directory another owns',
+      () => ({ under: [data], others: [data, join(data, 'sessions')], sticky: [data], caps: NO_CAPS }),
+      () => `${join(data, 'sessions')} is in ${data}, which has the sticky bit, and neither is this process's, so the fallback, ` +
+        "if 0.11.0 fails before it commits, couldn't move it. Give this user its ownership"],
+  ] as const) {
+    test(`a switch is refused, before its copy, when its fallback couldn't restore the data: ${name}`, async () => {
+      mark({ to: '0.11.0', why: 'update' });
+      await owned(arrangement(), async () => {
+        expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: false });
+      });
+      expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(says());
+      expect(lastCopy(root)).toBe(null);
+      expect(existsSync(installPaths(root).mark)).toBe(true);
+    });
+  }
 
   for (const [name, arrange, refused] of [
     ["a file it may write, though another owns it, is restored", () => chmodSync(settings, 0o666), false],
