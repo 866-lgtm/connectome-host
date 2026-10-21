@@ -67,7 +67,7 @@ import { McplAdminModule } from './modules/mcpl-admin-module.js';
 import { LifecycleModule } from './modules/lifecycle-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
-import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
+import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
 import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, batchEchoLine, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
 import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
@@ -621,15 +621,10 @@ async function createFramework(
         );
       }
     }
-    // A credential over ws:// to another machine is readable on the network
-    // between. mcpl_deploy refuses one; an operator's recipe, or an overlay
-    // entry saved before that refusal, still loads, with this warning. A
-    // grant counts only where the identity attaches its credential.
-    const cleartext = cleartextCredentialWarning(server.id, {
-      ...withEnv,
-      access: withEnv.accessProvider ? withEnv.access : undefined,
-    });
-    if (cleartext) console.error(cleartext);
+    // A credential over ws:// or http:// to another machine is readable on
+    // the network between. mcpl_deploy refuses one; an operator's recipe, or
+    // an overlay entry saved before that refusal, still loads, and
+    // agent-framework warns when it connects (serverConfigWarnings).
     return withEnv;
   });
 
