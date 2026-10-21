@@ -183,8 +183,8 @@ export interface InstallRecord {
   v: 1;
   /** The data directory this install serves; the entry point refuses another. */
   dataDir: string;
-  /** Server state setup found outside the data directory, copied with it. */
-  serverState: string[];
+  /** State kept outside the data directory, which each update copies with it. */
+  extraState: string[];
 }
 
 /** mark.json, written by the host. */

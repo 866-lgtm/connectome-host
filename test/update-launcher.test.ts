@@ -132,7 +132,7 @@ beforeEach(() => {
   release('0.10.2');
   release('0.11.0');
   moveCurrent(root, '0.10.2');
-  writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, serverState: [] } satisfies InstallRecord);
+  writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [] } satisfies InstallRecord);
   alive = new Set();
   groups = new Set();
   free = 2 ** 40;
@@ -184,15 +184,25 @@ describe('a start with nothing asked', () => {
     await expect(decide(root, o)).rejects.toThrow(ContractError);
   });
 
+  test("refuses a current that's there and isn't a link, saying setup says how to put it right", async () => {
+    rmSync(installPaths(root).current);
+    writeFileSync(installPaths(root).current, '');
+    const thrown = await decide(root, ops()).catch((error) => error);
+    expect(thrown).toBeInstanceOf(ContractError);
+    expect(thrown.message).toMatch(/current is there and isn't a link\. Run setup again, which says how to put it right/);
+  });
+
   test('refuses an install record it cannot read, saying to run setup again', async () => {
-    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: 5, serverState: [] });
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: 5, extraState: [] });
     await expect(decide(root, ops())).rejects.toThrow(/Run setup again/);
   });
 
   for (const [name, fields, says] of [
     ['an id that is no path segment', { id: 'a/b', to: '0.11.0', why: 'update' }, /has no id this release can use/],
     ['a release that is no path segment', { to: '../0.11.0', why: 'update' }, /names no release this release can use/],
-    ['a request it does not know', { to: '0.11.0', why: 'sideways' as Mark['why'] }, /which this release doesn't know/],
+    ['a request it does not know', { to: '0.11.0', why: 'sideways' as Mark['why'] }, /asks for "sideways", which this release doesn't know/],
+    ['no request', { to: '0.11.0', why: undefined as unknown as Mark['why'] }, /names no request, which this release doesn't know/],
+    ['a long request', { to: '0.11.0', why: 'x'.repeat(100) as Mark['why'] }, new RegExp(`asks for "${'x'.repeat(79)}… \\(cut\\), which`)],
   ] as const) {
     test(`a mark with ${name}: starts the release current names, says why, and keeps the mark`, async () => {
       mark(fields);
@@ -206,7 +216,7 @@ describe('a start with nothing asked', () => {
 });
 
 describe('what a switch copies', () => {
-  test("the data directory, the settings files, each child's directory and the server state recorded, each once", () => {
+  test("the data directory, the settings files, each child's directory and the extra state recorded, each once", () => {
     writeFileSync(join(work, 'mcpl-servers.agent.json'), '{"agent":1}');
     writeFileSync(join(dir, 'state.json'), 'server state');
     writeFileSync(join(data, 'inner.json'), 'inside the data');
@@ -215,7 +225,7 @@ describe('what a switch copies', () => {
     child('kid', join(dir, 'kid'));
     const record: InstallRecord = {
       v: 1, dataDir: data,
-      serverState: [join(dir, 'state.json'), join(data, 'inner.json'), join(dir, 'data-link'), join(dir, 'gone.json'), join(data, 'missing.json')],
+      extraState: [join(dir, 'state.json'), join(data, 'inner.json'), join(dir, 'data-link'), join(dir, 'gone.json'), join(data, 'missing.json')],
     };
     expect(dataItems(root, record, ops())).toEqual({
       present: [data, join(dir, 'kid'), join(dir, 'state.json'), settings, join(work, 'mcpl-servers.agent.json')].sort(),
@@ -226,7 +236,7 @@ describe('what a switch copies', () => {
   test("a child's data directory written relative to the working directory is the one there", () => {
     mkdirSync(join(work, 'kids', 'kid'), { recursive: true });
     child('kid', join('kids', 'kid'));
-    expect(dataItems(root, { v: 1, dataDir: data, serverState: [] }, ops()).present).toContain(join(work, 'kids', 'kid'));
+    expect(dataItems(root, { v: 1, dataDir: data, extraState: [] }, ops()).present).toContain(join(work, 'kids', 'kid'));
   });
 
   test("places that aren't there, named twice or one inside another, are one place, the outermost", () => {
@@ -235,15 +245,15 @@ describe('what a switch copies', () => {
       { name: 'b', pid: null, bootId: null, dataDir: join(dir, 'kids', 'b') },
       { name: 'c', pid: null, bootId: null, dataDir: join(dir, 'kids') },
     ] });
-    expect(dataItems(root, { v: 1, dataDir: data, serverState: [] }, ops()).absent)
+    expect(dataItems(root, { v: 1, dataDir: data, extraState: [] }, ops()).absent)
       .toEqual([join(dir, 'kids'), join(work, 'mcpl-servers.agent.json')]);
   });
 
   test('refuses a root inside the data, and data inside the root', () => {
-    const record: InstallRecord = { v: 1, dataDir: data, serverState: [] };
+    const record: InstallRecord = { v: 1, dataDir: data, extraState: [] };
     expect(() => dataItems(join(data, 'root'), record, ops())).toThrow(/one inside the other/);
     writeFileSync(join(root, 'state.json'), 'x');
-    expect(() => dataItems(root, { ...record, serverState: [join(root, 'state.json')] }, ops())).toThrow(/one inside the other/);
+    expect(() => dataItems(root, { ...record, extraState: [join(root, 'state.json')] }, ops())).toThrow(/one inside the other/);
   });
 
   test("the machine's own list of mounts on Linux holds /, and a platform with no list has none", () => {
@@ -685,7 +695,7 @@ describe('a switch', () => {
     const locked = join(dir, 'locked');
     mkdirSync(locked);
     writeJsonAtomic(installPaths(root).install,
-      { v: 1, dataDir: data, serverState: [join(locked, 'state.json')] } satisfies InstallRecord);
+      { v: 1, dataDir: data, extraState: [join(locked, 'state.json')] } satisfies InstallRecord);
     chmodSync(locked, 0o111);
     try {
       mark({ to: '0.11.0', why: 'update' });
@@ -850,10 +860,10 @@ describe('a switch', () => {
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${settings} is a link to something that isn't there`);
   });
 
-  test('refused when recorded server state is neither a file nor a directory', async () => {
+  test('refused when recorded extra state is neither a file nor a directory', async () => {
     const fifo = join(dir, 'state.fifo');
     Bun.spawnSync(['mkfifo', fifo]);
-    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, serverState: [fifo] } satisfies InstallRecord);
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [fifo] } satisfies InstallRecord);
     mark({ to: '0.11.0', why: 'update' });
     expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: false });
     expect(reports.find((l) => l.includes("didn't go ahead"))).toContain('is neither a file nor a directory');
@@ -929,6 +939,36 @@ describe('a switch', () => {
     }
     await decide(root, ops());
     expect(existsSync(copyPrev)).toBe(false);
+  });
+
+  test("a copy that fails, and whose unfinished copy can't be removed: both are said, the mark stands, and the next start removes it", async () => {
+    await committedSwitch();
+    release('0.12.0');
+    mark({ id: 'm2', to: '0.12.0', why: 'update' });
+    chmodSync(join(data, 'sessions', 'store.txt'), 0o000);
+    const failing = (real: (...a: never[]) => unknown) => ((path: fs.PathLike, ...rest: never[]) => {
+      if (String(path).startsWith(installPaths(root).copyTmp)) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return real(path as never, ...rest);
+    });
+    const [realRm, realRmdir] = [fs.rmSync, fs.rmdirSync];
+    const rm = spyOn(fs, 'rmSync').mockImplementation(failing(realRm as never) as typeof fs.rmSync);
+    const rmdir = spyOn(fs, 'rmdirSync').mockImplementation(failing(realRmdir as never) as typeof fs.rmdirSync);
+    try {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      rm.mockRestore();
+      rmdir.mockRestore();
+      chmodSync(join(data, 'sessions', 'store.txt'), 0o644);
+    }
+    expect(steps().at(-1)).toBe('copy failed m2');
+    expect(reports.find((l) => l.includes('Removing a copy a switch left unfinished'))).toContain('a later start tries again');
+    expect(reports.at(-1)).toMatch(/the copy failed/);
+    expect(existsSync(installPaths(root).copyTmp)).toBe(true);
+    expect(existsSync(installPaths(root).mark)).toBe(true);
+    rmSync(installPaths(root).mark);
+    reports = [];
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(existsSync(installPaths(root).copyTmp)).toBe(false);
   });
 
   test('a copy that fails: the copy before it stays whole, the mark stands, and nothing of the new one stays', async () => {
@@ -1394,13 +1434,29 @@ describe('a Go back', () => {
   });
 
   test("a Go back refuses a file place that is a link now, and one it would take away that is a mount", async () => {
+    const statePath = join(dir, 'state.json');
+    writeFileSync(statePath, '{"s":1}');
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [statePath] } satisfies InstallRecord);
     await committedSwitch();
     writeFileSync(join(dir, 'real.json'), '{}');
     rmSync(settings);
     symlinkSync(join(dir, 'real.json'), settings);
     mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
     expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
-    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${settings} is a link now`);
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${settings}, where the copy of 0.10.2's data took ` +
+      `a place, leads to ${join(realpathSync(dir), 'real.json')} now, through a link`);
+    // One that leads nowhere, which the record no longer lists, isn't written through either.
+    rmSync(settings);
+    writeFileSync(settings, '{"b":2}');
+    rmSync(join(dir, 'real.json'));
+    rmSync(statePath);
+    symlinkSync(join(dir, 'nowhere.json'), statePath);
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [] } satisfies InstallRecord);
+    reports = [];
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${statePath} is a link now`);
+    rmSync(statePath);
+    writeFileSync(statePath, '{"s":1}');
     rmSync(settings);
     writeFileSync(settings, '{"b":2}');
     const agent = join(work, 'mcpl-servers.agent.json');
@@ -1547,6 +1603,31 @@ describe('a Go back', () => {
     expect(read(settings)).toBe('{"trial":1}');
   });
 
+  test("a Go back refuses, before its line, to change a file this process may not write and doesn't own", async () => {
+    await committedSwitch();
+    chmodSync(settings, 0o444);
+    const realStat = fs.statSync;
+    const stat = spyOn(fs, 'statSync').mockImplementation(((path: fs.PathLike, options?: fs.StatSyncOptions) => {
+      const found = realStat(path, options as never) as fs.Stats;
+      if (String(path) === settings) return Object.assign(Object.create(Object.getPrototypeOf(found)), found, { uid: found.uid + 1 });
+      return found;
+    }) as typeof fs.statSync);
+    try {
+      mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      stat.mockRestore();
+      chmodSync(settings, 0o644);
+    }
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${settings} can't be written by this process, which doesn't own it`);
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
+    expect(read(settings)).toBe('{"b":2}');
+    // Its owner gives itself write for the write, so the same file it owns goes ahead.
+    chmodSync(settings, 0o444);
+    expect(await decide(root, ops())).toEqual({ release: '0.10.2', trial: true });
+    expect(read(settings)).toBe('{"a":1}');
+  });
+
   test("a Go back refuses, before its line, to change a file on a read-only filesystem, and goes ahead when the file holds the copy's content", async () => {
     await committedSwitch();
     const ro = readOnlyFilesystem([settings]);
@@ -1614,6 +1695,41 @@ describe('a Go back', () => {
     expect(store()).toBe('B wrote this');
   });
 
+  test("a Go back whose place leads elsewhere now, through a link a move left, is refused before its line", async () => {
+    const cfg = join(dir, 'cfg');
+    mkdirSync(cfg);
+    writeFileSync(join(cfg, 'state.json'), '{"a":1}');
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [join(cfg, 'state.json')] } satisfies InstallRecord);
+    await committedSwitch();
+    // Its directory moved, with a link left where it was: the file is found
+    // at its new path in its own right, beside the copy's.
+    renameSync(cfg, join(dir, 'cfg-moved'));
+    symlinkSync(join(dir, 'cfg-moved'), cfg);
+    writeFileSync(join(dir, 'cfg-moved', 'state.json'), '{"b":2}');
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(`${join(cfg, 'state.json')}, where the copy of ` +
+      `0.10.2's data took a place, leads to ${join(realpathSync(join(dir, 'cfg-moved')), 'state.json')} now, through a link`);
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
+    expect(read(join(dir, 'cfg-moved', 'state.json'))).toBe('{"b":2}');
+  });
+
+  test("a Go back is refused while a place recorded since the switch holds one the copy took on its own", async () => {
+    const stateDir = join(dir, 'state');
+    mkdirSync(stateDir);
+    writeFileSync(join(stateDir, 'config.json'), '{"a":1}');
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [join(stateDir, 'config.json')] } satisfies InstallRecord);
+    await committedSwitch();
+    writeFileSync(join(stateDir, 'other.json'), 'newer');
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [stateDir] } satisfies InstallRecord);
+    mark({ id: 'g1', to: '0.10.2', why: 'go-back' });
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(reports.find((l) => l.includes("didn't go ahead"))).toContain(
+      `${stateDir} is recorded now, and holds ${join(stateDir, 'config.json')}, which the copy of 0.10.2's data took on its own`);
+    expect(readJournal(root).some((l) => l.step === 'go-back' && l.outcome === 'ok')).toBe(false);
+    expect(read(join(stateDir, 'other.json'))).toBe('newer');
+  });
+
   test("a restore that fails before a later file place: putting back puts that file back from what the Go back kept before its line", async () => {
     const kid = join(dir, 'kid');
     mkdirSync(kid);
@@ -1621,11 +1737,11 @@ describe('a Go back', () => {
     child('kid', kid);
     await committedSwitch();
     rmSync(kid, { recursive: true });
-    // Server state recorded since the switch: a place the copy doesn't list,
+    // Extra state recorded since the switch: a place the copy doesn't list,
     // after every place it does.
     const state = join(dir, 'state.json');
     writeFileSync(state, '{"state":1}');
-    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, serverState: [state] } satisfies InstallRecord);
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: [state] } satisfies InstallRecord);
     const copied = join(installPaths(root).copy, lastCopy(root)!.items.find((i) => i.path === kid)!.name, 'store.txt');
     chmodSync(copied, 0o000);
     try {
@@ -1783,6 +1899,49 @@ describe('leftovers', () => {
     expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
     expect(existsSync(setAsideDir(root, 'stale'))).toBe(false);
     expect(existsSync(installPaths(root).copyTmp)).toBe(false);
+  });
+
+  test("a set-aside directory that can't be listed is said, and nothing in it is removed", async () => {
+    await committedSwitch();
+    mkdirSync(setAsideDir(root, 'stale'), { recursive: true });
+    writeJsonAtomic(join(setAsideDir(root, 'stale'), 'places.json'), { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
+    chmodSync(installPaths(root).setAside, 0o300);
+    try {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      chmodSync(installPaths(root).setAside, 0o755);
+    }
+    expect(reports.find((l) => l.includes("can't be listed, so it stays for now"))).toContain('EACCES');
+    expect(existsSync(join(setAsideDir(root, 'stale'), 'places.json'))).toBe(true);
+  });
+
+  test("an area of a Go back's preparation that can't be removed is said, its list stays to name it, and a later start removes both", async () => {
+    await committedSwitch();
+    mkdirSync(setAsideDir(root, 'stale'), { recursive: true });
+    writeJsonAtomic(join(setAsideDir(root, 'stale'), 'places.json'), { v: 1, places: [{ path: data, name: '0-data', before: 'dir', target: 'dir' }] });
+    const area = itemSetAsideDir(data, 'stale');
+    mkdirSync(area, { recursive: true });
+    writeFileSync(join(area, 'kept.txt'), 'kept');
+    const failing = (real: (...a: never[]) => unknown) => ((path: fs.PathLike, ...rest: never[]) => {
+      if (String(path).startsWith(area)) throw Object.assign(new Error('EACCES'), { code: 'EACCES' });
+      return real(path as never, ...rest);
+    });
+    const [realRm, realRmdir] = [fs.rmSync, fs.rmdirSync];
+    const rm = spyOn(fs, 'rmSync').mockImplementation(failing(realRm as never) as typeof fs.rmSync);
+    const rmdir = spyOn(fs, 'rmdirSync').mockImplementation(failing(realRmdir as never) as typeof fs.rmdirSync);
+    try {
+      expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    } finally {
+      rm.mockRestore();
+      rmdir.mockRestore();
+    }
+    expect(reports.find((l) => l.includes('Removing what the Go back under mark stale kept failed'))).toContain('a later start tries again');
+    expect(existsSync(join(setAsideDir(root, 'stale'), 'places.json'))).toBe(true);
+    expect(existsSync(area)).toBe(true);
+    reports = [];
+    expect(await decide(root, ops())).toEqual({ release: '0.11.0', trial: false });
+    expect(existsSync(area)).toBe(false);
+    expect(existsSync(setAsideDir(root, 'stale'))).toBe(false);
   });
 
   test("one whose directory the system won't search stays too, and the start says so", async () => {

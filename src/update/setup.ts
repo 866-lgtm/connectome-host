@@ -4,11 +4,11 @@
  * host in, with the release that brings the update mechanism installed, and
  * with DATA_DIR as the service gives the host (./data when it's unset):
  *
- *   DATA_DIR=... bun node_modules/@animalabs/connectome-host/src/update/setup.ts [--root DIR] [--server-state PATH]...
+ *   DATA_DIR=... bun node_modules/@animalabs/connectome-host/src/update/setup.ts [--root DIR] [--extra-state PATH]...
  *
  * It copies the install's code into the install root as its first release,
  * points `current` at the release, records the data directory the install
- * serves and any MCPL server state kept outside it, and writes the entry
+ * serves and any state kept outside it, which each update copies with it, and writes the entry
  * point, in that order, so a record always has a `current`. It then checks
  * that the service restarts the host when it exits with 75, as a switch's
  * restart does, and with 1, as a trial that ends before its commit does.
@@ -17,7 +17,7 @@
  *
  * Run again, it finishes whatever a run cut off left undone, and changes
  * nothing an earlier run finished: the release `current` names stays. With
- * --server-state, it records the paths given in place of those recorded;
+ * --extra-state, it records the paths given in place of those recorded;
  * without, those recorded stay.
  */
 import {
@@ -196,9 +196,9 @@ export interface SetupOptions {
   /** The data directory a host started there serves. */
   dataDir: string;
   root: string;
-  /** MCPL server state kept outside the data directory, or null to keep what
+  /** State kept outside the data directory, which each update copies with it, or null to keep what
    *  an earlier run recorded. */
-  serverState: string[] | null;
+  extraState: string[] | null;
   /** This package's directory. */
   hostRoot: string;
   say(line: string): void;
@@ -224,6 +224,16 @@ function errorText(error: unknown): string {
 }
 
 /** `path` as a shell reads it, quoted when it holds anything but plain characters. */
+/** What to do about `error`, met looking at a path: what `permission` says
+ *  for one a permission causes, which permissions mend; for any other, such
+ *  as a file where a directory should be or a loop of links, the path itself
+ *  is what's wrong. */
+function lookAdvice(error: unknown, permission: string): string {
+  const code = (error as NodeJS.ErrnoException).code;
+  return code === 'EACCES' || code === 'EPERM' ? `${permission}, and run setup again.`
+    : 'Repair what that path runs through, and run setup again.';
+}
+
 function shellWord(path: string): string {
   return /^[\w@%+=:,./-]+$/.test(path) ? path : `'${path.replace(/'/g, "'\\''")}'`;
 }
@@ -243,12 +253,12 @@ export function setup(options: SetupOptions): void {
       'gives the host.');
   }
   const dataDir = realpathSync(options.dataDir);
-  const given = options.serverState?.map((path) => {
-    if (!existsSync(path)) throw new ContractError(`The server state ${path} isn't there.`);
+  const given = options.extraState?.map((path) => {
+    if (!existsSync(path)) throw new ContractError(`The extra state ${path} isn't there.`);
     const real = realpathSync(path);
     const stat = lstatSync(real);
     if (!stat.isFile() && !stat.isDirectory()) {
-      throw new ContractError(`The server state ${path} is neither a file nor a directory, so a copy can't hold it.`);
+      throw new ContractError(`The extra state ${path} is neither a file nor a directory, so a copy can't hold it.`);
     }
     return real;
   }) ?? null;
@@ -260,8 +270,8 @@ export function setup(options: SetupOptions): void {
     }
   }
 
-  const writeAgain = `Write it again as {"v": 1, "dataDir": ${JSON.stringify(dataDir)}, "serverState": []}, listing in ` +
-    'serverState the paths it listed, where they can still be read, and any MCPL server state kept outside the data ' +
+  const writeAgain = `Write it again as {"v": 1, "dataDir": ${JSON.stringify(dataDir)}, "extraState": []}, listing in ` +
+    'extraState the paths it listed, where they can still be read, and any other state kept outside the data ' +
     'directory, and run setup again.';
   let existing: InstallRecord | null;
   try {
@@ -291,7 +301,7 @@ export function setup(options: SetupOptions): void {
   if (existing === null && existsSync(paths.releases) &&
     (existsSync(paths.journal) || existsSync(join(root, ENTRY_POINT)))) {
     throw new ContractError(`The install at ${root} has ${existsSync(paths.journal) ? 'a journal' : 'its entry point'} ` +
-      `and no record at ${paths.install}, so its record is gone, and with it the server state it listed. ${writeAgain}`);
+      `and no record at ${paths.install}, so its record is gone, and with it the extra state it listed. ${writeAgain}`);
   }
   const link = `\`ln -sfn ${shellWord(join('releases', '<that release>'))} ${shellWord(paths.current)}\``;
   const current = (): string | null => {
@@ -304,7 +314,8 @@ export function setup(options: SetupOptions): void {
       // whose last part isn't a release's name. Anything else is its own.
       const isLink = error instanceof ContractError;
       if (!isLink && (error as NodeJS.ErrnoException).code !== 'EINVAL') {
-        throw new ContractError(`${paths.current} can't be looked at: ${errorText(error)}.`);
+        throw new ContractError(`${paths.current} can't be looked at: ${errorText(error)}. ` +
+          lookAdvice(error, `Give this user search on ${root}`));
       }
       throw new ContractError(`${paths.current} ${isLink ? `is a link to ${readlinkSync(paths.current)}, which names no ` +
         'release' : 'is there and isn\'t a link'}, so it can't say which release this install runs. ` +
@@ -317,12 +328,12 @@ export function setup(options: SetupOptions): void {
     throw new ContractError(`The install at ${root} serves ${existing.dataDir}, not ${dataDir}. Each service needs an ` +
       'install of its own: give this one another --root.');
   }
-  const recorded = existing?.serverState;
+  const recorded = existing?.extraState;
   if (existing !== null && given === null &&
     !(Array.isArray(recorded) && recorded.every((path) => typeof path === 'string'))) {
-    throw new ContractError(`The install record at ${paths.install} has no list of server state this release can read. ` +
-      'Run setup again with --server-state PATH for each MCPL server\'s state kept outside the data directory, or, with ' +
-      'none, set serverState to [] in the record.');
+    throw new ContractError(`The install record at ${paths.install} has no list of extra state this release can read. ` +
+      'Run setup again with --extra-state PATH for each place of state kept outside the data directory, such as an MCPL ' +
+      'server\'s, or, with none, set extraState to [] in the record.');
   }
   if (existing !== null && current() === null) {
     const lines = readJournal(root);
@@ -357,7 +368,7 @@ export function setup(options: SetupOptions): void {
         if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
           throw new ContractError(`The install at ${root} has its record and no ${paths.current}, and the journal has ` +
             `no line, so it's the release setup installed; ${paths.releases} can't be listed to say which: ` +
-            `${errorText(error)}. Make it readable to this user, and run setup again.`);
+            `${errorText(error)}. ${lookAdvice(error, 'Make it readable to this user')}`);
         }
         releases = [];
       }
@@ -382,7 +393,7 @@ export function setup(options: SetupOptions): void {
     throw new ContractError(`${root} isn't empty, and holds no install record, so it isn't an install setup made. ` +
       'Choose another --root.');
   }
-  const serverState = given ?? recorded ?? [];
+  const extraState = given ?? recorded ?? [];
 
   // A module's own path is its real one, so a host reached through a link
   // reads as wherever the link leads: the directory's own node_modules says
@@ -458,12 +469,17 @@ export function setup(options: SetupOptions): void {
   const running = current();
   if (running !== null) {
     const release = releaseDir(root, running);
-    let host: boolean;
+    // Followed through any link, as the launcher's start does: a link to
+    // nothing is no host.
+    let host = true;
     try {
-      host = exists(join(release, HOST_ENTRY));
+      statSync(join(release, HOST_ENTRY));
     } catch (error) {
-      throw new ContractError(`${paths.current} names ${running}, and its host at ${join(release, HOST_ENTRY)} can't be ` +
-        `looked at: ${errorText(error)}. Give this user search on each directory on the way, and run setup again.`);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw new ContractError(`${paths.current} names ${running}, and its host at ${join(release, HOST_ENTRY)} can't ` +
+          `be looked at: ${errorText(error)}. ${lookAdvice(error, 'Give this user search on each directory on the way')}`);
+      }
+      host = false;
     }
     if (!host) {
       throw new ContractError(`${paths.current} names ${running}, and there's no host at ${join(release, HOST_ENTRY)}, ` +
@@ -492,7 +508,7 @@ export function setup(options: SetupOptions): void {
         `${shellWord(join('releases', running))} ${shellWord(paths.current)}\`, and run setup again.`);
     }
   }
-  writeJsonAtomic(paths.install, { v: 1, dataDir: existing?.dataDir ?? dataDir, serverState } satisfies InstallRecord);
+  writeJsonAtomic(paths.install, { v: 1, dataDir: existing?.dataDir ?? dataDir, extraState } satisfies InstallRecord);
   const entry = join(root, ENTRY_POINT);
   writeFileSync(`${entry}.tmp`, entryPointText());
   syncPath(`${entry}.tmp`);
@@ -504,7 +520,9 @@ export function setup(options: SetupOptions): void {
   } else {
     say(`The install at ${root} serves ${existing?.dataDir ?? dataDir} and runs ${readCurrent(root)}, as before.`);
   }
-  say(`Server state copied with the data: ${serverState.join(', ') || 'none recorded (pass --server-state PATH for each MCPL server\'s state kept outside the data directory)'}.`);
+  say(`State kept outside the data directory, which each update copies with it: ${extraState.join(', ') || 'none recorded ' +
+    '(pass --extra-state PATH for each place of it, such as an MCPL server\'s state, and for those already recorded too, ' +
+    'since a run given any records only those)'}.`);
   say(`The service starts the host with \`${shellWord(process.execPath)} ${shellWord(entry)}\`, followed by the arguments ` +
     `it gives the host${settingUp ? ' now; set that, and restart it' : ''}.`);
   const units = options.units(options.cwd);
@@ -528,19 +546,19 @@ export function setup(options: SetupOptions): void {
   }
 }
 
-export function parseArgs(argv: string[]): { root?: string; serverState: string[] | null } {
-  const out: { root?: string; serverState: string[] | null } = { serverState: null };
+export function parseArgs(argv: string[]): { root?: string; extraState: string[] | null } {
+  const out: { root?: string; extraState: string[] | null } = { extraState: null };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg !== '--root' && arg !== '--server-state') {
-      throw new ContractError(`Setup takes --root DIR and --server-state PATH, not ${JSON.stringify(arg)}.`);
+    if (arg !== '--root' && arg !== '--extra-state') {
+      throw new ContractError(`Setup takes --root DIR and --extra-state PATH, not ${JSON.stringify(arg)}.`);
     }
     const value = argv[++i];
     if (value === undefined) {
       throw new ContractError(`Setup's ${arg} takes ${arg === '--root' ? 'a directory' : 'a path'}, and none followed it.`);
     }
     if (arg === '--root') out.root = value;
-    else (out.serverState ??= []).push(resolve(value));
+    else (out.extraState ??= []).push(resolve(value));
   }
   return out;
 }
@@ -552,7 +570,7 @@ if (import.meta.main) {
       cwd: process.cwd(),
       dataDir: resolve(process.env.DATA_DIR || './data'),
       root: args.root ?? join(process.cwd(), 'connectome-host'),
-      serverState: args.serverState,
+      extraState: args.extraState,
       hostRoot: resolve(dirname(fileURLToPath(import.meta.url)), '..', '..'),
       say: (line) => console.log(line),
       units: (cwd) => systemdUnits(cwd),

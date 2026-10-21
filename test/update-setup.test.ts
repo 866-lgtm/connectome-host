@@ -31,7 +31,7 @@ const options = (over: Partial<SetupOptions> = {}): SetupOptions => ({
   cwd: install,
   dataDir: data,
   root,
-  serverState: null,
+  extraState: null,
   hostRoot: join(install, 'node_modules', '@animalabs', 'connectome-host'),
   say: (line) => { said.push(line); },
   units: () => units,
@@ -78,7 +78,7 @@ describe('setup', () => {
     expect(existsSync(join(release, 'package.json'))).toBe(true);
     expect(readlinkSync(join(release, 'node_modules', '.bin', 'connectome-host'))).toBe('../@animalabs/connectome-host/src/index.ts');
     expect(readCurrent(root)).toBe('0.10.2');
-    expect(record()).toEqual({ v: 1, dataDir: data, serverState: [] });
+    expect(record()).toEqual({ v: 1, dataDir: data, extraState: [] });
     expect(existsSync(join(root, ENTRY_POINT))).toBe(true);
     expect(said[0]).toBe(`Set up ${root} as the install of 0.10.2 that serves ${data}.`);
     expect(said.some((l) => l.includes('connectome.service restarts the host when it exits with 75 or 1 (Restart=on-failure)'))).toBe(true);
@@ -104,20 +104,20 @@ describe('setup', () => {
     expect(said.some((l) => l.includes("connectome.service won't restart the host"))).toBe(true);
   });
 
-  test('records server state given outside the data directory; a later run without any keeps it, and one with some records those instead', () => {
+  test('records extra state given outside the data directory; a later run without any keeps it, and one with some records those instead', () => {
     const state = join(install, 'mcpl-state');
     const other = join(install, 'other-state.json');
     mkdirSync(state);
     writeFileSync(other, '{}');
-    setup(options({ serverState: [state] }));
-    expect(record()!.serverState).toEqual([state]);
+    setup(options({ extraState: [state] }));
+    expect(record()!.extraState).toEqual([state]);
     setup(options());
-    expect(record()!.serverState).toEqual([state]);
+    expect(record()!.extraState).toEqual([state]);
     said = [];
-    setup(options({ serverState: [other] }));
-    expect(record()!.serverState).toEqual([other]);
+    setup(options({ extraState: [other] }));
+    expect(record()!.extraState).toEqual([other]);
     expect(said[0]).toBe(`The install at ${root} serves ${data} and runs 0.10.2, as before.`);
-    expect(said[1]).toBe(`Server state copied with the data: ${other}.`);
+    expect(said[1]).toBe(`State kept outside the data directory, which each update copies with it: ${other}.`);
   });
 
   test('a later run leaves the release current names as it is, however the install has moved on', () => {
@@ -140,7 +140,7 @@ describe('setup', () => {
     rmSync(entry);
     setup(options());
     expect(readCurrent(root)).toBe('0.10.2');
-    expect(record()).toEqual({ v: 1, dataDir: data, serverState: [] });
+    expect(record()).toEqual({ v: 1, dataDir: data, extraState: [] });
     expect(existsSync(entry)).toBe(true);
     // After current: no record or entry point, and current names a release
     // this install's code no longer is.
@@ -150,7 +150,7 @@ describe('setup', () => {
     rmSync(entry);
     setup(options());
     expect(readCurrent(root)).toBe('0.11.0');
-    expect(record()).toEqual({ v: 1, dataDir: data, serverState: [] });
+    expect(record()).toEqual({ v: 1, dataDir: data, extraState: [] });
     expect(existsSync(entry)).toBe(true);
     // After its record: no entry point.
     rmSync(entry);
@@ -185,7 +185,7 @@ describe('setup', () => {
     expect(record()).toBeNull();
     rmSync(join(root, 'install.json.tmp'), { recursive: true });
     setup(options());
-    expect(record()).toEqual({ v: 1, dataDir: data, serverState: [] });
+    expect(record()).toEqual({ v: 1, dataDir: data, extraState: [] });
   });
 
   test('a resumed run syncs the releases directory before it moves current, also when its release was renamed already', () => {
@@ -375,7 +375,7 @@ describe('setup', () => {
     } finally {
       chmodSync(installPaths(root).install, 0o644);
     }
-    writeJsonAtomic(installPaths(root).install, { v: 2, dataDir: data, serverState: [] });
+    writeJsonAtomic(installPaths(root).install, { v: 2, dataDir: data, extraState: [] });
     let message = '';
     try {
       setup(options());
@@ -404,11 +404,42 @@ describe('setup', () => {
       chmodSync(installPaths(root).releases, 0o755);
     }
     rmSync(installPaths(root).journal);
+    // A releases/ that's a file isn't mended by permissions.
+    renameSync(installPaths(root).releases, join(dir, 'releases-aside'));
+    writeFileSync(installPaths(root).releases, '');
+    expect(() => setup(options())).toThrow(/releases can't be listed to say which: .*ENOTDIR.*Repair what that path runs through/);
+    rmSync(installPaths(root).releases);
+    renameSync(join(dir, 'releases-aside'), installPaths(root).releases);
     rmSync(releaseDir(root, '0.10.2'), { recursive: true });
     expect(() => setup(options())).toThrow(/releases holds no release\. Put that release back in .*releases from a backup, point current at it with `ln -s /);
     // A releases/ that isn't there holds none either.
     rmSync(installPaths(root).releases, { recursive: true });
     expect(() => setup(options())).toThrow(/releases holds no release\. Put that release back/);
+  });
+
+  test("a host that's a link to nothing is no host, as the launcher's start finds it", () => {
+    setup(options());
+    const host = join(releaseDir(root, '0.10.2'), HOST_ENTRY);
+    rmSync(host);
+    symlinkSync(join(dir, 'nowhere.ts'), host);
+    expect(() => setup(options())).toThrow(/current names 0\.10\.2, and there's no host at /);
+  });
+
+  test("a current that can't be looked at says what to do for its error: search for a permission, a repair for anything else", () => {
+    setup(options());
+    const real = fs.readlinkSync;
+    for (const [code, advice] of [['EACCES', /can't be looked at: .*EACCES.*Give this user search on .*, and run setup again\./],
+      ['EIO', /can't be looked at: .*EIO.*Repair what that path runs through, and run setup again\./]] as const) {
+      const spy = spyOn(fs, 'readlinkSync').mockImplementation(((path: fs.PathLike, options?: unknown) => {
+        if (String(path) === installPaths(root).current) throw Object.assign(new Error(code), { code });
+        return real(path, options as never);
+      }) as typeof fs.readlinkSync);
+      try {
+        expect(() => setup(options())).toThrow(advice);
+      } finally {
+        spy.mockRestore();
+      }
+    }
   });
 
   test("a current whose release's host can't be looked at is refused with its error", () => {
@@ -423,34 +454,34 @@ describe('setup', () => {
 
   test("a record with no version is refused with how to write it again", () => {
     setup(options());
-    writeFileSync(installPaths(root).install, JSON.stringify({ dataDir: data, serverState: [] }));
+    writeFileSync(installPaths(root).install, JSON.stringify({ dataDir: data, extraState: [] }));
     expect(() => setup(options())).toThrow(/has version undefined, and this release reads only version 1\. Write it again as /);
   });
 
   test("a record that isn't JSON is refused with how to write it again", () => {
     setup(options());
     writeFileSync(installPaths(root).install, '{');
-    expect(() => setup(options())).toThrow(/install record at .* isn't JSON, so this release can't read it\. Write it again as \{"v": 1, "dataDir": .*listing in serverState the paths it listed, where they can still be read/);
+    expect(() => setup(options())).toThrow(/install record at .* isn't JSON, so this release can't read it\. Write it again as \{"v": 1, "dataDir": .*listing in extraState the paths it listed, where they can still be read/);
   });
 
   test("a journal with lines and no record is an install whose record is gone, refused with how to write it again", () => {
     setup(options());
     appendJournal(root, { v: 1, at: 'T1', step: 'commit', from: '0.10.2', to: '0.11.0', outcome: 'ok' });
     rmSync(installPaths(root).install);
-    expect(() => setup(options())).toThrow(/has a journal and no record at .*, so its record is gone, and with it the server state it listed\. Write it again as /);
+    expect(() => setup(options())).toThrow(/has a journal and no record at .*, so its record is gone, and with it the extra state it listed\. Write it again as /);
   });
 
-  test("refuses a record it can't read the server state of, unless --server-state says what to record", () => {
+  test("refuses a record it can't read the extra state of, unless --extra-state says what to record", () => {
     setup(options());
-    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, serverState: 'none' });
-    expect(() => setup(options())).toThrow(/has no list of server state this release can read/);
-    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, serverState: ['/srv/state.json', 7] });
-    expect(() => setup(options())).toThrow(/has no list of server state this release can read/);
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: 'none' });
+    expect(() => setup(options())).toThrow(/has no list of extra state this release can read/);
+    writeJsonAtomic(installPaths(root).install, { v: 1, dataDir: data, extraState: ['/srv/state.json', 7] });
+    expect(() => setup(options())).toThrow(/has no list of extra state this release can read/);
     const state = join(install, 'state.json');
     writeFileSync(state, '{}');
-    setup(options({ serverState: [state] }));
-    expect(record()).toEqual({ v: 1, dataDir: data, serverState: [state] });
-    writeJsonAtomic(installPaths(root).install, { v: 1, serverState: [] });
+    setup(options({ extraState: [state] }));
+    expect(record()).toEqual({ v: 1, dataDir: data, extraState: [state] });
+    writeJsonAtomic(installPaths(root).install, { v: 1, extraState: [] });
     expect(() => setup(options())).toThrow(/names no data directory this release can read/);
   });
 
@@ -489,7 +520,7 @@ describe('setup', () => {
       symlinkSync(data, join(dir, 'link'));
       return { root: join(dir, 'link', 'connectome-host') };
     }, /one inside the other/],
-    ['server state that holds the root', () => ({ serverState: ['/'] }), /one inside the other/],
+    ['extra state that holds the root', () => ({ extraState: ['/'] }), /one inside the other/],
     ['a data directory that is not there', () => ({ dataDir: join(install, 'nowhere') }), /isn't there/],
     ['a data directory that is a file', () => {
       writeFileSync(join(install, 'data-file'), 'x');
@@ -542,10 +573,10 @@ describe('setup', () => {
       symlinkSync(host, host);
       return { hostRoot: join(dir, 'loop-host') };
     }, /connectome-host can't be followed to the host it names: .*ELOOP/],
-    ['server state that is neither a file nor a directory', () => {
+    ['extra state that is neither a file nor a directory', () => {
       const fifo = join(install, 'state.fifo');
       Bun.spawnSync(['mkfifo', fifo]);
-      return { serverState: [fifo] };
+      return { extraState: [fifo] };
     }, /is neither a file nor a directory/],
     ['an install with a link that leads outside through another link', () => {
       mkdirSync(join(dir, 'outside', 'deep'), { recursive: true });
@@ -568,15 +599,15 @@ describe('setup', () => {
 });
 
 describe("setup's arguments", () => {
-  test('takes a root and any number of server states, and keeps the recorded ones when given none', () => {
-    expect(parseArgs([])).toEqual({ serverState: null });
-    expect(parseArgs(['--root', 'r', '--server-state', 'a', '--server-state', '/b'])).toEqual({ root: 'r', serverState: [join(process.cwd(), 'a'), '/b'] });
+  test('takes a root and any number of extra states, and keeps the recorded ones when given none', () => {
+    expect(parseArgs([])).toEqual({ extraState: null });
+    expect(parseArgs(['--root', 'r', '--extra-state', 'a', '--extra-state', '/b'])).toEqual({ root: 'r', extraState: [join(process.cwd(), 'a'), '/b'] });
   });
 
   test('says which flag lacks its value, and names what it does not take', () => {
     expect(() => parseArgs(['--root'])).toThrow("Setup's --root takes a directory, and none followed it.");
-    expect(() => parseArgs(['--server-state'])).toThrow("Setup's --server-state takes a path, and none followed it.");
-    expect(() => parseArgs(['--data', 'x'])).toThrow('Setup takes --root DIR and --server-state PATH, not "--data".');
+    expect(() => parseArgs(['--extra-state'])).toThrow("Setup's --extra-state takes a path, and none followed it.");
+    expect(() => parseArgs(['--data', 'x'])).toThrow('Setup takes --root DIR and --extra-state PATH, not "--data".');
   });
 });
 

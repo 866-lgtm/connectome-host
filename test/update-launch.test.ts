@@ -44,7 +44,7 @@ beforeEach(() => {
   mkdirSync(join(data, 'sessions'), { recursive: true });
   writeFileSync(join(data, 'sessions', 'store.txt'), 'A wrote this');
   setup({
-    cwd: install, dataDir: data, root, serverState: [],
+    cwd: install, dataDir: data, root, extraState: [],
     hostRoot: join(install, 'node_modules', '@animalabs', 'connectome-host'),
     say: () => {}, units: () => ({ found: [], unasked: [] }),
   });
