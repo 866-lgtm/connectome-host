@@ -66,9 +66,9 @@ function npm(dir: string, args: string[]): Promise<{ code: number; stdout: strin
 }
 
 /** `bun pm pack --dry-run` in `dir`, with the bun running these tests and
- *  npmEnv(), which reaches the npm that the prepack runs. */
-function bunPack(dir: string): Promise<{ code: number; stdout: string; stderr: string }> {
-  return run(process.execPath, ["pm", "pack", "--dry-run"], dir, npmEnv(dir));
+ *  npmEnv(), which reaches the npm that the prepack runs, and `extra`. */
+function bunPack(dir: string, extra: Record<string, string> = {}): Promise<{ code: number; stdout: string; stderr: string }> {
+  return run(process.execPath, ["pm", "pack", "--dry-run"], dir, { ...npmEnv(dir), ...extra });
 }
 
 function run(file: string, argv: string[], cwd: string, env: Record<string, string>): Promise<{ code: number; stdout: string; stderr: string }> {
@@ -123,13 +123,18 @@ for (const [name, packing] of [
   }, 30_000);
 }
 
-test("a file git tracks isn't a local one, whatever .gitignore says", async () => {
+test("a file git tracks isn't a local one, whatever .gitignore says: a tree whose only such file is tracked packs", async () => {
+  const dir = withLocalFiles();
+  rmSync(join(dir, "recipes", "data"), { recursive: true });
+  execFileSync("git", ["add", "-f", "recipes/my-recipe.json"], { cwd: dir });
+  const result = await npm(dir, ["pack", "--dry-run"]);
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /pack-contents: /);
+}, 30_000);
+
+test("a file git tracks isn't named beside a local file that stops the pack", async () => {
   const dir = withLocalFiles();
   execFileSync("git", ["add", "-f", "recipes/my-recipe.json"], { cwd: dir });
-  // The pack still stops for the untracked file, and names it alone. The stop
-  // is decided on the list the message prints, so a tracked file left off it
-  // can't stop a pack by itself either; a stop decided from another list would
-  // want a pack of a tree whose only ignored file is tracked back here.
   const result = await npm(dir, ["pack", "--dry-run"]);
   assert.notEqual(result.code, 0, result.stdout);
   assert.ok(
@@ -138,6 +143,13 @@ test("a file git tracks isn't a local one, whatever .gitignore says", async () =
     ),
     result.stderr,
   );
+}, 30_000);
+
+test("the npm that bun pm pack's prepack runs makes no request", async () => {
+  // At npm's http log level, each request npm makes is logged as "npm http fetch".
+  const result = await bunPack(project(), { npm_config_loglevel: "http" });
+  assert.equal(result.code, 0, result.stderr);
+  assert.doesNotMatch(result.stderr, /npm http fetch/);
 }, 30_000);
 
 test("a file git ignores in a listed directory outside dist/web stops the pack, even beside the built Web UI", async () => {
