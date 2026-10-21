@@ -732,6 +732,11 @@ export const TRACE_SCOPES: Readonly<Record<string, FrameScopes>> = {
   'prose:drafts-dismissed': OPS,
   // The routed prose, verbatim.
   'mcpl:speech-routed': ['messages', 'ops'],
+  // The prose published to an MCPL server's channel, chunk by chunk and whole
+  // at its end, with the server and channel: what the agent said, and where,
+  // with no outcome, so messages alone, as the model's own text is.
+  'inference:published': MESSAGES,
+  'inference:published_complete': MESSAGES,
 };
 
 /** What a trace needs before it may go to an observer (TRACE_SCOPES). A token

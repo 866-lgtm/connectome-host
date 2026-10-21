@@ -646,6 +646,9 @@ describe('scope filters', () => {
     expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
+    for (const type of ['inference:published', 'inference:published_complete']) {
+      expect(traceScopes({ type })).toEqual(['messages']);
+    }
     expect(traceScopes({ type: 'a-trace-added-later' })).toBe(FULL_CLIENTS_ONLY);
     expect(traceScopes({ type: 'toString' })).toBe(FULL_CLIENTS_ONLY);
   });

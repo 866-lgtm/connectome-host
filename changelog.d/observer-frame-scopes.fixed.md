@@ -10,8 +10,10 @@
     state (`host:` traces) `health`; failures, refusals, the gate's
     decisions, module changes, held speech's delivery and what operators
     did `ops`; the `process:` traces, which carry whole events and modules'
-    own payloads, every scope but `debug`; and `mcpl:speech-routed`, which
-    carries the routed text, `messages` and `ops`. A trace type the host
+    own payloads, every scope but `debug`; `mcpl:speech-routed`, which
+    carries the routed text, `messages` and `ops`; and the prose an agent
+    publishes to an MCPL server's channel (`inference:published` and
+    `inference:published_complete`), `messages`. A trace type the host
     doesn't classify goes to operators alone.
   - **A new `stream-ended` frame,** `{ type: 'stream-ended', agentName }`,
     goes to a client that holds `messages` in place of a stream-end trace
