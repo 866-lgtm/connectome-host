@@ -438,6 +438,9 @@ describe('close provenance + explicit-open protection (issue #5)', () => {
     // again, so the next try is a full budget away.
     await m.onProcess(ambient('c1', 'ab'), PS);
     expect(toolCalls.length).toBe(1);
+    // A full budget later (2 + 7 > 8), it tries once more.
+    await m.onProcess(ambient('c1', 'abcdefg'), PS);
+    expect(toolCalls.length).toBe(2);
 
     await m.stop();
   });
