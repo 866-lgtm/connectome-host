@@ -204,8 +204,10 @@ export function rootTurnEnd(
 }
 
 /**
- * The line the peek view shows for one of a subagent stream's ends other than
- * its completion, which shows none. Pure, so tests read each end's line.
+ * The line a peek view shows for one of a stream's ends other than its
+ * completion: an in-process subagent's peek, which shows none for a
+ * completion, and a fleet child's (formatWireEvent), which keeps its own line
+ * for one. Pure, so tests read each end's line.
  */
 export function peekEndLine(
   event: { type: string; reason?: unknown; error?: unknown },
@@ -244,9 +246,9 @@ export function formatWireEvent(evt: WireEvent): { text: string; color: string }
     }
     case 'inference:started': return { text: `─ inference started (${get('agentName') ?? '?'}) ─`, color: DIM_GRAY };
     case 'inference:completed': return { text: `─ inference completed ─`, color: DIM_GRAY };
-    // A stream's other ends, in the words and colours the in-process
-    // subagent's peek gives them (peekEndLine): a lone `exhausted` is a
-    // failure since agent-framework 0.22.3, as `failed` is.
+    // A stream's ends other than its completion, in the words and colours
+    // the in-process subagent's peek gives them (peekEndLine): a lone
+    // `exhausted` is a failure since agent-framework 0.22.3, as `failed` is.
     case 'inference:turn_ended':
     case 'inference:aborted':
     case 'inference:failed':

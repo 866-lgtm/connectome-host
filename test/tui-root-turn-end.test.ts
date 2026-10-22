@@ -111,7 +111,7 @@ describe('rootTurnStep', () => {
 });
 
 describe("a fleet child's peek log", () => {
-  test("shows each of a stream's ends as a subagent's peek does, a lone exhausted as a failure with its error", () => {
+  test("shows each of a stream's ends but its completion as a subagent's peek does, a lone exhausted as a failure with its error", () => {
     const ends = [
       { type: 'inference:turn_ended' },
       { type: 'inference:aborted', reason: 'user' },
@@ -123,8 +123,14 @@ describe("a fleet child's peek log", () => {
       expect(formatWireEvent(end as never)).toEqual({ text: line.text, color: peekEndColor(line.tone) });
     }
     expect(formatWireEvent({ type: 'inference:exhausted', error: 'Stream aborted: timeout' } as never)).toEqual({
-      text: '✗ turn ended: Stream aborted: timeout', color: peekEndColor('error'),
+      text: '✗ turn ended: Stream aborted: timeout', color: '#cc0000',
     });
+  });
+
+  test('a peek shows a failure in red, a stop in yellow and a turn a tool ended in grey', () => {
+    expect(peekEndColor('error')).toBe('#cc0000');
+    expect(peekEndColor('warn')).toBe('#cccc00');
+    expect(peekEndColor('dim')).toBe('#555555');
   });
 });
 

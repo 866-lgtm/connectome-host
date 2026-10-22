@@ -114,6 +114,15 @@ describe('the wait for a line\'s turn', () => {
     expect(out.at(-1)).toBe('err:(no answer after 0.3 s: going on without it)');
   });
 
+  test('the cap\'s line ends an unfinished stdout line first', async () => {
+    const { out, turns, emit } = setUp();
+    const wait = turns.waitForTurn(50);
+    emit('inference:started');
+    emit('inference:tokens', { content: 'Still going' });
+    await wait;
+    expect(out).toEqual(['out:\n', 'out:Still going', 'out:\n', 'err:(no answer after 0.05 s: going on without it)']);
+  });
+
   test('a turn that settles before the cap says nothing of it', async () => {
     const { out, turns, emit } = setUp();
     const wait = turns.waitForTurn(50);
@@ -148,10 +157,10 @@ describe('what piped mode prints', () => {
     turns.onTrace({ type: 'inference:aborted', agentName: 'spawn-a', reason: 'user' });
     turns.onTrace({ type: 'inference:started', agentName: 'spawn-b' });
     turns.onTrace({ type: 'inference:exhausted', agentName: 'spawn-b', error: 'Stream aborted: timeout' });
-    expect(out).toEqual(['out:\n', 'out:\n', 'out:\n', 'out:\n', 'err:(turn ended: Stream aborted: timeout)']);
+    expect(out).toEqual(['out:\n', 'out:\n', 'out:\n', 'err:(turn ended: Stream aborted: timeout)']);
   });
 
-  test('a turn that ends on stderr closes its prose line on stdout, so what prints next starts a line of its own', () => {
+  test('a line on stderr ends an unfinished stdout line first, so what prints next starts a line of its own', () => {
     const { emit, out } = setUp();
     emit('inference:started');
     emit('inference:tokens', { content: 'Partial answer' });
@@ -165,6 +174,39 @@ describe('what piped mode prints', () => {
       'out:\n', 'out:Partial answer', 'out:\n', 'err:(turn ended: Stream aborted: timeout)',
       'out:\n', 'out:Another', 'out:\n', 'err:Error: bad request',
     ]);
+  });
+
+  test('a line on stderr adds no empty stdout line where stdout\'s line is already ended', () => {
+    const { emit, out } = setUp();
+    // Before any prose: the stream's start ended the line.
+    emit('inference:started');
+    emit('inference:failed', { error: 'overloaded' });
+    // After prose and a tool round, whose lines end themselves.
+    emit('inference:started');
+    emit('inference:tokens', { content: 'Let me look.' });
+    emit('inference:tool_calls_yielded', { calls: [{ name: 'read' }] });
+    emit('tool:started', { tool: 'read' });
+    emit('inference:exhausted', { error: 'Stream aborted: timeout' });
+    // After prose that ends its own line.
+    emit('inference:started');
+    emit('inference:tokens', { content: 'A whole line\n' });
+    emit('inference:failed', { error: 'bad request' });
+    expect(out).toEqual([
+      'out:\n', 'err:Error: overloaded',
+      'out:\n', 'out:Let me look.', 'log:\n[tools] read', 'log:[tool] read', 'err:(turn ended: Stream aborted: timeout)',
+      'out:\n', 'out:A whole line\n', 'err:Error: bad request',
+    ]);
+  });
+
+  test('a retried attempt starts after a blank line, as the first does', () => {
+    const { emit, out } = setUp();
+    emit('inference:started');
+    emit('inference:tokens', { content: 'Partial' });
+    emit('inference:failed', { error: 'overloaded' });
+    emit('inference:started');
+    emit('inference:tokens', { content: 'Answer' });
+    emit('inference:completed');
+    expect(out).toEqual(['out:\n', 'out:Partial', 'out:\n', 'err:Error: overloaded', 'out:\n', 'out:Answer', 'out:\n']);
   });
 
   test('tool calls as before, a long input cut at 120 characters', () => {
@@ -193,7 +235,7 @@ describe('what piped mode prints', () => {
     emit('inference:exhausted', { error: 'Stream aborted: timeout' });
     expect(out).toEqual([
       'out:\n', 'log:\n(turn aborted: user)',
-      'out:\n', 'out:\n', 'err:(turn ended: Stream aborted: timeout)',
+      'out:\n', 'err:(turn ended: Stream aborted: timeout)',
     ]);
   });
 });

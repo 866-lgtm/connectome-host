@@ -2502,11 +2502,11 @@ export function validateRecipe(raw: unknown): Recipe {
   }
 
   // From 0.22.3, agent-framework's create() refuses a refusalHandling that
-  // isn't an object, null or false, and an autoRewind that isn't a boolean or
-  // null (assertAgentSwitches), which stops the boot after the recipe has
-  // loaded. The host passes refusalHandling on only when it's truthy
-  // (framework-agent-config.ts), so those are refused here in the recipe's
-  // words, and a falsy one loads as before.
+  // isn't an object other than an array, null or false, and an autoRewind
+  // that isn't a boolean or null (assertAgentSwitches), which stops the boot
+  // after the recipe has loaded. The host passes refusalHandling on only
+  // when it's truthy (framework-agent-config.ts), so those are refused here
+  // in the recipe's words, and a falsy one loads as before.
   const refusalHandling: unknown = agent.refusalHandling;
   if (refusalHandling) {
     if (typeof refusalHandling !== 'object' || Array.isArray(refusalHandling)) {
