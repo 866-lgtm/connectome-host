@@ -470,7 +470,12 @@ unknown-key warning, like those at the other levels.
   [`docs/ATTENTION-AND-GATING.md`](docs/ATTENTION-AND-GATING.md)
 - **Workspace** (`modules.workspace`, on) — mounted directories backed by
   Chronicle: the agent's durable, verbatim notes. Default mounts `input`
-  (read-only `./input`) and `products` (read-write `./output`)
+  (read-only `./input`) and `products` (read-write `./output`). A mount with
+  `"backend": "direct"` reads disk as it is, with no store or watcher, and
+  is read-only, the host's default for its `mode` there (while its store
+  holds changes from when it ran as Chronicle, it runs as Chronicle, and
+  says so); `include` limits what a mount holds. See `RecipeWorkspaceMount`
+  in `src/recipe.ts`
 - **History** (opt-in, `modules.history`) — the agent searches and extracts
   from its own uncompressed record. The object form
   `{ "semantic": { "url": … } }` adds `history--semantic_search`:
@@ -551,7 +556,9 @@ never satisfy the default path, so declare an `instructions` mount explicitly.
 read-write instructions mount. On a read-only mount the flow reverses:
 human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
-and letting the agent make the edit. The file is read through the
+and letting the agent make the edit. A mount running direct
+(`"backend": "direct"`) has no Chronicle copy: `workspace--read` reads disk
+too, so both see an edit to disk at once. The file is read through the
 workspace's `readFileFromDisk`, so on a mount that doesn't follow links, a
 recipe's default, a file that is itself a link isn't read (nor, from
 agent-framework's release with anima-research/agent-framework#468, is one

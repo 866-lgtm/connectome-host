@@ -776,9 +776,9 @@ describe('identity: what the agent reads when a call fails', () => {
       (await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs }))).error;
     expectSays(await send('nope/out.json'), 'Nothing was sent: `saveAs` names no mount the workspace has: "nope/out.json"', 'a mount it can write to (files)');
     expectSays(await send('files'), 'names the mount "files" but no file in it');
-    expectSays(await send('files/../../etc/out.json'), 'has a "." or ".." in it', 'such as "files/out.json"');
-    expectSays(await send('files//out.json'), 'has an empty part right after the mount\'s name', 'such as "files/out.json"');
-    expectSays(await send('files/away.json'), '`saveAs` "files/away.json" leads out of the mount "files"');
+    expectSays(await send('files/../../etc/out.json'), 'has a "." or ".." in it', 'name the file by its plain path.', 'a mount it can write to (files)');
+    expectSays(await send('files//out.json'), 'has an empty part right after the mount\'s name', 'name the file by its plain path.', 'a mount it can write to (files)');
+    expectSays(await send('files/away.json'), '`saveAs` "files/away.json" isn\'t a path the mount "files" holds: it leads out of the mount, lies in another mount\'s directory, or falls outside its include.');
     expectSays(await send('docs/out.json'), 'names the read-only mount "docs"', 'a mount it can write to (files)');
     expect(seen.orrery).toBe(0);
   });
@@ -836,7 +836,7 @@ describe('identity: what the agent reads when a call fails', () => {
     for (const form of forms) {
       if (dotted(form)) {
         expect([form, outcomes[form], reasons[form]]).toEqual([form, 'not sent', expect.stringContaining(
-          `"${form}" has a "." or ".." in it, which the workspace can't save to; name the file by its plain path, such as "files/out.json".`,
+          `"${form}" has a "." or ".." in it, which the workspace can't save to; name the file by its plain path.`,
         )]);
       } else expect([form, outcomes[form] === 'sent and saved']).toEqual([form, writes[form] === 'accepted']);
     }
@@ -844,6 +844,26 @@ describe('identity: what the agent reads when a call fails', () => {
       'files/out.json', 'files/sub/out.json', 'files/end.json/', 'files/twice//slash.json', 'files/dir/', 'files/a//b/c.json',
       'files/ends.json//',
     ]);
+  });
+
+  it("sends no saveAs its mount's include leaves out, saying so, and sends one it covers", async () => {
+    const dir = tempDir('ident-saveas-include-');
+    mkdirSync(join(dir, 'files'));
+    const workspace = new WorkspaceModule({
+      mounts: [{ name: 'files', path: join(dir, 'files'), mode: 'read-write', watch: 'never', include: ['*.md'] }],
+    });
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    cleanups.push(() => store.close?.());
+    workspace.initStore(store);
+    const { mod, ready, seen } = registeredModule({ workspace });
+    await ready;
+    const before = seen.orrery;
+    const left = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/out.json' }));
+    expect(left.success).toBe(false);
+    expect(seen.orrery).toBe(before);
+    expectSays(left.error, '`saveAs` "files/out.json" isn\'t a path the mount "files" holds', 'or falls outside its include.');
+    const kept = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/out.md' }));
+    expect(kept.success).toBe(true);
   });
 
   it('tells a request that got no reply from one whose reply came back but couldn\'t be read or saved', async () => {

@@ -152,6 +152,13 @@ describe('recipe modules.instructions validation', () => {
     }))).toThrow(/autoMaterialize/);
   });
 
+  test('accepts a direct instructions mount, which the host makes read-only', () => {
+    expect(() => validateRecipe(recipe({
+      instructions: true,
+      workspace: { mounts: [{ name: 'instructions', path: './instructions', backend: 'direct' }] },
+    }))).not.toThrow();
+  });
+
   test('cross-checks against the implicit default workspace too', () => {
     // `instructions: true` with the implicit workspace (mounts input +
     // products) can never inject — the default path's mount cannot exist.

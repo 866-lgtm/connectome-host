@@ -13,7 +13,7 @@
 
 import { readFileSync, writeFileSync, existsSync, lstatSync, statSync, mkdirSync, rmSync, chmodSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import type { CodeExecutionConfig, MountConfig } from '@animalabs/agent-framework';
+import { WorkspaceModule, type CodeExecutionConfig, type MountConfig } from '@animalabs/agent-framework';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
@@ -675,9 +675,8 @@ export interface RecipeCredentialFileField {
 }
 
 /**
- * A recipe's workspace mount: every key of agent-framework's MountConfig but
- * those named in `MountKeyNotPassedOn`, passed to the framework as given but
- * for `path`, which is resolved
+ * A recipe's workspace mount: every key of agent-framework's MountConfig,
+ * passed to the framework as given but for `path`, which is resolved
  * (workspace-mounts.ts), with `mode` and `watch` optional because the host
  * defaults them. The maximum file size is
  * operator-configurable because binary service artifacts may legitimately
@@ -686,7 +685,34 @@ export interface RecipeCredentialFileField {
 export interface RecipeWorkspaceMount {
   name: string;
   path: string;
+  /**
+   * Left out, the host makes a mount read-write, and a direct one
+   * (`backend: 'direct'`) read-only, the only mode agent-framework takes
+   * there (workspace-mounts.ts).
+   */
   mode?: 'read-write' | 'read-only';
+  /**
+   * Where the mount's tools get what they read, as agent-framework's
+   * `MountConfig.backend` says (its default is 'chronicle'). 'direct' reads
+   * disk's own copy as it is, keeps none of the mount's files in the store,
+   * and runs no scan or watcher: for a checkout an agent reads, not one it
+   * changes. A direct mount is read-only, and the framework refuses one
+   * with a setting that would never act there, such as a watch other than
+   * 'never', a wake on change or auto-materialize, which stops the recipe
+   * loading (validateRecipe). A mount configured direct whose store holds
+   * changes disk lacks, left from when it ran as 'chronicle' (a draft, a
+   * deletion or a conflict), runs as 'chronicle' until they're settled, and
+   * the framework says so at start.
+   */
+  backend?: 'chronicle' | 'direct';
+  /**
+   * What the mount holds, as agent-framework's `MountConfig.include` says:
+   * a non-empty list of names, `*.ext` globs and `dir/**` globs. A file the
+   * list doesn't cover is refused by reads and writes and left out of
+   * listings and searches, and a pattern the framework can't read stops the
+   * recipe loading (validateRecipe).
+   */
+  include?: string[];
   watch?: 'always' | 'on-agent-action' | 'never';
   ignore?: string[];
   /** Maximum file size in bytes (defaults to the framework's 5 MiB limit). */
@@ -1769,6 +1795,7 @@ void recipeKeyListsInStep;
 
 const RECIPE_WORKSPACE_KEYS = ['mounts', 'configMount'] as const;
 const MOUNT_MODES = ['read-write', 'read-only'] as const;
+const MOUNT_BACKENDS = ['chronicle', 'direct'] as const;
 const MOUNT_WATCH_VALUES = ['always', 'on-agent-action', 'never'] as const;
 const MOUNT_WAKE_OPS = ['created', 'modified', 'deleted'] as const;
 /** The longest delay a timer keeps: Bun's and Node's run a longer or negative one at once. */
@@ -1794,38 +1821,31 @@ const timerMs = (min: number): MountValueCheck => (v) =>
     : `a whole number of milliseconds from ${min} to ${TIMER_MS_MAX}`;
 
 /**
- * Mount keys an agent-framework release adds before the host passes them on:
- * `include`, from agent-framework #536, and `backend`, from agent-framework
- * #564. The checks below and the recipe's mount type leave them out, so this
- * file typechecks against a framework with the keys and against one without
- * them, and a recipe that gives one is refused as an unknown key, as before.
- * The host's step to the release that carries a key gives it a check here,
- * adds it to `RecipeWorkspaceMount`, and takes it out of this list. For
- * `backend`, that step also decides a direct mount's `mode`, since the mount
- * builder defaults it to `'read-write'` (workspace-mounts.ts), which
- * agent-framework #564 refuses on a direct mount.
- */
-type MountKeyNotPassedOn = 'include' | 'backend';
-
-/**
  * Each workspace mount key, with what its value must be: what the framework
  * reads as the recipe means it. It's typed by the framework's `MountConfig`,
  * so a framework release that adds a mount key fails this typecheck until
- * either the key has a check here, and the mount builder then passes it on
- * unchanged (workspace-mounts.ts), or it is named in `MountKeyNotPassedOn`.
- * A key these checks don't name stops the recipe loading (#275), one named
- * in `MountKeyNotPassedOn` included.
+ * the key has a check here, and the mount builder then passes it on
+ * unchanged (workspace-mounts.ts). To hold a new key back instead, leave it
+ * out of `RecipeWorkspaceMount`, and type this and the lists below by
+ * `Exclude<keyof MountConfig, 'key'>`, so a recipe that gives it is refused
+ * as a key a mount doesn't have. A key these checks don't name stops the
+ * recipe loading (#275). What a value must be together with the mount's
+ * other keys, such as a direct mount's, is the framework's to say
+ * (validateRecipe).
  */
-const MOUNT_KEY_CHECKS: { readonly [K in Exclude<keyof MountConfig, MountKeyNotPassedOn>]-?: MountValueCheck } = {
+const MOUNT_KEY_CHECKS: { readonly [K in keyof MountConfig]-?: MountValueCheck } = {
   name: nonEmptyText,
   path: nonEmptyText,
   mode: oneOf(MOUNT_MODES),
+  backend: oneOf(MOUNT_BACKENDS),
   watch: oneOf(MOUNT_WATCH_VALUES),
   // 0 is no wait, which the framework runs as that.
   watchDebounceMs: timerMs(0),
   // A poll of 0 runs as often as one of 1: the framework has no "off" for it.
   watchRootPollMs: timerMs(1),
   ignore: (v) => Array.isArray(v) && v.every((p) => typeof p === 'string') ? null : 'an array of strings',
+  // The framework refuses an empty list, and reads each pattern itself.
+  include: (v) => Array.isArray(v) && v.length > 0 && v.every((p) => typeof p === 'string') ? null : 'a non-empty list of strings',
   followSymlinks: trueOrFalse,
   // A cap of 0 refuses every file that isn't empty: the framework has no "no limit".
   maxFileSize: (v) => typeof v === 'number' && Number.isInteger(v) && v >= 1 ? null : 'a whole number of bytes, 1 or more',
@@ -1836,7 +1856,7 @@ const MOUNT_KEY_CHECKS: { readonly [K in Exclude<keyof MountConfig, MountKeyNotP
     ? null : `true, false, or a list of ${listed(MOUNT_WAKE_OPS)}`,
   autoMaterialize: trueOrFalse,
 };
-const RECIPE_MOUNT_KEYS = Object.keys(MOUNT_KEY_CHECKS) as Array<Exclude<keyof MountConfig, MountKeyNotPassedOn> & string>;
+const RECIPE_MOUNT_KEYS = Object.keys(MOUNT_KEY_CHECKS) as Array<keyof MountConfig & string>;
 /** The keys a recipe's mount must give; the builder supplies `mode` and `watch`. */
 const REQUIRED_MOUNT_KEYS: readonly string[] = ['name', 'path'];
 
@@ -1846,12 +1866,13 @@ type IsNever<T> = [T] extends [never] ? true : false;
 // don't follow yet.
 const mountListsInStep: [
   ListsExactly<keyof Extract<RecipeModules['workspace'], object> & string, typeof RECIPE_WORKSPACE_KEYS>,
-  ListsExactly<keyof RecipeWorkspaceMount & string, Array<Exclude<keyof MountConfig, MountKeyNotPassedOn> & string>>,
+  ListsExactly<keyof RecipeWorkspaceMount & string, Array<keyof MountConfig & string>>,
   ListsExactly<MountConfig['mode'], typeof MOUNT_MODES>,
+  ListsExactly<Exclude<MountConfig['backend'], undefined>, typeof MOUNT_BACKENDS>,
   ListsExactly<Exclude<MountConfig['watch'], undefined>, typeof MOUNT_WATCH_VALUES>,
   ListsExactly<Extract<Exclude<MountConfig['wakeOnChange'], undefined>, readonly unknown[]>[number], typeof MOUNT_WAKE_OPS>,
   IsNever<Exclude<MountConfig['wakeOnChange'], undefined | boolean | readonly unknown[]>>,
-] = [true, true, true, true, true, true];
+] = [true, true, true, true, true, true, true];
 void mountListsInStep;
 // "Type 'true' is not assignable to type 'false'" here means agent-framework's
 // CodeExecutionConfig gained or lost a setting CODE_EXECUTION_NUMBER_KEYS
@@ -1874,7 +1895,7 @@ function unknownKeyError(where: string, key: string, known: readonly string[], i
 
 /** A mount key recipes have used that the host never read, with what says it. */
 const MOUNT_KEY_INSTEAD: Record<string, string> = {
-  readOnly: 'mode: "read-only" makes a mount read-only, and a mount is read-write without it',
+  readOnly: 'mode: "read-only" makes a mount read-only, and a mount is read-write without it, unless it is direct',
 };
 
 /** Keys that were renamed or removed, with what replaced them. */
@@ -2646,6 +2667,22 @@ export function validateRecipe(raw: unknown): Recipe {
           const mustBe = MOUNT_KEY_CHECKS[key](m[key]);
           if (mustBe) throw new Error(`${where}.${key} must be ${mustBe}`);
         }
+      }
+      // What a mount's keys must be together, such as a direct mount's
+      // settings, and an include's patterns, are agent-framework's to say,
+      // and its WorkspaceModule constructor checks each mount and does
+      // nothing else: it reads no file, opens no store and starts no timer
+      // (0.24.0; it warns on stderr of a mount nested in another, as it
+      // will again at start). So the recipe's mounts are built and checked
+      // here, before the recipe is saved, and a refusal is in the
+      // framework's words. Built at start instead, a refused recipe would
+      // be saved first and fail every start that resumes it. The host's own
+      // `_config` mount isn't the recipe's, so it's left out. A framework
+      // release whose constructor does more is where this has to change.
+      try {
+        new WorkspaceModule({ mounts: buildWorkspaceMounts({ mounts: ws.mounts as RecipeWorkspaceMount[] }, '.')! });
+      } catch (err) {
+        throw new Error(`modules.workspace: ${(err instanceof Error ? err.message : String(err)).replace(/^\[workspace\] /, '')}`);
       }
     }
 
