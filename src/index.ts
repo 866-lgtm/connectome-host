@@ -55,6 +55,7 @@ import { RetrievalModule } from './modules/retrieval-module.js';
 import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
+import { waitToBeListed } from './fleet-begin.js';
 import { FleetModule, type FleetModuleConfig } from './modules/fleet-module.js';
 import { ActivityModule } from './modules/activity-module.js';
 import { NoticesModule } from './modules/notices-module.js';
@@ -1001,8 +1002,11 @@ async function main() {
   if (process.argv[2] === AUDIT_STORES_FLAG) {
     process.exit(await auditStoresFromEntry(process.argv.slice(3)));
   }
-  // Before anything else a host does: a host an install's entry point started
-  // has to be one of that install's releases, or it refuses to start
+  // First, a fleet child of a host that keeps the children file begins only
+  // once that file lists it (waitToBeListed).
+  await waitToBeListed();
+  // Then, before anything else a host does: a host an install's entry point
+  // started has to be one of that install's releases, or it refuses to start
   // (releaseHere).
   installHere = releaseHere();
   const recipe = await resolveRecipe();
