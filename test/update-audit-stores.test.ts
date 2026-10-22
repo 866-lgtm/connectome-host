@@ -12,7 +12,7 @@ import {
   symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, relative } from 'node:path';
+import { basename, dirname, join, relative, sep } from 'node:path';
 import { AgentFramework, resolveTimeZone } from '@animalabs/agent-framework';
 import { JsStore } from '@animalabs/chronicle';
 import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
@@ -1445,14 +1445,37 @@ describe("a fleet child's audit and what outlasts it", () => {
     const parent = await makeDataDir('parent', [{ namespace: 'agents/agent', crossed: false }]);
     const child = await makeDataDir('kid', [{ namespace: 'agents/agent', crossed: false }]);
     // The child's entry gives a setting of its own, which is the child's, not
-    // its audit's limit.
-    saveRecipe(parent.dir, { ...DEFAULT_RECIPE, modules: { ...DEFAULT_RECIPE.modules, fleet: { children: [{ name: 'kid', recipe: childRecipe('kid'), dataDir: child.dir, env: { CONNECTOME_FLEET_CHILD_AUDIT_MINUTES: '9' } }] } } });
+    // its audit's limit. The parent's strategy arms a long timer of its own,
+    // as a library the audit calls can: only the audit's own timers count.
+    const timing = join(root, 'timing-strategy.ts');
+    writeFileSync(timing, [
+      `import { PassthroughStrategy } from '${CONTEXT_MANAGER}';`,
+      "export function register(api) { api.registerStrategy('timing', () => { setTimeout(() => {}, 60_000).unref(); return new PassthroughStrategy(); }); }",
+    ].join('\n'));
+    saveRecipe(parent.dir, {
+      ...DEFAULT_RECIPE,
+      extensions: { timing: { kind: 'strategy', path: timing } },
+      agent: { ...DEFAULT_RECIPE.agent, strategy: { type: 'timing' } },
+      modules: { ...DEFAULT_RECIPE.modules, fleet: { children: [{ name: 'kid', recipe: childRecipe('kid'), dataDir: child.dir, env: { CONNECTOME_FLEET_CHILD_AUDIT_MINUTES: '9' } }] } },
+    });
     const before = process.env.CONNECTOME_FLEET_CHILD_AUDIT_MINUTES;
     leftovers.push(() => { if (before === undefined) delete process.env.CONNECTOME_FLEET_CHILD_AUDIT_MINUTES; else process.env.CONNECTOME_FLEET_CHILD_AUDIT_MINUTES = before; });
     const later = globalThis.setTimeout;
     const limits: number[] = [];
-    const timing = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number, ...rest: unknown[]) => {
-      if (typeof ms === 'number' && ms >= 60_000) limits.push(ms);
+    let others = 0;
+    // A timer is the audit's own when the first frame past this file's is in
+    // the audit's source.
+    const auditSource = join('src', 'update', 'audit-stores.ts');
+    const armedByAudit = (): boolean => {
+      const frames = (new Error().stack ?? '').split('\n').slice(1);
+      const caller = frames.find((frame) => frame.includes(sep) && !frame.includes(import.meta.path));
+      return caller?.includes(auditSource) ?? false;
+    };
+    const timers = spyOn(globalThis, 'setTimeout').mockImplementation(((handler: () => void, ms?: number, ...rest: unknown[]) => {
+      if (typeof ms === 'number' && ms >= 60_000) {
+        if (armedByAudit()) limits.push(ms);
+        else others++;
+      }
       return later(handler, ms, ...rest);
     }) as typeof setTimeout);
     try {
@@ -1463,13 +1486,17 @@ describe("a fleet child's audit and what outlasts it", () => {
         expect(result.status, result.failed.join('\n')).toBe(0);
       }
     } finally {
-      timing.mockRestore();
+      timers.mockRestore();
       if (before === undefined) delete process.env.CONNECTOME_FLEET_CHILD_AUDIT_MINUTES;
       else process.env.CONNECTOME_FLEET_CHILD_AUDIT_MINUTES = before;
     }
     // A billion minutes, or Infinity, is more than a timer holds, so it's the
     // longest one does.
     expect(limits).toEqual([7.5 * 60_000, 2 ** 31 - 1, 2 ** 31 - 1, 5 * 60_000, 5 * 60_000, 5 * 60_000, 5 * 60_000]);
+    // At least one long timer armed from outside the audit was left out, as
+    // the parent's strategy arms one each time it's built; the count doesn't
+    // say which caller armed it.
+    expect(others).toBeGreaterThan(0);
   }, 90_000);
 
   test("a child's audit past its limit whose SIGKILL ends nothing is settled without it, and stays listed", async () => {
