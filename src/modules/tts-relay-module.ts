@@ -219,7 +219,7 @@ interface ActivationState {
 
 /** A message the agent's prose recently published: the edit target for an
  *  interruption. */
-interface RoutedMessage {
+interface PublishedMessage {
   rawChannelId: string;
   mcplChannelId: string;
   messageId?: string;
@@ -227,7 +227,7 @@ interface RoutedMessage {
   at: number;
 }
 
-const ROUTED_RING_MAX = 32;
+const PUBLISHED_RING_MAX = 32;
 
 /** `discord:<guild>:<id>` / `portal:<id>` / raw → the raw surface id. */
 function rawChannelId(mcplId: string): string {
@@ -252,7 +252,7 @@ export class TtsRelayModule implements Module {
   private offTrace: (() => void) | null = null;
 
   private activations = new Map<string, ActivationState>();
-  private routed: RoutedMessage[] = [];
+  private published: PublishedMessage[] = [];
   /** Resolved lazily from the first trace when config omits botId/username. */
   private agentName: string | null = null;
 
@@ -287,7 +287,7 @@ export class TtsRelayModule implements Module {
     this.client?.disconnect();
     this.client = null;
     this.activations.clear();
-    this.routed = [];
+    this.published = [];
     this.ctx = null;
   }
 
@@ -355,15 +355,15 @@ export class TtsRelayModule implements Module {
         // server returned. `mcpl:speech-routed` also reports publishes that
         // aren't this prose, such as the `sleep` tool's announcement and a
         // subconscious's `speak_in_channel`, which no interruption edits.
-        this.routed.push({
+        this.published.push({
           rawChannelId: rawChannelId(event.channelId),
           mcplChannelId: event.channelId,
           messageId: event.messageId,
           text: event.text,
           at: event.timestamp,
         });
-        if (this.routed.length > ROUTED_RING_MAX) {
-          this.routed.splice(0, this.routed.length - ROUTED_RING_MAX);
+        if (this.published.length > PUBLISHED_RING_MAX) {
+          this.published.splice(0, this.published.length - PUBLISHED_RING_MAX);
         }
         break;
       }
@@ -463,7 +463,7 @@ export class TtsRelayModule implements Module {
         console.error(`[tts-relay] edit_message failed for ${target.messageId}:`, result.error);
       }
     } else if (!target?.messageId) {
-      console.error('[tts-relay] no routed message matched the interruption — nothing edited');
+      console.error('[tts-relay] no published message matched the interruption — nothing edited');
     }
 
     // Tell the agent she was cut off — otherwise her next turn believes the
@@ -481,11 +481,11 @@ export class TtsRelayModule implements Module {
    * Match the interruption to the posted segment being voiced when it hit:
    * newest-first, same channel, and the voiced words prefix-match the
    * segment's text (whitespace-collapsed — TTS clients normalize). Falls back
-   * to the newest message in the channel: with ROUTED_RING_MAX recency that's
+   * to the newest message in the channel: with PUBLISHED_RING_MAX recency that's
    * almost always the one being read aloud.
    */
-  private findInterruptedMessage(ev: InterruptionEvent): RoutedMessage | null {
-    const inChannel = this.routed.filter((r) => r.rawChannelId === ev.channelId).reverse();
+  private findInterruptedMessage(ev: InterruptionEvent): PublishedMessage | null {
+    const inChannel = this.published.filter((r) => r.rawChannelId === ev.channelId).reverse();
     if (inChannel.length === 0) return null;
     const spoken = collapseWs(ev.spokenText);
     if (spoken.length > 0) {

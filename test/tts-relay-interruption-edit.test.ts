@@ -11,7 +11,7 @@ import { TtsRelayModule } from '../src/modules/tts-relay-module.js';
 
 type Interruption = { channelId: string; spokenText: string; reason: 'user_speech' | 'manual' | 'timeout'; timestamp: number };
 
-/** The module on a context whose callTool answers `answer`, with one routed
+/** The module on a context whose callTool answers `answer`, with one published
  *  message posted to Discord channel 42, and the notes it gives the agent. */
 function relayWith(answer: Record<string, unknown>) {
   const notes: string[] = [];
@@ -23,11 +23,11 @@ function relayWith(answer: Record<string, unknown>) {
   const module = new TtsRelayModule({ url: 'ws://127.0.0.1:1/bot', token: 't' });
   const inner = module as unknown as {
     ctx: ModuleContext;
-    routed: Array<{ rawChannelId: string; mcplChannelId: string; messageId?: string; text: string; at: number }>;
+    published: Array<{ rawChannelId: string; mcplChannelId: string; messageId?: string; text: string; at: number }>;
     handleInterruption(ev: Interruption): Promise<void>;
   };
   inner.ctx = ctx;
-  inner.routed.push({ rawChannelId: '42', mcplChannelId: 'discord:42', messageId: 'm-1', text: 'The ferry leaves at noon, and the bridge is closed.', at: 1 });
+  inner.published.push({ rawChannelId: '42', mcplChannelId: 'discord:42', messageId: 'm-1', text: 'The ferry leaves at noon, and the bridge is closed.', at: 1 });
   const interrupt = () => inner.handleInterruption({ channelId: '42', spokenText: 'The ferry leaves at noon', reason: 'user_speech', timestamp: 2 });
   return { notes, calls, interrupt };
 }
