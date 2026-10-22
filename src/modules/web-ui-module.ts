@@ -1309,7 +1309,9 @@ export class WebUiModule implements Module {
         return Response.json(keptStrings ? keepNamedStrings(snapshot, keptStrings) : snapshot);
       } catch (err) {
         const status = err instanceof PanelError ? err.status : 500;
-        return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status });
+        // A read that failed whole is still a failed read without its text.
+        const failed = { error: err instanceof Error ? err.message : String(err) };
+        return Response.json(keptStrings ? keepNamedStrings(failed, keptStrings) : failed, { status });
       }
     }
 
@@ -1395,7 +1397,8 @@ export class WebUiModule implements Module {
     }
     const result = await fleet.requestPanel(childName, op, params);
     if (!result.ok) {
-      return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
+      const failed = { error: result.error ?? 'panel request failed' };
+      return Response.json(keptStrings ? keepNamedStrings(failed, keptStrings) : failed, { status: result.status ?? 502 });
     }
     return Response.json(keptStrings ? keepNamedStrings(result.data, keptStrings) : result.data);
   }
@@ -3186,9 +3189,10 @@ export class WebUiModule implements Module {
     }
     const result = await fleet.requestPanel(childName, op, params);
     if (!result.ok) {
+      // What the child's failure said is ops's, as broadcast and sendScoped send it.
       this.send(client, {
         type: 'error',
-        message: `${op} on '${childName}' failed: ${result.error ?? 'unknown error'}`,
+        message: `${op} on '${childName}' failed` + (clientHolds(client, ['ops']) ? `: ${result.error ?? 'unknown error'}` : ''),
       });
       return null;
     }

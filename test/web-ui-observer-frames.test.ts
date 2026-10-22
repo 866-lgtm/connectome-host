@@ -420,6 +420,34 @@ describe('what each client is sent', () => {
     }
   });
 
+  test("a health read that fails whole still says it failed to a client that holds health and not ops, without what the failure said", async () => {
+    const c = await everyone();
+    const app = (host.module as unknown as { panelApp(): { framework: { healthSnapshot: () => unknown } } }).panelApp();
+    const own = app.framework.healthSnapshot;
+    const request = fleet.requestPanel;
+    const answer = async (path: string, who: Connection | null) => {
+      const token = who && (who.framesOf('observer-ack')[0] as { sessionToken: string }).sessionToken;
+      const res = await fetch(`http://127.0.0.1:${host.port}${path}`, { headers: token ? { cookie: `fkm_obs=${token}` } : { authorization: BASIC } });
+      return { status: res.status, body: await res.json() };
+    };
+    try {
+      // The host's own snapshot throws, and a child answers each panel op with its failure.
+      app.framework.healthSnapshot = () => { throw new Error(TEXT.read); };
+      (fleet as { requestPanel: unknown }).requestPanel = async () => ({ ok: false, status: 500, error: TEXT.read });
+      for (const path of ['/healthz', '/healthz?scope=kid', '/quota?scope=kid', '/credential?scope=kid']) {
+        for (const who of [null, c.everything]) expect(await answer(path, who)).toEqual({ status: 500, body: { error: TEXT.read } });
+        expect(await answer(path, c.dashboard)).toEqual({ status: 500, body: { error: '' } });
+      }
+      for (const conn of [c.dashboard, c.everything]) conn.ws.send(JSON.stringify({ type: 'request-credential', scope: 'kid' }));
+      for (const conn of [c.dashboard, c.everything]) await conn.until('error');
+      expect(c.everything.framesOf('error').map((f) => f.message)).toEqual([`credential on 'kid' failed: ${TEXT.read}`]);
+      expect(c.dashboard.framesOf('error').map((f) => f.message)).toEqual(["credential on 'kid' failed"]);
+    } finally {
+      app.framework.healthSnapshot = own;
+      (fleet as { requestPanel: unknown }).requestPanel = request;
+    }
+  });
+
   test("after a branch switch, branch-changed reaches clients that hold messages, and a health observer's refreshed welcome has the new branch's id and no names", async () => {
     branch = { id: 'b1', name: 'main' };
     const c = await everyone();

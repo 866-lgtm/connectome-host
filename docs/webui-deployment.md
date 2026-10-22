@@ -111,14 +111,14 @@ The module accepts three credentials:
   grants as they were, since an editor's save can be read half-written. Each
   observer sees only its grant's scopes — `health`, `ops`, `messages`,
   `tools`, `thinking`, `debug` — and gets a session cookie for the matching
-  HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
-  and `/quota`, `messages` for `/media/…`, with `tools` as well for an image
-  a tool returned). An observer with `health` and without `ops` gets health
-  without the text of failures, which are `ops`'s: an error's or a reason's
-  words come empty, the credential's message among them, while its numbers,
-  times, names and codes stay, and so does a pending device-code login.
-  Observers are read-only; `/files/…` and `/debug/retrieval*` stay
-  password-only.
+  HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`,
+  `/quota` and `/credential`, `messages` for `/media/…`, with `tools` as well
+  for an image a tool returned). An observer with `health` and without `ops`
+  gets health without the text of failures, which are `ops`'s: an error's or
+  a reason's words come empty, the credential's message among them, while
+  its numbers, times, names and codes stay, and so does a pending
+  device-code login. Observers are read-only; `/files/…` and
+  `/debug/retrieval*` stay password-only.
 
 ## Caddy
 
