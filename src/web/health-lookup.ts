@@ -22,3 +22,16 @@ export function healthEntry<T>(map: Record<string, T> | null | undefined, key: s
 export function readFailureLine(section: string, message: string): string {
   return message ? `${section} couldn't be read: ${message}` : `${section} couldn't be read`;
 }
+
+/** The line under the credential's kind: its message, while the state isn't
+ *  ok and the snapshot carries the text (an observer without 'ops' gets it
+ *  empty, and then there's no line). */
+export function credentialNote(credential: { kind?: string; message?: string }): string | undefined {
+  return (credential.kind ?? 'ok') !== 'ok' && credential.message ? credential.message : undefined;
+}
+
+/** The last operator action, after "last action:": which, how it ended and
+ *  `ago`, then what it said when the snapshot carries it. */
+export function lastActionText(action: { id: string; ok: boolean; message: string }, ago: string): string {
+  return `${action.id} ${action.ok ? 'ok' : 'FAILED'} ${ago}${action.message ? ` — ${action.message}` : ''}`;
+}

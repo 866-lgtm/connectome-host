@@ -36,12 +36,13 @@ import {
   FULL_CLIENTS_ONLY,
   scopeWelcome,
   keepNamedStrings,
+  frameWithoutFailureText,
   HEALTH_STRINGS,
   QUOTA_STRINGS,
   type ObserverScope,
   type ObserversFile,
 } from '../src/modules/web-ui-observers.js';
-import { WEB_PROTOCOL_VERSION, type WelcomeMessage, type WelcomeMessageEntry } from '../src/web/protocol.js';
+import { WEB_PROTOCOL_VERSION, type WebUiServerMessage, type WelcomeMessage, type WelcomeMessageEntry } from '../src/web/protocol.js';
 import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
 import { BASIC, helloFor, makeKeypair } from './web-ui-observed-host.js';
 
@@ -880,7 +881,12 @@ describe('scope filters', () => {
         lastInference: { startedAt: 1, endedAt: 2, failedAt: 3, lastError: text },
         refusalStats: { total: 1, byCategory: { policy: 1 }, lastAt: 3, lastCategory: 'policy' },
       }],
-      credential: { agent: 'main', kind: 'auth-expired', provider: 'anthropic', message: 'the token expired', lastAction: { id: 'refresh', at: 1, ok: false, message: 'refused' } },
+      credential: {
+        subscription: true, agent: 'main', kind: 'auth-login-required', provider: 'anthropic', message: text, since: 1, until: 2, windows: ['5h'],
+        rotatable: false, expiresAt: 3, actions: [{ id: 'login', label: 'Restart login', hint: 'Starts a new device-code login.' }],
+        login: { verificationUrl: 'https://example.invalid/device', userCode: 'ABCD-1234' },
+        lastAction: { id: 'refresh', at: 1, ok: false, message: text },
+      },
       compressionQuarantine: {
         main: {
           count: 1, keys: ['q1'],
@@ -927,6 +933,8 @@ describe('scope filters', () => {
     expected.compressionDebt.main.error = '';
     expected.readFailures.main.contextComposition = '';
     Object.assign(expected.callLedger.rows[0]!, { cause: '', error: '' });
+    expected.credential.message = '';
+    expected.credential.lastAction.message = '';
     expect(JSON.parse(JSON.stringify(keepNamedStrings(health, HEALTH_STRINGS)))).toEqual(expected);
 
     const quota = {
@@ -934,6 +942,27 @@ describe('scope filters', () => {
       windows: [{ key: 'five_hour', label: '5h', utilization: 10, resetsAt: 1, model: 'a-model', advisory: false }],
     };
     expect(JSON.parse(JSON.stringify(keepNamedStrings(quota, QUOTA_STRINGS)))).toEqual({ ...quota, error: '' });
+  });
+
+  test('frameWithoutFailureText gives the call ledger and the credential state without their failure text, and any other frame as it is', () => {
+    const ledger = {
+      type: 'call-ledger',
+      ledger: { rows: [{ id: 'c1', model: 'a-model', verdict: 'ERROR', cause: 'raw', error: 'raw' }], summary: { calls: 1, byVerdict: { ERROR: 1 } } },
+    } as unknown as WebUiServerMessage;
+    expect(JSON.parse(JSON.stringify(frameWithoutFailureText(ledger)))).toEqual({
+      type: 'call-ledger',
+      ledger: { rows: [{ id: 'c1', model: 'a-model', verdict: 'ERROR', cause: '', error: '' }], summary: { calls: 1, byVerdict: { ERROR: 1 } } },
+    });
+    const credential = {
+      type: 'credential-state', scope: 'kid', subscription: true, agent: 'main', kind: 'auth-rejected', provider: 'anthropic',
+      message: 'anthropic rejected the credential (raw)', since: 1, rotatable: true, actions: [{ id: 'refresh', label: 'Refresh' }],
+      lastAction: { id: 'refresh', at: 2, ok: false, message: 'refresh failed: raw' },
+    } as unknown as WebUiServerMessage;
+    expect(JSON.parse(JSON.stringify(frameWithoutFailureText(credential)))).toEqual({
+      ...credential, message: '', lastAction: { id: 'refresh', at: 2, ok: false, message: '' },
+    });
+    const trace = { type: 'trace', event: { type: 'usage:updated', agentName: 'main' } } as unknown as WebUiServerMessage;
+    expect(frameWithoutFailureText(trace)).toBe(trace);
   });
 
   test('the agent trees go only with every scope but debug, since their nodes carry token counts and how each run ended', () => {

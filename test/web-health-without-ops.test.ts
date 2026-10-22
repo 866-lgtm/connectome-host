@@ -7,8 +7,8 @@
  * helpers; Health.tsx and App.tsx only lay their answers out.
  */
 import { describe, expect, test } from 'bun:test';
-import { HEALTH_STRINGS, QUOTA_STRINGS, keepNamedStrings, type KeptStrings } from '../src/modules/web-ui-observers.js';
-import { healthEntry, readFailureLine } from '../src/web/health-lookup.js';
+import { CREDENTIAL_STRINGS, HEALTH_STRINGS, QUOTA_STRINGS, keepNamedStrings, type KeptStrings } from '../src/modules/web-ui-observers.js';
+import { credentialNote, healthEntry, lastActionText, readFailureLine } from '../src/web/health-lookup.js';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt } from '../src/web/compression-debt.js';
 import type { CallLedgerRow, QuotaSnapshotData } from '../src/web/protocol.js';
 import { planHealthAlerts } from '../web/src/health-alerts';
@@ -22,6 +22,8 @@ const TEXT = {
   debt: 'The compression report failed.\nCause: the store said no.',
   read: 'the store refused the read',
   quota: 'the usage endpoint answered 500',
+  credential: 'anthropic rejected the credential (invalid x-api-key)',
+  action: 'refresh failed: the token endpoint answered 400',
 };
 
 /** As the page receives it: through JSON, without the strings `kept` doesn't name. */
@@ -104,5 +106,31 @@ describe('the health panel, with health and without ops', () => {
     expect(quotaUnreadable({ ...quota, error: undefined })).toBe(false);
     expect(quotaTitle(bareQuota)).toBe('Subscription quota (anthropic)\nLast refresh failed');
     expect(quotaTitle(quota)).toBe(`Subscription quota (anthropic)\nLast refresh failed: ${TEXT.quota}`);
+    // Before the first poll answers there is no quota; a meter that read once
+    // and then failed keeps its windows, so it isn't unreadable; a good read
+    // says nothing failed.
+    expect(quotaUnreadable(null)).toBe(false);
+    const kept = { ...bareQuota, windows: [{ key: 'five_hour', label: '5h', utilization: 10 }] };
+    expect(quotaUnreadable(kept)).toBe(false);
+    expect(quotaTitle(kept)).toBe('Subscription quota (anthropic)\n5h: 10% used\nLast refresh failed');
+    expect(quotaTitle({ ...kept, error: undefined })).toBe('Subscription quota (anthropic)\n5h: 10% used');
+  });
+
+  test("the credential still shows its kind, its login and how its last action ended, without what either said", () => {
+    const credential = {
+      subscription: true, kind: 'auth-rejected', provider: 'anthropic', message: TEXT.credential, since: 1, rotatable: true,
+      actions: [{ id: 'refresh', label: 'Refresh' }], login: { verificationUrl: 'https://example.invalid/device', userCode: 'ABCD-1234' },
+      lastAction: { id: 'refresh', at: 2, ok: false, message: TEXT.action },
+    };
+    const bare = sent(credential, CREDENTIAL_STRINGS);
+    expect(JSON.stringify(bare)).not.toContain(TEXT.credential);
+    expect(JSON.stringify(bare)).not.toContain(TEXT.action);
+    expect(bare).toMatchObject({ kind: 'auth-rejected', login: credential.login, actions: credential.actions });
+    // The line under the kind goes when its text does; it says nothing while the state is ok.
+    expect(credentialNote(credential)).toBe(TEXT.credential);
+    expect(credentialNote(bare)).toBeUndefined();
+    expect(credentialNote({ ...credential, kind: 'ok' })).toBeUndefined();
+    expect(lastActionText(credential.lastAction, '5s ago')).toBe(`refresh FAILED 5s ago — ${TEXT.action}`);
+    expect(lastActionText(bare.lastAction, '5s ago')).toBe('refresh FAILED 5s ago');
   });
 });

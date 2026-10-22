@@ -551,6 +551,8 @@ export interface CredentialStateMessage {
   agent?: string;
   kind?: string;
   provider?: string;
+  /** The state's alert text, which can hold the provider's rejection detail
+   *  or a quota read's error: an observer without 'ops' gets it empty. */
   message?: string;
   since?: number;
   until?: number;
@@ -559,6 +561,8 @@ export interface CredentialStateMessage {
   expiresAt?: number;
   actions?: Array<{ id: string; label: string; hint?: string }>;
   login?: { verificationUrl: string; userCode: string };
+  /** The last operator action. Its `message`, which holds a failed action's
+   *  reason, an observer without 'ops' gets empty. */
   lastAction?: { id: string; at: number; ok: boolean; message: string };
 }
 

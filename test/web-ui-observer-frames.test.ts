@@ -27,6 +27,14 @@ describe('what each client is sent', () => {
     debt: 'The compression report failed.\nCause: the store said no.',
     read: 'the store refused the read',
     quota: 'the usage endpoint answered 500',
+    credential: 'anthropic rejected the credential (invalid x-api-key)',
+    action: 'refresh failed: the token endpoint answered 400',
+  };
+  // The credential monitor's state, a rejected credential after a failed refresh.
+  const login = { verificationUrl: 'https://example.invalid/device', userCode: 'ABCD-1234' };
+  const credentialState = {
+    kind: 'auth-rejected', provider: 'anthropic', message: TEXT.credential, since: 1, rotatable: true,
+    actions: [{ id: 'refresh', label: 'Refresh' }], login, lastAction: { id: 'refresh', at: 2, ok: false, message: TEXT.action },
   };
   // The store's windowed reads, which the welcome and history pages take, and
   // its listener, which message-appended comes from.
@@ -117,7 +125,7 @@ describe('what each client is sent', () => {
             return () => {};
           },
         },
-        credentials: { runAction: async () => ({ state: 'ok' }) },
+        credentials: { snapshot: () => credentialState, runAction: async () => credentialState },
         quotaMeter: {
           provider: 'anthropic',
           refresh: async () => ({ provider: 'anthropic', windows: [], fetchedAt: 1, error: TEXT.quota }),
@@ -360,7 +368,7 @@ describe('what each client is sent', () => {
     panels.quota = await get('/quota', null);
     for (const path of ['/healthz', '/healthz?scope=kid']) {
       for (const who of [null, c.everything]) {
-        expect(texts(await get(path, who))).toEqual(['call', 'cooldown', 'wait', 'lastError', 'debt', 'read']);
+        expect(texts(await get(path, who))).toEqual(['call', 'cooldown', 'wait', 'lastError', 'debt', 'read', 'credential', 'action']);
       }
       const health = await get(path, c.dashboard);
       expect(texts(health)).toEqual([]);
@@ -376,10 +384,39 @@ describe('what each client is sent', () => {
       expect(health.readFailures).toEqual({ main: { contextComposition: '' } });
       expect(health.runtimeSettings.main).toEqual({ contextBudgetTokens: 1000, transition: 'stable' });
       expect(health.callLedger).toEqual(ledgerWithoutText);
+      // The credential keeps its kind and its device-code login.
+      expect(health.credential).toMatchObject({ kind: 'auth-rejected', message: '', login, lastAction: { id: 'refresh', ok: false, message: '' } });
     }
     for (const path of ['/quota', '/quota?scope=kid']) {
       for (const who of [null, c.everything]) expect((await get(path, who)).error).toBe(TEXT.quota);
       expect(await get(path, c.dashboard)).toMatchObject({ subscription: true, provider: 'anthropic', windows: [], fetchedAt: 1, error: '' });
+    }
+
+    // The credential's state, by each route that carries it: /credential, the
+    // request-credential reply, and the broadcast after an action.
+    panels.credential = await get('/credential', null);
+    for (const path of ['/credential', '/credential?scope=kid']) {
+      for (const who of [null, c.everything]) expect(texts(await get(path, who))).toEqual(['credential', 'action']);
+      expect(await get(path, c.dashboard)).toMatchObject({ subscription: true, kind: 'auth-rejected', message: '', login, lastAction: { id: 'refresh', ok: false, message: '' } });
+    }
+    for (const conn of [c.dashboard, c.everything]) {
+      for (const scope of ['local', 'kid']) conn.ws.send(JSON.stringify({ type: 'request-credential', scope }));
+    }
+    c.operator.ws.send(JSON.stringify({ type: 'credential-action', scope: 'local', action: 'refresh' }));
+    const credentialFrames = async (conn: Connection) => {
+      const deadline = performance.now() + 5000;
+      while (conn.framesOf('credential-state').length < 3) {
+        if (performance.now() >= deadline) throw new Error('timed out waiting for credential-state');
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      return conn.framesOf('credential-state');
+    };
+    for (const frame of await credentialFrames(c.everything)) expect(texts(frame)).toEqual(['credential', 'action']);
+    const bare = await credentialFrames(c.dashboard);
+    expect(bare.map((f) => f.scope).sort()).toEqual(['kid', 'local', 'local']);
+    for (const frame of bare) {
+      expect(texts(frame)).toEqual([]);
+      expect(frame).toMatchObject({ kind: 'auth-rejected', message: '', login, lastAction: { id: 'refresh', ok: false, message: '' } });
     }
   });
 

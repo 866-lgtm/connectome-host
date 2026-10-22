@@ -19,7 +19,7 @@
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
 import { callFailed, callOriginLabel, callOriginTone } from './call-origin';
-import { healthEntry, readFailureLine } from '@conhost/web/health-lookup';
+import { credentialNote, healthEntry, lastActionText, readFailureLine } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
 
@@ -430,8 +430,8 @@ export function CredentialSection(props: {
             />
           </span>
         </div>
-        <Show when={kind() !== 'ok'}>
-          <div class={`${tone()} break-words`}>{c()!.message}</div>
+        <Show when={credentialNote(c()!)}>
+          {(note) => <div class={`${tone()} break-words`}>{note()}</div>}
         </Show>
         <div class="text-neutral-500">
           {c()!.expiresAt !== undefined
@@ -446,7 +446,7 @@ export function CredentialSection(props: {
         </Show>
         <Show when={c()!.lastAction}>
           <div class={c()!.lastAction!.ok ? 'text-neutral-400' : 'text-rose-300'}>
-            last action: {c()!.lastAction!.id} {c()!.lastAction!.ok ? 'ok' : 'FAILED'} {fmtAgo(c()!.lastAction!.at)} — {c()!.lastAction!.message}
+            last action: {lastActionText(c()!.lastAction!, fmtAgo(c()!.lastAction!.at))}
           </div>
         </Show>
       </section>

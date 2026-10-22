@@ -121,10 +121,11 @@ import {
   clientHolds,
   frameScopes,
   filterEntryForScopes,
+  frameWithoutFailureText,
   keepNamedStrings,
   scopeWelcome,
+  CREDENTIAL_STRINGS,
   HEALTH_STRINGS,
-  LEDGER_STRINGS,
   QUOTA_STRINGS,
   type KeptStrings,
   type ObserverScope,
@@ -262,9 +263,10 @@ const HTTP_PANEL_OPS: Record<string, string> = {
 /** The health routes an observer without 'ops' gets without their failure
  *  text, each keeping the strings its spec names (keepNamedStrings), whether
  *  this process answers or a fleet child does. */
-const HEALTH_ROUTE_STRINGS: ReadonlyMap<string, KeptStrings> = new Map([
+const HEALTH_ROUTE_STRINGS: ReadonlyMap<string, KeptStrings> = new Map<string, KeptStrings>([
   ['/healthz', HEALTH_STRINGS],
   ['/quota', QUOTA_STRINGS],
+  ['/credential', CREDENTIAL_STRINGS],
 ]);
 
 /** True when a wire `scope` field names a fleet child (vs the local process). */
@@ -606,7 +608,7 @@ export class WebUiModule implements Module {
     // calls without polling the JSONL log.
     state.callLedgerDetacher = this.config.callLedger?.onUpdate((ledger) => {
       state.latestCallLedger = ledger;
-      this.sendCallLedger(ledger);
+      this.broadcast({ type: 'call-ledger', ledger });
     }) ?? null;
 
     console.log(`[webui] listening on ${webUiHttpUrl(host, boundPort)}`);
@@ -940,37 +942,28 @@ export class WebUiModule implements Module {
    *  Every frame that goes whole to more than one client goes this way, so
    *  the live stream refuses an observer what its welcome and its requests
    *  do. `message-appended` goes to each observer projected through
-   *  filterEntryForScopes instead. A client that may not have `frame` gets
-   *  `standIn` in its place, if it may have that. */
+   *  filterEntryForScopes instead. An observer that may have `frame` but
+   *  doesn't hold 'ops' gets it without its failure text
+   *  (frameWithoutFailureText), a copy made for the first such observer. A
+   *  client that may not have `frame` gets `standIn` in its place, if it may
+   *  have that. */
   private broadcast(frame: WebUiServerMessage, standIn?: WebUiServerMessage | null): void {
     if (!sharedServer) return;
     const scopes = frameScopes(frame);
     const fallback = standIn ? { frame: standIn, scopes: frameScopes(standIn) } : null;
+    let withoutText: WebUiServerMessage | undefined;
     for (const client of sharedServer.clients.values()) {
       if (!client.welcomed) continue;
-      if (clientHolds(client, scopes)) this.send(client, frame);
-      else if (fallback && clientHolds(client, fallback.scopes)) this.send(client, fallback.frame);
+      if (clientHolds(client, scopes)) {
+        this.send(client, clientHolds(client, ['ops']) ? frame : (withoutText ??= frameWithoutFailureText(frame)));
+      } else if (fallback && clientHolds(client, fallback.scopes)) this.send(client, fallback.frame);
     }
   }
 
-  /** The call ledger to every client that may have it, as broadcast sends a
-   *  frame, but without its failure text to an observer without 'ops'
-   *  (LEDGER_STRINGS). That copy is made for the first such client, so a
-   *  ledger with none costs nothing more. */
-  private sendCallLedger(ledger: CallLedgerSnapshot): void {
-    if (!sharedServer) return;
-    const frame: WebUiServerMessage = { type: 'call-ledger', ledger };
-    const scopes = frameScopes(frame);
-    let withoutText: WebUiServerMessage | undefined;
-    for (const client of sharedServer.clients.values()) {
-      if (!client.welcomed || !clientHolds(client, scopes)) continue;
-      if (clientHolds(client, ['ops'])) {
-        this.send(client, frame);
-        continue;
-      }
-      withoutText ??= { type: 'call-ledger', ledger: keepNamedStrings(ledger, LEDGER_STRINGS) as CallLedgerSnapshot };
-      this.send(client, withoutText);
-    }
+  /** Send `frame` to one client that may have it, as broadcast sends it:
+   *  without its failure text to an observer without 'ops'. */
+  private sendScoped(client: ClientState, frame: WebUiServerMessage): void {
+    this.send(client, clientHolds(client, ['ops']) ? frame : frameWithoutFailureText(frame));
   }
 
   private fanOutTrace(event: TraceEvent): void {
@@ -1242,10 +1235,12 @@ export class WebUiModule implements Module {
 
     // Fleet-scope proxying: every debug/health route accepts ?scope=<child>.
     // The request is forwarded to that fleet child over the panel IPC verb
-    // and the child's JSON comes back verbatim — same URLs, same payloads,
-    // whether the process answering is this one or a child. Keeps these
-    // endpoints curl-able for operators / connectome-doctor / the fleet hub
-    // without teaching any of them a second transport.
+    // and the child's JSON comes back as it sent it — same URLs, same
+    // payloads, whether the process answering is this one or a child, and an
+    // observer without 'ops' gets a health route's answer without its failure
+    // text from either (HEALTH_ROUTE_STRINGS). Keeps these endpoints
+    // curl-able for operators / connectome-doctor / the fleet hub without
+    // teaching any of them a second transport.
     const scopeParam = url.searchParams.get('scope');
     if (scopeParam && scopeParam !== 'local') {
       const op = HTTP_PANEL_OPS[url.pathname];
@@ -1330,7 +1325,8 @@ export class WebUiModule implements Module {
     if (url.pathname === '/credential') {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      return Response.json(buildCredentialSnapshot(app));
+      const credential = buildCredentialSnapshot(app);
+      return Response.json(keptStrings ? keepNamedStrings(credential, keptStrings) : credential);
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
@@ -2328,13 +2324,13 @@ export class WebUiModule implements Module {
       case 'request-credential': {
         if (isChildScope(parsed.scope)) {
           void this.requestChildPanel(client, parsed.scope!, 'credential', {}).then((data) => {
-            if (data !== null) this.send(client, { type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+            if (data !== null) this.sendScoped(client, { type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
           });
           return;
         }
         const app = this.panelApp();
         if (!app) return;
-        this.send(client, { type: 'credential-state', scope: 'local', ...buildCredentialSnapshot(app) } as WebUiServerMessage);
+        this.sendScoped(client, { type: 'credential-state', scope: 'local', ...buildCredentialSnapshot(app) } as WebUiServerMessage);
         return;
       }
 

@@ -784,8 +784,8 @@ export function childEventScopes(event: { type?: unknown }): FrameScopes {
  *  reaches no observer until it's given a scope: today that's `pins-list` and
  *  `settings-state`, which no observer may request. `message-appended` isn't
  *  sent this way: each observer gets it projected through
- *  filterEntryForScopes. Nor, past this gate, is `call-ledger`: an observer
- *  without 'ops' gets it without its failure text (LEDGER_STRINGS). */
+ *  filterEntryForScopes. A client that a frame's scopes admit but that
+ *  doesn't hold 'ops' is sent frameWithoutFailureText's copy of it. */
 export function frameScopes(frame: WebUiServerMessage): FrameScopes {
   switch (frame.type) {
     case 'trace':
@@ -914,9 +914,25 @@ export const LEDGER_STRINGS: KeptStrings = {
   summary: { cost: { currency: true, pricingVersion: true } },
 };
 
+/** The credential's state's strings that aren't failure text
+ *  (buildCredentialSnapshot): all but its `message`, which is the alert's
+ *  text and holds the provider's rejection detail or the quota read's error,
+ *  and the last action's `message`, which holds a failed action's reason, as
+ *  the alert's data leaves out both (CredentialMonitor.alertData). The
+ *  actions' labels and hints are the host's own words, and a device-code
+ *  login goes whole, for whoever completes it. */
+export const CREDENTIAL_STRINGS = {
+  agent: true,
+  kind: true,
+  provider: true,
+  windows: true,
+  actions: true,
+  login: true,
+  lastAction: { id: true },
+} satisfies KeptStrings;
+
 /** `/healthz`'s strings that aren't failure text: agent-framework's
- *  healthSnapshot, and what buildHealthSnapshot adds. The credential's state
- *  goes whole, as health-tier telemetry (buildCredentialSnapshot). */
+ *  healthSnapshot, and what buildHealthSnapshot adds. */
 export const HEALTH_STRINGS: KeptStrings = {
   at: true,
   gate: { inferring: true },
@@ -930,7 +946,7 @@ export const HEALTH_STRINGS: KeptStrings = {
     },
     refusalStats: { lastCategory: true },
   },
-  credential: true,
+  credential: CREDENTIAL_STRINGS,
   compressionQuarantine: {
     '*': {
       keys: true,
@@ -952,6 +968,21 @@ export const QUOTA_STRINGS: KeptStrings = {
   provider: true,
   windows: { key: true, label: true, model: true },
 };
+
+/** The frame a client that holds 'health' and not 'ops' is sent in place of
+ *  `frame`: the call ledger and the credential's state without their
+ *  failure text (LEDGER_STRINGS, CREDENTIAL_STRINGS), and any other frame as
+ *  it is. */
+export function frameWithoutFailureText(frame: WebUiServerMessage): WebUiServerMessage {
+  switch (frame.type) {
+    case 'call-ledger':
+      return { ...frame, ledger: keepNamedStrings(frame.ledger, LEDGER_STRINGS) as CallLedgerSnapshot };
+    case 'credential-state':
+      return keepNamedStrings(frame, { type: true, scope: true, ...CREDENTIAL_STRINGS }) as WebUiServerMessage;
+    default:
+      return frame;
+  }
+}
 
 /** Project a welcome through an observer's scope mask. Without 'messages'
  *  the conversation's entries are emptied — a health/ops observer like the
