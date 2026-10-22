@@ -77,20 +77,24 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
     const state = streams.get(agent);
     if (state === undefined) return;
     const primary = agent === primaryAgentName;
-    // A stream's first end closes its prose line, and for the primary says
-    // how its turn ended. An end after an end, such as `exhausted` after
-    // `failed`, prints nothing. From agent-framework 0.22.3 a lone
-    // `exhausted` comes only from an abort whose reason isn't `user`, which
-    // the framework counts as a failure, so its line goes to stderr with
-    // `failed`'s; a stop ends with `aborted`, which isn't a failure.
+    // A stream's first end closes its prose line on stdout, so that what
+    // prints next, such as a batch's echo of its next line, starts a line of
+    // its own, and says how the stream ended. A failure goes to stderr, for
+    // any agent: `failed`, and a lone `exhausted`, which from agent-framework
+    // 0.22.3 comes only from an abort whose reason isn't `user` and which the
+    // framework counts as a failure. The primary's stop, `aborted`, goes to
+    // stdout, since it isn't one. An end after an end, such as `exhausted`
+    // after `failed`, prints nothing.
     if (state === 'open') {
       if (event.type === 'inference:failed') {
-        out.error(`\nError: ${traceError(event)}`);
+        out.write('\n');
+        out.error(`Error: ${traceError(event)}`);
+      } else if (event.type === 'inference:exhausted') {
+        out.write('\n');
+        out.error(`(turn ended: ${traceError(event)})`);
       } else if (primary && event.type === 'inference:aborted') {
         const reason = typeof event.reason === 'string' && event.reason !== '' ? `: ${event.reason}` : '';
         out.log(`\n(turn aborted${reason})`);
-      } else if (primary && event.type === 'inference:exhausted') {
-        out.error(`\n(turn ended: ${traceError(event)})`);
       } else {
         out.write('\n');
       }

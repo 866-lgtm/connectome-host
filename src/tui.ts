@@ -224,6 +224,66 @@ export function peekEndLine(
   }
 }
 
+/** The colour a peek view shows a stream end's line in (peekEndLine). */
+export function peekEndColor(tone: 'dim' | 'warn' | 'error'): string {
+  return tone === 'dim' ? DIM_GRAY : tone === 'warn' ? YELLOW : RED;
+}
+
+/** One line of a fleet child's peek log for one of its wire events, or null
+ *  for one it doesn't show. Pure, so tests read each event's line. */
+export function formatWireEvent(evt: WireEvent): { text: string; color: string } | null {
+  const type = typeof evt.type === 'string' ? evt.type : '';
+  if (!type) return null;
+  const get = (k: string): unknown => (evt as Record<string, unknown>)[k];
+
+  switch (type) {
+    case 'lifecycle': {
+      const phase = get('phase') as string;
+      const color = phase === 'ready' ? GREEN : phase === 'exiting' ? YELLOW : GRAY;
+      return { text: `◆ lifecycle: ${phase}${get('reason') ? ` (${get('reason') as string})` : ''}`, color };
+    }
+    case 'inference:started': return { text: `─ inference started (${get('agentName') ?? '?'}) ─`, color: DIM_GRAY };
+    case 'inference:completed': return { text: `─ inference completed ─`, color: DIM_GRAY };
+    // A stream's other ends, in the words and colours the in-process
+    // subagent's peek gives them (peekEndLine): a lone `exhausted` is a
+    // failure since agent-framework 0.22.3, as `failed` is.
+    case 'inference:turn_ended':
+    case 'inference:aborted':
+    case 'inference:failed':
+    case 'inference:exhausted': {
+      const end = peekEndLine(evt as { type: string; reason?: unknown; error?: unknown });
+      return end && { text: end.text, color: peekEndColor(end.tone) };
+    }
+    case 'inference:tokens': {
+      // Token streams would spam the log; the line-merge needed to show them
+      // nicely is in peek-proc's dedicated renderer, not this formatter.
+      return null;
+    }
+    case 'inference:content_block':
+    case 'inference:usage':
+    case 'usage:updated':
+      // High-frequency bookkeeping events — a `· type` dot line per block/
+      // round is pure noise between the lines that carry meaning.
+      return null;
+    case 'ops:alert': {
+      // The single most important thing a child can say must not fall
+      // through to the dim default-dot rendering.
+      const kind = typeof get('kind') === 'string' ? get('kind') as string : 'unknown';
+      const msg = typeof get('message') === 'string' ? get('message') as string : '';
+      const who = typeof get('agentName') === 'string' ? ` [${get('agentName') as string}]` : '';
+      return kind.endsWith('-clear')
+        ? { text: `✓${who} ${kind}: ${msg}`, color: CYAN }
+        : { text: `⚠${who} ${kind}: ${msg}`, color: RED };
+    }
+    case 'tool:started': return { text: `  ⟳ ${get('tool') as string}`, color: YELLOW };
+    case 'tool:completed': return { text: `  ✓ ${get('tool') as string} (${get('durationMs') ?? '?'}ms)`, color: CYAN };
+    case 'tool:failed': return { text: `  ✗ ${get('tool') as string}: ${get('error') as string}`, color: RED };
+    case 'command-output': return { text: `  ${get('text') as string}`, color: GRAY };
+    default:
+      return { text: `· ${type}`, color: DIM_GRAY };
+  }
+}
+
 /** Whether the TUI's Escape acts, and the status bar offers it. Not when
  *  the status line reads idle, nor while the host switches sessions, whose
  *  end sets the status itself; for any other status but an error, whenever
@@ -2273,50 +2333,6 @@ export async function runTui(app: AppContext): Promise<void> {
     if (log.length > 500) log.splice(0, log.length - 500);
   }
 
-  function formatWireEvent(evt: WireEvent): { text: string; color: string } | null {
-    const type = typeof evt.type === 'string' ? evt.type : '';
-    if (!type) return null;
-    const get = (k: string): unknown => (evt as Record<string, unknown>)[k];
-
-    switch (type) {
-      case 'lifecycle': {
-        const phase = get('phase') as string;
-        const color = phase === 'ready' ? GREEN : phase === 'exiting' ? YELLOW : GRAY;
-        return { text: `◆ lifecycle: ${phase}${get('reason') ? ` (${get('reason') as string})` : ''}`, color };
-      }
-      case 'inference:started': return { text: `─ inference started (${get('agentName') ?? '?'}) ─`, color: DIM_GRAY };
-      case 'inference:completed': return { text: `─ inference completed ─`, color: DIM_GRAY };
-      case 'inference:failed': return { text: `✗ inference failed: ${traceError(evt)}`, color: RED };
-      case 'inference:tokens': {
-        // Token streams would spam the log; the line-merge needed to show them
-        // nicely is in peek-proc's dedicated renderer, not this formatter.
-        return null;
-      }
-      case 'inference:content_block':
-      case 'inference:usage':
-      case 'usage:updated':
-        // High-frequency bookkeeping events — a `· type` dot line per block/
-        // round is pure noise between the lines that carry meaning.
-        return null;
-      case 'ops:alert': {
-        // The single most important thing a child can say must not fall
-        // through to the dim default-dot rendering.
-        const kind = typeof get('kind') === 'string' ? get('kind') as string : 'unknown';
-        const msg = typeof get('message') === 'string' ? get('message') as string : '';
-        const who = typeof get('agentName') === 'string' ? ` [${get('agentName') as string}]` : '';
-        return kind.endsWith('-clear')
-          ? { text: `✓${who} ${kind}: ${msg}`, color: CYAN }
-          : { text: `⚠${who} ${kind}: ${msg}`, color: RED };
-      }
-      case 'tool:started': return { text: `  ⟳ ${get('tool') as string}`, color: YELLOW };
-      case 'tool:completed': return { text: `  ✓ ${get('tool') as string} (${get('durationMs') ?? '?'}ms)`, color: CYAN };
-      case 'tool:failed': return { text: `  ✗ ${get('tool') as string}: ${get('error') as string}`, color: RED };
-      case 'command-output': return { text: `  ${get('text') as string}`, color: GRAY };
-      default:
-        return { text: `· ${type}`, color: DIM_GRAY };
-    }
-  }
-
   // Subscribe to each subagent's stream for peek logs + done events.
   const subagentStreamUnsubs: Array<() => void> = [];
   const subscribedSubagents = new Set<string>();
@@ -2403,7 +2419,7 @@ export async function runTui(app: AppContext): Promise<void> {
           peekTokenLine.delete(name);
           peekCurrentTool.set(name, null);
           const end = peekEndLine(event);
-          if (end) appendPeekLog(name, end.text, end.tone === 'dim' ? DIM_GRAY : end.tone === 'warn' ? YELLOW : RED);
+          if (end) appendPeekLog(name, end.text, peekEndColor(end.tone));
           break;
         }
 
