@@ -13,7 +13,7 @@
 
 import { readFileSync, writeFileSync, existsSync, lstatSync, statSync, mkdirSync, rmSync, chmodSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import type { MountConfig } from '@animalabs/agent-framework';
+import type { CodeExecutionConfig, MountConfig } from '@animalabs/agent-framework';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
@@ -201,6 +201,10 @@ export interface RecipeKvUnifiedConfig {
     continuityRecencyFloor: number;
     continuityStableHalfLife: number;
     continuityStableFloor: number;
+    /** Age bands per doubling for fidelity and continuity ages
+     * (context-manager ≥ 0.17): an integer from 0 to 64, 0 prices exact ages.
+     * Optional; a strategy built from a recipe takes 4 unless set. */
+    ageBandSteps?: number;
   };
   tokenBucketSize: number;
   continuityBucketSize: number;
@@ -212,8 +216,16 @@ export interface RecipeKvUnifiedConfig {
    * with treeifyNonContiguousSummaries; both flags must be explicit. */
   preserveGapBearingSummaries: boolean;
   /** Skip the full Pareto pass when the previously accepted layout is provably
-   * still selected (context-manager ≥ 0.14). Optional; off unless set. */
+   * still selected (context-manager ≥ 0.14). Optional; from context-manager
+   * 0.15 a strategy built from a recipe takes it on unless set to `false`. */
   hysteresisCertificate?: boolean;
+  /** Which engine solves the forest (context-manager ≥ 0.17): `auto` (absent)
+   * runs the subtree engine and falls back to the packed DAG engine past the
+   * label ceiling; `subtree` and `dag` pin one. */
+  engine?: 'auto' | 'subtree' | 'dag';
+  /** How producible merges are measured against the live cut
+   * (context-manager ≥ 0.17): `joint` unless set to `individual`. */
+  latentDemandMode?: 'individual' | 'joint';
 }
 
 export interface RecipeAgent {
@@ -1147,25 +1159,41 @@ export interface RecipeExtension {
 }
 
 /**
- * Client-side programmatic tool calling (af `code_execution` tool, af ≥0.7.2).
+ * Client-side programmatic tool calling (af `code_execution` tool), passed to
+ * the framework as written, so it is the framework's own config type.
  *
- * SECURITY: like mcpl_deploy, enabling this means trusting the agent with
- * code execution — model-authored python runs as the host user with the
- * agent's full tool surface injected. It is a robustness boundary (deadline,
- * kill, respawn), not a sandbox. The agents we host already have shells;
- * enable deliberately all the same.
+ * SECURITY: from agent-framework 0.24, model-authored JavaScript runs in a
+ * QuickJS WebAssembly engine, in a child process of the host, and reaches
+ * nothing but its agent's tools: no network, files or environment. The
+ * framework claims no containment beyond its engine and glue: the child runs
+ * as the host's user, with no operating-system sandbox around it. Enable
+ * deliberately.
  */
-export interface RecipeCodeExecution {
-  enabled: boolean;
-  /** Python interpreter (default: python3 from PATH; needs ≥3.8). */
-  pythonPath?: string;
-  /** Per-inner-tool-call timeout, ms (default 270_000). */
-  toolCallTimeoutMs?: number;
-  /** Whole-script deadline, ms (default 600_000). */
-  scriptTimeoutMs?: number;
-  /** Idle interpreter reclaim, ms (default 300_000; 0 disables). */
-  idleReclaimMs?: number;
-}
+export type RecipeCodeExecution = CodeExecutionConfig;
+
+/**
+ * What agent-framework 0.24's JavaScript runner refuses from the Python
+ * runner's settings, with what to do instead: its isolateSettings' table,
+ * which the package doesn't export. The host refuses them at recipe load, as
+ * the framework does at create(), so such a recipe fails before the host
+ * starts rather than at the framework's boot.
+ */
+const RETIRED_CODE_EXECUTION_KEYS: Readonly<Record<string, string>> = {
+  pythonPath: 'scripts are JavaScript now, run by an engine built into agent-framework, so there is no interpreter to name; leave it out',
+  idleReclaimMs: 'each script starts fresh and keeps nothing after it ends, so there is nothing to reclaim; leave it out',
+  env: "a script's world holds only your agent's tools, with no environment; leave it out",
+  inheritEnv: "a script's world holds only your agent's tools, with no environment; leave it out",
+  scriptTimeoutMs: 'a script now yields at its bound and keeps running: set yieldMs for the bound',
+  maxScriptTimeoutMs: 'set maxYieldMs, the most an agent may ask a run or a wait to wait',
+  backgroundMaxLifetimeMs: 'every script now has one limit: set scriptLifetimeMs',
+  maxBackgroundScripts: 'set maxRunningScripts, how many scripts an agent may have running at once, yielded ones included',
+};
+/** The runner's numeric settings, each a whole number of 0 or more; the
+ *  framework checks their ranges when it builds the runner. */
+const CODE_EXECUTION_NUMBER_KEYS = [
+  'yieldMs', 'maxYieldMs', 'scriptLifetimeMs', 'maxRunningScripts', 'maxScriptChildren',
+  'toolCallTimeoutMs', 'wakeMinIntervalMs', 'maxWakesPerScript', 'memoryMaxBytes',
+] as const;
 
 /**
  * The subconscious resident (agent-framework FrameworkConfig.subconscious,
@@ -1635,6 +1663,13 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
       throw new Error(`Recipe agent.strategy.kvUnified.policy.${key} must be in [0, 1].`);
     }
   }
+  // Mirror context-manager 0.17: src/adaptive/kv-unified-policy.ts (MAX_AGE_BAND_STEPS).
+  if (
+    policy.ageBandSteps !== undefined &&
+    (!Number.isInteger(policy.ageBandSteps) || (policy.ageBandSteps as number) < 0 || (policy.ageBandSteps as number) > 64)
+  ) {
+    throw new Error('Recipe agent.strategy.kvUnified.policy.ageBandSteps must be an integer from 0 to 64 when present.');
+  }
   for (const key of [
     'tokenBucketSize', 'continuityBucketSize', 'fidelityBucketSize', 'labelCeiling',
   ] as const) {
@@ -1664,6 +1699,14 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
   if (config.hysteresisCertificate !== undefined && typeof config.hysteresisCertificate !== 'boolean') {
     throw new Error('Recipe agent.strategy.kvUnified.hysteresisCertificate must be a boolean when present.');
   }
+  // A typo here doesn't fail in context-manager: an engine it doesn't know
+  // runs as `auto`, and a mode other than `joint` ranks individually.
+  if (config.engine !== undefined && !['auto', 'subtree', 'dag'].includes(config.engine as string)) {
+    throw new Error('Recipe agent.strategy.kvUnified.engine must be "auto", "subtree" or "dag" when present.');
+  }
+  if (config.latentDemandMode !== undefined && !['individual', 'joint'].includes(config.latentDemandMode as string)) {
+    throw new Error('Recipe agent.strategy.kvUnified.latentDemandMode must be "individual" or "joint" when present.');
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1672,9 +1715,9 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
 
 /**
  * The keys each recipe level reads. The type check below keeps these lists in
- * step with Recipe, RecipeAgent, RecipeModules and RecipeMockConfig: a key
- * added to an interface and not here (or listed here and gone from the
- * interface) fails to compile.
+ * step with Recipe, RecipeAgent, RecipeModules, RecipeMockConfig and
+ * RecipeKvUnifiedConfig with its policy: a key added to an interface and not
+ * here (or listed here and gone from the interface) fails to compile.
  */
 const RECIPE_KEYS = [
   'name', 'description', 'version', 'agent', 'mcpServers', 'modules', 'extensions',
@@ -1697,6 +1740,17 @@ const RECIPE_MODULE_KEYS = [
   'mcplAdmin', 'history', 'identity', 'fleet', 'webui', 'ttsRelay', 'subscriptionGc',
   'channelMode', 'selfRestart',
 ] as const;
+const RECIPE_KV_UNIFIED_KEYS = [
+  'policy', 'tokenBucketSize', 'continuityBucketSize', 'fidelityBucketSize', 'labelCeiling',
+  'adoptEpsilon', 'treeifyNonContiguousSummaries', 'preserveGapBearingSummaries',
+  'hysteresisCertificate', 'engine', 'latentDemandMode',
+] as const;
+const RECIPE_KV_UNIFIED_POLICY_KEYS = [
+  'alpha', 'budgetLowRatio', 'budgetHighRatio', 'budgetUnderLambda', 'budgetOverLambda',
+  'cacheLambda', 'cacheScale', 'cacheReadPrice', 'cacheWritePrice', 'continuityLambda',
+  'continuityScale', 'continuityRecencyHalfLifeTokens', 'continuityRecencyFloor',
+  'continuityStableHalfLife', 'continuityStableFloor', 'ageBandSteps',
+] as const;
 type ListsExactly<K extends string, L extends readonly string[]> =
   [Exclude<K, L[number]>] extends [never] ? ([Exclude<L[number], K>] extends [never] ? true : false) : false;
 // "Type 'true' is not assignable to type 'false'" here means a key was added
@@ -1706,7 +1760,9 @@ const recipeKeyListsInStep: [
   ListsExactly<keyof RecipeAgent & string, typeof RECIPE_AGENT_KEYS>,
   ListsExactly<keyof RecipeModules & string, typeof RECIPE_MODULE_KEYS>,
   ListsExactly<keyof RecipeMockConfig & string, typeof RECIPE_AGENT_MOCK_KEYS>,
-] = [true, true, true, true];
+  ListsExactly<keyof RecipeKvUnifiedConfig & string, typeof RECIPE_KV_UNIFIED_KEYS>,
+  ListsExactly<keyof RecipeKvUnifiedConfig['policy'] & string, typeof RECIPE_KV_UNIFIED_POLICY_KEYS>,
+] = [true, true, true, true, true, true];
 void recipeKeyListsInStep;
 
 const RECIPE_WORKSPACE_KEYS = ['mounts', 'configMount'] as const;
@@ -1795,6 +1851,13 @@ const mountListsInStep: [
   IsNever<Exclude<MountConfig['wakeOnChange'], undefined | boolean | readonly unknown[]>>,
 ] = [true, true, true, true, true, true];
 void mountListsInStep;
+// "Type 'true' is not assignable to type 'false'" here means agent-framework's
+// CodeExecutionConfig gained or lost a setting CODE_EXECUTION_NUMBER_KEYS
+// doesn't follow yet.
+const codeExecutionKeysInStep: ListsExactly<
+  Exclude<keyof CodeExecutionConfig, 'enabled'> & string, typeof CODE_EXECUTION_NUMBER_KEYS
+> = true;
+void codeExecutionKeysInStep;
 
 /**
  * A key a section doesn't have, refused with what to write instead, when the
@@ -1844,7 +1907,8 @@ function nearestRecipeKey(key: string, known: readonly string[]): string | null 
 
 /**
  * The keys a recipe carries that the host never reads — at the top level,
- * under `agent`, `agent.mock` and `modules` — each with what it was probably
+ * under `agent`, `agent.mock`, `agent.strategy.kvUnified` and its `policy`,
+ * and `modules` — each with what it was probably
  * meant to be. A misspelled key doesn't fail, it just doesn't happen (#167);
  * for now they are warned about, not rejected, so recipes carrying leftovers
  * keep loading (the strict schema is #91's direction).
@@ -1866,8 +1930,17 @@ export function unknownRecipeKeys(raw: unknown): string[] {
   };
   check('', obj, RECIPE_KEYS);
   check('agent.', obj.agent, RECIPE_AGENT_KEYS);
-  if (obj.agent && typeof obj.agent === 'object' && !Array.isArray(obj.agent)) {
-    check('agent.mock.', (obj.agent as Record<string, unknown>).mock, RECIPE_AGENT_MOCK_KEYS);
+  const isObject = (value: unknown): value is Record<string, unknown> =>
+    !!value && typeof value === 'object' && !Array.isArray(value);
+  if (isObject(obj.agent)) {
+    check('agent.mock.', obj.agent.mock, RECIPE_AGENT_MOCK_KEYS);
+    // context-manager reads the kvUnified block as written, so a misspelled
+    // optional key there (`latentDemandMod`) silently takes the default.
+    const kvUnified = isObject(obj.agent.strategy) ? obj.agent.strategy.kvUnified : undefined;
+    check('agent.strategy.kvUnified.', kvUnified, RECIPE_KV_UNIFIED_KEYS);
+    if (isObject(kvUnified)) {
+      check('agent.strategy.kvUnified.policy.', kvUnified.policy, RECIPE_KV_UNIFIED_POLICY_KEYS);
+    }
   }
   check('modules.', obj.modules, RECIPE_MODULE_KEYS);
   return found;
@@ -2951,12 +3024,17 @@ export function validateRecipe(raw: unknown): Recipe {
     if (typeof ce.enabled !== 'boolean') {
       throw new Error('Recipe codeExecution.enabled must be a boolean.');
     }
-    if (ce.pythonPath !== undefined && (typeof ce.pythonPath !== 'string' || !ce.pythonPath.trim())) {
-      throw new Error('Recipe codeExecution.pythonPath must be a non-empty string.');
-    }
-    for (const k of ['toolCallTimeoutMs', 'scriptTimeoutMs', 'idleReclaimMs'] as const) {
-      if (ce[k] !== undefined && (typeof ce[k] !== 'number' || (ce[k] as number) < 0)) {
-        throw new Error(`Recipe codeExecution.${k} must be a non-negative number.`);
+    // As in the framework, a block that isn't on has nothing else read.
+    if (ce.enabled) {
+      for (const [key, instead] of Object.entries(RETIRED_CODE_EXECUTION_KEYS)) {
+        if (ce[key] !== undefined && ce[key] !== null) {
+          throw new Error(`Recipe codeExecution.${key} is no longer read (agent-framework 0.24): ${instead}.`);
+        }
+      }
+      for (const k of CODE_EXECUTION_NUMBER_KEYS) {
+        if (ce[k] !== undefined && (typeof ce[k] !== 'number' || !Number.isSafeInteger(ce[k]) || (ce[k] as number) < 0)) {
+          throw new Error(`Recipe codeExecution.${k} must be a whole number of 0 or more.`);
+        }
       }
     }
   }
