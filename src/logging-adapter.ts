@@ -109,6 +109,19 @@ export function modelAcceptsEffort(model: string, level: EffortLevel): boolean {
 export function modelAcceptsAdaptiveThinking(model: string): boolean {
   return /claude-(fable|mythos)-|claude-opus-(4-[6-9]|[5-9])|claude-sonnet-(4-6|[5-9])/.test(model);
 }
+
+/** Whether `model` returns the notes it writes between tool calls ("found X,
+ *  checking Y next") as signed `thinking` blocks instead of `text`, and
+ *  accepts `thinking.display: 'updates'` to get their text back: Fable 5 and
+ *  5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 (Anthropic's migration docs; on
+ *  Opus 5.5 and Sonnet 5.5, notes longer than a sentence or two). Thinking
+ *  can't be turned off on any of them, and under the default display
+ *  ('omitted') those notes come back empty. A later model isn't assumed to
+ *  accept 'updates': an unaccepted display is a 400 on every turn, the same
+ *  fail-safe posture as modelAcceptsEffort. */
+export function modelReturnsNotesInThinking(model: string): boolean {
+  return /claude-(fable-5(-1)?|mythos-5-1|opus-5-5|sonnet-5-5)(?![-\d])/.test(model);
+}
 export type ProviderCallObserver = (record: ProviderCallRecord) => void;
 
 /** Exact first-system-block identity Anthropic requires on subscription
@@ -433,6 +446,39 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     };
   }
 
+  /** Never leave the notes the model writes between tool calls empty on a
+   *  model that returns them as thinking blocks (modelReturnsNotesInThinking).
+   *  The thinking config in effect (`extra.thinking` wins over
+   *  `request.thinking`, as in the adapter) is sent with `display: 'updates'`
+   *  where it would leave display at 'omitted', explicitly or by sending none,
+   *  including with reasoning off, which these models can't honour anyway:
+   *  reasoning stays hidden either way, and only the notes come back.
+   *  'summarized' already returns the notes (mixed with reasoning summaries),
+   *  and a config of another type ('disabled', 'between_tools') is the
+   *  caller's to keep, so both pass untouched, as does every other model.
+   *  The config's other fields, such as block binding, are kept.
+   *
+   *  Needs membrane >= 0.7.0, which adds the
+   *  `thinking-display-updates-2026-08-18` beta whenever the body it sends
+   *  asks for 'updates'; without the beta the API refuses the value. */
+  private withProgressNotes(request: ProviderRequest): ProviderRequest {
+    if (!modelReturnsNotesInThinking(request.model)) return request;
+    const extraThinking = (request.extra as { thinking?: unknown } | undefined)?.thinking;
+    const current = (extraThinking ?? request.thinking) as Record<string, unknown> | null | undefined;
+    if (current) {
+      const type = current.type ?? 'enabled';
+      if (type !== 'adaptive' && type !== 'enabled') return request;
+      if (current.display === 'summarized' || current.display === 'updates') return request;
+    }
+    return {
+      ...request,
+      extra: {
+        ...request.extra,
+        thinking: { ...(current ?? { type: 'adaptive' }), display: 'updates' },
+      },
+    };
+  }
+
   /** Apply the agent's reasoning_effort setting as `output_config.effort`.
    *  Called for stream() only: agent turns stream, while compression and
    *  maintenance calls go through complete() — a resident turning effort down
@@ -751,7 +797,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withReasoning(request));
+    const effective = this.withOAuthIdentity(this.withProgressNotes(this.withReasoning(request)));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     let response: ProviderResponse;
@@ -772,7 +818,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withEffort(this.withReasoning(request)));
+    const effective = this.withOAuthIdentity(this.withEffort(this.withProgressNotes(this.withReasoning(request))));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     let response: ProviderResponse;
