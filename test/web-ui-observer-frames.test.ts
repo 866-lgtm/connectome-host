@@ -7,6 +7,7 @@
  * observer only when its grant covers what the frame carries.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
+import { continuesBody, type BodyShard } from '@animalabs/context-manager';
 import { BASIC, startObservedHost, type Connection, type ObservedHost } from './web-ui-observed-host.js';
 
 describe('what each client is sent', () => {
@@ -36,12 +37,21 @@ describe('what each client is sent', () => {
     kind: 'auth-rejected', provider: 'anthropic', message: TEXT.credential, since: 1, rotatable: true,
     actions: [{ id: 'refresh', label: 'Refresh' }], login, lastAction: { id: 'refresh', at: 2, ok: false, message: TEXT.action },
   };
+  // Told of each windowed read, before it's answered: where it begins and how many slots it asks for.
+  let onRead: ((offset: number, limit: number) => void) | undefined;
   // The store's windowed reads, which the welcome and history pages take, and
   // its listener, which message-appended comes from.
   const cm = {
     getMessageCount: () => transcript.length,
-    getMessageWindow: (offset: number, limit: number) =>
-      ({ messages: transcript.slice(offset, offset + limit), startIndex: offset, totalCount: transcript.length }),
+    getMessageWindow: (offset: number, limit: number, opts?: { alignToBodyGroups?: boolean }) => {
+      onRead?.(offset, limit);
+      // As the store does with alignToBodyGroups, a window that begins inside
+      // a sharded body begins at its first shard. (The store also carries a
+      // window's end to its body's last shard, which no test here needs.)
+      let start = offset;
+      while (opts?.alignToBodyGroups && start > 0 && continuesBody(transcript[start - 1] as BodyShard, transcript[start] as BodyShard)) start--;
+      return { messages: transcript.slice(start, offset + limit), startIndex: start, totalCount: transcript.length };
+    },
     onMessage: (listener: (event: { type: string; message?: unknown }) => void) => {
       appended = listener;
       return () => { if (appended === listener) appended = undefined; };
@@ -305,6 +315,126 @@ describe('what each client is sent', () => {
     } finally {
       transcript = [];
     }
+  });
+
+  describe('a message whose every block its scopes remove', () => {
+    type Entry = { id?: string };
+    const ids = (entries: unknown) => (entries as Entry[]).map((e) => e.id);
+    const say = (id: string, participant: string, content: unknown[], body?: { bodyGroupId: string; shardIndex: number }) =>
+      ({ id, participant, content, ...body });
+    const toolUse = (id: string, call: string) => say(id, 'assistant', [{ type: 'tool_use', id: call, name: 'shell', input: {} }]);
+    const toolResult = (id: string, call: string, body?: { bodyGroupId: string; shardIndex: number }) =>
+      say(id, 'user', [{ type: 'tool_result', toolUseId: call, content: [{ type: 'text', text: 'out' }] }], body);
+    const page = async (conn: Connection, corrId: string, beforeIndex: number, limit = 2) => {
+      conn.ws.send(JSON.stringify({ type: 'request-history', corrId, beforeIndex, limit }));
+      const f = await conn.until('history-page', (p) => p.corrId === corrId);
+      return { ids: ids(f.entries), startIndex: f.startIndex, totalCount: f.totalCount };
+    };
+    // Where each page read began, for reads of `limit` slots: the welcome's
+    // reads take every slot, so they never match.
+    const readsOf = (limit: number) => {
+      const offsets: number[] = [];
+      onRead = (offset, size) => { if (size === limit) offsets.push(offset); };
+      return offsets;
+    };
+
+    test("doesn't reach a client in its welcome, live, or in a page, which reads back past such messages to one the client may see, or to the start", async () => {
+      transcript = [
+        toolUse('m0', 't0'),
+        toolResult('m1', 't0'),
+        say('m2', 'user', [{ type: 'text', text: 'a word' }]),
+        toolUse('m3', 't1'),
+        toolResult('m4', 't1'),
+        say('m5', 'assistant', [{ type: 'thinking', thinking: 'mulling' }]),
+        toolUse('m6', 't2'),
+      ];
+      try {
+        const c = await everyone();
+        expect(ids(c.reader.framesOf('welcome')[0]!.messages)).toEqual(['m2']);
+        expect(ids(c.interior.framesOf('welcome')[0]!.messages)).toEqual(['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6']);
+        // The reader may see nothing of 3 to 6, so its page reads back to the window holding 2.
+        expect(await page(c.reader, 'r-back', 7)).toEqual({ ids: ['m2'], startIndex: 1, totalCount: 7 });
+        // Before 2 it may see nothing, and history starts two windows back: an empty page.
+        const reads = readsOf(1);
+        expect(await page(c.reader, 'r-start', 2, 1)).toEqual({ ids: [], startIndex: 0, totalCount: 7 });
+        expect(reads).toEqual([1, 0]);
+        onRead = undefined;
+        expect(await page(c.interior, 'i-back', 7)).toEqual({ ids: ['m5', 'm6'], startIndex: 5, totalCount: 7 });
+        expect(await page(c.operator, 'o-back', 7)).toEqual({ ids: ['m5', 'm6'], startIndex: 5, totalCount: 7 });
+
+        for (const m of [toolUse('m7', 't3'), say('m8', 'assistant', [{ type: 'text', text: 'done' }])]) {
+          transcript.push(m);
+          appended!({ type: 'add', message: m });
+        }
+        await host.fence(Object.values(c));
+        const live = (conn: Connection) => ids(conn.framesOf('message-appended').map((f) => f.entry));
+        expect(live(c.reader)).toEqual(['m8']);
+        expect(live(c.interior)).toEqual(['m7', 'm8']);
+      } finally {
+        onRead = undefined;
+        transcript = [];
+      }
+    });
+
+    test('a page reads back from where the store began each window, a sharded body\'s first shard included', async () => {
+      const body = (shardIndex: number) => ({ bodyGroupId: 'bg-out', shardIndex });
+      transcript = [
+        say('m0', 'user', [{ type: 'text', text: 'a word' }]),
+        toolUse('m1', 't0'),
+        toolResult('m2', 't0', body(0)),
+        toolResult('m3', 't0', body(1)),
+        toolResult('m4', 't0', body(2)),
+        toolUse('m5', 't1'),
+      ];
+      try {
+        const c = await everyone();
+        // The window asked for at 4 begins at the body's first shard, 2.
+        const reads = readsOf(2);
+        expect(await page(c.reader, 'r-body', 6)).toEqual({ ids: ['m0'], startIndex: 0, totalCount: 6 });
+        expect(reads).toEqual([4, 0]);
+        expect(await page(c.interior, 'i-body', 6)).toEqual({ ids: ['m2', 'm5'], startIndex: 2, totalCount: 6 });
+      } finally {
+        onRead = undefined;
+        transcript = [];
+      }
+    });
+
+    test('a welcome whose tail such messages fill reads back too, on connecting and when a refresh welcomes the client again', async () => {
+      transcript = [say('m0', 'user', [{ type: 'text', text: 'a word' }]), ...Array.from({ length: 250 }, (_, i) => toolUse(`m${i + 1}`, `t${i}`))];
+      try {
+        const c = await everyone();
+        const welcomed = (conn: Connection) => {
+          const w = conn.framesOf('welcome').at(-1)!;
+          return { ids: ids(w.messages), history: w.history };
+        };
+        const tail = Array.from({ length: 200 }, (_, i) => `m${i + 51}`);
+        expect(welcomed(c.reader)).toEqual({ ids: ['m0'], history: { startIndex: 0, totalCount: 251 } });
+        expect(welcomed(c.interior)).toEqual({ ids: tail, history: { startIndex: 51, totalCount: 251 } });
+        // Without messages there's nothing to read back for.
+        expect(welcomed(c.dashboard)).toEqual({ ids: [], history: { startIndex: 251, totalCount: 251 } });
+        // A refresh, as a change of branch sends, welcomes every client again.
+        await host.fence([c.reader, c.interior]);
+        expect(c.reader.framesOf('welcome').length).toBe(2);
+        expect(welcomed(c.reader)).toEqual({ ids: ['m0'], history: { startIndex: 0, totalCount: 251 } });
+        expect(welcomed(c.interior)).toEqual({ ids: tail, history: { startIndex: 51, totalCount: 251 } });
+      } finally {
+        transcript = [];
+      }
+    });
+
+    test('a page reads back at most ten windows of its own size, then answers empty from where it stopped, and the next page reads on from there', async () => {
+      transcript = [say('m0', 'user', [{ type: 'text', text: 'a word' }]), ...Array.from({ length: 25 }, (_, i) => toolUse(`m${i + 1}`, `t${i}`))];
+      try {
+        const c = await everyone();
+        const reads = readsOf(2);
+        expect(await page(c.reader, 'r-ten', 26)).toEqual({ ids: [], startIndex: 6, totalCount: 26 });
+        expect(reads.length).toBe(10);
+        expect(await page(c.reader, 'r-on', 6)).toEqual({ ids: ['m0'], startIndex: 0, totalCount: 26 });
+      } finally {
+        onRead = undefined;
+        transcript = [];
+      }
+    });
   });
 
   test('the serving state and the agents\' models reach clients that hold health in the welcome, the serving state live too, and provider calls live', async () => {

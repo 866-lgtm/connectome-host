@@ -834,8 +834,12 @@ export function clientHolds(
 }
 
 /** Project a wire entry through a scope mask: null when the observer may not
- *  see messages at all; otherwise thinking/tool blocks are elided per scope.
- *  Filtering, not rewriting — the wire is already typed blocks. */
+ *  see messages at all, or when the mask removes every block the entry has;
+ *  otherwise thinking/tool blocks are elided per scope. An entry the mask
+ *  empties would reach the observer as an empty row with its time, telling
+ *  it only that something it may not see happened, and when. An entry that
+ *  had no blocks to begin with is the store's own, and stays. Filtering,
+ *  not rewriting — the wire is already typed blocks. */
 export function filterEntryForScopes(
   entry: WelcomeMessageEntry,
   scopes: Set<ObserverScope>,
@@ -849,6 +853,7 @@ export function filterEntryForScopes(
     if (b.kind === 'media' && b.toolUseId !== undefined && !scopes.has('tools')) return false;
     return true;
   });
+  if (blocks.length === 0 && entry.blocks.length > 0) return null;
   return { ...entry, blocks };
 }
 

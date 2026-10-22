@@ -308,6 +308,10 @@ const AUTOSTART_RECORD_WAIT_MS = 1_000;
 /** Default / max page size for request-history. */
 const HISTORY_PAGE_DEFAULT = 200;
 const HISTORY_PAGE_MAX = 500;
+/** The most windows of its own size an observer's request-history reads
+ *  back past messages its scopes empty, so one request holds the host for
+ *  at most about ten times what one page costs a full client. */
+const HISTORY_READ_BACK_WINDOWS = 10;
 
 /** Re-exported from the shared panel-data layer (moved there so headless
  *  fleet children serve the same snapshot over the fleet IPC). */
@@ -3246,16 +3250,30 @@ export class WebUiModule implements Module {
     const childRecipes = await this.loadWelcomeRecipes();
     if (!current()) return;
     const welcome = this.buildWelcome(childRecipes);
-    this.send(client, client.scopes === null ? welcome : scopeWelcome(welcome, client.scopes));
+    this.send(client, client.scopes === null ? welcome : this.observerWelcome(welcome, client.scopes));
     client.welcomed = true;
     // Live trace forwarding is driven by the single fan-out listener
     // installed in setApp(); membership is implicit in `sharedServer!.clients`.
   }
 
+  /** The welcome as an observer with `scopes` gets it (scopeWelcome). When
+   *  its scopes empty every message of the tail, it reads back as a history
+   *  page does (readHistory), so it opens on the last messages it may see,
+   *  and its `startIndex` is where the reading stopped. It reads in the same
+   *  turn the welcome was built in, so no message lands between them. */
+  private observerWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>): WelcomeMessage {
+    const scoped = scopeWelcome(welcome, scopes);
+    if (scoped.messages.length > 0 || !scopes.has('messages')) return scoped;
+    const cmw = sharedServer?.app?.framework.getAllAgents()[0]?.getContextManager() as unknown as WindowCapableCm | undefined;
+    if (typeof cmw?.getMessageWindow !== 'function') return scoped;
+    const { entries, startIndex } = readHistory(cmw, scoped.history.startIndex, WELCOME_HISTORY_LIMIT, scopes);
+    return { ...scoped, messages: entries, history: { ...scoped.history, startIndex } };
+  }
+
   /**
-   * Serve a page of older history ending just before `beforeIndex`. Windowed
-   * read with bodyGroup alignment; the reply carries the same corrId so the
-   * SPA can match it to its in-flight scroll request.
+   * Serve a page of older history ending just before `beforeIndex`
+   * (readHistory); the reply carries the same corrId so the SPA can match it
+   * to its in-flight scroll request.
    */
   private handleRequestHistory(client: ClientState, req: RequestHistoryMessage): void {
     const cm = sharedServer?.app?.framework.getAllAgents()[0]?.getContextManager();
@@ -3273,24 +3291,7 @@ export class WebUiModule implements Module {
     }
     const limit = Math.min(req.limit ?? HISTORY_PAGE_DEFAULT, HISTORY_PAGE_MAX);
     const beforeIndex = Math.min(req.beforeIndex, cmw.getMessageCount());
-    const offset = Math.max(0, beforeIndex - limit);
-    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
-      resolveBlobs: false,
-      alignToBodyGroups: true,
-    });
-    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
-    if (client.scopes !== null) {
-      entries = entries
-        .map((e) => filterEntryForScopes(e, client.scopes!))
-        .filter((e): e is WelcomeMessageEntry => e !== null);
-    }
-    this.send(client, {
-      type: 'history-page',
-      corrId: req.corrId,
-      entries,
-      startIndex: win.startIndex,
-      totalCount: win.totalCount,
-    });
+    this.send(client, { type: 'history-page', corrId: req.corrId, ...readHistory(cmw, beforeIndex, limit, client.scopes) });
   }
 
   /** Each fleet child's recipe, for its tree in the welcome. sendWelcome
@@ -3750,6 +3751,43 @@ function flattenToolResultContent(content: unknown): string {
     else if (typeof b.type === 'string') parts.push(`[${b.type}]`);
   }
   return parts.join('\n');
+}
+
+/**
+ * A page of history ending just before `beforeIndex`: one window of about
+ * `limit` slots, widened to whole bodies (alignToBodyGroups), for a full
+ * client (`scopes` null). An observer's page leaves out the entries its
+ * scopes empty, so a window of messages it may see nothing of comes back
+ * empty, and the page takes an empty page for the start of history. So for
+ * an observer it reads the window before, and the one before that, until a
+ * window leaves it an entry or history starts, for at most
+ * HISTORY_READ_BACK_WINDOWS windows. Past that the page is empty, and its
+ * startIndex is where the reading stopped: the page still shows that older
+ * messages remain, and its next request reads on from there.
+ */
+function readHistory(
+  cmw: WindowCapableCm,
+  beforeIndex: number,
+  limit: number,
+  scopes: Set<ObserverScope> | null,
+): { entries: WelcomeMessageEntry[]; startIndex: number; totalCount: number } {
+  for (let windows = 1; ; windows++) {
+    const offset = Math.max(0, beforeIndex - limit);
+    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
+      resolveBlobs: false,
+      alignToBodyGroups: true,
+    });
+    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
+    if (scopes !== null) {
+      entries = entries
+        .map((e) => filterEntryForScopes(e, scopes))
+        .filter((e): e is WelcomeMessageEntry => e !== null);
+    }
+    if (entries.length > 0 || win.startIndex === 0 || windows === HISTORY_READ_BACK_WINDOWS) {
+      return { entries, startIndex: win.startIndex, totalCount: win.totalCount };
+    }
+    beforeIndex = win.startIndex;
+  }
 }
 
 /**

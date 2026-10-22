@@ -110,7 +110,9 @@ The module accepts three credentials:
   observer off, remove the file. A file that doesn't parse at all leaves the
   grants as they were, since an editor's save can be read half-written. Each
   observer sees only its grant's scopes — `health`, `ops`, `messages`,
-  `tools`, `thinking`, `debug` — and gets a session cookie for the matching
+  `tools`, `thinking`, `debug` — and isn't sent a message whose every part
+  its grant leaves out, such as a tool's call without `tools`. It gets a
+  session cookie for the matching
   HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`,
   `/quota` and `/credential`, `messages` for `/media/…`, with `tools` as well
   for an image a tool returned). An observer with `health` and without `ops`
