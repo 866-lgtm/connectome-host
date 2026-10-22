@@ -778,7 +778,7 @@ describe('identity: what the agent reads when a call fails', () => {
     expectSays(await send('files'), 'names the mount "files" but no file in it');
     expectSays(await send('files/../../etc/out.json'), 'has a "." or ".." in it', 'name the file by its plain path.', 'a mount it can write to (files)');
     expectSays(await send('files//out.json'), 'has an empty part right after the mount\'s name', 'name the file by its plain path.', 'a mount it can write to (files)');
-    expectSays(await send('files/away.json'), '`saveAs` "files/away.json" isn\'t a path the mount "files" holds: it leads out of the mount, lies in another mount\'s directory, or falls outside its include.');
+    expectSays(await send('files/away.json'), '`saveAs` "files/away.json" isn\'t a path the mount "files" holds: it leads out of the mount, lies in another mount\'s directory, falls outside its include, or can\'t name a file there.');
     expectSays(await send('docs/out.json'), 'names the read-only mount "docs"', 'a mount it can write to (files)');
     expect(seen.orrery).toBe(0);
   });
@@ -861,9 +861,32 @@ describe('identity: what the agent reads when a call fails', () => {
     const left = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/out.json' }));
     expect(left.success).toBe(false);
     expect(seen.orrery).toBe(before);
-    expectSays(left.error, '`saveAs` "files/out.json" isn\'t a path the mount "files" holds', 'or falls outside its include.');
+    expectSays(left.error, '`saveAs` "files/out.json" isn\'t a path the mount "files" holds', 'falls outside its include');
     const kept = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/out.md' }));
     expect(kept.success).toBe(true);
+  });
+
+  it("sends no saveAs into another mount's directory nested in the one it names, saying so", async () => {
+    const dir = tempDir('ident-saveas-nested-');
+    mkdirSync(join(dir, 'files', 'inner'), { recursive: true });
+    const warn = spyOn(console, 'warn').mockImplementation(() => {});
+    cleanups.push(() => warn.mockRestore());
+    const workspace = new WorkspaceModule({
+      mounts: [
+        { name: 'files', path: join(dir, 'files'), mode: 'read-write', watch: 'never' },
+        { name: 'inner', path: join(dir, 'files', 'inner'), mode: 'read-write', watch: 'never' },
+      ],
+    });
+    const store = JsStore.openOrCreate({ path: join(dir, 'store') });
+    cleanups.push(() => store.close?.());
+    workspace.initStore(store);
+    const { mod, ready, seen } = registeredModule({ workspace });
+    await ready;
+    const before = seen.orrery;
+    const res = await mod.handleToolCall(call('request', { service: 'orrery', path: '/api/x', method: 'POST', body: {}, saveAs: 'files/inner/x.json' }));
+    expect(res.success).toBe(false);
+    expect(seen.orrery).toBe(before);
+    expectSays(res.error, '`saveAs` "files/inner/x.json" isn\'t a path the mount "files" holds', "lies in another mount's directory");
   });
 
   it('tells a request that got no reply from one whose reply came back but couldn\'t be read or saved', async () => {

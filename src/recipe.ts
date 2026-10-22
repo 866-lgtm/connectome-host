@@ -686,9 +686,10 @@ export interface RecipeWorkspaceMount {
   name: string;
   path: string;
   /**
-   * Left out, the host makes a mount read-write, and a direct one
-   * (`backend: 'direct'`) read-only, the only mode agent-framework takes
-   * there (workspace-mounts.ts).
+   * Left out, the host makes a mount read-write (workspace-mounts.ts). A
+   * direct mount (`backend: 'direct'`) must say its mode, which in
+   * agent-framework 0.24 can only be 'read-only'; one that doesn't stops the
+   * recipe loading (validateRecipe).
    */
   mode?: 'read-write' | 'read-only';
   /**
@@ -696,13 +697,16 @@ export interface RecipeWorkspaceMount {
    * `MountConfig.backend` says (its default is 'chronicle'). 'direct' reads
    * disk's own copy as it is, keeps none of the mount's files in the store,
    * and runs no scan or watcher: for a checkout an agent reads, not one it
-   * changes. A direct mount is read-only, and the framework refuses one
-   * with a setting that would never act there, such as a watch other than
-   * 'never', a wake on change or auto-materialize, which stops the recipe
-   * loading (validateRecipe). A mount configured direct whose store holds
-   * changes disk lacks, left from when it ran as 'chronicle' (a draft, a
-   * deletion or a conflict), runs as 'chronicle' until they're settled, and
-   * the framework says so at start.
+   * changes. A direct mount says `mode: 'read-only'`, and the framework
+   * refuses one with a setting that would never act there, such as a watch
+   * other than 'never', a wake on change or auto-materialize, which stops
+   * the recipe loading (validateRecipe). A mount configured direct whose
+   * store holds changes disk lacks, left from when it ran as 'chronicle' (a
+   * draft, a deletion or a conflict), runs as 'chronicle' until a start
+   * after they're settled, and the framework says at start how to settle
+   * them. A direct mount that names no `ignore` passes over node_modules,
+   * .git, dist, build, coverage, target, __pycache__ and .venv; one that
+   * names any passes over only what it names.
    */
   backend?: 'chronicle' | 'direct';
   /**
@@ -1895,7 +1899,7 @@ function unknownKeyError(where: string, key: string, known: readonly string[], i
 
 /** A mount key recipes have used that the host never read, with what says it. */
 const MOUNT_KEY_INSTEAD: Record<string, string> = {
-  readOnly: 'mode: "read-only" makes a mount read-only, and a mount is read-write without it, unless it is direct',
+  readOnly: 'mode: "read-only" makes a mount read-only, and a mount is read-write without it',
 };
 
 /** Keys that were renamed or removed, with what replaced them. */
@@ -2667,22 +2671,40 @@ export function validateRecipe(raw: unknown): Recipe {
           const mustBe = MOUNT_KEY_CHECKS[key](m[key]);
           if (mustBe) throw new Error(`${where}.${key} must be ${mustBe}`);
         }
+        // Writing a checkout with no store and no undo should be said in the
+        // recipe, so a direct mount states its mode: a default would give a
+        // recipe a meaning a later framework release, where a direct mount
+        // can be read-write, could change.
+        if (m.backend === 'direct' && m.mode === undefined) {
+          throw new Error(`${where} is direct, so it must say its mode: add "mode": "read-only", the only mode a direct mount takes in agent-framework 0.24`);
+        }
       }
       // What a mount's keys must be together, such as a direct mount's
       // settings, and an include's patterns, are agent-framework's to say,
       // and its WorkspaceModule constructor checks each mount and does
       // nothing else: it reads no file, opens no store and starts no timer
-      // (0.24.0; it warns on stderr of a mount nested in another, as it
-      // will again at start). So the recipe's mounts are built and checked
-      // here, before the recipe is saved, and a refusal is in the
-      // framework's words. Built at start instead, a refused recipe would
-      // be saved first and fail every start that resumes it. The host's own
-      // `_config` mount isn't the recipe's, so it's left out. A framework
-      // release whose constructor does more is where this has to change.
+      // (0.24.0). So the recipe's mounts are built and checked here, before
+      // the recipe is saved, and a refusal is in the framework's words.
+      // Built at start instead, a refused recipe would be saved first and
+      // fail every start that resumes it. A framework release whose
+      // constructor does more is where this has to change.
+      //
+      // The constructor also warns on stderr of a mount nested in another,
+      // which it reads from paths resolved against this process's working
+      // directory. A store audit, a fleet parent or the Web UI can validate
+      // a recipe somewhere other than where it runs, so the warning here
+      // could be false, where the refusals hold wherever validation runs.
+      // Nesting is the start's to report, where the recipe runs, so the
+      // constructor's warnings are kept to this call: it's synchronous, and
+      // nothing else prints during it.
+      const warn = console.warn;
+      console.warn = () => {};
       try {
-        new WorkspaceModule({ mounts: buildWorkspaceMounts({ mounts: ws.mounts as RecipeWorkspaceMount[] }, '.')! });
+        new WorkspaceModule({ mounts: buildWorkspaceMounts(ws as RecipeModules['workspace'], '.')! });
       } catch (err) {
         throw new Error(`modules.workspace: ${(err instanceof Error ? err.message : String(err)).replace(/^\[workspace\] /, '')}`);
+      } finally {
+        console.warn = warn;
       }
     }
 

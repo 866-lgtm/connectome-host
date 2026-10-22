@@ -471,11 +471,16 @@ unknown-key warning, like those at the other levels.
 - **Workspace** (`modules.workspace`, on) — mounted directories backed by
   Chronicle: the agent's durable, verbatim notes. Default mounts `input`
   (read-only `./input`) and `products` (read-write `./output`). A mount with
-  `"backend": "direct"` reads disk as it is, with no store or watcher, and
-  is read-only, the host's default for its `mode` there (while its store
-  holds changes from when it ran as Chronicle, it runs as Chronicle, and
-  says so); `include` limits what a mount holds. See `RecipeWorkspaceMount`
-  in `src/recipe.ts`
+  `"backend": "direct"` reads disk as it is, with no store or watcher, for a
+  checkout an agent reads: it names `"mode": "read-only"`, the only mode
+  agent-framework takes on a direct mount, and a mount the agent writes, or
+  whose changes should wake it, leaves `backend` out. A direct mount that names no `ignore` passes over `node_modules`,
+  `.git`, `dist`, `build`, `coverage`, `target`, `__pycache__` and `.venv`,
+  and one that names any passes over only what it names. While its store
+  holds changes from when it ran as Chronicle, it runs as Chronicle until a
+  start after they're settled, and says at start how to settle them.
+  `include` limits what a mount holds. See `RecipeWorkspaceMount` in
+  `src/recipe.ts`
 - **History** (opt-in, `modules.history`) — the agent searches and extracts
   from its own uncompressed record. The object form
   `{ "semantic": { "url": … } }` adds `history--semantic_search`:

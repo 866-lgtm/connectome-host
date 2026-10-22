@@ -152,10 +152,10 @@ describe('recipe modules.instructions validation', () => {
     }))).toThrow(/autoMaterialize/);
   });
 
-  test('accepts a direct instructions mount, which the host makes read-only', () => {
+  test('accepts a direct instructions mount, which is read-only', () => {
     expect(() => validateRecipe(recipe({
       instructions: true,
-      workspace: { mounts: [{ name: 'instructions', path: './instructions', backend: 'direct' }] },
+      workspace: { mounts: [{ name: 'instructions', path: './instructions', backend: 'direct', mode: 'read-only' }] },
     }))).not.toThrow();
   });
 

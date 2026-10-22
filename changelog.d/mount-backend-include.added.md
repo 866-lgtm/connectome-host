@@ -2,12 +2,17 @@
   `include`. `backend: "direct"` reads disk's own copy as it is, with no
   store, scan or watcher, for a checkout an agent reads; a mount whose store
   still holds changes from when it ran as Chronicle runs as Chronicle until
-  they're settled, as agent-framework says at start. `include` lists what a
+  a start after they're settled, and agent-framework says at start how to
+  settle them. A direct mount that
+  names no `ignore` passes over `node_modules`, `.git`, `dist`, `build`,
+  `coverage`, `target`, `__pycache__` and `.venv`, and one that names any
+  passes over only what it names. `include` lists what a
   mount holds, as names, `*.ext` globs and `dir/**` globs. Before, a recipe
   that gave either stopped loading, as a key a mount doesn't have.
-- A direct mount that gives no `mode` is read-only, the host's default
-  there and the only mode agent-framework takes on a direct mount. Other
-  mounts are still read-write by default.
+- A direct mount names `mode: "read-only"`, the only mode agent-framework
+  takes on a direct mount, and one that names no mode stops the recipe
+  loading, saying so. A mount the agent writes, or whose changes should wake
+  it, leaves `backend` out. Other mounts are still read-write by default.
 - What agent-framework refuses in a recipe's mounts, such as a `watch`
   other than `"never"`, `wakeOnChange` or `autoMaterialize` on a direct
   mount, or an `include`
