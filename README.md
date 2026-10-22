@@ -95,8 +95,9 @@ refuses one without naming it.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
 
-`agent.clock` (off when omitted) gives the agent clock rows in that zone:
-with `{ "intervalMinutes": 10 }`, once a ten-minute boundary of its local
+`agent.clock` gives the agent clock rows in that zone, every ten minutes
+when the recipe omits it; `false` turns them off. With
+`{ "intervalMinutes": 10 }`, the default, once a ten-minute boundary of its local
 wall clock (counted from local midnight) has passed, the window takes one
 `Clock: 10:50 Europe/Berlin (UTC+02:00)` row at the next of these: before
 an incoming event such as a message, at the start of a turn (a silent

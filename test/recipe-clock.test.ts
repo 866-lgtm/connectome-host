@@ -11,10 +11,15 @@ const base = (value?: unknown) => ({
 });
 
 describe('clock recipe wiring', () => {
-  test('is off by omission and passes a clock through to AgentConfig unchanged', () => {
+  test('is every ten minutes by omission, off with false, and passes a clock through to AgentConfig unchanged', () => {
     const absent = validateRecipe(base());
     expect(absent.agent.clock).toBeUndefined();
-    expect(buildFrameworkAgentConfig(absent, 'a', 'm', { kind: 's' } as never).clock).toBeUndefined();
+    expect(buildFrameworkAgentConfig(absent, 'a', 'm', { kind: 's' } as never).clock).toEqual({ intervalMinutes: 10 });
+
+    const off = validateRecipe(base(false));
+    expect(off.agent.clock).toBe(false);
+    expect(buildFrameworkAgentConfig(off, 'a', 'm', { kind: 's' } as never).clock).toBeUndefined();
+    expect('clock' in buildFrameworkAgentConfig(off, 'a', 'm', { kind: 's' } as never)).toBe(false);
 
     const minutes = validateRecipe(base({ intervalMinutes: 10 }));
     expect(buildFrameworkAgentConfig(minutes, 'a', 'm', { kind: 's' } as never).clock).toEqual({ intervalMinutes: 10 });
@@ -42,11 +47,13 @@ describe('clock recipe wiring', () => {
 
   test('refuses a clock the framework would refuse at boot, at recipe validation, naming the recipe key', () => {
     const cases: Array<[unknown, string]> = [
-      [10, 'Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got 10.'],
-      [null, 'Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got null.'],
+      // true is no clock: a recipe names an interval, or false for none.
+      [true, 'Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got true.'],
+      [10, 'Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got 10.'],
+      [null, 'Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got null.'],
       // A string or an array would otherwise reach the key check, which would name "0" as a key.
-      ['10', 'Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got "10".'],
-      [[10], 'Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got [10].'],
+      ['10', 'Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got "10".'],
+      [[10], 'Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got [10].'],
       [{ interval: 10 }, 'Recipe agent.clock has unknown key "interval"; it takes intervalMinutes, intervalSeconds and precision.'],
       [{ intervalMinutes: 10, every: 5, presicion: 'minutes' }, 'Recipe agent.clock has unknown keys "every", "presicion"; it takes intervalMinutes, intervalSeconds and precision.'],
       [{}, 'Recipe agent.clock takes exactly one of intervalMinutes and intervalSeconds'],

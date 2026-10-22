@@ -1,5 +1,6 @@
-- Recipe `agent.clock` (off when omitted) turns on agent-framework's clock
-  rows: `{ "intervalMinutes": 10 }` (or `intervalSeconds`, with optional
+- Recipe `agent.clock` sets agent-framework's clock rows, every ten minutes
+  when the recipe omits it (see Changed), `false` for none, or an interval of
+  its own: `{ "intervalMinutes": 10 }` (or `intervalSeconds`, with optional
   `precision: "minutes" | "seconds"`) writes a `Clock: 10:50 Europe/Berlin
   (UTC+02:00)` row, in `agent.timezone`, whenever a boundary of that interval
   has passed: before an incoming message, at a turn's start, and mid-turn

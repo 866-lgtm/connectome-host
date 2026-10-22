@@ -339,8 +339,9 @@ export interface RecipeAgent {
   /** Default-off containment of whole-response prose wrappers for known tools. */
   toolWrapperProseGuard?: boolean;
   /**
-   * Clock rows (agent-framework `AgentConfig.clock`; off when omitted): e.g.
-   * `{ "intervalMinutes": 10 }`, or `{ "intervalSeconds": 15 }` for clocks
+   * Clock rows (agent-framework `AgentConfig.clock`): every 10 minutes when
+   * omitted (`DEFAULT_RECIPE_CLOCK`), `false` for none, or e.g.
+   * `{ "intervalMinutes": 30 }`, or `{ "intervalSeconds": 15 }` for clocks
    * finer than a minute, with optional `"precision": "minutes" | "seconds"`.
    * When a boundary of the interval on the agent's local wall clock (in
    * `timezone`) has passed, the window takes one `Clock: 10:50 Europe/Berlin
@@ -350,7 +351,7 @@ export interface RecipeAgent {
    * thinking, at most once an interval. Subagent streams take none; see the
    * README.
    */
-  clock?: ClockConfig;
+  clock?: ClockConfig | false;
   /**
    * Extra Anthropic beta flags sent as the `anthropic-beta` header on every
    * request (e.g. `["context-1m-2025-08-07"]` for the 1M context window on
@@ -1781,6 +1782,10 @@ const RECIPE_AGENT_KEYS = [
   'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
   'refusalHandling', 'clock',
 ] as const;
+/** The clock an agent gets when its recipe omits `agent.clock`: a row every
+ *  ten minutes. A recipe turns clock rows off with `agent.clock: false`. */
+export const DEFAULT_RECIPE_CLOCK: ClockConfig = Object.freeze({ intervalMinutes: 10 }) as ClockConfig;
+
 /** agent-framework's `ClockConfig` keys, the ones `agent.clock` takes: the
  *  framework reads only these and ignores any other, so the host refuses the
  *  rest rather than letting a misspelling load as no setting at all. */
@@ -2077,9 +2082,9 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.toolWrapperProseGuard must be a boolean, got ${JSON.stringify(agent.toolWrapperProseGuard)}.`);
   }
 
-  if (agent.clock !== undefined) {
+  if (agent.clock !== undefined && agent.clock !== false) {
     if (!agent.clock || typeof agent.clock !== 'object' || Array.isArray(agent.clock)) {
-      throw new Error(`Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
+      throw new Error(`Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
     }
     const known: readonly string[] = RECIPE_AGENT_CLOCK_KEYS;
     const unknown = Object.keys(agent.clock).filter((k) => !known.includes(k));
