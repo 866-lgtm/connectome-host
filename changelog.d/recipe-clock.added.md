@@ -7,5 +7,4 @@
   Subagent streams take none, and a subagent's start orientation lists its
   clock rows as off, beside its parent's or caller's where it has one.
   Validated at recipe load with the framework's own rules, naming the key; a
-  key the framework doesn't take is refused. Needs agent-framework 0.24.1,
-  which the host now requires.
+  key the framework doesn't take is refused.

@@ -1762,7 +1762,10 @@ function validateKvUnifiedConfig(strategy: Record<string, unknown>): void {
  * The keys each recipe level reads. The type check below keeps these lists in
  * step with Recipe, RecipeAgent, RecipeModules, RecipeMockConfig and
  * RecipeKvUnifiedConfig with its policy: a key added to an interface and not
- * here (or listed here and gone from the interface) fails to compile.
+ * here (or listed here and gone from the interface) fails to compile. It also
+ * ties agent.clock's keys to agent-framework's ClockConfig, a dependency's
+ * type, so a framework release that adds or removes a clock key fails the
+ * host's typecheck once the lockfile takes it.
  */
 const RECIPE_KEYS = [
   'name', 'description', 'version', 'agent', 'mcpServers', 'modules', 'extensions',

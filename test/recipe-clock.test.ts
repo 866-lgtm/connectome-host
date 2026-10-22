@@ -28,7 +28,11 @@ describe('clock recipe wiring', () => {
 
     // The other readings the framework accepts: minutes asked for at a whole-minute
     // interval, and a whole-minute interval given in seconds.
-    for (const clock of [{ intervalMinutes: 10, precision: 'minutes' }, { intervalSeconds: 120 }]) {
+    for (const clock of [
+      { intervalMinutes: 10, precision: 'minutes' }, { intervalSeconds: 120 },
+      // A day, the longest interval, given either way.
+      { intervalMinutes: 1440 }, { intervalSeconds: 86_400 },
+    ]) {
       expect(buildFrameworkAgentConfig(validateRecipe(base(clock)), 'a', 'm', { kind: 's' } as never).clock).toEqual(clock);
     }
   });
@@ -48,6 +52,7 @@ describe('clock recipe wiring', () => {
       [{ intervalMinutes: 1.5 }, 'Recipe agent.clock.intervalMinutes must be a positive whole number'],
       [{ intervalSeconds: '15' }, 'Recipe agent.clock.intervalSeconds must be a positive whole number'],
       [{ intervalMinutes: 2000 }, 'Recipe agent.clock interval is at most a day (1440 minutes); boundaries count from local midnight'],
+      [{ intervalSeconds: 86_401 }, 'Recipe agent.clock interval is at most a day (1440 minutes); boundaries count from local midnight'],
       [{ intervalMinutes: 10, precision: 'hours' }, "Recipe agent.clock.precision must be 'minutes' or 'seconds'"],
       [{ intervalSeconds: 90, precision: 'minutes' }, "Recipe agent.clock: an interval of 90 seconds isn't whole minutes, so its clocks need precision 'seconds'"],
     ];

@@ -863,9 +863,14 @@ describe('what a launch block says beyond the settings it compares', () => {
   });
 
   // A fork inherits its parent's clock rows and takes no more of its own, so
-  // it's told so, in minutes when the interval is whole minutes, else seconds.
+  // it's told so, in minutes when the interval is whole minutes, else seconds,
+  // and with the parent's precision where it isn't its interval's default.
   test('a fork of a parent with clock rows is told its own are off', async () => {
-    for (const [clock, every] of [[{ intervalMinutes: 10 }, '10 minutes'], [{ intervalSeconds: 15 }, '15 seconds']] as const) {
+    for (const [clock, every] of [
+      [{ intervalMinutes: 10 }, '10 minutes'],
+      [{ intervalMinutes: 10, precision: 'seconds' }, '10 minutes, read to the second'],
+      [{ intervalSeconds: 15 }, '15 seconds'],
+    ] as const) {
       const h = await makeHarness({ parent: { clock } });
       try {
         const input = { name: 'timed', task: 't' };
@@ -952,9 +957,11 @@ describe('each agent setting is read from its own field', () => {
       [{ refusalHandling: { mode: 'rewind' } }, 'refusal handling', 'set'],
       [{ toolResultGuard: { enabled: true } }, 'tool-result guard', 'on'],
       [{ toolWrapperProseGuard: true }, 'tool-wrapper prose guard', 'on'],
-      [{ clock: { intervalSeconds: 600 } }, 'clock rows', 'every 10 minutes'],
-      [{ clock: { intervalSeconds: 60 } }, 'clock rows', 'every 1 minute'],
-      [{ clock: { intervalSeconds: 1 } }, 'clock rows', 'every 1 second'],
+      [{ clock: { intervalSeconds: 600, precision: 'minutes' } }, 'clock rows', 'every 10 minutes'],
+      [{ clock: { intervalSeconds: 600, precision: 'seconds' } }, 'clock rows', 'every 10 minutes, read to the second'],
+      [{ clock: { intervalSeconds: 60, precision: 'minutes' } }, 'clock rows', 'every 1 minute'],
+      [{ clock: { intervalSeconds: 90, precision: 'seconds' } }, 'clock rows', 'every 90 seconds'],
+      [{ clock: { intervalSeconds: 1, precision: 'seconds' } }, 'clock rows', 'every 1 second'],
     ];
     expect(new Set(cases.map(([, name]) => name))).toStrictEqual(new Set(Object.keys(base)));
     for (const [agent, name, value] of cases) {
