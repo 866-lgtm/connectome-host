@@ -79,7 +79,10 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
     const primary = agent === primaryAgentName;
     // A stream's first end closes its prose line, and for the primary says
     // how its turn ended. An end after an end, such as `exhausted` after
-    // `failed`, prints nothing.
+    // `failed`, prints nothing. From agent-framework 0.22.3 a lone
+    // `exhausted` comes only from an abort whose reason isn't `user`, which
+    // the framework counts as a failure, so its line goes to stderr with
+    // `failed`'s; a stop ends with `aborted`, which isn't a failure.
     if (state === 'open') {
       if (event.type === 'inference:failed') {
         out.error(`\nError: ${traceError(event)}`);
@@ -87,7 +90,7 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
         const reason = typeof event.reason === 'string' && event.reason !== '' ? `: ${event.reason}` : '';
         out.log(`\n(turn aborted${reason})`);
       } else if (primary && event.type === 'inference:exhausted') {
-        out.log(`\n(turn ended: ${traceError(event)})`);
+        out.error(`\n(turn ended: ${traceError(event)})`);
       } else {
         out.write('\n');
       }

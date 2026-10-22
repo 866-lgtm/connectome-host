@@ -63,7 +63,7 @@ describe('the wait for a line\'s turn', () => {
     emit('inference:started');
     emit('inference:exhausted', {});
     expect(await settled(wait)).toBe(true);
-    expect(out).toContain('log:\n(turn ended: Unknown error)');
+    expect(out).toContain('err:\n(turn ended: Unknown error)');
   });
 
   test('a failure the framework gives up on ends it at exhausted, printing the error once', async () => {
@@ -166,16 +166,18 @@ describe('what piped mode prints', () => {
     ]);
   });
 
-  test('how the primary\'s turn ended, once', () => {
+  test('how the primary\'s turn ended: a stop on stdout, a turn the framework ended as a failure on stderr', () => {
+    // agent-framework's ends from 0.22.3: a stop ends with a lone `aborted`,
+    // and a lone `exhausted` comes only from an abort whose reason isn't
+    // `user`, which the framework counts as a failure.
     const { emit, out } = setUp();
     emit('inference:started');
-    emit('inference:aborted', { reason: 'quiesce_abandoned' });
-    emit('inference:exhausted', { error: 'Stream aborted: user' });
+    emit('inference:aborted', { reason: 'user' });
     emit('inference:started');
-    emit('inference:exhausted', { error: 'Stream aborted: user' });
+    emit('inference:exhausted', { error: 'Stream aborted: timeout' });
     expect(out).toEqual([
-      'out:\n', 'log:\n(turn aborted: quiesce_abandoned)',
-      'out:\n', 'log:\n(turn ended: Stream aborted: user)',
+      'out:\n', 'log:\n(turn aborted: user)',
+      'out:\n', 'err:\n(turn ended: Stream aborted: timeout)',
     ]);
   });
 });
