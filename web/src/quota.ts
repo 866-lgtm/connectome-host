@@ -107,8 +107,9 @@ export function quotaTone(q: QuotaSnapshotData): string {
   return worst >= 90 ? 'text-rose-400' : worst >= 75 ? 'text-amber-400' : 'text-emerald-300';
 }
 
-/** A subscription meter that has never read: no windows, and a failed read,
- *  whose text an observer without 'ops' gets empty. */
+/** A subscription meter with nothing to show: no windows, and a failed read,
+ *  whose text an observer without 'ops' gets empty. A meter that fails while
+ *  it still holds windows from an earlier read shows those instead. */
 export function quotaUnreadable(q: QuotaSnapshotData | null): boolean {
   return q?.subscription === true && q.windows.length === 0 && q.error !== undefined;
 }

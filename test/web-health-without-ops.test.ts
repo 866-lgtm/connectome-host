@@ -106,9 +106,9 @@ describe('the health panel, with health and without ops', () => {
     expect(quotaUnreadable({ ...quota, error: undefined })).toBe(false);
     expect(quotaTitle(bareQuota)).toBe('Subscription quota (anthropic)\nLast refresh failed');
     expect(quotaTitle(quota)).toBe(`Subscription quota (anthropic)\nLast refresh failed: ${TEXT.quota}`);
-    // Before the first poll answers there is no quota; a meter that read once
-    // and then failed keeps its windows, so it isn't unreadable; a good read
-    // says nothing failed.
+    // Before the first poll answers there is no quota; a meter that failed
+    // while it still holds windows from an earlier read has windows to show,
+    // so it isn't unreadable; a good read says nothing failed.
     expect(quotaUnreadable(null)).toBe(false);
     const kept = { ...bareQuota, windows: [{ key: 'five_hour', label: '5h', utilization: 10 }] };
     expect(quotaUnreadable(kept)).toBe(false);
@@ -130,7 +130,11 @@ describe('the health panel, with health and without ops', () => {
     expect(credentialNote(credential)).toBe(TEXT.credential);
     expect(credentialNote(bare)).toBeUndefined();
     expect(credentialNote({ ...credential, kind: 'ok' })).toBeUndefined();
+    // A state that names no kind is taken as ok.
+    expect(credentialNote({ message: TEXT.credential })).toBeUndefined();
     expect(lastActionText(credential.lastAction, '5s ago')).toBe(`refresh FAILED 5s ago — ${TEXT.action}`);
     expect(lastActionText(bare.lastAction, '5s ago')).toBe('refresh FAILED 5s ago');
+    expect(lastActionText({ id: 'recheck', ok: true, message: 'credential verified' }, '5s ago')).toBe('recheck ok 5s ago — credential verified');
+    expect(lastActionText({ id: 'recheck', ok: true, message: '' }, '5s ago')).toBe('recheck ok 5s ago');
   });
 });
