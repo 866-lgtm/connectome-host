@@ -862,6 +862,27 @@ describe('what a launch block says beyond the settings it compares', () => {
     }
   });
 
+  // A fork inherits its parent's clock rows and takes no more of its own, so
+  // it's told so, in the unit the recipe gives the interval in.
+  test('a fork of a parent with clock rows is told its own are off', async () => {
+    for (const [clock, every] of [[{ intervalMinutes: 10 }, '10 minutes'], [{ intervalSeconds: 15 }, '15 seconds']] as const) {
+      const h = await makeHarness({ parent: { clock } });
+      try {
+        const input = { name: 'timed', task: 't' };
+        seedForkCall(h.framework, 'toolu_timed', input);
+        await h.subagent.handleToolCall(call('fork', 'toolu_timed', input));
+        await h.asyncPromise('timed');
+        const start = startSection(h.runs.find((r) => r.name.startsWith('timed-'))!.firstContext);
+        expect(line(start, '- Agent settings')).toStartWith(
+          "- Agent settings not carried from the parent stream, so the framework's defaults apply: " +
+            `clock rows off (the parent stream's: every ${every}). The rest match: `,
+        );
+      } finally {
+        await h.cleanup();
+      }
+    }
+  });
+
   test('a fork from a parent on the defaults says they match', async () => {
     const h = await makeHarness({});
     try {
@@ -931,6 +952,7 @@ describe('each agent setting is read from its own field', () => {
       [{ refusalHandling: { mode: 'rewind' } }, 'refusal handling', 'set'],
       [{ toolResultGuard: { enabled: true } }, 'tool-result guard', 'on'],
       [{ toolWrapperProseGuard: true }, 'tool-wrapper prose guard', 'on'],
+      [{ clock: { intervalSeconds: 600 } }, 'clock rows', 'every 10 minutes'],
     ];
     expect(new Set(cases.map(([, name]) => name))).toStrictEqual(new Set(Object.keys(base)));
     for (const [agent, name, value] of cases) {

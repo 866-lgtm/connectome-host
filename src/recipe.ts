@@ -344,8 +344,9 @@ export interface RecipeAgent {
    * finer than a minute, with optional `"precision": "minutes" | "seconds"`.
    * When a boundary of the interval on the agent's local wall clock (in
    * `timezone`) has passed, the window takes one `Clock: 10:50 Europe/Berlin
-   * (UTC+02:00)` row before what it takes next, mid-turn after a tool
-   * round's results included.
+   * (UTC+02:00)` row before the next event or turn start, or mid-turn after
+   * a tool round's results (not on the `anthropic-xml` formatter's XML
+   * prefill path). Subagent streams take none; see the README.
    */
   clock?: ClockConfig;
   /**
@@ -1775,6 +1776,10 @@ const RECIPE_AGENT_KEYS = [
   'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
   'refusalHandling', 'clock',
 ] as const;
+/** agent-framework's `ClockConfig` keys, the ones `agent.clock` takes: the
+ *  framework reads only these and ignores any other, so the host refuses the
+ *  rest rather than letting a misspelling load as no setting at all. */
+const RECIPE_AGENT_CLOCK_KEYS = ['intervalMinutes', 'intervalSeconds', 'precision'] as const;
 const RECIPE_AGENT_MOCK_KEYS = [
   'echoMode', 'defaultResponse', 'completeDelayMs', 'streamChunkDelayMs', 'streamChunkSize',
   'responseQueue',
@@ -1806,7 +1811,8 @@ const recipeKeyListsInStep: [
   ListsExactly<keyof RecipeMockConfig & string, typeof RECIPE_AGENT_MOCK_KEYS>,
   ListsExactly<keyof RecipeKvUnifiedConfig & string, typeof RECIPE_KV_UNIFIED_KEYS>,
   ListsExactly<keyof RecipeKvUnifiedConfig['policy'] & string, typeof RECIPE_KV_UNIFIED_POLICY_KEYS>,
-] = [true, true, true, true, true, true];
+  ListsExactly<keyof ClockConfig & string, typeof RECIPE_AGENT_CLOCK_KEYS>,
+] = [true, true, true, true, true, true, true];
 void recipeKeyListsInStep;
 
 const RECIPE_WORKSPACE_KEYS = ['mounts', 'configMount'] as const;
@@ -2070,9 +2076,10 @@ export function validateRecipe(raw: unknown): Recipe {
     if (!agent.clock || typeof agent.clock !== 'object' || Array.isArray(agent.clock)) {
       throw new Error(`Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
     }
-    const unknown = Object.keys(agent.clock).filter((k) => !['intervalMinutes', 'intervalSeconds', 'precision'].includes(k));
+    const known: readonly string[] = RECIPE_AGENT_CLOCK_KEYS;
+    const unknown = Object.keys(agent.clock).filter((k) => !known.includes(k));
     if (unknown.length > 0) {
-      throw new Error(`Recipe agent.clock has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes intervalMinutes, intervalSeconds and precision.`);
+      throw new Error(`Recipe agent.clock has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes ${known.slice(0, -1).join(', ')} and ${known[known.length - 1]}.`);
     }
     // The framework's own rules, so a recipe fails here rather than at boot.
     try {

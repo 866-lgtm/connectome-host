@@ -677,6 +677,8 @@ export function agentSettingsOf(agent: {
   refusalHandling?: unknown;
   toolResultGuard?: { enabled?: boolean };
   toolWrapperProseGuard?: boolean;
+  /** agent-framework's resolved `AgentConfig.clock` (`Agent.clock`). */
+  clock?: { intervalSeconds: number } | undefined;
   getRuntimeSettings?(): { sameRoundThinkTextPolicy?: string };
 }): AgentSettings {
   const onOff = (v: boolean | undefined) => (v ? 'on' : 'off');
@@ -693,7 +695,15 @@ export function agentSettingsOf(agent: {
     'refusal handling': agent.refusalHandling ? 'set' : 'none',
     'tool-result guard': onOff(agent.toolResultGuard?.enabled),
     'tool-wrapper prose guard': onOff(agent.toolWrapperProseGuard),
+    'clock rows': agent.clock ? `every ${clockInterval(agent.clock.intervalSeconds)}` : 'off',
   };
+}
+
+/** A clock interval in the unit a recipe would give it in. */
+function clockInterval(seconds: number): string {
+  if (seconds % 60 !== 0) return seconds === 1 ? '1 second' : `${seconds} seconds`;
+  const minutes = seconds / 60;
+  return minutes === 1 ? '1 minute' : `${minutes} minutes`;
 }
 
 const formatTokens = (n: number): string => `${n.toLocaleString('en-US')} tokens`;
