@@ -22,8 +22,10 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import * as fsp from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
-import { ContractError, installPaths, lastCopy, readCurrent, readMark, releaseDir } from './contract.js';
-import { syncPath } from './data-swap.js';
+import {
+  ContractError, copyLabelPath, installPaths, lastCopy, readCurrent, readMark, releaseDir,
+} from './contract.js';
+import { exists, syncPath } from './data-swap.js';
 import type { ReleaseHere } from './host.js';
 import { HOST_ENTRY, LAUNCHER, RELEASE_HOST } from './launcher.js';
 
@@ -92,7 +94,8 @@ export async function installRelease(here: ReleaseHere, version: string, ops: In
     const { releases } = installPaths(here.root);
     const release = releaseDir(here.root, version);
     await prune(here, version, ops);
-    if (existsSync(release)) {
+    // Not following a link, so a dangling one gets the host check's refusal.
+    if (exists(release)) {
       const problem = hostProblem(release, version);
       if (problem !== null) {
         throw new ContractError(`${release} is there, but ${problem}, so it isn't the release ${version}. Remove it, ` +
@@ -133,7 +136,9 @@ export async function installRelease(here: ReleaseHere, version: string, ops: In
  *  lockfile with the manager that wrote the lockfile, as an operator updating
  *  by hand would (docs/DEPLOYMENTS.md, "Updating an install"), so the
  *  operator's other packages keep their locked versions when the release has
- *  a lockfile. Then check that the host is in place at `version`. */
+ *  a lockfile. Unlike by hand, the exact version is pinned in package.json,
+ *  so it names the release it holds. Then check that the host is in place at
+ *  `version`. */
 async function installInto(tmp: string, running: string, version: string, ops: InstallOps): Promise<void> {
   const lock = LOCKFILES.find(({ name }) => existsSync(join(running, name)));
   copyFileSync(join(running, 'package.json'), join(tmp, 'package.json'));
@@ -147,8 +152,9 @@ async function installInto(tmp: string, running: string, version: string, ops: I
   if (status !== 0) {
     const tail = output.length > OUTPUT_TAIL ? `…${output.slice(-OUTPUT_TAIL)}` : output;
     const how = status !== null ? `exited ${status}`
-      : 'gave no exit status, so it couldn\'t start or was stopped' +
-        (manager === 'npm' ? ' (if npm isn\'t on the PATH the host runs with, give its service a PATH that has it)' : '');
+      : 'gave no exit status, so it couldn\'t start or was stopped by a signal' +
+        (manager === 'npm' ? ' (if its output says npm wasn\'t found, the service that runs the host needs a PATH that ' +
+          'has npm)' : '');
     throw new ContractError(`Installing ${version} failed, so it isn't installed: \`${command}\` ${how}. Its output ` +
       `ends:\n${tail.trimEnd()}`);
   }
@@ -209,60 +215,67 @@ async function syncTree(dir: string): Promise<void> {
   }));
 }
 
-/** Remove what installs cut off left, and each release nothing names. After
- *  a switch, releases/ then holds the running release, the one a Go back
+/** Remove what installs cut off left, and each release nothing names: an
+ *  entry holding its host that's none of the release `current` names, the
+ *  running one, the one the copy holds the data of, which a Go back returns
+ *  to, the one a standing mark asks for, and the one being installed. After a
+ *  switch, releases/ then holds the running release, the one a Go back
  *  returns to, and, until the next install removes it, the one before that.
  *
- *  It keeps the release `current` names, the running one, the one the copy
- *  holds the data of, which a Go back returns to, the one a standing mark
- *  asks for, and the one being installed. A release is removed only when
- *  `current` and the copy's label are both there to say what a start and a
- *  Go back need: a labelled copy is there from an install's first switch on,
- *  so without one there has been no switch yet, or something has damaged
- *  it, and either way only what cut installs left is removed. A name ending
- *  in `.tmp` is never a release's (installRelease refuses one), so that is
- *  what an install or a removal cut off left. A release is renamed to one
+ *  A release is removed only when `current` and the copy's label are both
+ *  there, and the label names a release, to say what a start and a Go back
+ *  need. A labelled copy is there from an install's first switch on, and a
+ *  start settles a switch cut off while it moved one before any host runs
+ *  (settleCopy), so without one there has been no switch yet, or something
+ *  has damaged it. Then, or when one of them can't be read, it says so and
+ *  removes only what cuts left, keeping the names it could read.
+ *
+ *  A `.tmp` nothing keeps is what an install or a removal cut off left.
+ *  installRelease refuses a version so named, so only setup could make a
+ *  release that is, and one that's kept stays. A release is renamed to one
  *  before its removal, and the rename synced, so a removal cut short never
- *  leaves part of a release under its own name. A removal that fails is
- *  reported, and the install goes on, since nothing needs what it would have
- *  removed. Anything else in `releases/`, which nothing the update does puts
- *  there, is left alone. */
+ *  leaves part of a release under its own name; and releases/ is synced
+ *  before a `.tmp` is removed, since its rename aside may not have been. A
+ *  removal that fails is reported, and the install goes on, since nothing
+ *  needs what it would have removed. Anything else in `releases/`, which
+ *  nothing the update does puts there, is left alone. */
 async function prune(here: ReleaseHere, version: string, ops: InstallOps): Promise<void> {
-  const { releases } = installPaths(here.root);
+  const paths = installPaths(here.root);
   const keep = new Set([here.release, version]);
-  let known = false;
+  let unknown: string | null;
   try {
     const current = readCurrent(here.root);
+    if (current !== null) keep.add(current);
     const label = lastCopy(here.root);
-    for (const name of [current, label?.from, readMark(here.root)?.to]) {
-      if (typeof name === 'string') keep.add(name);
-    }
-    known = current !== null && label !== null;
+    if (typeof label?.from === 'string') keep.add(label.from);
+    const to = readMark(here.root)?.to;
+    if (typeof to === 'string') keep.add(to);
+    unknown = current === null ? `${paths.current} isn't there`
+      : label === null ? 'the copy\'s label isn\'t there, since no switch has taken a copy yet or it was lost, so nothing ' +
+        'says which release a Go back needs'
+      : typeof label.from !== 'string' ? `the copy's label at ${copyLabelPath(paths.copy)} names no release` : null;
   } catch (error) {
-    ops.report(`[update] No older release is removed this time: which releases a start, a Go back or a request ` +
-      `needs can't be told (${errorText(error)}).`);
+    unknown = `which releases a start, a Go back or a request needs can't be told (${errorText(error)})`;
   }
+  if (unknown !== null) ops.report(`[update] No older release is removed this time: ${unknown}.`);
   let names: string[];
   try {
-    names = readdirSync(releases);
+    names = readdirSync(paths.releases);
   } catch (error) {
-    ops.report(`[update] Nothing in ${releases} is removed this time: it can't be listed (${errorText(error)}).`);
+    ops.report(`[update] Nothing in ${paths.releases} is removed this time: it can't be listed (${errorText(error)}).`);
     return;
   }
   // What cuts left first, so a release's rename aside doesn't meet it.
   const cut = names.filter((name) => name.endsWith(WORKING) && !keep.has(name));
-  const unneeded = known ? names.filter((name) => !name.endsWith(WORKING) && !keep.has(name) &&
-    existsSync(join(releases, name, HOST_ENTRY))) : [];
-  for (const name of [...cut, ...unneeded]) {
-    const path = join(releases, name);
+  const unneeded = unknown === null ? names.filter((name) => !keep.has(name) &&
+    existsSync(join(paths.releases, name, HOST_ENTRY))) : [];
+  for (const name of new Set([...cut, ...unneeded])) {
+    const path = join(paths.releases, name);
+    const aside = name.endsWith(WORKING) ? path : `${path}${WORKING}`;
     try {
-      if (name.endsWith(WORKING)) {
-        await fsp.rm(path, { recursive: true, force: true });
-      } else {
-        renameSync(path, `${path}${WORKING}`);
-        syncPath(releases);
-        await fsp.rm(`${path}${WORKING}`, { recursive: true, force: true });
-      }
+      if (aside !== path) renameSync(path, aside);
+      syncPath(paths.releases);
+      await fsp.rm(aside, { recursive: true, force: true });
     } catch (error) {
       ops.report(`[update] ${path}, which nothing needs, couldn't be removed, and the next install tries again: ` +
         errorText(error));

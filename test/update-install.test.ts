@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync,
+  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -143,6 +143,8 @@ beforeEach(() => {
   root = join(dir, 'connectome-host');
   release('0.11.0', '0.11.0', { 'package.json': RUNNING_PACKAGE, 'package-lock.json': RUNNING_LOCK });
   moveCurrent(root, '0.11.0');
+  // A labelled copy, as there is from an install's first switch on.
+  copyFrom('0.11.0');
   said = [];
   calls = [];
 });
@@ -153,6 +155,18 @@ afterEach(() => {
 
 const installed = () => readdirSync(installPaths(root).releases).sort();
 const failure = (promise: Promise<unknown>) => promise.then(() => { throw new Error('expected a refusal'); }, (e: unknown) => e as Error);
+
+/** Run `body` with a PATH that finds nothing, so only what the ops find
+ *  without it can start. */
+async function withoutPath(body: () => Promise<void>): Promise<void> {
+  const path = process.env.PATH;
+  process.env.PATH = join(dir, 'nothing-here');
+  try {
+    await body();
+  } finally {
+    process.env.PATH = path;
+  }
+}
 
 describe('installing a release beside the running one', () => {
   test('installs the exact version with npm from the running release\'s package.json and lockfile, then renames it in', async () => {
@@ -231,8 +245,8 @@ describe('installing a release beside the running one', () => {
   test('npm with no exit status says it couldn\'t start or was stopped, and where npm is looked for', async () => {
     const error = await failure(installRelease(here(), '0.12.0', manager({ status: null, output: 'Executable not found in $PATH: "npm"' })));
     expect(error.message).toContain("`npm install --save-exact --no-audit --no-fund @animalabs/connectome-host@0.12.0` gave no " +
-      "exit status, so it couldn't start or was stopped (if npm isn't on the PATH the host runs with, give its service a PATH " +
-      'that has it). Its output ends:\nExecutable not found in $PATH: "npm"');
+      "exit status, so it couldn't start or was stopped by a signal (if its output says npm wasn't found, the service that " +
+      'runs the host needs a PATH that has npm). Its output ends:\nExecutable not found in $PATH: "npm"');
     expect(installed()).toEqual(['0.11.0']);
   });
 
@@ -240,7 +254,7 @@ describe('installing a release beside the running one', () => {
     rmSync(join(releaseDir(root, '0.11.0'), 'package-lock.json'));
     writeFileSync(join(releaseDir(root, '0.11.0'), 'bun.lock'), '{}\n');
     const error = await failure(installRelease(here(), '0.12.0', manager({ status: null, output: 'killed' })));
-    expect(error.message).toContain("gave no exit status, so it couldn't start or was stopped. Its output ends:\nkilled");
+    expect(error.message).toContain("gave no exit status, so it couldn't start or was stopped by a signal. Its output ends:\nkilled");
   });
 
   test('a failed install whose tmp can\'t be removed refuses with the manager\'s failure, and says so', async () => {
@@ -272,6 +286,7 @@ describe('installing a release beside the running one', () => {
       [null, new RegExp(`didn't put its host in place: ${manifest.replace(/[.]/g, '\\.')} isn't there, so`)],
       ['{not json', /didn't put its host in place: .*package\.json can't be read \(.*\), so/],
       ['{"version":12}', /didn't put its host in place: .*package\.json names no version, so/],
+      ['null', /didn't put its host in place: .*package\.json names no version, so/],
     ];
     for (const [text, expected] of cases) {
       const error = await failure(installRelease(here(), '0.12.0', manager({ manifest: text })));
@@ -309,6 +324,43 @@ describe('installing a release beside the running one', () => {
     expect(launcher.message).toContain(`but ${join(releaseDir(root, '0.12.0'), LAUNCHER)} isn't there, so it isn't the release`);
     expect(calls).toEqual([]);
     expect(installed()).toEqual(['0.11.0', '0.12.0']);
+  });
+
+  test('a dangling link where the release would be is refused by the host check, before any manager runs', async () => {
+    symlinkSync(join(dir, 'gone'), releaseDir(root, '0.12.0'));
+    const error = await failure(installRelease(here(), '0.12.0', manager()));
+    expect(error).toBeInstanceOf(ContractError);
+    expect(error.message).toBe(`${releaseDir(root, '0.12.0')} is there, but ` +
+      `${join(releaseDir(root, '0.12.0'), RELEASE_HOST, 'package.json')} isn't there, so it isn't the release 0.12.0. Remove it, ` +
+      'then update again.');
+    expect(calls).toEqual([]);
+  });
+
+  test('links the manager wrote are left to their directory\'s sync, a dangling one included', async () => {
+    const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
+    const linking = manager();
+    const run = linking.run;
+    linking.run = async (...args) => {
+      const ran = await run(...args);
+      mkdirSync(join(tmp, 'node_modules', '.bin'), { recursive: true });
+      symlinkSync('../@animalabs/connectome-host/src/index.ts', join(tmp, 'node_modules', '.bin', 'host'));
+      symlinkSync('../nowhere', join(tmp, 'node_modules', '.bin', 'dangling'));
+      return ran;
+    };
+    const seen = await steps(() => installRelease(here(), '0.12.0', linking));
+    expect(seen.filter((step) => step.includes('.bin/'))).toEqual([]);
+    expect(seen).toContain(`sync ${join(tmp, 'node_modules', '.bin')}`);
+    expect(installed()).toEqual(['0.11.0', '0.12.0']);
+  });
+
+  test('with the machine\'s own manager and no npm to be found, the refusal says so', async () => {
+    await withoutPath(async () => {
+      const error = await failure(installRelease(here(), '0.12.0'));
+      expect(error).toBeInstanceOf(ContractError);
+      expect(error.message).toEndWith('(if its output says npm wasn\'t found, the service that runs the host needs a PATH that ' +
+        'has npm). Its output ends:\nExecutable not found in $PATH: "npm"');
+    });
+    expect(installed()).toEqual(['0.11.0']);
   });
 
   test('refuses a version that isn\'t exact, one ending in .tmp, and the release running, before anything', async () => {
@@ -354,12 +406,18 @@ describe('installing a release beside the running one', () => {
 
   test('runs one install at a time', async () => {
     let finish!: () => void;
+    let entered!: () => void;
+    const inRun = new Promise<void>((done) => { entered = done; });
     const slow = manager();
     const run = slow.run;
-    slow.run = async (...args) => { await new Promise<void>((done) => { finish = done; }); return run(...args); };
+    slow.run = async (...args) => {
+      entered();
+      await new Promise<void>((done) => { finish = done; });
+      return run(...args);
+    };
     const first = installRelease(here(), '0.12.0', slow);
     try {
-      await Bun.sleep(10);
+      await inRun;
       const second = await failure(installRelease(here(), '0.12.1', manager()));
       expect(second.message).toBe('An install of 0.12.0 is under way. Wait for it to end, or restart the host to end one ' +
         'that hangs, then ask again.');
@@ -368,7 +426,8 @@ describe('installing a release beside the running one', () => {
       await first;
     }
     await installRelease(here(), '0.12.1', manager());
-    expect(installed()).toEqual(['0.11.0', '0.12.0', '0.12.1']);
+    // 0.12.0 went, since nothing names it.
+    expect(installed()).toEqual(['0.11.0', '0.12.1']);
   });
 
   test('an install that failed doesn\'t hold the next one back', async () => {
@@ -385,8 +444,9 @@ describe('removing releases nothing needs', () => {
     for (const name of ['0.9.0', '0.10.0', '0.10.2', '0.13.0']) release(name);
     mkdirSync(join(installPaths(root).releases, 'notes'));
     mkdirSync(join(installPaths(root).releases, '0.12.0.tmp', 'node_modules'), { recursive: true });
-    // A removal of 0.10.0 cut short, beside the release itself.
+    // A removal of 0.10.0 cut short, beside the release itself, and one of 0.8.0 that hadn't started.
     mkdirSync(join(installPaths(root).releases, '0.10.0.tmp', 'node_modules'), { recursive: true });
+    release('0.8.0.tmp');
     copyFrom('0.10.2');
     writeJsonAtomic(installPaths(root).mark, { v: 1, id: 'b9c3a1de-0000-4000-8000-000000000000', to: '0.13.0', why: 'update', at: new Date().toISOString() } satisfies Mark);
     await installRelease(here(), '0.12.0', manager());
@@ -420,17 +480,41 @@ describe('removing releases nothing needs', () => {
     expect(installed()).toEqual(['0.11.0-rc.tmp', '0.12.0']);
   });
 
-  test('with no copy\'s label, or no current, removes no release, only what cuts left', async () => {
+  test('with no copy\'s label, a label naming no release, or no current, removes no release, only what cuts left, and says why', async () => {
     release('0.9.0');
+    rmSync(installPaths(root).copy, { recursive: true });
     mkdirSync(join(installPaths(root).releases, '0.9.1.tmp'));
     await installRelease(here(), '0.12.0', manager());
     expect(installed()).toEqual(['0.11.0', '0.12.0', '0.9.0']);
+    expect(said).toEqual(["[update] No older release is removed this time: the copy's label isn't there, since no switch " +
+      'has taken a copy yet or it was lost, so nothing says which release a Go back needs.']);
+    copyFrom('0.11.0');
+    const label = copyLabelPath(installPaths(root).copy);
+    const fromless = JSON.parse(readFileSync(label, 'utf-8')) as Record<string, unknown>;
+    delete fromless.from;
+    writeJsonAtomic(label, fromless);
+    said = [];
+    await installRelease(here(), '0.12.1', manager());
+    expect(installed()).toEqual(['0.11.0', '0.12.0', '0.12.1', '0.9.0']);
+    expect(said).toEqual([`[update] No older release is removed this time: the copy's label at ${label} names no release.`]);
     copyFrom('0.11.0');
     unlinkSync(installPaths(root).current);
     mkdirSync(join(installPaths(root).releases, '0.9.1.tmp'));
-    await installRelease(here(), '0.12.1', manager());
-    expect(installed()).toEqual(['0.11.0', '0.12.0', '0.12.1', '0.9.0']);
-    expect(said).toEqual([]);
+    said = [];
+    await installRelease(here(), '0.12.2', manager());
+    expect(installed()).toEqual(['0.11.0', '0.12.0', '0.12.1', '0.12.2', '0.9.0']);
+    expect(said).toEqual([`[update] No older release is removed this time: ${installPaths(root).current} isn't there.`]);
+  });
+
+  test('a mark that can\'t be read leaves current\'s and the copy\'s names kept', async () => {
+    release('0.11.0-rc.tmp', '0.11.0-rc.tmp', { 'package.json': RUNNING_PACKAGE });
+    release('0.10.0-rc.tmp');
+    moveCurrent(root, '0.11.0-rc.tmp');
+    copyFrom('0.10.0-rc.tmp');
+    writeJsonAtomic(installPaths(root).mark, { v: 1, id: '../x', to: '0.13.0', why: 'update', at: new Date().toISOString() });
+    await installRelease(here(), '0.12.0', manager());
+    expect(installed()).toEqual(['0.10.0-rc.tmp', '0.11.0', '0.11.0-rc.tmp', '0.12.0']);
+    expect(said[0]).toContain('No older release is removed this time');
   });
 
   test('a refused request removes nothing, and a reuse still removes what nothing needs', async () => {
@@ -542,6 +626,24 @@ describe('removing releases nothing needs', () => {
     expect(calls).toEqual([]);
   });
 
+  test('a tmp that can\'t be made otherwise than being there throws its own error', async () => {
+    const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
+    const mkdir = fs.mkdirSync;
+    const spy = spyOn(fs, 'mkdirSync').mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
+      if (String(path) === tmp) throw Object.assign(new Error(`EACCES: permission denied, mkdir '${tmp}'`), { code: 'EACCES' });
+      return (mkdir as (...a: unknown[]) => unknown)(path, ...rest);
+    }) as typeof fs.mkdirSync);
+    let error: Error;
+    try {
+      error = await failure(installRelease(here(), '0.12.0', manager()));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(error).not.toBeInstanceOf(ContractError);
+    expect(error.message).toBe(`EACCES: permission denied, mkdir '${tmp}'`);
+    expect(calls).toEqual([]);
+  });
+
   test('a release that can\'t be renamed aside stays whole, and the install goes on', async () => {
     release('0.9.0');
     copyFrom('0.11.0');
@@ -563,18 +665,6 @@ describe('removing releases nothing needs', () => {
 });
 
 describe('the machine\'s package manager', () => {
-  /** Run `body` with a PATH that finds nothing, so only what the ops find
-   *  without it can start. */
-  async function withoutPath(body: () => Promise<void>): Promise<void> {
-    const path = process.env.PATH;
-    process.env.PATH = join(dir, 'nothing-here');
-    try {
-      await body();
-    } finally {
-      process.env.PATH = path;
-    }
-  }
-
   test('runs the Bun running this host in the directory given, and gives its exit status and the end of both streams', async () => {
     const ops = machineInstallOps();
     await withoutPath(async () => {
