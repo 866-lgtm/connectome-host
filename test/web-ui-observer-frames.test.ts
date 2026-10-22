@@ -15,8 +15,9 @@ describe('what each client is sent', () => {
   let stored: Record<string, unknown> | null = null;
   let hostStatus: Record<string, unknown> = { quiesced: false };
   let ledgerUpdate: ((ledger: unknown) => void) | undefined;
+  let transcript: Record<string, unknown>[] = [];
   const cm = {
-    getAllMessages: () => [],
+    getAllMessages: () => transcript,
     currentBranch: () => branch,
     getMessage: () => stored,
   };
@@ -174,6 +175,41 @@ describe('what each client is sent', () => {
       expect(conn.framesOf('inbound-trigger').map((f) => f.text)).toEqual(['hello from zulip']);
     }
     expect(c.dashboard.framesOf('inbound-trigger')).toEqual([]);
+  });
+
+  test("an image a tool returned reaches only clients that hold tools, in the welcome and at /media, and an image in a message reaches every client that holds messages", async () => {
+    const png = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } });
+    transcript = [
+      { id: 'm1', participant: 'assistant', content: [{ type: 'text', text: 'looking' }, { type: 'tool_use', id: 't1', name: 'camera', input: {} }] },
+      { id: 'm2', participant: 'user', content: [
+        { type: 'tool_result', toolUseId: 't1', content: [{ type: 'text', text: 'a frame' }, png('AAAA')] },
+        { type: 'text', text: 'and this' },
+        png('BBBB'),
+      ] },
+    ];
+    try {
+      const c = await everyone();
+      const media = (conn: { framesOf(type: string): Record<string, unknown>[] }) =>
+        ((conn.framesOf('welcome')[0]!.messages as { blocks: { kind: string }[] }[]).flatMap((m) => m.blocks))
+          .filter((b) => b.kind === 'media');
+      expect(media(c.reader)).toEqual([{ kind: 'media', mediaType: 'image/png', ref: 'm2/2' }]);
+      expect(media(c.interior)).toEqual([
+        { kind: 'media', mediaType: 'image/png', ref: 'm2/0.1', toolUseId: 't1' },
+        { kind: 'media', mediaType: 'image/png', ref: 'm2/2' },
+      ]);
+      expect(media(c.operator)).toEqual(media(c.interior));
+      // /media: the nested path is the tool's result, which reader may not have. Not 401 means
+      // the request got past the scope gate, to the stub host's store.
+      const fetchAs = async (conn: Connection, path: string) => fetch(`http://127.0.0.1:${host.port}${path}`, {
+        headers: { cookie: `fkm_obs=${conn.framesOf('observer-ack')[0]!.sessionToken as string}` },
+      });
+      expect((await fetchAs(c.reader, '/media/m2/0.1')).status).toBe(401);
+      expect((await fetchAs(c.reader, '/media/m2/2')).status).not.toBe(401);
+      expect((await fetchAs(c.interior, '/media/m2/0.1')).status).not.toBe(401);
+      expect((await fetchAs(c.dashboard, '/media/m2/2')).status).toBe(401);
+    } finally {
+      transcript = [];
+    }
   });
 
   test('the serving state and the agents\' models reach clients that hold health in the welcome, the serving state live too, and provider calls live', async () => {

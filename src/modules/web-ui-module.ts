@@ -1258,9 +1258,13 @@ export class WebUiModule implements Module {
     }
 
     // Inline image bytes for transcript media refs (see serveMedia). Same
-    // sensitivity tier as the transcript itself.
+    // sensitivity tier as the transcript itself, and a nested block path
+    // (`<n>.<m>`), which buildMediaBlock resolves only inside a tool's
+    // result, as the tool result itself.
     if (url.pathname.startsWith('/media/')) {
       if (!httpAllowed('messages')) return this.unauthorized();
+      const blockPath = url.pathname.slice('/media/'.length).split('/').slice(1).join('/');
+      if (blockPath.includes('.') && !httpAllowed('tools')) return this.unauthorized();
       return this.serveMedia(url);
     }
 
@@ -3641,7 +3645,7 @@ function toWireEntry(
                 : null;
               if (!mt || !mt.startsWith('image/')) continue;
               const ref = mediaRef(`${bi}.${ii}`, mt);
-              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}) });
+              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}), toolUseId: b.toolUseId });
             }
           }
         }
