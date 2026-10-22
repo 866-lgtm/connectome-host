@@ -87,7 +87,9 @@ three, and in practice is how headless residents are operated.
    then a default.
 6. **Build Membrane** with the right formatter (native, Anthropic-XML prefill,
    or OpenAI Responses), retry policy and caching defaults.
-7. **`createFramework()`** — load recipe extensions, build the module list,
+7. **`createFramework()`** — take the recipe extensions `main()` loaded
+   (a trial's store audit builds its strategies from the same ones), build
+   the module list,
    merge MCP servers, build the memory strategy and agent config, then
    `AgentFramework.create()` with the gate, provider hold, code execution,
    conversations and subconscious configuration. Post-create hooks bind the
@@ -97,7 +99,8 @@ three, and in practice is how headless residents are operated.
    logs, and the chosen runtime.
 
 **Switching sessions** (`/session switch`) stops the framework and runs
-`createFramework()` again against the new store, reusing the same Membrane,
+`createFramework()` again against the new store, which loads the recipe's
+extensions again once the framework before has stopped, reusing the same Membrane,
 adapter, settings, ledger, quota meter and agent name. The WebUI's HTTP/WS
 server is a process-level singleton and survives the switch.
 

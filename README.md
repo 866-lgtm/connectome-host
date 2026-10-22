@@ -629,6 +629,7 @@ bun src/index.ts <recipe> --headless                     # Daemon: JSONL IPC ove
 bun src/index.ts <recipe> --headless --exit-when-idle    # One-shot: exit once the agent goes idle
 bun src/index.ts <recipe> --headless --socket-path <p>   # Custom socket path
 bun --watch src/index.ts            # Dev mode
+bun src/index.ts --audit-stores --recipe <recipe> <data dir>  # Store audit: starts no agent (below)
 ```
 
 Put the recipe before other arguments: the first argument that doesn't start
@@ -644,6 +645,18 @@ anything meant to keep serving needs `--headless`. The host prints a
 `[batch]` line at the start and before the teardown. If the recipe enables
 the web UI, its server outlives the agent by design, so the process keeps
 running, with no agent data behind the page, until interrupted.
+
+`--audit-stores [--recipe <recipe>] <data directory>…`, given first and in
+place of a recipe, starts no agent. It opens the agent's context in every
+session's store in each data directory, and its recipe's fleet children's,
+but one that reaches past what an update copies, of which it says why not, or
+one that isn't there yet, which a start makes empty,
+the way a start of this version opens it, under the recipe `--recipe` names or
+else the one the last start saved. It opens them in place, so run it after a copy you'd go
+back to. It prints a line on stderr for each store under each agent name it opens it under, the recipe's or the default and each session's own, or one for a store it doesn't open, and exits 0 when no store
+was refused and every one there was audited, 1 otherwise. Run it with the
+agents stopped: "Updating an install" in
+[`docs/DEPLOYMENTS.md`](docs/DEPLOYMENTS.md) says when.
 
 ## Web UI
 
