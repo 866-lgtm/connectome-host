@@ -1680,5 +1680,7 @@ export async function buildDebugContext(
   requireAgent(app, agentName);
   const injections = params.injections === true;
   const request = await app.framework.previewActivation(agentName, { injections });
-  return { agent: agentName, injections, transparent: !injections, request };
+  // The presentation captured with this request, or null for an agent without one.
+  return { agent: agentName, injections, transparent: !injections, request,
+    toolPresentation: app.framework.getRequestToolPresentation(request) };
 }

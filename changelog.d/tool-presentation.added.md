@@ -1,0 +1,1 @@
+- Accept opt-in tool-presentation configuration (`agent.toolPresentation`) and expose matching description/visibility metadata in context previews.
