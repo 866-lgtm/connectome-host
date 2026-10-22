@@ -112,8 +112,9 @@ The module accepts three credentials:
   observer sees only its grant's scopes — `health`, `ops`, `messages`,
   `tools`, `thinking`, `debug` — and gets a session cookie for the matching
   HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
-  and `/quota`, `messages` for `/media/…`). Observers are read-only;
-  `/files/…` and `/debug/retrieval*` stay password-only.
+  and `/quota`, `messages` for `/media/…`, with `tools` as well for an image
+  a tool returned). Observers are read-only; `/files/…` and
+  `/debug/retrieval*` stay password-only.
 
 ## Caddy
 
