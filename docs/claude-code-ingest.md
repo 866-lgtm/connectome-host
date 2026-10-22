@@ -263,8 +263,10 @@ strategy config chunks its frontier under *that* config):
 
 1. Compile it with the recipe's strategy and **read the rendered messages**. Search
    the compiled output for `isn't shown in this context`, which the stub for a call
-   whose result the context doesn't hold says (context-manager 0.16.0 on), and for
-   `[tool call omitted]`. There should be none for a fresh seed.
+   whose result the context doesn't hold says (context-manager 0.16.0 on), for
+   `[tool call omitted]`, and for `[tool result moved during context repair]`, which
+   marks where a result sat apart from its call and was moved next to it. There
+   should be none for a fresh seed.
 2. Compare exact `count_tokens` against the estimate. A real/estimate ratio far from
    ~1.0–1.3 means blocks are missing or doubled. Made with a real key, this call is
    also the cheapest proof that the API accepts the seed's *shape* (signed thinking,
@@ -464,7 +466,7 @@ that's the cheap moment. After first boot it's a store surgery.
 - [ ] `cache_control` stripped; no `isMeta` / command echoes / interrupt markers
 - [ ] `tool_reference` blocks replaced with text (the API 400s the whole request otherwise)
 - [ ] Ingest strategy mirrors recipe; `namespace` = `agents/<agent.name>` exactly
-- [ ] Compiled a **copy**: no `isn't shown in this context` / `[tool call omitted]` stubs; real/estimate tokens sane
+- [ ] Compiled a **copy**: no `isn't shown in this context` / `[tool call omitted]` / `[tool result moved during context repair]` stubs; real/estimate tokens sane
 - [ ] Store backed up pre-first-boot
 - [ ] Recipe: same model, adaptive thinking, minimal system prompt, budget fits window
 - [ ] `refusalHandling.retries: 2`; runtime carries tools-less-compression deferral
