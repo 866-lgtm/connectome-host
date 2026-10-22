@@ -863,7 +863,7 @@ describe('what a launch block says beyond the settings it compares', () => {
   });
 
   // A fork inherits its parent's clock rows and takes no more of its own, so
-  // it's told so, in the unit the recipe gives the interval in.
+  // it's told so, in minutes when the interval is whole minutes, else seconds.
   test('a fork of a parent with clock rows is told its own are off', async () => {
     for (const [clock, every] of [[{ intervalMinutes: 10 }, '10 minutes'], [{ intervalSeconds: 15 }, '15 seconds']] as const) {
       const h = await makeHarness({ parent: { clock } });
@@ -953,6 +953,8 @@ describe('each agent setting is read from its own field', () => {
       [{ toolResultGuard: { enabled: true } }, 'tool-result guard', 'on'],
       [{ toolWrapperProseGuard: true }, 'tool-wrapper prose guard', 'on'],
       [{ clock: { intervalSeconds: 600 } }, 'clock rows', 'every 10 minutes'],
+      [{ clock: { intervalSeconds: 60 } }, 'clock rows', 'every 1 minute'],
+      [{ clock: { intervalSeconds: 1 } }, 'clock rows', 'every 1 second'],
     ];
     expect(new Set(cases.map(([, name]) => name))).toStrictEqual(new Set(Object.keys(base)));
     for (const [agent, name, value] of cases) {

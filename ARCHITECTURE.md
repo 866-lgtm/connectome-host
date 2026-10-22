@@ -122,12 +122,15 @@ A recipe is JSON; the full key set is typed and validated in
   snapshot as its value, so keep secrets out of those two fields. Other state
   in the data dir can hold secrets too — the identity key, and fleet
   children's resolved `env` (#162).
-- **Validation checks values, not spelling.** Bad values, impossible
+- **Validation checks values, and spelling in part.** Bad values, impossible
   combinations (e.g. an instructions path on a mount that can't be written)
-  and partial policies are rejected at load, naming the key. Unrecognized keys
-  are generally not rejected (a few blocks, such as `subconscious`, the
-  object form of `modules.history`, and `modules.workspace` and its mounts,
-  refuse unknown fields), so a misspelled key is silently ignored.
+  and partial policies are rejected at load, naming the key. An unrecognized
+  key at the top level or in `agent`, `agent.mock`, `agent.strategy.kvUnified`
+  and its `policy`, or `modules` is warned about, naming it, and the load
+  goes on. Some blocks, such as `subconscious`, the object form of
+  `modules.history`, `agent.retry`, `agent.clock`, and `modules.workspace`
+  and its mounts, refuse unknown fields. Keys elsewhere aren't checked, so a
+  misspelled one there is silently ignored.
 - **Paths.** Fleet child recipes resolve relative to the parent recipe file;
   runtime paths (data dirs, workspace mounts) resolve against the CWD.
 - **Extensions.** `extensions` maps names to local modules that register

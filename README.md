@@ -86,9 +86,10 @@ the key. An unrecognized key at the recipe's top level or in `agent`,
 (`mcplServers`, a leftover `modules.files`) doesn't stop the load: the host
 warns, naming it and, where one is close, the key it was probably meant to
 be. Keys inside other objects aren't checked this way, so check spelling
-against this README and `src/recipe.ts`. `modules.workspace`, each of its
-mounts, and `agent.clock` refuse a key they don't have, naming it, and
-`agent.toolPresentation` refuses one without naming it.
+against this README and `src/recipe.ts`. Some objects refuse a key they
+don't have, naming it, such as `modules.workspace` and each of its mounts,
+`modules.history`, `agent.retry` and `agent.clock`; `agent.toolPresentation`
+refuses one without naming it.
 
 `agent.timezone` is an IANA zone used only for times rendered to the agent.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
@@ -117,8 +118,10 @@ the next event or turn start writes it. On some models a clock after a
 tool's results drops the loop's earlier thinking from the request, as any
 message heard while acting does there, at most once an interval. Subagents
 take no clock rows: a fork keeps the rows it inherits and gets no more, and
-its start orientation names its clock rows as off beside its parent's. The
-subconscious takes none of its own; it reads the agent's.
+its start orientation names its clock rows as off beside its parent's.
+Agents that share one window read each other's clock rows, one with no
+clock of its own included. The subconscious takes none of its own and reads
+them through its merged view.
 
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
 the autobiographical memory strategy with adaptive resolution, **kv-unified

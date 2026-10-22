@@ -699,7 +699,8 @@ export function agentSettingsOf(agent: {
   };
 }
 
-/** A clock interval in the unit a recipe would give it in. */
+/** A clock interval in minutes when it is whole minutes, else in seconds.
+ *  `Agent.clock` keeps only seconds, so the unit the recipe gave can't be told. */
 function clockInterval(seconds: number): string {
   if (seconds % 60 !== 0) return seconds === 1 ? '1 second' : `${seconds} seconds`;
   const minutes = seconds / 60;
