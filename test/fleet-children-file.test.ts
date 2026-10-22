@@ -298,7 +298,7 @@ describe("the fleet's children file", () => {
       expect(result.error, kind).toStartWith(`Child 'leaf' didn't start (it couldn't be listed in ${childrenFile}, which an ` +
         'update reads to see which children are running: ');
       expect(result.error, kind).toContain('Replacing it would drop the children it lists, which an update reads to see ' +
-        'which may still be running, so every launch fails this way until whoever runs this host fixes it, or removes it ' +
+        'which may still be running, so every launch that spawns a child fails this way until whoever runs this host fixes it, or removes it ' +
         'once no child it lists is running)');
       expect(readFileSync(childrenFile, 'utf8'), kind).toBe(text);
       expect(fleet.getChildren().get('leaf')?.status, kind).toBe('crashed');

@@ -8,6 +8,13 @@ type AgentConfig = Parameters<typeof AgentFramework.create>[0]['agents'][number]
  *  (budget + maxTokens has to fit under the window). */
 export const DEFAULT_CONTEXT_BUDGET_TOKENS = 300_000;
 
+/** The model a recipe's agent runs: `envModel`, the environment's `MODEL`,
+ *  when it's set, else the recipe's own, else its provider's default. */
+export function recipeModel(recipe: Recipe, envModel: string | undefined): string {
+  return envModel || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+}
+
 /** The compile budget the recipe configures: its own, else the default. A
  *  runtime override (agent settings) can still move the live budget. */
 export function effectiveContextBudgetTokens(recipe: Recipe): number {

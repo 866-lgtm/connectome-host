@@ -313,6 +313,26 @@ ones it wants. `command-output` needs no entry: it bypasses the child's filter
   same name, recipe and dataDir, `autoStart: false` entries included, and a
   mismatch logs the differing fields and withholds the overrides, without
   logging their values (#180).
+- **The children file.** A host started from an install (with
+  `CONNECTOME_INSTALL_ROOT`) whose recipe has a fleet also keeps
+  `<DATA_DIR>/fleet-children.json`, which the install's launcher reads before
+  a switch: whether any child may still be running, and where each child's
+  data is. The module writes it with each persist, after the store's write,
+  and at a launch after the store's sync too, so it never lists a child the
+  store hasn't kept. Each entry has the child's name, data directory and boot
+  id, and its pid while it's starting or ready, null once it has exited or
+  crashed. A write lists the module's own children and keeps what the file
+  already holds that it doesn't replace, so it's the host's list across its
+  sessions: another directory's entry, its pid kept only while a process of
+  this boot may hold it; another generation still running in a child's own
+  directory; and an entry without a child's shape (`isChildEntry`), as it is.
+  A file the module can't read is left as it is, and the write fails: at a
+  launch's spawn the launch then fails, and every launch that spawns a child
+  fails that way until whoever runs the host fixes the file, or removes it
+  once no child it lists is running. A host on trial also lists there each
+  fleet child's store audit while it runs (`<child>'s store audit`, with its
+  pid), which the launcher's fallback waits for like a child
+  (`src/update/audit-stores.ts`).
 - **Adopt on start.** For each persisted child whose record allows it (`ready`
   or `starting` with no exit time, or `crashed` by an earlier failed
   adoption): check the pid is alive and the socket path is a socket, connect,

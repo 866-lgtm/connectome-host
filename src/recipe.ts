@@ -1468,9 +1468,11 @@ export async function loadRecipe(source: string): Promise<Recipe> {
 /**
  * Like loadRecipe, but also returns the persistable (unresolved) form —
  * see LoadedRecipe. Callers that snapshot the recipe to disk (index.ts's
- * resolveRecipe) must save `persistable`, never `recipe`.
+ * resolveRecipe) must save `persistable`, never `recipe`. The store audit
+ * (src/update/audit-stores.ts) loads a fleet child's recipe with
+ * `fetchSystemPrompt: false`, as it reads a saved one.
  */
-export async function loadRecipeDetailed(source: string): Promise<LoadedRecipe> {
+export async function loadRecipeDetailed(source: string, options: { fetchSystemPrompt?: boolean } = {}): Promise<LoadedRecipe> {
   let raw: unknown;
   let sourceBase: RecipeSourceBase;
 
@@ -1494,7 +1496,7 @@ export async function loadRecipeDetailed(source: string): Promise<LoadedRecipe> 
   const recipe = validateRecipe(raw);
   resolveChildRecipePaths(recipe, sourceBase);
   resolveExtensionPaths(recipe, sourceBase);
-  const resolved = await resolveSystemPrompt(recipe);
+  const resolved = options.fetchSystemPrompt === false ? recipe : await resolveSystemPrompt(recipe);
   copyResolvedPathsIntoRaw(persistable, resolved);
   return { recipe: resolved, persistable };
 }
@@ -3229,8 +3231,12 @@ export function savedRecipeDirectory(dataDir: string): string | null {
  * Legacy snapshots (no marker — saved fully resolved by older versions) are
  * validated and returned verbatim: no substitution, so a literal `${...}`
  * that survived resolution in prose cannot fail the load.
+ *
+ * The store audit (src/update/audit-stores.ts) reads it with
+ * `fetchSystemPrompt: false`, since opening the resident's stores needs no
+ * system prompt, and an audit shouldn't wait on the network for one.
  */
-export async function loadSavedRecipe(dataDir: string): Promise<Recipe | null> {
+export async function loadSavedRecipe(dataDir: string, options: { fetchSystemPrompt?: boolean } = {}): Promise<Recipe | null> {
   const path = savedRecipePath(dataDir);
   let text: string;
   try {
@@ -3268,7 +3274,7 @@ export async function loadSavedRecipe(dataDir: string): Promise<Recipe | null> {
   // secret removed from the environment), not corruption to shrug off.
   const substituted = substituteEnvVars(unresolved, path);
   const recipe = validateRecipe(substituted);
-  return resolveSystemPrompt(recipe);
+  return options.fetchSystemPrompt === false ? recipe : resolveSystemPrompt(recipe);
 }
 
 /**
