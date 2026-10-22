@@ -13,13 +13,17 @@
  * Only a host started through the install's entry point calls it, and that
  * host holds the install's lock while it runs (takeLock), so neither a
  * launcher nor another host writes `releases/` meanwhile. Within the host,
- * one install runs at a time.
+ * one install runs at a time. Its work on a release's whole tree, syncing one
+ * and removing one, goes through fs/promises, so the host it runs in goes on
+ * serving meanwhile: on the VPS, syncing a release of 21,784 entries by sync
+ * calls held the event loop for 15 s (J29000).
  */
 import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 import { ContractError, installPaths, lastCopy, readCurrent, readMark, releaseDir } from './contract.js';
-import { removeTree, syncPath } from './data-swap.js';
+import { syncPath } from './data-swap.js';
 import type { ReleaseHere } from './host.js';
 import { HOST_ENTRY, LAUNCHER, RELEASE_HOST } from './launcher.js';
 
@@ -42,6 +46,9 @@ const LOCKFILES: Array<{ name: string; manager: 'npm' | 'bun' }> = [
 
 /** How much of a failed manager's output a refusal quotes, from its end. */
 const OUTPUT_TAIL = 2000;
+
+/** How many of a release's files and directories are synced at once. */
+const SYNC_WIDTH = 16;
 
 /** What installing needs from the machine, given to it so tests can stand in. */
 export interface InstallOps {
@@ -84,7 +91,7 @@ export async function installRelease(here: ReleaseHere, version: string, ops: In
   try {
     const { releases } = installPaths(here.root);
     const release = releaseDir(here.root, version);
-    prune(here, version, ops);
+    await prune(here, version, ops);
     if (existsSync(release)) {
       const problem = hostProblem(release, version);
       if (problem !== null) {
@@ -103,11 +110,11 @@ export async function installRelease(here: ReleaseHere, version: string, ops: In
       }
       try {
         await installInto(tmp, releaseDir(here.root, here.release), version, ops);
-        syncTree(tmp);
+        await syncTree(tmp);
         renameSync(tmp, release);
       } catch (error) {
         try {
-          removeTree(tmp);
+          await fsp.rm(tmp, { recursive: true, force: true });
         } catch (removal) {
           ops.report(`[update] ${tmp}, the install that failed, couldn't be removed, and the next install removes it: ` +
             errorText(removal));
@@ -173,16 +180,33 @@ function hostProblem(dir: string, version: string): string | null {
   return null;
 }
 
-/** Sync each file and directory under `dir`, and `dir` last, so a rename of
- *  `dir` can't outlive on disk what it holds, as setup's copy of its first
- *  release does (copyTree). A link is synced as its directory's entry. */
-function syncTree(dir: string): void {
-  for (const entry of readdirSync(dir, { withFileTypes: true })) {
-    const path = join(dir, entry.name);
-    if (entry.isDirectory()) syncTree(path);
-    else if (entry.isFile()) syncPath(path);
-  }
-  syncPath(dir);
+/** Sync each file and directory under `dir`, and `dir`, so a rename of `dir`
+ *  can't outlive on disk what it holds, as setup's copy of its first release
+ *  does (copyTree). A link is synced as its directory's entry. SYNC_WIDTH at
+ *  a time: on the VPS, a release of 21,784 entries took 5 s so, and 29 s one
+ *  at a time (J29000). */
+async function syncTree(dir: string): Promise<void> {
+  const paths: string[] = [];
+  const walk = async (at: string): Promise<void> => {
+    for (const entry of await fsp.readdir(at, { withFileTypes: true })) {
+      const path = join(at, entry.name);
+      if (entry.isDirectory()) await walk(path);
+      else if (entry.isFile()) paths.push(path);
+    }
+    paths.push(at);
+  };
+  await walk(dir);
+  let next = 0;
+  await Promise.all(Array.from({ length: SYNC_WIDTH }, async () => {
+    while (next < paths.length) {
+      const handle = await fsp.open(paths[next++]!, 'r');
+      try {
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
+    }
+  }));
 }
 
 /** Remove what installs cut off left, and each release nothing names. After
@@ -203,7 +227,7 @@ function syncTree(dir: string): void {
  *  reported, and the install goes on, since nothing needs what it would have
  *  removed. Anything else in `releases/`, which nothing the update does puts
  *  there, is left alone. */
-function prune(here: ReleaseHere, version: string, ops: InstallOps): void {
+async function prune(here: ReleaseHere, version: string, ops: InstallOps): Promise<void> {
   const { releases } = installPaths(here.root);
   const keep = new Set([here.release, version]);
   let known = false;
@@ -233,11 +257,11 @@ function prune(here: ReleaseHere, version: string, ops: InstallOps): void {
     const path = join(releases, name);
     try {
       if (name.endsWith(WORKING)) {
-        removeTree(path);
+        await fsp.rm(path, { recursive: true, force: true });
       } else {
         renameSync(path, `${path}${WORKING}`);
         syncPath(releases);
-        removeTree(`${path}${WORKING}`);
+        await fsp.rm(`${path}${WORKING}`, { recursive: true, force: true });
       }
     } catch (error) {
       ops.report(`[update] ${path}, which nothing needs, couldn't be removed, and the next install tries again: ` +

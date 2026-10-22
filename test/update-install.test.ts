@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test';
 import * as fs from 'node:fs';
+import * as fsp from 'node:fs/promises';
 import {
   existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
@@ -77,7 +78,17 @@ function copyFrom(from: string): void {
   writeJsonAtomic(copyLabelPath(copy), { v: 1, from, at: new Date().toISOString(), items: [{ path: '/srv/data', name: '0-data' }] } satisfies CopyLabel);
 }
 
-/** Spy on renames, syncs and removals in order, for the length of `body`. */
+/** Make fs/promises' rm of `path` fail as a busy directory does, until the spy is restored. */
+function failRm(path: string) {
+  const rm = fsp.rm;
+  return spyOn(fsp, 'rm').mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+    if (String(target) === path) throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${path}'`), { code: 'EBUSY' });
+    return rm(target, options);
+  }) as typeof fsp.rm);
+}
+
+/** Spy on renames, syncs and removals in order, by sync calls and through
+ *  fs/promises, for the length of `body`. */
 async function steps(body: () => Promise<void>): Promise<string[]> {
   const paths = new Map<number, string>();
   const seen: string[] = [];
@@ -85,6 +96,8 @@ async function steps(body: () => Promise<void>): Promise<string[]> {
   const realFsync = fs.fsyncSync;
   const realRename = fs.renameSync;
   const realUnlink = fs.unlinkSync;
+  const realOpenP = fsp.open;
+  const realRm = fsp.rm;
   const spies = [
     spyOn(fs, 'openSync').mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
       const fd = (realOpen as (...args: unknown[]) => number)(path, ...rest);
@@ -103,6 +116,19 @@ async function steps(body: () => Promise<void>): Promise<string[]> {
       seen.push(`unlink ${path}`);
       realUnlink(path);
     }) as typeof fs.unlinkSync),
+    spyOn(fsp, 'open').mockImplementation((async (path: fs.PathLike, ...rest: unknown[]) => {
+      const handle = await (realOpenP as (...args: unknown[]) => Promise<fsp.FileHandle>)(path, ...rest);
+      const sync = handle.sync.bind(handle);
+      handle.sync = async () => {
+        seen.push(`sync ${path}`);
+        return sync();
+      };
+      return handle;
+    }) as typeof fsp.open),
+    spyOn(fsp, 'rm').mockImplementation((async (path: fs.PathLike, options?: fs.RmOptions) => {
+      seen.push(`rm ${path}`);
+      return realRm(path, options);
+    }) as typeof fsp.rm),
   ];
   try {
     await body();
@@ -219,11 +245,7 @@ describe('installing a release beside the running one', () => {
 
   test('a failed install whose tmp can\'t be removed refuses with the manager\'s failure, and says so', async () => {
     const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
-    const rmdir = fs.rmdirSync;
-    const spy = spyOn(fs, 'rmdirSync').mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
-      if (String(path) === tmp) throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${tmp}'`), { code: 'EBUSY' });
-      return (rmdir as (...a: unknown[]) => void)(path, ...rest);
-    }) as typeof fs.rmdirSync);
+    const spy = failRm(tmp);
     let error: Error;
     try {
       error = await failure(installRelease(here(), '0.12.0', manager({ status: 1, output: 'ETARGET' })));
@@ -316,7 +338,6 @@ describe('installing a release beside the running one', () => {
       expect(at(`sync ${path}`)).toBeGreaterThan(-1);
       expect(at(`sync ${path}`)).toBeLessThan(renamed);
     }
-    expect(seen[renamed - 1]).toBe(`sync ${tmp}`);
     expect(seen.slice(renamed + 1)).toEqual([`sync ${installPaths(root).releases}`]);
   });
 
@@ -480,7 +501,7 @@ describe('removing releases nothing needs', () => {
     const renamed = seen.indexOf(`rename ${releaseDir(root, '0.9.0')}`);
     expect(renamed).toBeGreaterThan(-1);
     expect(seen[renamed + 1]).toBe(`sync ${installPaths(root).releases}`);
-    expect(seen.findIndex((step) => step.startsWith(`unlink ${aside}`))).toBeGreaterThan(renamed + 1);
+    expect(seen[renamed + 2]).toBe(`rm ${aside}`);
     expect(installed()).toEqual(['0.11.0', '0.12.0']);
   });
 
@@ -489,11 +510,7 @@ describe('removing releases nothing needs', () => {
     release('0.10.0');
     copyFrom('0.11.0');
     const stuck = `${releaseDir(root, '0.9.0')}.tmp`;
-    const rmdir = fs.rmdirSync;
-    const spy = spyOn(fs, 'rmdirSync').mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
-      if (String(path) === stuck) throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${stuck}'`), { code: 'EBUSY' });
-      return (rmdir as (...a: unknown[]) => void)(path, ...rest);
-    }) as typeof fs.rmdirSync);
+    const spy = failRm(stuck);
     try {
       await installRelease(here(), '0.12.0', manager());
     } finally {
@@ -512,11 +529,7 @@ describe('removing releases nothing needs', () => {
     copyFrom('0.11.0');
     const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
     mkdirSync(join(tmp, 'node_modules'), { recursive: true });
-    const rmdir = fs.rmdirSync;
-    const spy = spyOn(fs, 'rmdirSync').mockImplementation(((path: fs.PathLike, ...rest: unknown[]) => {
-      if (String(path) === tmp) throw Object.assign(new Error(`EBUSY: resource busy or locked, rmdir '${tmp}'`), { code: 'EBUSY' });
-      return (rmdir as (...a: unknown[]) => void)(path, ...rest);
-    }) as typeof fs.rmdirSync);
+    const spy = failRm(tmp);
     let error: Error;
     try {
       error = await failure(installRelease(here(), '0.12.0', manager()));
