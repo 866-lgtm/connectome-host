@@ -6,6 +6,191 @@ release time — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 ## Unreleased
 
+## 0.12.0 — 2026-10-22
+
+### Breaking
+
+- **Recipe authors who set `engine`, `latentDemandMode` or
+  `policy.ageBandSteps` under `agent.strategy.kvUnified`:** the host now
+  types and validates context-manager 0.17's keys (#346). `engine` takes
+  `"auto"`, `"subtree"` or `"dag"`, `latentDemandMode` takes `"individual"`
+  or `"joint"`, and `policy.ageBandSteps` takes an integer from 0 to 64.
+  Any other value stops the recipe loading with an error naming the key,
+  where the host passed it on and context-manager read an unknown engine as
+  `auto` and any mode but `"joint"` as individual ranking. Leaving a key out
+  keeps context-manager's default. Keys under `kvUnified` and its `policy`
+  that the host doesn't read are now named in the unknown-key warning, with
+  the key each was probably meant to be.
+
+- **Operators:** connectome-host now requires `@animalabs/agent-framework`
+  ^0.24.0 (was ^0.23.1), `@animalabs/context-manager` ^0.18.0 (was ^0.14.0)
+  and `@animalabs/membrane` ^0.6.0 (was ^0.5.87), and installs one copy of
+  each. The changes operators meet, in brief; agent-framework 0.24.0's notes
+  give each in full, and list what reaches a host from the context-manager
+  and membrane releases in between:
+  - **`code_execution` runs JavaScript, not Python,** in a QuickJS sandbox on
+    the host's own runtime, reaching nothing but its agent's tools, and the
+    host no longer needs a Python interpreter. A recipe whose
+    `codeExecution` is on and sets one of the Python runner's settings
+    (`pythonPath`, `env`, `inheritEnv`, `scriptTimeoutMs`, `idleReclaimMs`,
+    `maxScriptTimeoutMs`, `backgroundMaxLifetimeMs`, `maxBackgroundScripts`)
+    now stops loading, with an error naming what to set instead, such as
+    `yieldMs` for `scriptTimeoutMs`. The recipe type is now the framework's
+    `CodeExecutionConfig`, and the runner's numeric settings (`yieldMs`,
+    `maxYieldMs`, `scriptLifetimeMs`, `maxRunningScripts`,
+    `maxScriptChildren`, `toolCallTimeoutMs`, `wakeMinIntervalMs`,
+    `maxWakesPerScript`, `memoryMaxBytes`) must be whole numbers of 0 or
+    more. A prompt that teaches an agent Python scripts needs rewriting.
+  - **Subagents' usage is one line:** every ephemeral agent counts in one
+    shared `ephemeral agents` entry, so `/usage` and the Web UI's per-agent
+    cost show one line for all subagents instead of one each.
+  - **Live surgery places no Discord awareness marks.** A Web UI rollback or
+    suppression used to react 💤 on every Discord message it removed. The
+    framework now places marks only when the operator chooses them, and this
+    host doesn't offer that choice yet.
+  - **Workspace paths written with `//` or a trailing `/`** are read in one
+    spelling, so an entry the store's history holds under another spelling
+    is outside its mount.
+  - **kv-unified:** a recipe's kv-unified strategy now prices ages in bands,
+    ranks latent merge demand jointly and solves with the subtree engine,
+    unless the recipe opts out (`policy.ageBandSteps: 0`,
+    `latentDemandMode: "individual"`, `engine: "dag"`), and takes the
+    hysteresis certificate unless `hysteresisCertificate` is `false`. The
+    first compile after the upgrade can lay the context out differently,
+    which rewrites the prompt cache once. A merge no longer groups the
+    summaries on either side of a message no chunk owns, which made every
+    later compile throw `CanonicalForestError`.
+  - **Prompt cache:** membrane 0.6.0's notes for media it doesn't send, and
+    stored content that context-manager 0.16.0 now reads mended, can each
+    miss the cache once, at the first request after the upgrade.
+  - Going back to connectome-host 0.11.x installs agent-framework 0.23.x and
+    context-manager 0.14.x from its lockfile. Back the store up before
+    upgrading.
+
+### Added
+
+- Agents can restart their own host (`modules.selfRestart`, off by default):
+  the `lifecycle--restart` tool arms a restart that happens once the asking
+  turn has ended and nothing is in flight (every agent idle, no turn,
+  subagent run or background script alive). The host exits with code 75 and
+  its supervisor (launchd `KeepAlive`, systemd `Restart=`, a fleet parent's
+  `autoRestart`, which the child's entry must set) starts it again; a fleet
+  parent's own self-restart stops its children, and the restarted parent
+  starts again only its `autoStart` ones. After the restart one context line
+  says which agent
+  asked, when, why, and when the host came back. Only
+  headless mode arms it, `cancel: true` disarms it, and `cooldownMinutes`
+  (default 10) spaces restarts out. The request and the last completed
+  restart live in `DATA_DIR` as `self-restart.json` and
+  `self-restart.last.json`.
+
+### Fixed
+
+- Batch mode no longer prints a credential an `/auth` line may carry when it
+  echoes each stdin line: the words after the subcommand, or from a word
+  `/auth` doesn't know, show as `<hidden>`, as in `> /auth token <hidden>`.
+  Batch output goes wherever the host's stdout goes, a supervisor's journal
+  or a CI log included.
+
+- The fleet records a child as soon as its process is spawned, not only once
+  it's ready, and writes that record to disk at once. A parent stopped or
+  killed while a child starts then finds that child in its record at its next
+  start, where before it knew nothing of it. A launch whose record can't be
+  written stops its child and fails, saying why.
+- A parent stopped or killed while it takes back its fleet's children at start
+  leaves the fleet's record as it was, where before the record could hold only
+  the children taken back so far.
+
+- The host no longer prints its own warning, beside agent-framework's, for a
+  credential that would go over `ws://` to another machine. agent-framework
+  warns when it connects such a server, for `http://` as well as `ws://`,
+  and for more places a credential can sit in a url. It counts `localhost.`
+  and names under `.localhost` as this machine, so a credential sent to one
+  of those now gets no warning.
+- An agent overlay entry with `"transport": null` reads as naming no
+  transport, as it did under agent-framework 0.22, where 0.23 refused it
+  whatever else it said. Such an entry with a url, or with a command, starts
+  its server again, and a credential it carries over `ws://` is sent, with
+  agent-framework's warning. One with both a command and a url is refused, as
+  under 0.23 it is with no transport at all.
+- The host's startup line for an agent overlay entry that agent-framework
+  refuses no longer says the framework ignores a transport it doesn't know,
+  and now also names entries the framework refuses for other settings, such
+  as an `https://` url carrying a user and password. agent-framework's own
+  startup line says why it refuses the entry.
+- The overlay tools' receipts and the startup lines for an agent overlay
+  entry no longer say that an entry agent-framework refuses lacks the
+  operator's env, token or grants, since nothing connects in its place. An
+  entry with a command beside an `https://` url under `transport: "http"`
+  is read as dialling the url, as agent-framework does, so what they say of
+  it concerns its url, token and access grant, not the command's env.
+
+- A Web UI observer now gets only what its grant's scopes cover, live as
+  well as when it connects. The Web UI's protocol version is now 2, so a
+  page left open from before the update asks to be reloaded.
+  - **The host's traces** are each sent by what they carry. Tool calls
+    and their results need `messages` and `tools`, and a failed or dropped
+    call, or one an operator made for the agent, `ops` as well; thinking
+    deltas `messages` and `thinking`; a turn's end, which carries token
+    counts, `messages` and `health`; a stopped turn, whose reason says
+    where it was stopped from, `messages` and `ops`; usage and the serving
+    state (`host:` traces) `health`; failures, refusals, the gate's
+    decisions, module changes, held speech's delivery and what operators
+    did `ops`; the `process:` traces, which carry whole events and modules'
+    own payloads, every scope but `debug`; `mcpl:speech-routed`, which
+    carries the routed text, `messages` and `ops`; and the prose an agent
+    publishes to an MCPL server's channel (`inference:published` and
+    `inference:published_complete`), `messages`. A trace type the host
+    doesn't classify goes to operators alone.
+  - **A new `stream-ended` frame,** `{ type: 'stream-ended', agentName }`,
+    goes to a client that holds `messages` in place of a stream-end trace
+    it may not have: `inference:failed`, `inference:exhausted` or
+    `inference:aborted` without `ops`, and `inference:completed` without
+    `health`. For a fleet child's stream it comes inside a `child-event`.
+    It says only whose stream ended, and the Web UI ends the streamed turn
+    on it as on the trace. A client of the protocol other than the Web UI
+    should do the same.
+  - **A child's events** go by the same rules. Its lifecycle needs
+    `health`, its agent tree every scope but `debug`, and its speech
+    `messages`, `thinking` and `tools`. An operator's command output in a
+    child, and any kind the host doesn't classify, go to operators alone.
+  - **Other live frames:** an incoming message's excerpt and a branch
+    change need `messages`, and the serving state `health`. Pins and
+    context settings go to operators alone.
+  - **The welcome:** without `messages`, it leaves out the session's and
+    the branch's names and keeps their ids, since an auto-named session's
+    name summarizes the conversation. Without `health`, it leaves out the
+    serving state and each agent's model. The agent trees, whose nodes
+    say how each run ended, go only to an observer granted every scope
+    but `debug`. The Web UI's scope picker lists children from the trees, so
+    a grant without them no longer has it; `/healthz?scope=` still
+    answers a grant that holds `health`.
+  - **The page:** it shows the agent tree only to an operator or an
+    observer granted every scope but `debug`, and tells another observer
+    so in the tree tab. A tool call whose result has loaded shows failed or
+    done by that result, so a page that doesn't get `tool:failed` still
+    shows a failed call as failed. A page that signed in as an observer and
+    later reconnects as a full client shows the operator's view again.
+
+  An operator's connection is unchanged.
+
+- A TUI host asked to stop by a signal now stops as `/quit` does: it puts the
+  terminal back, stops the framework, and exits 0, or 1 if the stop fails. That
+  holds for SIGTERM, which the Web UI's own quit sends, for SIGINT and SIGHUP,
+  and for its terminal going away. When the lost terminal's error reaches the
+  host before its stop ends, `tui-error.log` names that error. Before, the host
+  exited 1 within a second, without stopping the framework. While the stop
+  runs, a further SIGTERM, SIGINT or SIGHUP joins it rather than ending the
+  process.
+- `/quit` in a TUI host with the Web UI loaded now ends the process. Before, the
+  framework stopped but the web server kept the process running.
+- A session switch, from the TUI or the Web UI, that is under way when a TUI
+  host stops no longer leaves a framework running: one it makes after the
+  stop began is stopped rather than installed, and the Web UI's server,
+  which making it opens again, is closed. A switch that hasn't begun making
+  one by then makes none. Either way the host still ends; after a stop that
+  succeeds, it ends once a making under way has settled.
+
 ## 0.11.0 — 2026-10-20
 
 ### Breaking

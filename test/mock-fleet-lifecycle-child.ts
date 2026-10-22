@@ -54,6 +54,7 @@ if (options.lockStartupLog) chmodSync(startupLog, 0o000);
 
 appendFileSync(join(dataDir, 'launches.jsonl'), JSON.stringify({
   pid: process.pid, sentinel: process.env.FLEET_TEST_SENTINEL ?? null,
+  installRoot: process.env.CONNECTOME_INSTALL_ROOT ?? null,
 }) + '\n');
 
 if (options.lockDataDir) chmodSync(dataDir, 0o600);

@@ -1,17 +1,17 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test';
 import * as fs from 'node:fs';
 import {
-  mkdtempSync, rmSync, writeFileSync, readlinkSync, appendFileSync, existsSync, readdirSync, mkdirSync, symlinkSync,
+  chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync, readlinkSync, appendFileSync, existsSync, readdirSync, mkdirSync, symlinkSync,
   renameSync, unlinkSync,
 } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import {
-  ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, RESTART_EXIT_CODE, appendJournal, childrenFilePath, copyItemName,
-  copyLabelPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent, moveCurrent, readCurrent,
-  readJournal, readMark, readRecord, releaseDir, setAsideDir, unfinishedTrial, writeJsonAtomic, type CopyLabel,
-  type JournalLine, type Mark,
+  ContractError, INSTALL_ROOT_ENV, JOURNAL_STEPS, PLACE_KINDS, RESTART_EXIT_CODE, appendJournal, childrenFilePath,
+  copyItemName, copyLabelPath, goBackListPath, installPaths, installRootFromEnv, itemSetAsideDir, lastCopy, markSpent,
+  moveCurrent, pendingGoBack, readCurrent, realOrResolved, readGoBackList, readJournal, readMark, readRecord, releaseDir, setAsideDir,
+  trialPlaces, unfinishedTrial, writeJsonAtomic, type CopyLabel, type GoBackList, type JournalLine, type Mark,
 } from '../src/update/contract.js';
 
 let root: string;
@@ -31,10 +31,27 @@ describe('the update contract', () => {
     expect(installRootFromEnv({ CONNECTOME_INSTALL_ROOT: 'install' })).toBe(resolve('install'));
   });
 
+  test("realOrResolved resolves a path that isn't there, or runs through a file, by its nearest ancestor, and names any other error", () => {
+    const real = realpathSync(root);
+    mkdirSync(join(root, 'real'));
+    symlinkSync(join(root, 'real'), join(root, 'link'));
+    expect(realOrResolved(join(root, 'link'))).toBe(join(real, 'real'));
+    expect(realOrResolved(join(root, 'link', 'not', 'there'))).toBe(join(real, 'real', 'not', 'there'));
+    writeFileSync(join(root, 'file'), '');
+    expect(realOrResolved(join(root, 'file', 'under'))).toBe(join(real, 'file', 'under'));
+    mkdirSync(join(root, 'shut', 'inner'), { recursive: true });
+    chmodSync(join(root, 'shut'), 0o600);
+    try {
+      expect(() => realOrResolved(join(root, 'shut', 'inner'))).toThrow(expect.objectContaining({ code: 'EACCES' }));
+    } finally {
+      chmodSync(join(root, 'shut'), 0o755);
+    }
+  });
+
   test('the names are the contract: an older release reads them, so none changes', () => {
     expect(installPaths('/r')).toEqual({
       root: '/r', releases: '/r/releases', current: '/r/current', install: '/r/install.json', mark: '/r/mark.json',
-      journal: '/r/journal.jsonl', lock: '/r/lock.json', copy: '/r/copy', copyTmp: '/r/copy.tmp',
+      journal: '/r/journal.jsonl', lock: '/r/lock.json', copy: '/r/copy', copyTmp: '/r/copy.tmp', copyPrev: '/r/copy.prev',
       setAside: '/r/set-aside', midTurn: '/r/midturn.json',
     });
     expect(releaseDir('/r', '0.11.0')).toBe('/r/releases/0.11.0');
@@ -45,6 +62,8 @@ describe('the update contract', () => {
     expect(INSTALL_ROOT_ENV).toBe('CONNECTOME_INSTALL_ROOT');
     expect(RESTART_EXIT_CODE).toBe(75);
     expect(JOURNAL_STEPS).toEqual(['lock', 'children-check', 'audit', 'copy', 'trial-start', 'commit', 'fallback', 'go-back', 'notes']);
+    expect(goBackListPath('/r', 'm1')).toBe('/r/set-aside/m1/places.json');
+    expect(PLACE_KINDS).toEqual(['dir', 'file', 'none']);
   });
 
   test('a record written atomically reads back, absent reads as null, and fields it does not know are kept for whoever does', () => {
@@ -424,7 +443,7 @@ describe('the update contract', () => {
     } finally {
       unreadable.mockRestore();
     }
-    // A copy that goes loses its label first, so what is left of it is no copy either.
+    // A copy that has lost its label, as only damage leaves one, is no copy.
     unlinkSync(copyLabelPath(copy));
     expect(lastCopy(root)).toBeNull();
   });
@@ -436,7 +455,7 @@ describe('the update contract', () => {
     const unreadable = new ContractError(
       `The copy's label at ${path} has no list of items this release can read: it lists one or more, each with an ` +
       'absolute path and a name in the copy that is one path segment and starts with its position in the list ' +
-      'and a "-", as copyItemName gives it.',
+      'and a "-", as copyItemName gives it, and then any places that weren\'t there the same way, numbered on.',
     );
     const item = (name: unknown, at: unknown = '/srv/host/data') => ({ path: at, name });
     for (const items of [
@@ -462,5 +481,170 @@ describe('the update contract', () => {
     expect(lastCopy(root)).toEqual(later as CopyLabel);
     writeFileSync(path, JSON.stringify({ v: 2, from: '0.10.2', at: 'T1', items: [] }));
     expect(() => lastCopy(root)).toThrow(new ContractError(`The copy's label at ${path} has version 2, and this release reads only version 1.`));
+    // The places that weren't there are numbered on from the items, and the
+    // copy holds nothing for them.
+    const absent = { ...later, absent: [item('1-mcpl-servers.agent.json', '/srv/host/mcpl-servers.agent.json')] };
+    writeFileSync(path, JSON.stringify(absent));
+    expect(lastCopy(root)).toEqual(absent as CopyLabel);
+    for (const list of [[item('0-agent.json')], [item('1-a', 'relative')], 'none', [null], null]) {
+      writeFileSync(path, JSON.stringify({ ...later, absent: list }));
+      expect(() => lastCopy(root)).toThrow(unreadable);
+    }
+    // A mark, when there is one, is a mark's id: one path segment.
+    writeFileSync(path, JSON.stringify({ ...later, mark: 'm1' }));
+    expect(lastCopy(root)).toEqual({ ...later, mark: 'm1' } as CopyLabel);
+    for (const mark of [7, '', '..', 'a/b', null, {}]) {
+      writeFileSync(path, JSON.stringify({ ...later, mark }));
+      expect(() => lastCopy(root)).toThrow(
+        new ContractError(`The copy's label at ${path} names a mark this release can't read: a mark's id is one path segment.`),
+      );
+    }
+  });
+
+  test("a Go back's list of places reads back, and one that's missing or that this release can't read is refused, naming it", () => {
+    const path = goBackListPath(root, 'g1');
+    expect(path).toBe(join(setAsideDir(root, 'g1'), 'places.json'));
+    const unreadable = new ContractError(
+      `The Go back under mark g1 has no list of its places at ${path} that this release can read, so what it changed can't be found.`,
+    );
+    expect(() => readGoBackList(root, 'g1')).toThrow(unreadable);
+    mkdirSync(setAsideDir(root, 'g1'), { recursive: true });
+    const place = { path: '/srv/host/data', name: '0-data', before: 'dir', target: 'dir' };
+    const list: GoBackList = {
+      v: 1, places: [place as GoBackList['places'][number], { path: '/srv/kid', name: '1-kid', before: 'dir', target: 'none' }],
+    };
+    writeJsonAtomic(path, list);
+    expect(readGoBackList(root, 'g1')).toEqual(list.places);
+    for (const places of [
+      undefined, 'none', [], [null], [{ ...place, path: 'srv/host/data' }], [{ ...place, path: 7 }], [{ ...place, name: '0-a/b' }],
+      [{ ...place, before: 'link' }], [{ ...place, target: undefined }],
+      // Each name is numbered by its place in the list, as copyItemName gives it, so no two share an entry.
+      [{ ...place, name: 'data' }], [{ ...place, name: 'places.json' }], [place, { ...place, path: '/srv/kid' }],
+      // The position and its "-": position 1 can't take position 10's name, and a name must be there to read.
+      [{ ...place, name: '0data' }], [place, { ...place, path: '/srv/kid', name: '10-kid' }],
+      [{ ...place, name: undefined }], [{ ...place, name: 7 }],
+    ]) {
+      writeFileSync(path, JSON.stringify({ v: 1, places }));
+      expect(() => readGoBackList(root, 'g1')).toThrow(unreadable);
+    }
+    // A list the filesystem can't read is its own error, not one this release can't read.
+    rmSync(path);
+    mkdirSync(path);
+    expect(() => readGoBackList(root, 'g1')).toThrow(expect.objectContaining({ code: 'EISDIR' }));
+  });
+
+  test("the places a trial's fallback would undo: none without a trial, a switch's copy's, and a Go back's list", () => {
+    const { copy } = installPaths(root);
+    const data = '/srv/host/data';
+    const agent = '/srv/host/mcpl-servers.agent.json';
+    moveCurrent(root, '0.10.2');
+    expect(trialPlaces(root)).toBeNull();
+    // A switch's trial: the copy it took, its items and the places that weren't there.
+    mkdirSync(join(copy, copyItemName(0, data)), { recursive: true });
+    const label: CopyLabel = {
+      v: 1, from: '0.10.2', at: 'T1', mark: 'm1',
+      items: [{ path: data, name: copyItemName(0, data) }], absent: [{ path: agent, name: copyItemName(1, agent) }],
+    };
+    writeJsonAtomic(copyLabelPath(copy), label);
+    appendJournal(root, { ...line('copy'), mark: 'm1' });
+    appendJournal(root, { ...line('trial-start'), mark: 'm1' });
+    expect(trialPlaces(root)).toEqual([data, agent]);
+    // A label with no places that weren't there gives its items.
+    const whole: CopyLabel = { ...label };
+    delete whole.absent;
+    writeJsonAtomic(copyLabelPath(copy), whole);
+    expect(trialPlaces(root)).toEqual([data]);
+    // Another switch's copy, one of another release's data, or one that names
+    // no mark, isn't this trial's: the fallback would refuse it.
+    for (const other of [{ ...label, mark: 'm0' }, { ...label, from: '0.9.0' }, { ...whole, mark: undefined }]) {
+      writeJsonAtomic(copyLabelPath(copy), other);
+      expect(() => trialPlaces(root)).toThrow(new ContractError(
+        `The copy at ${copy} isn't the one the switch to 0.11.0 under mark m1 took from 0.10.2, the release current names ` +
+        `(it holds ${other.from}'s data for mark ${other.mark ?? 'none'}), so what its fallback would undo can't be told.`,
+      ));
+    }
+    // The fallback checks the copy against the release current names, so the reader does too.
+    writeJsonAtomic(copyLabelPath(copy), label);
+    moveCurrent(root, '0.9.0');
+    expect(() => trialPlaces(root)).toThrow(/under mark m1 took from 0\.9\.0, the release current names \(it holds 0\.10\.2's/);
+    // With no current at all, which the launcher refuses to start without, the copy is no one's.
+    unlinkSync(installPaths(root).current);
+    expect(() => trialPlaces(root)).toThrow(/under mark m1 took from no release, the release current names \(it holds 0\.10\.2's/);
+    // A label the filesystem can't read is passed on as its own error.
+    moveCurrent(root, '0.10.2');
+    rmSync(copyLabelPath(copy));
+    mkdirSync(copyLabelPath(copy));
+    expect(() => trialPlaces(root)).toThrow(expect.objectContaining({ code: 'EISDIR' }));
+    rmSync(copy, { recursive: true });
+    expect(() => trialPlaces(root)).toThrow(/isn't the one the switch to 0\.11\.0 under mark m1 took from 0\.10\.2, the release current names, so/);
+    // Once current names the release it tried, the trial is over, though the
+    // commit's line hasn't gone in; and once that line is in.
+    moveCurrent(root, '0.11.0');
+    expect(trialPlaces(root)).toBeNull();
+    appendJournal(root, line('commit'));
+    expect(trialPlaces(root)).toBeNull();
+    // A Go back's trial: every place in its list, though the last switch's copy is still there.
+    mkdirSync(join(copy, copyItemName(0, data)), { recursive: true });
+    writeJsonAtomic(copyLabelPath(copy), label);
+    const back = (step: JournalLine['step'], outcome: JournalLine['outcome'] = 'ok'): JournalLine =>
+      ({ ...line(step, outcome, '0.10.2'), from: '0.11.0', mark: 'g1' });
+    appendJournal(root, { ...back('go-back'), keptData: false });
+    appendJournal(root, back('trial-start'));
+    expect(() => trialPlaces(root)).toThrow(/The Go back under mark g1 has no list of its places/);
+    const kid = '/srv/kid';
+    mkdirSync(setAsideDir(root, 'g1'), { recursive: true });
+    writeJsonAtomic(goBackListPath(root, 'g1'), {
+      v: 1, places: [
+        { path: data, name: '0-data', before: 'dir', target: 'dir' },
+        { path: agent, name: '1-mcpl-servers.agent.json', before: 'file', target: 'none' },
+        { path: kid, name: '2-kid', before: 'dir', target: 'none' },
+      ],
+    } satisfies GoBackList);
+    expect(trialPlaces(root)).toEqual([data, agent, kid]);
+    // A trial-start that names no mark can't say whose places they are.
+    appendJournal(root, back('fallback'));
+    appendJournal(root, { ...line('trial-start', 'ok', '0.12.0'), from: '0.11.0' });
+    expect(() => trialPlaces(root)).toThrow(/trial-start line for 0\.12\.0 names no mark/);
+  });
+
+  test("only an ok go-back line with the trial's own mark makes a trial a Go back's", () => {
+    const { copy } = installPaths(root);
+    const data = '/srv/host/data';
+    moveCurrent(root, '0.11.0');
+    mkdirSync(join(copy, copyItemName(0, data)), { recursive: true });
+    writeJsonAtomic(copyLabelPath(copy), { v: 1, from: '0.11.0', at: 'T2', mark: 'm2', items: [{ path: data, name: '0-data' }] } satisfies CopyLabel);
+    // An earlier Go back, under its own mark, then a switch's trial: the copy's places.
+    const goBack = (mark: string, outcome: JournalLine['outcome']): JournalLine =>
+      ({ ...line('go-back', outcome, '0.10.2'), from: '0.11.0', mark, keptData: true });
+    appendJournal(root, goBack('g1', 'ok'));
+    appendJournal(root, { ...line('trial-start', 'ok', '0.10.2'), from: '0.11.0', mark: 'g1' });
+    appendJournal(root, { ...line('fallback', 'ok', '0.10.2'), from: '0.11.0', mark: 'g1' });
+    const trial = (mark: string): JournalLine => ({ ...line('trial-start', 'ok', '0.12.0'), from: '0.11.0', mark });
+    appendJournal(root, trial('m2'));
+    expect(trialPlaces(root)).toEqual([data]);
+    // A go-back line that isn't ok, under the trial's own mark, left the data untouched.
+    appendJournal(root, { ...line('fallback', 'ok', '0.12.0'), from: '0.11.0', mark: 'm2' });
+    appendJournal(root, goBack('m3', 'refused'));
+    writeJsonAtomic(copyLabelPath(copy), { v: 1, from: '0.11.0', at: 'T3', mark: 'm3', items: [{ path: data, name: '0-data' }] } satisfies CopyLabel);
+    appendJournal(root, trial('m3'));
+    expect(trialPlaces(root)).toEqual([data]);
+  });
+
+  test('the Go back a start goes on with: the last ok go-back with no ok trial-start, commit or fallback after it', () => {
+    const goBack = (mark: string, outcome: JournalLine['outcome'] = 'ok'): JournalLine => ({ ...line('go-back', outcome, '0.10.2'), mark });
+    expect(pendingGoBack([])).toBeNull();
+    expect(pendingGoBack([goBack('g1')])).toEqual(goBack('g1'));
+    // A refused or failed go-back left the data untouched.
+    expect(pendingGoBack([goBack('g1', 'refused')])).toBeNull();
+    expect(pendingGoBack([goBack('g1', 'failed')])).toBeNull();
+    // Each ok line after it ends it; a refused trial-start or a failed
+    // fallback leaves the data as it may be, so the Go back goes on.
+    for (const step of ['trial-start', 'commit', 'fallback'] as const) {
+      expect(pendingGoBack([goBack('g1'), line(step)])).toBeNull();
+      expect(pendingGoBack([goBack('g1'), line(step, step === 'fallback' ? 'failed' : 'refused')])).toEqual(goBack('g1'));
+    }
+    // The last one counts.
+    expect(pendingGoBack([goBack('g1'), line('fallback'), goBack('g2')])).toEqual(goBack('g2'));
+    expect(pendingGoBack([goBack('g1'), goBack('g2'), line('trial-start')])).toBeNull();
   });
 });

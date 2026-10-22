@@ -496,8 +496,9 @@ unknown-key warning, like those at the other levels.
   channels an @-mention never binds or triggers a fork. Still works; the host
   logs a `[deprecated]` line at startup
 - **Subconscious** (top-level `subconscious`) — a secondary agent that can
-  `tune_out` channels; **code execution** (top-level `codeExecution`) — a
-  Python tool runner
+  `tune_out` channels; **code execution** (top-level `codeExecution`) —
+  JavaScript scripts that call the agent's tools, in a QuickJS engine
+  (agent-framework 0.24)
 - **Activity** (`modules.activity`) typing indicators and a **TTS relay**
   (`modules.ttsRelay`) for voice clients
 - **Extensions** (top-level `extensions`) — local modules that register
@@ -508,6 +509,7 @@ unknown-key warning, like those at the other levels.
 - **Web UI** (`modules.webui`) — browser operator console, below
 - **TUI, readline and batch modes** — OpenTUI interactive terminal, `--no-tui` for a plain prompt, or piped stdin for a one-shot batch run
 - **Headless mode** — `--headless`: no terminal, JSONL over a Unix socket; how residents run under a supervisor
+- **Self-restart** (opt-in, `modules.selfRestart`) — `lifecycle--restart`: the agent restarts its own host, for an edited recipe or rebuilt code. It happens once the asking turn has ended; the host exits with code 75 for its supervisor to start it again, so enable it only under one that does (launchd `KeepAlive`, systemd `Restart=on-failure`, a fleet parent's `autoRestart`, which is off unless the child's entry sets it, and which counts a self-restart toward its cap of 3 restarts in 60 s). A fleet parent's own self-restart stops its children as any shutdown does, and the restarted parent starts again only its `autoStart` children. `cooldownMinutes` (default 10) spaces restarts out
 - **Time-travel** — Chronicle-backed undo/redo, checkpoints, branch exploration; in the web UI, rolling back to a message and suppressing messages
 - **Session management** — isolated sessions with auto-naming
 - **Ops alerts** — compression quarantine, refusal streaks, inference exhaustion and more surface as `ops:alert` traces, `logs/failures.log` records, and an optional webhook (`CONNECTOME_OPS_WEBHOOK`)

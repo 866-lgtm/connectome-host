@@ -40,6 +40,7 @@ import { loadRecipe } from '../recipe.js';
 import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
 import { parseCommand } from '../command-name.js';
 import { unknownToolResult } from './unknown-tool.js';
+import { INSTALL_ROOT_ENV, readRecord, writeJsonAtomic, type ChildrenFile } from '../update/contract.js';
 
 /**
  * Cross-process telemetry the parent host needs from every child, on top of
@@ -130,6 +131,15 @@ export interface FleetModuleConfig {
    * aligned with the matcher.
    */
   allowedRecipes?: string[];
+  /**
+   * Where to keep the children file an install's launcher reads before a
+   * switch (ChildrenFile in src/update/contract.ts): every child of the
+   * host's fleet, in any of its sessions, with its data directory, and the
+   * process and boot of each that may be running (writeChildrenFile). The
+   * host sets it only when an install's entry point started it; unset, no
+   * such file is written.
+   */
+  childrenFile?: string;
 }
 
 export interface AutoStartChild {
@@ -305,17 +315,33 @@ function spawnCause(err: unknown): 'runtime' | 'configuration' | 'other' {
 // Module
 // ---------------------------------------------------------------------------
 
+/** Whether a children file's entry has a child's shape (ChildrenFile): a
+ *  write reads only those as children, and keeps anything else as it is. */
+function isChildEntry(entry: unknown): entry is ChildrenFile['children'][number] {
+  if (typeof entry !== 'object' || entry === null) return false;
+  const e = entry as Record<string, unknown>;
+  return typeof e.name === 'string' && typeof e.dataDir === 'string' &&
+    (e.pid === null || typeof e.pid === 'number') && (e.bootId === null || typeof e.bootId === 'string');
+}
+
 export class FleetModule implements Module {
   readonly name = 'fleet';
 
   private ctx: ModuleContext | null = null;
   private children = new Map<string, FleetChild>();
-  private config: Required<Omit<FleetModuleConfig, 'autoStart' | 'allowedRecipes'>>;
+  private config: Required<Omit<FleetModuleConfig, 'autoStart' | 'allowedRecipes' | 'childrenFile'>>;
+  /** See FleetModuleConfig.childrenFile; null when the host keeps none. */
+  private readonly childrenFile: string | null;
   private autoStartChildren: AutoStartChild[];
   /** Set when stop() has been called; suppresses autoRestart during shutdown. */
   private stopping = false;
   /** Set once start() has adopted the children still running. */
   private started = false;
+  /** Set while start() adopts: the map then holds only the children taken
+   *  back so far, so nothing persists it until adoption's own write. */
+  private adopting = false;
+  /** Makes the parent's store durable now (setStoreSync), or null. */
+  private storeSync: (() => void) | null = null;
   /** Whether launchAutoStart() has run, so a second call launches nothing. */
   private autoStartLaunched = false;
   /** Each autoStart launch launchAutoStart() has begun, until it records its
@@ -357,6 +383,7 @@ export class FleetModule implements Module {
     };
 
     this.autoStartChildren = config.autoStart ?? [];
+    this.childrenFile = config.childrenFile ?? null;
 
     const explicit = config.allowedRecipes;
     const implicit = this.autoStartChildren.map((c) => c.recipe);
@@ -485,14 +512,28 @@ export class FleetModule implements Module {
   }
 
   /**
+   * Give the fleet what makes the parent's store durable now, such as the
+   * framework's store sync, which the host passes once the framework exists.
+   * A store write is otherwise durable only at the store's next sync or close,
+   * so the record of a child's spawn is synced at once: a parent killed while
+   * the child starts then leaves the record for its next start's adoption.
+   */
+  setStoreSync(sync: () => void): void {
+    this.storeSync = sync;
+  }
+
+  /**
    * Persist the current children map to Chronicle (via ModuleContext).
    * Called after every lifecycle transition so a parent restart can see
    * the last known state.  Ephemeral fields (process handle, socket,
-   * event buffer) are excluded.
+   * event buffer) are excluded. `sync` makes the record durable before the
+   * children file follows it (setStoreSync). Returns why the children file
+   * couldn't be written, or null: written, or none kept, or nothing persisted.
    */
-  private persistState(): void {
-    if (!this.ctx) return;
-    if (typeof this.ctx.setState !== 'function') return;
+  private persistState(sync = false): string | null {
+    if (!this.ctx) return null;
+    if (typeof this.ctx.setState !== 'function') return null;
+    if (this.adopting) return null;
     const persisted: Record<string, PersistedChild> = {};
     for (const [name, c] of this.children) {
       persisted[name] = {
@@ -513,6 +554,95 @@ export class FleetModule implements Module {
       };
     }
     this.ctx.setState<PersistedFleetState>({ children: persisted });
+    if (sync) this.storeSync?.();
+    return this.writeChildrenFile();
+  }
+
+  /**
+   * Write the children file, when the host keeps one: every child of the
+   * host's fleet with its data directory, which a switch copies and restores
+   * with the parent's, and the process and boot of each that may be running,
+   * which the launcher checks before it switches. The file is the host's, in
+   * its data directory, while each session has its own fleet, so a write
+   * lists this fleet's children as its record has them, and keeps what the
+   * file already holds that it doesn't replace:
+   * - an entry for a directory this fleet lists no child in, such as another
+   *   session's child, with its pid while a process of this boot may still
+   *   hold it (the launcher's own rule), and null once none can;
+   * - an entry for a directory it does list a child in, while its pid may
+   *   still be running and isn't one this fleet knows for its own children:
+   *   another generation's, such as another session's, whose process still
+   *   runs there;
+   * - an entry it can't read as a child, as it is.
+   * A file it can't read at all is left as it is, and the write fails, since
+   * replacing it would drop what the launcher checks. A child the fleet has
+   * seen exit carries no pid, so a pid reused since can't stand for it.
+   * Returns why the write failed, or null when it succeeded or the host
+   * keeps no such file. A failure is logged here, and the launch whose child
+   * the file would add (handleLaunch) is the one place it stops anything.
+   */
+  private writeChildrenFile(): string | null {
+    if (this.childrenFile === null) return null;
+    const failed = (why: string): string => {
+      console.error(
+        `[fleet] couldn't write ${this.childrenFile}, which an update reads to see which children are running: ` +
+        `${why}. Until a write succeeds, it may list this host's children as an earlier write left them.`,
+      );
+      return why;
+    };
+    const earlier = this.childrenFileEntries();
+    if (typeof earlier === 'string') return failed(earlier);
+    const children: unknown[] = [];
+    const listedDirs = new Set<string>();
+    const knownPids = new Set<number>();
+    for (const c of this.children.values()) {
+      listedDirs.add(resolve(c.dataDir));
+      // A child's pid stays set after its exit, so only the pids written as
+      // running here say which earlier entries this one replaces.
+      const pid = c.status === 'starting' || c.status === 'ready' ? c.pid : null;
+      if (pid !== null) knownPids.add(pid);
+      children.push({ name: c.name, pid, bootId: c.bootId ?? null, dataDir: c.dataDir });
+    }
+    const thisBoot = this.bootId() ?? null;
+    for (const entry of earlier) {
+      if (!isChildEntry(entry)) {
+        children.push(entry);
+        continue;
+      }
+      const child = entry;
+      const running = child.pid !== null && this.pidInUse(child.pid) &&
+        (child.bootId === null || thisBoot === null || child.bootId === thisBoot);
+      if (listedDirs.has(resolve(child.dataDir))) {
+        if (running && !knownPids.has(child.pid!)) children.push(child);
+      } else {
+        children.push(running || child.pid === null ? child : { ...child, pid: null });
+      }
+    }
+    try {
+      writeJsonAtomic(this.childrenFile, { v: 1, children });
+      return null;
+    } catch (err) {
+      return failed(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  /** What the children file holds now: its entries, none when there's no
+   *  file, or why it can't be read, as when it isn't JSON, its version isn't
+   *  one this release reads, or it has no list of children. */
+  private childrenFileEntries(): unknown[] | string {
+    if (this.childrenFile === null) return [];
+    let file: ChildrenFile | null;
+    const fix = 'Replacing it would drop the children it lists, which an update reads to see which may still be ' +
+      'running, so every launch fails this way until whoever runs this host fixes it, or removes it once no child ' +
+      'it lists is running';
+    try {
+      file = readRecord<ChildrenFile>(this.childrenFile, 'file');
+    } catch (err) {
+      return `${err instanceof Error ? err.message : String(err)} ${fix}`;
+    }
+    if (file === null) return [];
+    if (!Array.isArray(file.children)) return `The file at ${this.childrenFile} holds no list of children. ${fix}`;
+    return file.children;
   }
 
   /**
@@ -542,50 +672,59 @@ export class FleetModule implements Module {
     const bootedAt = Date.now() - uptime() * 1000 - 60_000;
     const fromThisBoot = (p: PersistedChild): boolean =>
       typeof p.bootId === 'string' && thisBoot !== undefined ? p.bootId === thisBoot : p.startedAt >= bootedAt;
-    for (const [name, p] of Object.entries(state.children)) {
-      if (name !== p.name || p.socketPath !== join(p.dataDir, 'ipc.sock')) continue;
+    // A reattached child's ready event changes its status while the map holds
+    // only the children taken back so far, so persisting waits until all are
+    // in the map: a parent killed before then leaves the record and the
+    // children file as the last parent left them.
+    this.adopting = true;
+    try {
+      for (const [name, p] of Object.entries(state.children)) {
+        if (name !== p.name || p.socketPath !== join(p.dataDir, 'ipc.sock')) continue;
 
-      if (!this.canRetryAdoption(p)) {
-        this.children.set(name, this.reconstructOrphan(p));
-        continue;
-      }
-      const alive = await this.probeLiveness(p);
-      if (!alive) {
-        // Persisted records and failed probes cannot authorize artifact deletion.
-        const orphan = this.reconstructOrphan(p);
-        // A pid that's gone or unusable, or a record from an earlier boot,
-        // leaves no process of it running. A pid in use may be a child still
-        // starting, which no launch replaces (handleLaunch), so the record
-        // says why none starts; fleet--restart uses the record's own recipe
-        // and dataDir. canRetryAdoption reads the text up to and including
-        // the semicolon.
-        const inUse = fromThisBoot(p) && this.pidInUse(p.pid);
-        orphan.status = inUse ? 'starting' : 'crashed';
-        orphan.exitReason = inUse
-          ? `adoption unresolved; its pid (${p.pid}) is still in use, so this host starts no other copy of it, and ` +
-            'fleet--restart of it reattaches once it answers on its socket'
-          : 'adoption unresolved; fleet--restart of it, or fleet--launch with its recipe and ' +
-            'dataDir, probes it again';
-        this.children.set(name, orphan);
-        continue;
-      }
+        if (!this.canRetryAdoption(p)) {
+          this.children.set(name, this.reconstructOrphan(p));
+          continue;
+        }
+        const alive = await this.probeLiveness(p);
+        if (!alive) {
+          // Persisted records and failed probes cannot authorize artifact deletion.
+          const orphan = this.reconstructOrphan(p);
+          // A pid that's gone or unusable, or a record from an earlier boot,
+          // leaves no process of it running. A pid in use may be a child still
+          // starting, which no launch replaces (handleLaunch), so the record
+          // says why none starts; fleet--restart uses the record's own recipe
+          // and dataDir. canRetryAdoption reads the text up to and including
+          // the semicolon.
+          const inUse = fromThisBoot(p) && this.pidInUse(p.pid);
+          orphan.status = inUse ? 'starting' : 'crashed';
+          orphan.exitReason = inUse
+            ? `adoption unresolved; its pid (${p.pid}) is still in use, so this host starts no other copy of it, and ` +
+              'fleet--restart of it reattaches once it answers on its socket'
+            : 'adoption unresolved; fleet--restart of it, or fleet--launch with its recipe and ' +
+              'dataDir, probes it again';
+          this.children.set(name, orphan);
+          continue;
+        }
 
-      // Attempt to reattach. Failure leaves a blocked historical record;
-      // it does not prove that the socket belongs to a dead process.
-      try {
-        const reattached = await this.reattachToLivingChild(p);
-        this.children.set(name, reattached);
-        console.error(`[fleet] adopted "${name}" (pid=${p.pid}, socket=${p.socketPath})`);
-      } catch (err) {
-        console.error(`[fleet] failed to adopt "${name}": ${String(err)}`);
-        // Persisted records and failed probes cannot authorize artifact deletion.
-        // As above, a record from an earlier boot, or one whose pid has gone,
-        // has no process to wait on.
-        const orphan = this.reconstructOrphan(p);
-        orphan.status = fromThisBoot(p) && this.pidInUse(p.pid) ? 'starting' : 'crashed';
-        orphan.exitReason = `adopt failed: ${err instanceof Error ? err.message : String(err)}`;
-        this.children.set(name, orphan);
+        // Attempt to reattach. Failure leaves a blocked historical record;
+        // it does not prove that the socket belongs to a dead process.
+        try {
+          const reattached = await this.reattachToLivingChild(p);
+          this.children.set(name, reattached);
+          console.error(`[fleet] adopted "${name}" (pid=${p.pid}, socket=${p.socketPath})`);
+        } catch (err) {
+          console.error(`[fleet] failed to adopt "${name}": ${String(err)}`);
+          // Persisted records and failed probes cannot authorize artifact deletion.
+          // As above, a record from an earlier boot, or one whose pid has gone,
+          // has no process to wait on.
+          const orphan = this.reconstructOrphan(p);
+          orphan.status = fromThisBoot(p) && this.pidInUse(p.pid) ? 'starting' : 'crashed';
+          orphan.exitReason = `adopt failed: ${err instanceof Error ? err.message : String(err)}`;
+          this.children.set(name, orphan);
+        }
       }
+    } finally {
+      this.adopting = false;
     }
 
     this.persistState();
@@ -1615,6 +1754,17 @@ export class FleetModule implements Module {
     const { fd: startupFd, log: startupLog } = openStartupLog(join(dataDir, 'startup.log'),
       `\n--- launch ${new Date().toISOString()} recipe=${recipePath} pid=parent:${process.pid} ---\n`);
 
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ...input.env,
+      AGENT_TIMEZONE: this.config.timeZone,
+      DATA_DIR: dataDir,
+    };
+    // Without the variable, a child finds no install though it runs its
+    // parent's entry, so it isn't the install's host: it neither commits a
+    // release nor keeps the install's files (src/update/contract.ts), whoever
+    // set the variable.
+    delete env[INSTALL_ROOT_ENV];
     let proc: ChildProcess | undefined;
     try {
       proc = spawnProcess(
@@ -1623,12 +1773,7 @@ export class FleetModule implements Module {
         {
           detached: true,
           stdio: startupFd !== null ? ['ignore', startupFd, startupFd] : 'ignore',
-          env: {
-            ...process.env,
-            ...input.env,
-            AGENT_TIMEZONE: this.config.timeZone,
-            DATA_DIR: dataDir,
-          },
+          env,
         },
       );
     } catch (err) {
@@ -1681,7 +1826,13 @@ export class FleetModule implements Module {
       try { child.socket?.destroy(); } catch { /* noop */ }
       child.socket = null;
 
-      this.persistState();
+      // A store that refuses the write is said here, since nothing above an
+      // event listener would catch it.
+      try {
+        this.persistState();
+      } catch (err) {
+        console.error(`[fleet] couldn't record that child "${child.name}" exited: ${err instanceof Error ? err.message : String(err)}`);
+      }
 
       // autoRestart: respawn on crash (non-zero non-null exit), skip if:
       //   - we asked the child to stop (killRequested)
@@ -1700,8 +1851,22 @@ export class FleetModule implements Module {
       }
     });
 
-    let failureStage = 'launch failed';
+    let failureStage = 'its record couldn\'t be kept';
     try {
+      // The record holds the child from the moment its process exists, not
+      // only once it's ready, synced at once: a parent killed while a child
+      // starts then leaves the child where the next parent's adoption, and an
+      // update's check of the children file, can find it. This is the write
+      // that adds a running child to the children file, so a child the file
+      // can't list is stopped, through failLaunch, rather than left running
+      // where an update can't see it.
+      const unlisted = this.persistState(true);
+      if (unlisted !== null) {
+        failureStage = `it couldn't be listed in ${this.childrenFile}, which an update reads to see which children ` +
+          'are running';
+        throw new Error(unlisted);
+      }
+      failureStage = 'launch failed';
       await this.connectStartingChild(child);
       failureStage = 'subscribe failed';
       this.sendToChild(child, { type: 'subscribe', events: subscription });

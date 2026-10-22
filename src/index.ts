@@ -60,19 +60,23 @@ import { ActivityModule } from './modules/activity-module.js';
 import { NoticesModule } from './modules/notices-module.js';
 import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
-import { WebUiModule } from './modules/web-ui-module.js';
+import { WebUiModule, stopWebUiServer } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
+import { LifecycleModule } from './modules/lifecycle-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
-import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, cleartextCredentialWarning, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
+import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
-import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
+import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, batchEchoLine, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
 import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
 import { startFramework } from './start-framework.js';
+import { releaseHere, type ReleaseHere } from './update/host.js';
+import { childrenFilePath } from './update/contract.js';
+import { switchSessionSteps } from './session-switch.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
 import {
@@ -156,6 +160,10 @@ interface AppContext {
    *  (openai-codex through an inference gateway, which tracks them per
    *  login): usage readouts still stay off dollars. */
   subscriptionUnmetered: boolean;
+  /** Set by the TUI's stop once it has begun; the host's other modes don't
+   *  set it. A session switch then makes nothing more, and stops what it has
+   *  already made (switchSessionSteps). */
+  stopping?: boolean;
 
   /** Stop current framework, switch to a different session, start new framework. */
   switchSession(id: string): Promise<void>;
@@ -254,6 +262,9 @@ function resolveModel(recipe: Recipe): string {
 let noticesRef: NoticesModule | null = null;
 /** The host's one InstructionsModule, kept across session switches (see createFramework). */
 let instructionsRef: InstructionsModule | null = null;
+/** The install whose entry point started this host, and its release, or null
+ *  when none did. Set first thing in main(), and the same for the host's life. */
+let installHere: ReleaseHere | null = null;
 
 async function createFramework(
   membrane: Membrane,
@@ -303,13 +314,16 @@ async function createFramework(
     moduleInstances.push(lessonsModule);
   }
 
-  // Fleet (cross-process child orchestration). Opt-in via recipe.
-  if (modules.fleet === true) {
-    moduleInstances.push(new FleetModule({ timeZone }));
-  } else if (modules.fleet && typeof modules.fleet === 'object') {
-    const fleetCfg = modules.fleet;
-    const fleetModuleConfig: FleetModuleConfig = {};
-    fleetModuleConfig.timeZone = timeZone;
+  // Fleet (cross-process child orchestration). Opt-in via recipe, as `true` or
+  // as its settings, which `true` leaves at their defaults. A host an install
+  // started keeps the children file its launcher reads before a switch.
+  let fleetModule: FleetModule | null = null;
+  if (modules.fleet === true || (modules.fleet && typeof modules.fleet === 'object')) {
+    const fleetCfg = modules.fleet === true ? {} : modules.fleet;
+    const fleetModuleConfig: FleetModuleConfig = {
+      timeZone,
+      childrenFile: installHere ? childrenFilePath(resolve(config.dataDir)) : undefined,
+    };
     if (fleetCfg.children) {
       fleetModuleConfig.autoStart = fleetCfg.children.map((c) => {
         const entry: NonNullable<FleetModuleConfig['autoStart']>[number] = {
@@ -330,7 +344,8 @@ async function createFramework(
     if (fleetCfg.readyTimeoutMs !== undefined) fleetModuleConfig.readyTimeoutMs = fleetCfg.readyTimeoutMs;
     if (fleetCfg.gracefulShutdownMs !== undefined) fleetModuleConfig.gracefulShutdownMs = fleetCfg.gracefulShutdownMs;
     if (fleetCfg.sigtermEscalationMs !== undefined) fleetModuleConfig.sigtermEscalationMs = fleetCfg.sigtermEscalationMs;
-    moduleInstances.push(new FleetModule(fleetModuleConfig));
+    fleetModule = new FleetModule(fleetModuleConfig);
+    moduleInstances.push(fleetModule);
   }
 
   // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
@@ -477,6 +492,18 @@ async function createFramework(
     moduleInstances.push(mcplAdminModule);
   }
 
+  // Self-restart (`lifecycle--restart`) — opt-in per recipe. The request and
+  // the last completed restart live in the data dir; only headless mode arms
+  // it (src/self-restart.ts).
+  if (modules.selfRestart !== undefined && modules.selfRestart !== false) {
+    const srCfg = typeof modules.selfRestart === 'object' ? modules.selfRestart : {};
+    moduleInstances.push(new LifecycleModule({
+      dataDir: resolve(config.dataDir),
+      timeZone,
+      ...(srCfg.cooldownMinutes !== undefined ? { cooldownMinutes: srCfg.cooldownMinutes } : {}),
+    }));
+  }
+
   // Archipelago identity — opt-in per recipe. Utilities-only: enrollment is
   // one-time and token refresh is rare, so it costs no tool slots (see
   // identity-module.ts header). Keypair lives at the dataDir level — an
@@ -594,15 +621,10 @@ async function createFramework(
         );
       }
     }
-    // A credential over ws:// to another machine is readable on the network
-    // between. mcpl_deploy refuses one; an operator's recipe, or an overlay
-    // entry saved before that refusal, still loads, with this warning. A
-    // grant counts only where the identity attaches its credential.
-    const cleartext = cleartextCredentialWarning(server.id, {
-      ...withEnv,
-      access: withEnv.accessProvider ? withEnv.access : undefined,
-    });
-    if (cleartext) console.error(cleartext);
+    // A credential over ws:// or http:// to another machine is readable on
+    // the network between. mcpl_deploy refuses one; an operator's recipe, or
+    // an overlay entry saved before that refusal, still loads, and
+    // agent-framework warns when it connects (serverConfigWarnings).
     return withEnv;
   });
 
@@ -712,6 +734,10 @@ agents: [agentConfig],
 
   if (workspaceModule) {
     workspaceModule.initStore(framework.getStore());
+  }
+
+  if (fleetModule) {
+    fleetModule.setStoreSync(() => framework.getStore().sync());
   }
 
   // Stash the WebUiModule reference on the framework so main() can call
@@ -899,7 +925,7 @@ async function runPiped(app: AppContext) {
     for await (const line of rl) lines.push(line);
     console.log(`Processing ${lines.length} commands...`);
     for (const line of lines) {
-      console.log(`> ${line}`);
+      console.log(`> ${batchEchoLine(line)}`);
       if (await processLine(line)) break;
     }
     console.log('Done.');
@@ -964,6 +990,9 @@ function countLines(path: string): number {
 let beforeFatalExit: (() => Promise<void>) | undefined;
 
 async function main() {
+  // Before anything else: a host an install's entry point started has to be
+  // one of that install's releases, or it refuses to start (releaseHere).
+  installHere = releaseHere();
   const recipe = await resolveRecipe();
   const provider = resolveProvider(recipe);
 
@@ -1337,21 +1366,33 @@ async function main() {
     subscriptionUnmetered: !!codexGate,
 
     async switchSession(id: string) {
-      handleExport(this);
-      await stopForSessionSwitch(this.framework, id);
-      sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);
-      // Note: agentName stays as resolved at startup. A per-session
-      // re-resolution would matter only if recipe.agent.name is absent
-      // AND the user switches between imports that used different
-      // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
-      startFramework(this.framework);
-      this.userMessageCount = 0;
-      resetBranchState(this.branchState);
-      setupSynesthete(this);
-      setupMcplStderrLog(this, newStorePath);
-      getWebUiModule(this.framework)?.setApp(this);
+      await switchSessionSteps(this, {
+        stopOld: async () => {
+          handleExport(this);
+          await stopForSessionSwitch(this.framework, id);
+        },
+        make: () => {
+          sessionManager.setActiveSession(id);
+          // Note: agentName stays as resolved at startup. A per-session
+          // re-resolution would matter only if recipe.agent.name is absent
+          // AND the user switches between imports that used different
+          // --agent values; not the canonical flow.
+          return createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
+        },
+        install: async (next) => {
+          this.framework = next;
+          // No install: a switch can't change the release, which the host's own
+          // start committed before any agent ran, so there is nothing to commit.
+          await startFramework(next, null);
+          this.userMessageCount = 0;
+          resetBranchState(this.branchState);
+          setupSynesthete(this);
+          setupMcplStderrLog(this, newStorePath);
+          getWebUiModule(next)?.setApp(this);
+        },
+        stopServer: stopWebUiServer,
+      }, (line) => console.error(`${line} (switching to session ${id})`));
     },
   };
 
@@ -1375,7 +1416,7 @@ async function main() {
     };
   }
 
-  startFramework(framework);
+  await startFramework(framework, installHere);
   setupSynesthete(app);
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);
@@ -1393,7 +1434,19 @@ async function main() {
       await runPiped(app);
     } else {
       const { runTui } = await import('./tui.js');
-      await runTui(app);
+      try {
+        await runTui(app);
+      } finally {
+        // WebUiModule.stop() leaves the web server up so it serves across
+        // session switches, and it would keep the process running. Once
+        // runTui settles, whether the TUI quit or its setup failed, the host
+        // is ending, so the server ends too. stopWebUiServer calls the
+        // server's stop first, so a throw in what it detaches after that is
+        // logged rather than failing a host whose stop succeeded.
+        await stopWebUiServer().catch((error: unknown) => {
+          console.error(`[webui] the TUI has ended, and closing the Web UI's server failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
     }
   } finally {
     credentials?.dispose();

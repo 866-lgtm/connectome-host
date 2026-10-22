@@ -15,6 +15,7 @@ type Internal = {
   handleLaunch: (input: Launch, opts: { viaAutoStart: boolean; autoRestartOf?: Child }) => Promise<Result>;
   tryAutoRestart: (child: Child) => void;
   connectChildSocket: (child: Child) => Promise<void>;
+  waitForSocket: (child: Child, deadline?: number, lastRefusal?: unknown) => Promise<void>;
   waitForExit: (proc: ChildProcess, timeoutMs: number) => Promise<boolean>;
   waitForReady: (child: Child) => Promise<void>;
   waitForExitByPid: (pid: number, timeoutMs: number) => Promise<boolean>;
@@ -1079,10 +1080,16 @@ describe('FleetModule lifecycle: every launch answers to stop, kill and newer la
   });
 
   // At the deadline, the error says the wait ran out, not just the last
-  // connect's refusal.
+  // connect's refusal. The child opens no socket, and the wait for one is
+  // stubbed to put a file at its path at once, so the stubbed connect is
+  // refused from the start of the 300 ms to its end, however slowly a
+  // loaded host starts the child.
   test('a socket that keeps refusing connections is reported as having run out its wait', async () => {
-    const { fleet, input } = fixture({}, { socketWaitTimeoutMs: 300 });
+    const { fleet, input } = fixture({ noSocket: true }, { socketWaitTimeoutMs: 300 });
     const api = internal(fleet);
+    api.waitForSocket = async (child) => {
+      if (!existsSync(child.socketPath)) writeFileSync(child.socketPath, '');
+    };
     api.connectChildSocket = async () => {
       throw Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' });
     };

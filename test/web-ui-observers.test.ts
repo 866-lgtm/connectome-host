@@ -11,52 +11,36 @@
  *   observer is read-only (user-message → forbidden)
  */
 import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, readFileSync, rmSync, utimesSync, statSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { generateKeyPairSync, sign as cryptoSign } from 'node:crypto';
+import { dirname, join } from 'node:path';
 import type { ModuleContext } from '@animalabs/agent-framework';
 import {
   WebUiModule,
   __getSharedServerPortForTests,
-  __resetSharedServerForTests,
+  stopWebUiServer,
 } from '../src/modules/web-ui-module.js';
 import {
   ObserverRegistry,
   ObserverSessions,
   closeConnectionsWithoutGrant,
-  observerStatement,
   saveObserversFile,
   loadObserversFile,
   filterEntryForScopes,
-  traceRequiredScope,
+  traceScopes,
+  TRACE_SCOPES,
+  childEventScopes,
+  frameScopes,
+  streamEndedFor,
+  clientHolds,
+  FULL_CLIENTS_ONLY,
   scopeWelcome,
   type ObserverScope,
   type ObserversFile,
 } from '../src/modules/web-ui-observers.js';
-import type { WelcomeMessage, WelcomeMessageEntry } from '../src/web/protocol.js';
-
-// ---------------------------------------------------------------------------
-// Key helpers — raw ed25519 via node:crypto
-// ---------------------------------------------------------------------------
-
-function makeKeypair() {
-  const { publicKey, privateKey } = generateKeyPairSync('ed25519');
-  const spki = publicKey.export({ format: 'der', type: 'spki' }) as Buffer;
-  const raw = spki.subarray(spki.length - 32);
-  const id = `ed25519:${raw.toString('base64url')}`;
-  return { id, privateKey };
-}
-
-function helloFor(kp: ReturnType<typeof makeKeypair>, host: string, timestamp = new Date().toISOString()) {
-  const proof = cryptoSign(null, Buffer.from(observerStatement(host, timestamp), 'utf8'), kp.privateKey);
-  return {
-    scheme: 'ed25519' as const,
-    id: kp.id,
-    proof: proof.toString('base64url'),
-    timestamp,
-  };
-}
+import { WEB_PROTOCOL_VERSION, type WelcomeMessage, type WelcomeMessageEntry } from '../src/web/protocol.js';
+import { STREAM_END_TRACES } from '../src/state/turn-trace.js';
+import { BASIC, helloFor, makeKeypair } from './web-ui-observed-host.js';
 
 // ---------------------------------------------------------------------------
 // Unit: registry verification
@@ -631,20 +615,109 @@ describe('scope filters', () => {
     expect(f).toEqual(entry);
   });
 
-  test('trace scope mapping', () => {
-    expect(traceRequiredScope({ type: 'ops:alert' })).toBe('ops');
-    expect(traceRequiredScope({ type: 'mcpl:server-closed' })).toBe('ops');
-    expect(traceRequiredScope({ type: 'usage:updated' })).toBe('health');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'thinking' } as never)).toBe('thinking');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'tool_call' } as never)).toBe('tools');
-    expect(traceRequiredScope({ type: 'inference:tokens', blockType: 'text' } as never)).toBe('messages');
-    expect(traceRequiredScope({ type: 'tool:started' })).toBe('tools');
-    expect(traceRequiredScope({ type: 'inference:completed' })).toBe('messages');
+  test("a trace needs every scope whose data it carries, a token or block its block's too, and any type not in the table goes to full clients alone", () => {
+    expect(traceScopes({ type: 'message:added' })).toEqual(['messages']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'text' })).toEqual(['messages']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'thinking' })).toEqual(['messages', 'thinking']);
+    expect(traceScopes({ type: 'inference:content_block', blockType: 'tool_call' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'tool_result' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'inference:tokens', blockType: 'a-block-added-later' })).toBe(FULL_CLIENTS_ONLY);
+    expect(traceScopes({ type: 'inference:tool_calls_yielded' })).toEqual(['messages', 'tools']);
+    expect(traceScopes({ type: 'tool:completed' })).toEqual(['messages', 'tools']);
+    // A failed or dropped call's error, and an operator's call for the agent.
+    for (const type of ['tool:failed', 'tool:result_dropped', 'puppet:tool-call']) {
+      expect(traceScopes({ type })).toEqual(['messages', 'tools', 'ops']);
+    }
+    // Whole process events and module responses.
+    for (const type of ['process:received', 'process:completed']) {
+      expect(traceScopes({ type })).toEqual(['messages', 'thinking', 'tools', 'health', 'ops']);
+    }
+    expect(traceScopes({ type: 'inference:completed' })).toEqual(['messages', 'health']);
+    expect(traceScopes({ type: 'inference:usage' })).toEqual(['health']);
+    expect(traceScopes({ type: 'host:quiesce' })).toEqual(['health']);
+    expect(traceScopes({ type: 'inference:failed' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'inference:exhausted' })).toEqual(['ops']);
+    // Why a turn was stopped is ops; that it ended reaches messages as stream-ended.
+    expect(traceScopes({ type: 'inference:aborted' })).toEqual(['messages', 'ops']);
+    for (const type of ['inbound:observer-failed', 'mcpl:request-handler-error', 'prose:drafts-held', 'prose:draft-resent', 'prose:drafts-dismissed']) {
+      expect(traceScopes({ type })).toEqual(['ops']);
+    }
+    // The operator log's entry, as request-operator-log gives ops.
+    expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
+    expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
+    for (const type of ['inference:published', 'inference:published_complete']) {
+      expect(traceScopes({ type })).toEqual(['messages']);
+    }
+    expect(traceScopes({ type: 'a-trace-added-later' })).toBe(FULL_CLIENTS_ONLY);
+    expect(traceScopes({ type: 'toString' })).toBe(FULL_CLIENTS_ONLY);
   });
 
-  test('scopeWelcome without messages empties conversation payload', () => {
+  test("every trace type the installed agent-framework defines has an entry in the table", () => {
+    // Read the source the runtime resolves the package to from here, as the host loads it, wherever
+    // it's installed: in this repository's node_modules, or in one above it, as a hoisted install or a
+    // linked checkout leaves it. Its exports give Bun the index of that source.
+    const index = Bun.resolveSync('@animalabs/agent-framework', import.meta.dir);
+    const source = readFileSync(join(dirname(index), 'types', 'trace.ts'), 'utf-8');
+    const types = [...new Set([...source.matchAll(/\btype: '([^']+)'/g)].map((m) => m[1]!))].sort();
+    expect(types.length).toBeGreaterThan(50);
+    expect(types.filter((type) => !Object.hasOwn(TRACE_SCOPES, type))).toEqual([]);
+  });
+
+  test("a child's events go by the host's trace table, its lifecycle needs health, its snapshot a tree's scopes, its speech thinking and tools, a stream end's stand-in messages, and any other kind a full client", () => {
+    expect(childEventScopes({ type: 'message:added' })).toEqual(['messages']);
+    expect(childEventScopes({ type: 'inference:tokens', blockType: 'thinking' } as never)).toEqual(['messages', 'thinking']);
+    expect(childEventScopes({ type: 'tool:started' })).toEqual(['messages', 'tools']);
+    expect(childEventScopes({ type: 'usage:updated' })).toEqual(['health']);
+    expect(childEventScopes({ type: 'ops:alert' })).toEqual(['ops']);
+    expect(childEventScopes({ type: 'inference:speech' })).toEqual(['messages', 'thinking', 'tools']);
+    expect(childEventScopes({ type: 'stream-ended', agentName: 'kid' } as never)).toEqual(['messages']);
+    expect(childEventScopes({ type: 'lifecycle', phase: 'ready' } as never)).toEqual(['health']);
+    expect(childEventScopes({ type: 'snapshot' })).toEqual(['messages', 'thinking', 'tools', 'health', 'ops']);
+    for (const type of ['command-output', 'a-kind-added-later', 'private:new-kind', '', undefined, 7]) {
+      expect(childEventScopes({ type })).toBe(FULL_CLIENTS_ONLY);
+    }
+  });
+
+  test('a frame sent to more than one client needs what its welcome field or request needs, and any other goes to full clients alone', () => {
+    const scopesOf = (frame: Record<string, unknown>) => frameScopes(frame as never);
+    expect(scopesOf({ type: 'trace', event: { type: 'tool:started' } })).toEqual(['messages', 'tools']);
+    expect(scopesOf({ type: 'child-event', childName: 'kid', event: { type: 'lifecycle' } })).toEqual(['health']);
+    for (const type of ['usage', 'call-ledger', 'credential-state', 'host-mode']) expect(scopesOf({ type })).toEqual(['health']);
+    for (const type of ['inbound-trigger', 'branch-changed', 'stream-ended']) expect(scopesOf({ type })).toEqual(['messages']);
+    for (const type of ['pins-list', 'settings-state', 'a-frame-added-later']) expect(scopesOf({ type })).toBe(FULL_CLIENTS_ONLY);
+  });
+
+  test('a stream-end trace has a stand-in that says only whose stream ended, and no other trace has one', () => {
+    for (const type of STREAM_END_TRACES) {
+      expect(streamEndedFor({ type, agentName: 'main', error: 'provider said no', stack: 'at x' } as never))
+        .toEqual({ type: 'stream-ended', agentName: 'main' });
+    }
+    expect(streamEndedFor({ type: 'inference:failed' })).toEqual({ type: 'stream-ended' });
+    for (const type of ['inference:started', 'inference:tokens', 'tool:failed', 'ops:alert']) {
+      expect(streamEndedFor({ type, agentName: 'main' })).toBeNull();
+    }
+  });
+
+  test('a full client holds every frame, an observer what its scopes cover, and a connection waiting for its hello nothing', () => {
+    const full = { auth: 'full', scopes: null };
+    const waiting = { auth: 'pending', scopes: null };
+    const observer = { auth: 'observer', scopes: new Set<ObserverScope>(['messages', 'health']) };
+    expect(clientHolds(full, FULL_CLIENTS_ONLY)).toBe(true);
+    expect(clientHolds(full, ['thinking'])).toBe(true);
+    expect(clientHolds(waiting, ['health'])).toBe(false);
+    expect(clientHolds(observer, ['health'])).toBe(true);
+    expect(clientHolds(observer, ['messages', 'health'])).toBe(true);
+    expect(clientHolds(observer, ['messages', 'thinking'])).toBe(false);
+    expect(clientHolds(observer, FULL_CLIENTS_ONLY)).toBe(false);
+  });
+
+  test("scopeWelcome without messages empties conversation payload, and the session's and branch's names", () => {
     const welcome = {
-      type: 'welcome', protocolVersion: 1,
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION,
+      agents: [{ name: 'main', model: 'claude-x' }],
+      session: { id: 's1', name: 'Debugging the bridge', autoNamed: true },
+      branch: { id: 'b1', name: 'experiment' },
       messages: [entry],
       history: { startIndex: 40, totalCount: 240 },
       localTree: { asOfTs: 1, nodes: [{ secret: true }], callIdIndex: { a: 'b' } },
@@ -657,14 +730,22 @@ describe('scope filters', () => {
     expect(w.childTrees).toEqual([]);
     expect(w.history.startIndex).toBe(240);
     expect(w.usage.input).toBe(1); // structure/usage survive
+    // An auto-named session's name summarizes the conversation, and branch
+    // names are request-branches' tier; the ids stay, as the client's key.
+    expect(w.session).toEqual({ id: 's1', name: '', autoNamed: true });
+    expect(w.branch).toEqual({ id: 'b1', name: '' });
+    const reader = scopeWelcome(welcome, new Set<ObserverScope>(['messages']));
+    expect(reader.session).toEqual(welcome.session);
+    expect(reader.branch).toEqual(welcome.branch);
+    expect(welcome.session.name).toBe('Debugging the bridge'); // never mutated
   });
 
   // Health-gated telemetry must be masked exactly like its live frames:
-  // `usage` and `call-ledger` pushes require the 'health' scope, so the
-  // welcome cannot hand the same data to a messages-only observer.
-  test('scopeWelcome without health strips callLedger/perAgentCost and zeroes usage', () => {
+  // `usage`, `call-ledger` and `host-mode` pushes require the 'health' scope,
+  // so the welcome cannot hand the same data to a messages-only observer.
+  test('scopeWelcome without health strips callLedger/perAgentCost/hostMode and zeroes usage', () => {
     const welcome = {
-      type: 'welcome', protocolVersion: 1,
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION,
       messages: [entry],
       history: { startIndex: 40, totalCount: 240 },
       localTree: { asOfTs: 1, nodes: [], callIdIndex: {} },
@@ -674,11 +755,15 @@ describe('scope filters', () => {
       callLedger: {
         calls: [{ model: 'secret-model', error: 'raw provider error', costUsd: 0.42 }],
       },
+      hostMode: { mode: 'quiesced', detail: {} },
+      agents: [{ name: 'main', model: 'secret-model' }],
     } as unknown as WelcomeMessage;
 
     const w = scopeWelcome(welcome, new Set<ObserverScope>(['messages']));
+    expect(w.agents).toEqual([{ name: 'main', model: '' }]);
     expect(w.callLedger).toBeUndefined();
     expect(w.perAgentCost).toBeUndefined();
+    expect(w.hostMode).toBeUndefined();
     expect(w.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
     expect(w.messages.length).toBe(1); // messages scope still gets content
     // No trace of the ledger anywhere in the serialized frame.
@@ -689,17 +774,43 @@ describe('scope filters', () => {
     const opsOnly = scopeWelcome(welcome, new Set<ObserverScope>(['ops']));
     expect(opsOnly.callLedger).toBeUndefined();
     expect(opsOnly.perAgentCost).toBeUndefined();
+    expect(opsOnly.hostMode).toBeUndefined();
     expect(opsOnly.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
     // A health-scoped observer keeps the telemetry verbatim.
     const h = scopeWelcome(welcome, new Set<ObserverScope>(['health']));
     expect(h.callLedger).toEqual(welcome.callLedger);
     expect(h.perAgentCost).toEqual(welcome.perAgentCost);
+    expect(h.hostMode).toEqual(welcome.hostMode);
+    expect(h.agents).toEqual(welcome.agents);
     expect(h.usage).toEqual(welcome.usage);
 
     // Input welcome is never mutated (shared across clients in sendWelcome).
     expect(welcome.callLedger).toBeDefined();
+    expect(welcome.hostMode).toBeDefined();
     expect(welcome.usage.input).toBe(1);
+  });
+
+  test('the agent trees go only with every scope but debug, since their nodes carry token counts and how each run ended', () => {
+    const tree = { asOfTs: 1, nodes: [{ name: 'main', tokens: { input: 5 } }], callIdIndex: {} };
+    const welcome = {
+      type: 'welcome', protocolVersion: WEB_PROTOCOL_VERSION, agents: [], messages: [],
+      session: { id: 's', name: 's', autoNamed: false }, branch: { id: 'b', name: 'b' },
+      history: { startIndex: 0, totalCount: 0 },
+      localTree: tree,
+      childTrees: [{ name: 'kid', ...tree, recipe: { name: 'kid', agentModel: 'a-model' } }],
+      usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
+    } as unknown as WelcomeMessage;
+    for (const missing of ['messages', 'thinking', 'tools', 'health', 'ops'] as const) {
+      const scopes = new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health', 'ops']);
+      scopes.delete(missing);
+      const w = scopeWelcome(welcome, scopes);
+      expect(w.localTree.nodes).toEqual([]);
+      expect(w.childTrees).toEqual([]);
+    }
+    const all = scopeWelcome(welcome, new Set<ObserverScope>(['messages', 'thinking', 'tools', 'health', 'ops']));
+    expect(all.localTree).toEqual(tree);
+    expect(all.childTrees).toEqual(welcome.childTrees);
   });
 });
 
@@ -731,8 +842,6 @@ describe('ObserverSessions', () => {
 // hot-appears → observer flow works.
 // ---------------------------------------------------------------------------
 
-const BASIC = `Basic ${Buffer.from('admin:pw').toString('base64')}`;
-
 describe('WebUiModule observer flow (e2e)', () => {
   let tmp: string;
   let observersPath: string;
@@ -761,7 +870,7 @@ describe('WebUiModule observer flow (e2e)', () => {
 
   afterAll(async () => {
     await mod.stop();
-    await __resetSharedServerForTests();
+    await stopWebUiServer();
     rmSync(tmp, { recursive: true, force: true });
   });
 
