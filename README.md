@@ -81,11 +81,15 @@ A recipe is a JSON file that configures everything specific to one agent:
 Every string value may reference the environment as `${VAR}` or
 `${VAR:-default}`; a missing required variable fails the load, naming it.
 Values and combinations are validated at load time and fail loudly, naming
-the key. Unrecognized keys, though, are generally *not* rejected — a
-misspelled key (`mcplServers`, a leftover `modules.files`) is silently
-ignored, so check spelling against this README and `src/recipe.ts`.
-`modules.workspace` and each of its mounts do refuse a key they don't have,
-naming it.
+the key. An unrecognized key at the recipe's top level or in `agent`,
+`agent.mock`, `agent.strategy.kvUnified` and its `policy`, or `modules`
+(`mcplServers`, a leftover `modules.files`) doesn't stop the load: the host
+warns, naming it and, where one is close, the key it was probably meant to
+be. Keys inside other objects aren't checked this way, so check spelling
+against this README and `src/recipe.ts`. Some objects refuse a key they
+don't have, naming it, such as `modules.workspace` and each of its mounts,
+`modules.history`, `agent.retry` and `agent.clock`; `agent.toolPresentation`
+refuses one without naming it.
 
 `agent.timezone` is an IANA zone used only for times rendered to the agent.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
@@ -93,15 +97,31 @@ it, `AGENT_TIMEZONE` is used, then the process timezone.
 
 `agent.clock` (off when omitted) gives the agent clock rows in that zone:
 with `{ "intervalMinutes": 10 }`, once a ten-minute boundary of its local
-wall clock has passed, the window takes one `Clock: 10:50 Europe/Berlin
-(UTC+02:00)` row before whatever it takes next: an incoming message, the
-start of a turn (a silent heartbeat tick too), or, mid-turn, the results of
-a tool round. Only the latest boundary is written. It reads the boundary's
-time where that boundary falls among the rows, and the time it is written
-where it can't (after a tool round that spanned it), and it shows the date
-when the day has changed. `{ "intervalSeconds": 15 }` gives clocks finer
-than a minute (read to the second; `"precision": "seconds"` asks for that
-at any interval).
+wall clock (counted from local midnight) has passed, the window takes one
+`Clock: 10:50 Europe/Berlin (UTC+02:00)` row at the next of these: before
+an incoming event such as a message, at the start of a turn (a silent
+heartbeat tick too), or, mid-turn, after a tool round's results. A window
+with no clock row yet, as when the clock is first turned on, takes one at
+the next of these. Only the latest boundary is written. It reads the
+boundary's time where that boundary falls among the rows, and the time it
+is written where it can't (after a tool round that spanned it), and it
+shows the weekday and date when the day has changed.
+`{ "intervalSeconds": 15 }` gives clocks finer than a minute (read to the
+second; `"precision": "seconds"` asks for that at any interval). A recipe
+gives one of the two intervals, as a positive whole number of at most a
+day, and `"precision": "minutes"` only for whole minutes; anything else
+stops the load, naming the key.
+
+Where the clock doesn't reach: with the `anthropic-xml` formatter
+(membrane's XML prefill path), a tool round's results take no clock, and
+the next event or turn start writes it. On some models a clock after a
+tool's results drops the loop's earlier thinking from the request, as any
+message heard while acting does there, at most once an interval. Subagents
+take no clock rows: a fork keeps the rows it inherits and gets no more, and
+its start orientation names its clock rows as off beside its parent's.
+Agents that share one window read each other's clock rows, one with no
+clock of its own included. The subconscious takes none of its own and reads
+them through its merged view.
 
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
 the autobiographical memory strategy with adaptive resolution, **kv-unified
