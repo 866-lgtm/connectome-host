@@ -12,7 +12,7 @@ import {
   symlinkSync, truncateSync, writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, relative } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 import { AgentFramework, resolveTimeZone } from '@animalabs/agent-framework';
 import { JsStore } from '@animalabs/chronicle';
 import { AutobiographicalStrategy, ContextManager } from '@animalabs/context-manager';
@@ -32,7 +32,16 @@ import {
 
 const MODEL = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) } as never;
 const INDEX_PATH = join(import.meta.dir, '..', 'src', 'index.ts');
-const CONTEXT_MANAGER = join(import.meta.dir, '..', 'node_modules', '@animalabs', 'context-manager', 'dist', 'src', 'index.js');
+// context-manager's own build, the `main` its package names: another copy of
+// the library than the host's, which Bun loads from its source, as an
+// extension's own would be. The package is found where Bun resolves it from
+// here, in this checkout's node_modules or one above it, as a hoisted or
+// linked install leaves it.
+const CONTEXT_MANAGER = ((): string => {
+  let dir = dirname(Bun.resolveSync('@animalabs/context-manager', import.meta.dir));
+  while (!existsSync(join(dir, 'package.json')) && dirname(dir) !== dir) dir = dirname(dir);
+  return join(dir, (JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8')) as { main: string }).main);
+})();
 const REMEDY = 'AGENT-ONBOARDING.md §11.8 says what a store with crossed summaries needs.';
 const MODEL_CALLED = 'its strategy called a model while opening it, and the audit gives a strategy none: only a start of this release can answer for this store';
 
@@ -765,7 +774,7 @@ describe('the store audit', () => {
     // after a model call it catches. It's another copy of the library than
     // the host's (Bun loads the host's from its source), as an extension's
     // own would be, so its error's class isn't the host's.
-    const library = join(import.meta.dir, '..', 'node_modules/@animalabs/context-manager/dist/src/index.js');
+    const library = CONTEXT_MANAGER;
     withStrategy(dir, 'calling', [
       `import { AutobiographicalStrategy } from ${JSON.stringify(library)};`,
       "export function register(api) { api.registerStrategy('calling', () => {",
