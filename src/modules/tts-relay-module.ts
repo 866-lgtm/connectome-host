@@ -25,10 +25,11 @@
  * aborts the in-flight stream and substitutes spokenText as the completion —
  * connectome posts prose at tool-round boundaries, so the message is usually
  * already on Discord. We therefore EDIT it down to the voiced words (matching
- * the interruption against recent `mcpl:speech-routed` traces, which carry
- * channelId + messageId + text) via the discord MCPL's edit_message tool, and
- * drop a note into the agent's context so she knows she was cut off — the
- * next turn shouldn't believe the full paragraph landed.
+ * the interruption against the messages recent `inference:published` traces
+ * report, each with its channelId + messageId + text) via the discord MCPL's
+ * edit_message tool, and drop a note into the agent's context so she knows
+ * she was cut off — the next turn shouldn't believe the full paragraph
+ * landed.
  *
  * Nothing here touches the host loop: remove the recipe block and the tap is
  * gone. No tools are exposed to the agent (v1).
@@ -216,7 +217,8 @@ interface ActivationState {
   blocks: Map<number, string>;
 }
 
-/** A recently routed prose segment — the edit target for an interruption. */
+/** A message the agent's prose recently published: the edit target for an
+ *  interruption. */
 interface RoutedMessage {
   rawChannelId: string;
   mcplChannelId: string;
@@ -346,30 +348,26 @@ export class TtsRelayModule implements Module {
   }
 
   private onTraceEvent(event: TraceEvent): void {
-    // `mcpl:speech-routed` is a custom trace type emitted by the speech
-    // router, not part of the framework's TraceEvent union — the typed
-    // switch below could never narrow to it. Handle it up front via the
-    // standard custom-trace cast.
-    if ((event as { type: string }).type === 'mcpl:speech-routed') {
-      // Remember what landed where, so an interruption can find its edit
-      // target: (channelId, messageId, text) per posted segment.
-      const e = event as unknown as {
-        channelId: string; messageId?: string; text: string; timestamp: number;
-      };
-      this.routed.push({
-        rawChannelId: rawChannelId(e.channelId),
-        mcplChannelId: e.channelId,
-        messageId: e.messageId,
-        text: e.text,
-        at: e.timestamp,
-      });
-      if (this.routed.length > ROUTED_RING_MAX) {
-        this.routed.splice(0, this.routed.length - ROUTED_RING_MAX);
-      }
-      return;
-    }
-
     switch (event.type) {
+      case 'inference:published': {
+        // Remember what the agent's prose posted where, so an interruption
+        // can find its edit target: each published message, with the id its
+        // server returned. `mcpl:speech-routed` also reports publishes that
+        // aren't this prose, such as the `sleep` tool's announcement and a
+        // subconscious's `speak_in_channel`, which no interruption edits.
+        this.routed.push({
+          rawChannelId: rawChannelId(event.channelId),
+          mcplChannelId: event.channelId,
+          messageId: event.messageId,
+          text: event.text,
+          at: event.timestamp,
+        });
+        if (this.routed.length > ROUTED_RING_MAX) {
+          this.routed.splice(0, this.routed.length - ROUTED_RING_MAX);
+        }
+        break;
+      }
+
       case 'inference:started': {
         // A context-budget restart re-emits inference:started mid-turn; the
         // existing activation (announced or not) simply carries on.
