@@ -10,10 +10,9 @@
     answered "File not found".
   - **A turn's tool results share the readers' per-message bound** when they
     pass it together, each taking an equal share, where a later result was
-    cut or left out without a word. A cut result's notice, which names the
-    workspace file holding the rest, now survives the readers' cut unless a
-    turn's notices alone fill the bound, or a mount name past about seventy
-    characters makes the notice longer than its room.
+    cut or left out without a word. A cut result's notice names the
+    workspace file holding the rest. The readers' cut can still shorten a
+    notice longer than its share, even when it is the turn's only one.
   - **A message that arrives during a tool call** is injected as the agent's
     strategy renders it as the newest of its window, where it was injected
     whole, so one over `maxMessageTokens` or with more images than

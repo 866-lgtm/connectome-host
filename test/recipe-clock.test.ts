@@ -30,6 +30,9 @@ describe('clock recipe wiring', () => {
     // interval, and a whole-minute interval given in seconds.
     for (const clock of [
       { intervalMinutes: 10, precision: 'minutes' }, { intervalSeconds: 120 },
+      // Seconds asked for at a whole-minute interval, the one precision that
+      // isn't its interval's default.
+      { intervalMinutes: 10, precision: 'seconds' },
       // A day, the longest interval, given either way.
       { intervalMinutes: 1440 }, { intervalSeconds: 86_400 },
     ]) {
@@ -57,7 +60,11 @@ describe('clock recipe wiring', () => {
       [{ intervalSeconds: 90, precision: 'minutes' }, "Recipe agent.clock: an interval of 90 seconds isn't whole minutes, so its clocks need precision 'seconds'"],
     ];
     for (const [clock, message] of cases) {
-      expect(() => validateRecipe(base(clock))).toThrow(message);
+      // The whole message: toThrow(string) passes on any message that holds it.
+      let thrown: unknown;
+      try { validateRecipe(base(clock)); } catch (err) { thrown = err; }
+      expect(thrown).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toBe(message);
     }
   });
 });

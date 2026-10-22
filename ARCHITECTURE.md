@@ -129,8 +129,8 @@ A recipe is JSON; the full key set is typed and validated in
   and its `policy`, or `modules` is warned about, naming it, and the load
   goes on. Some blocks, such as `subconscious`, the object form of
   `modules.history`, `agent.retry`, `agent.clock`, and `modules.workspace`
-  and its mounts, refuse unknown fields. Keys elsewhere aren't checked, so a
-  misspelled one there is silently ignored.
+  and its mounts, refuse unknown fields. Others, such as `agent.thinking`,
+  don't check their keys, so a misspelled one there is silently ignored.
 - **Paths.** Fleet child recipes resolve relative to the parent recipe file;
   runtime paths (data dirs, workspace mounts) resolve against the CWD.
 - **Extensions.** `extensions` maps names to local modules that register

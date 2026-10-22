@@ -888,6 +888,23 @@ describe('what a launch block says beyond the settings it compares', () => {
     }
   });
 
+  // A spawn's caller is read the same way, and named as the calling stream.
+  test('a spawn from a caller with clock rows is told its own are off, beside the caller\'s', async () => {
+    const h = await makeHarness({ parent: { clock: { intervalMinutes: 10 } } });
+    try {
+      const input = { name: 'timed', systemPrompt: 'p', task: 't' };
+      await h.subagent.handleToolCall(call('spawn', 'toolu_timed_spawn', input));
+      await h.asyncPromise('timed');
+      const start = startSection(h.runs[0]!.firstContext);
+      expect(line(start, '- Agent settings')).toStartWith(
+        "- Agent settings not carried from the calling stream, so the framework's defaults apply: " +
+          "clock rows off (the calling stream's: every 10 minutes). The rest match: ",
+      );
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   test('a fork from a parent on the defaults says they match', async () => {
     const h = await makeHarness({});
     try {

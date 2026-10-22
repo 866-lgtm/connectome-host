@@ -346,7 +346,9 @@ export interface RecipeAgent {
    * `timezone`) has passed, the window takes one `Clock: 10:50 Europe/Berlin
    * (UTC+02:00)` row before the next event or turn start, or mid-turn after
    * a tool round's results (not on the `anthropic-xml` formatter's XML
-   * prefill path). Subagent streams take none; see the README.
+   * prefill path); on some models that mid-turn row drops the loop's earlier
+   * thinking, at most once an interval. Subagent streams take none; see the
+   * README.
    */
   clock?: ClockConfig;
   /**
