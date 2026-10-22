@@ -48,6 +48,7 @@ import type {
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  PublishRefusalReason,
   EventResponse,
   ToolDefinition,
   ToolCall,
@@ -267,8 +268,30 @@ export function statusClearText(subject: string, kind: string, message: string, 
 }
 
 interface Registry {
-  publishForAgent?: (channelId: string, text: string, agentName: string) => Promise<{ success: boolean; error?: string }>;
+  publishForAgent?: (channelId: string, text: string, agentName: string) => Promise<PublishResult>;
 }
+
+type PublishResult = { success: boolean; error?: string; reason?: PublishRefusalReason };
+
+/**
+ * The refusals that mean the chat server may simply not be up, for which
+ * post() parks a notice or owes a line until a reconnect or a server's
+ * return: the channel isn't registered (yet), its server is gone, connecting
+ * or down, or its connection refused the request before writing anything.
+ * agent-framework names each refusal's cause in `reason`. post() logs any
+ * other refusal (a channel that takes no posts, a publish the host isn't
+ * permitted), a failure with no reason and a thrown error, and neither parks
+ * nor owes it, since nothing here waits for those to change. A line already
+ * owed is retried at each reconnect whatever its replay's refusal
+ * (flushOwed).
+ */
+const PARKED_REFUSALS: ReadonlySet<PublishRefusalReason> = new Set<PublishRefusalReason>([
+  'channel-not-registered',
+  'server-gone',
+  'server-connecting',
+  'server-down',
+  'not-sent',
+]);
 
 export class NoticesModule implements Module {
   readonly name = 'notices';
@@ -790,9 +813,9 @@ export class NoticesModule implements Module {
   }
 
   /**
-   * Publish as the host. On a "channel/server not found" failure — the chat
-   * server may simply not be up — a tracked notice parks its channel on the
-   * episode for re-admission on reconnect, and an untracked clear / "back"
+   * Publish as the host. On a refusal a reconnect can undo (PARKED_REFUSALS),
+   * since the chat server may simply not be up, a tracked notice parks its
+   * channel on the episode for re-admission on reconnect, and an untracked clear / "back"
    * line is owed to the channel and retried on reconnect regardless. `reflush`
    * tells the caller that a reconnect happened during this attempt, so the
    * flush it triggered was deduplicated against this post's claim and another
@@ -807,7 +830,7 @@ export class NoticesModule implements Module {
     const registry = this.framework?.channels as Registry | undefined;
     if (!registry?.publishForAgent) return { ok: false, reflush: false };
     const epoch = this.reconnectEpoch;
-    let result: { success: boolean; error?: string };
+    let result: PublishResult;
     try {
       result = await registry.publishForAgent(channelId, text, this.config.agentName ?? 'host');
     } catch (err) {
@@ -824,7 +847,7 @@ export class NoticesModule implements Module {
       }
       return { ok: true, reflush: false };
     }
-    const absent = /not found/i.test(result.error ?? '');
+    const absent = result.reason !== undefined && PARKED_REFUSALS.has(result.reason);
     if (!absent) {
       console.error(`[notices] post to ${channelId} failed: ${result.error ?? 'unknown error'}`);
       return { ok: false, reflush: false };
