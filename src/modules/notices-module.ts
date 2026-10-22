@@ -34,12 +34,13 @@
  * what remains. Replies never wait — a human is.
  *
  * The chat MCPL server may itself be down. Channel ids are opaque here and
- * resolved at post time through the ChannelRegistry; a notice that fails
- * because the channel or server is absent is parked on the episode and
- * re-admitted when a server (re)connects while the episode is still open, else
- * dropped silently. A clear or "back" line that fails the same way is owed to
- * the channel and retried on reconnect regardless, so no channel is left
- * carrying a warning nobody will clear.
+ * resolved at post time through the ChannelRegistry; a notice refused because
+ * the channel or server isn't there to take it (the reasons in
+ * PARKED_REFUSALS) is parked on the episode and re-admitted when a server
+ * (re)connects while the episode is still open, else dropped silently. A
+ * clear or "back" line refused the same way is owed to the channel and
+ * retried on reconnect regardless, so no channel is left carrying a warning
+ * nobody will clear. A first post's other failures are logged and dropped.
  */
 
 import type {
