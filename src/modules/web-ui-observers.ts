@@ -844,6 +844,8 @@ export function filterEntryForScopes(
   const blocks = entry.blocks.filter((b) => {
     if ((b.kind === 'thinking' || b.kind === 'redacted_thinking') && !scopes.has('thinking')) return false;
     if ((b.kind === 'tool_use' || b.kind === 'tool_result') && !scopes.has('tools')) return false;
+    // An image a tool returned goes where its result goes.
+    if (b.kind === 'media' && b.toolUseId !== undefined && !scopes.has('tools')) return false;
     return true;
   });
   return { ...entry, blocks };

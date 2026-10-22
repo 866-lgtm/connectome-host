@@ -610,6 +610,25 @@ describe('scope filters', () => {
     expect(f.blocks.map((b) => b.kind)).toEqual(['text']);
   });
 
+  test("an image a tool returned goes with its result, and an image in a message stays with the message's text", () => {
+    const withImages: WelcomeMessageEntry = {
+      index: 1,
+      participant: 'user',
+      text: 'and this',
+      blocks: [
+        { kind: 'tool_result', toolUseId: 't1', text: 'a frame' },
+        { kind: 'media', mediaType: 'image/png', ref: 'm2/0.1', toolUseId: 't1' },
+        { kind: 'text', text: 'and this' },
+        { kind: 'media', mediaType: 'image/png', ref: 'm2/2' },
+      ],
+    };
+    expect(filterEntryForScopes(withImages, new Set<ObserverScope>(['messages']))!.blocks)
+      .toEqual([{ kind: 'text', text: 'and this' }, { kind: 'media', mediaType: 'image/png', ref: 'm2/2' }]);
+    expect(filterEntryForScopes(withImages, new Set<ObserverScope>(['messages', 'thinking']))!.blocks.map((b) => b.kind))
+      .toEqual(['text', 'media']);
+    expect(filterEntryForScopes(withImages, new Set<ObserverScope>(['messages', 'tools']))).toEqual(withImages);
+  });
+
   test('full interiority scopes → identical entry', () => {
     const f = filterEntryForScopes(entry, new Set<ObserverScope>(['messages', 'thinking', 'tools']));
     expect(f).toEqual(entry);

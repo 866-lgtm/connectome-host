@@ -136,8 +136,9 @@ export type MessageBlock =
   | { kind: 'tool_result'; toolUseId: string; text: string; isError?: boolean; truncated?: boolean }
   /** Image/document/audio/video or un-inflated blob_ref placeholder. `ref`
    *  is present for images the host can serve lazily at `/media/<ref>` —
-   *  bytes never ride the WebSocket. */
-  | { kind: 'media'; mediaType: string; ref?: string };
+   *  bytes never ride the WebSocket. `toolUseId` names the tool call whose
+   *  result the image came in, so it goes only where tool results go. */
+  | { kind: 'media'; mediaType: string; ref?: string; toolUseId?: string };
 
 export interface WelcomeMessageEntry {
   /** Stable id from the message store; clients can use this for keys. */

@@ -15,10 +15,20 @@ describe('what each client is sent', () => {
   let stored: Record<string, unknown> | null = null;
   let hostStatus: Record<string, unknown> = { quiesced: false };
   let ledgerUpdate: ((ledger: unknown) => void) | undefined;
+  let transcript: Record<string, unknown>[] = [];
+  let appended: ((event: { type: string; message?: unknown }) => void) | undefined;
+  // The store's windowed reads, which the welcome and history pages take, and
+  // its listener, which message-appended comes from.
   const cm = {
-    getAllMessages: () => [],
+    getMessageCount: () => transcript.length,
+    getMessageWindow: (offset: number, limit: number) =>
+      ({ messages: transcript.slice(offset, offset + limit), startIndex: offset, totalCount: transcript.length }),
+    onMessage: (listener: (event: { type: string; message?: unknown }) => void) => {
+      appended = listener;
+      return () => { if (appended === listener) appended = undefined; };
+    },
     currentBranch: () => branch,
-    getMessage: () => stored,
+    getMessage: (id: string) => transcript.find((m) => m.id === id) ?? stored,
   };
   const agent = { name: 'main', model: 'a-model', getContextManager: () => cm };
   // A child's panel answers, as a fleet child's panel ops give them.
@@ -26,6 +36,7 @@ describe('what each client is sent', () => {
     'pin-add': { agent: 'main', pins: [], pinsSupported: true, levelHonored: false, candidates: [{ id: 'm1', index: 0, participant: 'user', text: 'a pinned line' }] },
     'settings-update': { agent: 'main', settings: { contextBudgetTokens: 1000, transition: 'stable' }, overrides: [], hotKeys: [], hotConfigurable: true, previewAvailable: false },
     'credential-action': { subscription: false },
+    media: { mediaType: 'image/png', base64: 'CCCC' },
   };
   const fleet = {
     name: 'fleet',
@@ -174,6 +185,67 @@ describe('what each client is sent', () => {
       expect(conn.framesOf('inbound-trigger').map((f) => f.text)).toEqual(['hello from zulip']);
     }
     expect(c.dashboard.framesOf('inbound-trigger')).toEqual([]);
+  });
+
+  test("an image a tool returned reaches only clients that hold tools, in the welcome, a history page, a live message and at /media, a child's too, and an image in a message reaches every client that holds messages", async () => {
+    const png = (data: string) => ({ type: 'image', source: { type: 'base64', mediaType: 'image/png', data } });
+    transcript = [
+      { id: 'm1', participant: 'assistant', content: [{ type: 'text', text: 'looking' }, { type: 'tool_use', id: 't1', name: 'camera', input: {} }] },
+      { id: 'm2', participant: 'user', content: [
+        { type: 'tool_result', toolUseId: 't1', content: [{ type: 'text', text: 'a frame' }, png('AAAA')] },
+        { type: 'text', text: 'and this' },
+        png('BBBB'),
+      ] },
+    ];
+    try {
+      const c = await everyone();
+      type Entry = { blocks: { kind: string }[] };
+      const media = (entries: Entry[]) => entries.flatMap((m) => m.blocks).filter((b) => b.kind === 'media');
+      const ofTool = { kind: 'media', mediaType: 'image/png', ref: 'm2/0.1', toolUseId: 't1' };
+      const ofMessage = { kind: 'media', mediaType: 'image/png', ref: 'm2/2' };
+      const welcomed = (conn: Connection) => media(conn.framesOf('welcome')[0]!.messages as Entry[]);
+      expect(welcomed(c.reader)).toEqual([ofMessage]);
+      expect(welcomed(c.interior)).toEqual([ofTool, ofMessage]);
+      expect(welcomed(c.operator)).toEqual([ofTool, ofMessage]);
+
+      const paged = async (conn: Connection, corrId: string) => {
+        conn.ws.send(JSON.stringify({ type: 'request-history', corrId, beforeIndex: 2 }));
+        return media((await conn.until('history-page', (f) => f.corrId === corrId)).entries as Entry[]);
+      };
+      expect(await paged(c.reader, 'h-reader')).toEqual([ofMessage]);
+      expect(await paged(c.interior, 'h-interior')).toEqual([ofTool, ofMessage]);
+
+      const m3 = { id: 'm3', participant: 'user', content: [
+        { type: 'tool_result', toolUseId: 't2', content: [png('CCCC')] },
+        { type: 'text', text: 'and another' },
+      ] };
+      transcript.push(m3);
+      appended!({ type: 'add', message: m3 });
+      await host.fence(Object.values(c));
+      const live = (conn: Connection) => conn.framesOf('message-appended').map((f) => f.entry as Entry);
+      expect(live(c.reader).map((e) => e.blocks)).toEqual([[{ kind: 'text', text: 'and another' }]]);
+      expect(media(live(c.interior))).toEqual([{ kind: 'media', mediaType: 'image/png', ref: 'm3/0.0', toolUseId: 't2' }]);
+
+      // /media: a message's own image is a top-level block (`<n>`); any other
+      // path, such as a tool result's nested one, takes tools as well, an
+      // encoded dot and a fleet child's request included. The stub fleet
+      // answers every child's media request with CCCC.
+      const get = async (conn: Connection, path: string) => {
+        const res = await fetch(`http://127.0.0.1:${host.port}${path}`, {
+          headers: { cookie: `fkm_obs=${conn.framesOf('observer-ack')[0]!.sessionToken as string}` },
+        });
+        return res.status === 200 ? Buffer.from(await res.arrayBuffer()).toString('base64') : res.status;
+      };
+      expect(await get(c.reader, '/media/m2/2')).toBe('BBBB');
+      expect(await get(c.reader, '/media/m2/0.1')).toBe(401);
+      expect(await get(c.reader, '/media/m2/0%2E1')).toBe(401);
+      expect(await get(c.reader, '/media/m2/0.1?scope=kid')).toBe(401);
+      expect(await get(c.interior, '/media/m2/0.1')).toBe('AAAA');
+      expect(await get(c.interior, '/media/m2/0.1?scope=kid')).toBe('CCCC');
+      expect(await get(c.dashboard, '/media/m2/2')).toBe(401);
+    } finally {
+      transcript = [];
+    }
   });
 
   test('the serving state and the agents\' models reach clients that hold health in the welcome, the serving state live too, and provider calls live', async () => {

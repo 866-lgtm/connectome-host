@@ -65,7 +65,7 @@ type UiBlock =
       durationMs?: number;
     }
   | { kind: 'tool_result'; toolUseId: string; text: string; isError?: boolean; truncated?: boolean }
-  | { kind: 'media'; mediaType: string; ref?: string }
+  | { kind: 'media'; mediaType: string; ref?: string; toolUseId?: string }
   /** Client-only: a tool call being written live (raw partial JSON from
    *  blockType 'tool_call' token deltas). Replaced by the parsed tool_use
    *  blocks when inference:tool_calls_yielded lands. */

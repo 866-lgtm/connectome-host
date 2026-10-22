@@ -1257,10 +1257,15 @@ export class WebUiModule implements Module {
       return this.handleToolClasses(url);
     }
 
-    // Inline image bytes for transcript media refs (see serveMedia). Same
-    // sensitivity tier as the transcript itself.
+    // Inline image bytes for transcript media refs (see serveMedia). A
+    // message's own image, at a top-level block path (`<n>`), is the same
+    // sensitivity tier as the transcript itself. Any other path, such as a
+    // nested one (`<n>.<m>`), which buildMediaBlock resolves only inside a
+    // tool's result, is the tool result's tier.
     if (url.pathname.startsWith('/media/')) {
       if (!httpAllowed('messages')) return this.unauthorized();
+      const blockPath = url.pathname.slice('/media/'.length).split('/').slice(1).join('/');
+      if (!/^\d+$/.test(blockPath) && !httpAllowed('tools')) return this.unauthorized();
       return this.serveMedia(url);
     }
 
@@ -1872,7 +1877,10 @@ export class WebUiModule implements Module {
    * `/media/<messageId>/<blockPath>` — one inline image, streamed as bytes.
    * Transcript frames carry only a `ref`; the browser fetches on render, so
    * multi-MB base64 never rides the WebSocket and never inflates a welcome.
-   * Observer sessions need the `messages` scope (same tier as the transcript).
+   * Observer sessions need the `messages` scope (same tier as the transcript)
+   * for a message's own image, at a top-level block path, and `tools` as well
+   * for any other path, such as a tool result's image; the route checks both
+   * before a fleet child's request is sent on.
    */
   private async serveMedia(url: URL): Promise<Response> {
     const rest = url.pathname.slice('/media/'.length);
@@ -3641,7 +3649,7 @@ function toWireEntry(
                 : null;
               if (!mt || !mt.startsWith('image/')) continue;
               const ref = mediaRef(`${bi}.${ii}`, mt);
-              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}) });
+              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}), toolUseId: b.toolUseId });
             }
           }
         }
