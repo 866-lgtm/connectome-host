@@ -482,7 +482,17 @@ unknown-key warning, like those at the other levels.
   [`docs/ATTENTION-AND-GATING.md`](docs/ATTENTION-AND-GATING.md)
 - **Workspace** (`modules.workspace`, on) — mounted directories backed by
   Chronicle: the agent's durable, verbatim notes. Default mounts `input`
-  (read-only `./input`) and `products` (read-write `./output`)
+  (read-only `./input`) and `products` (read-write `./output`). A mount with
+  `"backend": "direct"` reads disk as it is, with no store or watcher, for a
+  checkout an agent reads: it names `"mode": "read-only"`, the only mode
+  agent-framework takes on a direct mount, and a mount the agent writes, or
+  whose changes should wake it, leaves `backend` out. A direct mount that names no `ignore` passes over `node_modules`,
+  `.git`, `dist`, `build`, `coverage`, `target`, `__pycache__` and `.venv`,
+  and one that names any passes over only what it names. While its store
+  holds changes from when it ran as Chronicle, it runs as Chronicle until a
+  start after they're settled, and says at start how to settle them.
+  `include` limits what a mount holds. See `RecipeWorkspaceMount` in
+  `src/recipe.ts`
 - **History** (opt-in, `modules.history`) — the agent searches and extracts
   from its own uncompressed record. The object form
   `{ "semantic": { "url": … } }` adds `history--semantic_search`:
@@ -563,7 +573,9 @@ never satisfy the default path, so declare an `instructions` mount explicitly.
 read-write instructions mount. On a read-only mount the flow reverses:
 human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
-and letting the agent make the edit. The file is read through the
+and letting the agent make the edit. A mount running direct
+(`"backend": "direct"`) has no Chronicle copy: `workspace--read` reads disk
+too, so both see an edit to disk at once. The file is read through the
 workspace's `readFileFromDisk`, so on a mount that doesn't follow links, a
 recipe's default, a file that is itself a link isn't read (nor, from
 agent-framework's release with anima-research/agent-framework#468, is one
