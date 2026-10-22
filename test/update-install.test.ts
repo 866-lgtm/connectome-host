@@ -44,6 +44,7 @@ function release(name: string, version = name, files: Record<string, string> = {
  *  directory, with their bytes. */
 function manager(outcome: {
   status?: number | null; output?: string; version?: string; manifest?: string | null; entry?: boolean; launcher?: boolean;
+  files?: number;
 } = {}): InstallOps {
   return {
     run: async (manager, args, cwd) => {
@@ -63,6 +64,10 @@ function manager(outcome: {
         }
         if (outcome.entry !== false) writeFileSync(join(cwd, HOST_ENTRY), '// host\n');
         if (outcome.launcher !== false) writeFileSync(join(cwd, LAUNCHER), '// launcher\n');
+        if (outcome.files) {
+          mkdirSync(join(cwd, 'node_modules', 'many'));
+          for (let i = 0; i < outcome.files; i++) writeFileSync(join(cwd, 'node_modules', 'many', `f${i}`), `${i}`);
+        }
       }
       return { status, output: outcome.output ?? '' };
     },
@@ -87,8 +92,9 @@ function failRm(path: string) {
   }) as typeof fsp.rm);
 }
 
-/** Spy on renames, syncs and removals in order, by sync calls and through
- *  fs/promises, for the length of `body`. */
+/** Spy on renames, syncs and removals in order, for the length of `body`: a
+ *  sync call's fsync as `sync`, and through fs/promises a sync once it has
+ *  completed as `synced`, and its handle's close as `closed`. */
 async function steps(body: () => Promise<void>): Promise<string[]> {
   const paths = new Map<number, string>();
   const seen: string[] = [];
@@ -119,9 +125,14 @@ async function steps(body: () => Promise<void>): Promise<string[]> {
     spyOn(fsp, 'open').mockImplementation((async (path: fs.PathLike, ...rest: unknown[]) => {
       const handle = await (realOpenP as (...args: unknown[]) => Promise<fsp.FileHandle>)(path, ...rest);
       const sync = handle.sync.bind(handle);
+      const close = handle.close.bind(handle);
       handle.sync = async () => {
-        seen.push(`sync ${path}`);
-        return sync();
+        await sync();
+        seen.push(`synced ${path}`);
+      };
+      handle.close = async () => {
+        await close();
+        seen.push(`closed ${path}`);
       };
       return handle;
     }) as typeof fsp.open),
@@ -245,8 +256,9 @@ describe('installing a release beside the running one', () => {
   test('npm with no exit status says it couldn\'t start or was stopped, and where npm is looked for', async () => {
     const error = await failure(installRelease(here(), '0.12.0', manager({ status: null, output: 'Executable not found in $PATH: "npm"' })));
     expect(error.message).toContain("`npm install --save-exact --no-audit --no-fund @animalabs/connectome-host@0.12.0` gave no " +
-      "exit status, so it couldn't start or was stopped by a signal (if its output says npm wasn't found, the service that " +
-      'runs the host needs a PATH that has npm). Its output ends:\nExecutable not found in $PATH: "npm"');
+      "exit status, so it couldn't start or was stopped by a signal (if its output says npm isn't in the PATH, as Bun's " +
+      '"Executable not found in $PATH" does, the service that runs the host needs a PATH that has npm). Its output ends:\n' +
+      'Executable not found in $PATH: "npm"');
     expect(installed()).toEqual(['0.11.0']);
   });
 
@@ -349,7 +361,7 @@ describe('installing a release beside the running one', () => {
     };
     const seen = await steps(() => installRelease(here(), '0.12.0', linking));
     expect(seen.filter((step) => step.includes('.bin/'))).toEqual([]);
-    expect(seen).toContain(`sync ${join(tmp, 'node_modules', '.bin')}`);
+    expect(seen).toContain(`synced ${join(tmp, 'node_modules', '.bin')}`);
     expect(installed()).toEqual(['0.11.0', '0.12.0']);
   });
 
@@ -357,8 +369,8 @@ describe('installing a release beside the running one', () => {
     await withoutPath(async () => {
       const error = await failure(installRelease(here(), '0.12.0'));
       expect(error).toBeInstanceOf(ContractError);
-      expect(error.message).toEndWith('(if its output says npm wasn\'t found, the service that runs the host needs a PATH that ' +
-        'has npm). Its output ends:\nExecutable not found in $PATH: "npm"');
+      expect(error.message).toEndWith('(if its output says npm isn\'t in the PATH, as Bun\'s "Executable not found in $PATH" ' +
+        'does, the service that runs the host needs a PATH that has npm). Its output ends:\nExecutable not found in $PATH: "npm"');
     });
     expect(installed()).toEqual(['0.11.0']);
   });
@@ -372,8 +384,8 @@ describe('installing a release beside the running one', () => {
       expect(error.message).toBe(`${JSON.stringify(version)} isn't an exact version of @animalabs/connectome-host, such as 0.12.0.`);
     }
     const working = await failure(installRelease(here(), '0.12.0-rc.tmp', manager()));
-    expect(working.message).toBe("0.12.0-rc.tmp ends in .tmp, which names the install's own unfinished work in releases/, so " +
-      "it can't be installed here.");
+    expect(working.message).toBe("0.12.0-rc.tmp ends in .tmp, which names unfinished work in releases/, so it can't be " +
+      'installed here.');
     const running = await failure(installRelease(here(), '0.11.0', manager()));
     expect(running.message).toBe('This host already runs 0.11.0.');
     expect(calls).toEqual([]);
@@ -382,15 +394,48 @@ describe('installing a release beside the running one', () => {
 
   test('syncs every file and directory it installed before its rename, and the releases directory after', async () => {
     const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
-    const seen = await steps(() => installRelease(here(), '0.12.0', manager()));
+    const seen = await steps(() => installRelease(here(), '0.12.0', manager({ files: 40 })));
     const at = (step: string) => seen.indexOf(step);
     const renamed = at(`rename ${tmp}`);
     for (const path of [join(tmp, 'package.json'), join(tmp, 'package-lock.json'), join(tmp, HOST_ENTRY), join(tmp, LAUNCHER),
       join(tmp, RELEASE_HOST, 'package.json'), join(tmp, RELEASE_HOST, 'src', 'update'), join(tmp, 'node_modules'), tmp]) {
-      expect(at(`sync ${path}`)).toBeGreaterThan(-1);
-      expect(at(`sync ${path}`)).toBeLessThan(renamed);
+      expect(at(`synced ${path}`)).toBeGreaterThan(-1);
+      expect(at(`synced ${path}`)).toBeLessThan(renamed);
     }
+    // More entries than SYNC_WIDTH, each synced through fs/promises and its handle closed, all before the rename,
+    // and no entry of the tree by a sync call.
+    const extra = Array.from({ length: 40 }, (_, i) => join(tmp, 'node_modules', 'many', `f${i}`));
+    for (const path of extra) {
+      expect(at(`synced ${path}`)).toBeGreaterThan(-1);
+      expect(at(`synced ${path}`)).toBeLessThan(renamed);
+    }
+    const synced = seen.filter((step) => step.startsWith('synced '));
+    expect(synced.length).toBeGreaterThan(40);
+    for (const step of synced) {
+      expect(at(step.replace('synced', 'closed'))).toBeGreaterThan(-1);
+      expect(at(step.replace('synced', 'closed'))).toBeLessThan(renamed);
+    }
+    expect(seen.filter((step) => step.startsWith(`sync ${tmp}`))).toEqual([]);
     expect(seen.slice(renamed + 1)).toEqual([`sync ${installPaths(root).releases}`]);
+  });
+
+  test('a sync that fails leaves no tmp, and throws its own error', async () => {
+    const tmp = `${releaseDir(root, '0.12.0')}.tmp`;
+    const open = fsp.open;
+    const spy = spyOn(fsp, 'open').mockImplementation((async (path: fs.PathLike, ...rest: unknown[]) => {
+      if (String(path) === join(tmp, HOST_ENTRY)) throw Object.assign(new Error('EIO: i/o error, open'), { code: 'EIO' });
+      return (open as (...a: unknown[]) => Promise<fsp.FileHandle>)(path, ...rest);
+    }) as typeof fsp.open);
+    let error: Error;
+    try {
+      error = await failure(installRelease(here(), '0.12.0', manager()));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(error).not.toBeInstanceOf(ContractError);
+    expect(error.message).toBe('EIO: i/o error, open');
+    await Bun.sleep(50);
+    expect(installed()).toEqual(['0.11.0']);
   });
 
   test('a reuse syncs the releases directory, so a retry makes the sync a failed call didn\'t', async () => {
@@ -589,6 +634,50 @@ describe('removing releases nothing needs', () => {
     expect(installed()).toEqual(['0.11.0', '0.12.0']);
   });
 
+  test('a .tmp is removed after releases/ is synced, and once though it holds a host', async () => {
+    release('0.9.0');
+    release('0.8.0.tmp');
+    const cut = join(installPaths(root).releases, '0.8.0.tmp');
+    const seen = await steps(() => installRelease(here(), '0.12.0', manager()));
+    const removals = seen.flatMap((step, at) => step === `rm ${cut}` ? [at] : []);
+    expect(removals).toHaveLength(1);
+    expect(seen[removals[0]! - 1]).toBe(`sync ${installPaths(root).releases}`);
+    expect(installed()).toEqual(['0.11.0', '0.12.0']);
+    expect(said).toEqual([]);
+  });
+
+  test('a second install while the first is in its prune is refused and removes nothing', async () => {
+    release('0.9.0');
+    release('0.8.0');
+    let hold!: () => void;
+    let held!: () => void;
+    const inRm = new Promise<void>((done) => { held = done; });
+    const rm = fsp.rm;
+    let first = true;
+    const spy = spyOn(fsp, 'rm').mockImplementation((async (target: fs.PathLike, options?: fs.RmOptions) => {
+      if (first) {
+        first = false;
+        held();
+        await new Promise<void>((done) => { hold = done; });
+      }
+      return rm(target, options);
+    }) as typeof fsp.rm);
+    try {
+      const installing = installRelease(here(), '0.12.0', manager());
+      await inRm;
+      const before = installed();
+      const second = await failure(installRelease(here(), '0.13.0', manager()));
+      expect(second.message).toStartWith('An install of 0.12.0 is under way.');
+      expect(installed()).toEqual(before);
+      expect(calls).toEqual([]);
+      hold();
+      await installing;
+    } finally {
+      spy.mockRestore();
+    }
+    expect(installed()).toEqual(['0.11.0', '0.12.0']);
+  });
+
   test('a release that can\'t be removed is reported and never taken for a release, and the next install removes it', async () => {
     release('0.9.0');
     release('0.10.0');
@@ -601,8 +690,8 @@ describe('removing releases nothing needs', () => {
       spy.mockRestore();
     }
     expect(installed()).toEqual(['0.11.0', '0.12.0', '0.9.0.tmp']);
-    expect(said).toEqual([`[update] ${releaseDir(root, '0.9.0')}, which nothing needs, couldn't be removed, and the next ` +
-      `install tries again: EBUSY: resource busy or locked, rmdir '${stuck}'`]);
+    expect(said).toEqual([`[update] ${stuck}, which nothing needs, couldn't be removed, and the next install tries again: ` +
+      `EBUSY: resource busy or locked, rmdir '${stuck}'`]);
     // What the removal left isn't a release, so installing 0.9.0 installs it whole.
     await installRelease(here(), '0.9.0', manager());
     expect(calls.map(({ cwd }) => cwd)).toEqual([`${releaseDir(root, '0.12.0')}.tmp`, stuck]);

@@ -34,8 +34,8 @@ export const PACKAGE = '@animalabs/connectome-host';
 /** An exact version as npm publishes one: release numbers, then any prerelease. */
 const EXACT = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?$/;
 
-/** The suffix of the install's own unfinished work in `releases/`: an install
- *  under way, and a release renamed aside for its removal. */
+/** The suffix of unfinished work in `releases/`: an install under way,
+ *  setup's first copy, and a release renamed aside for its removal. */
 const WORKING = '.tmp';
 
 /** The lockfiles a release may hold, each with the manager that writes it, in
@@ -81,8 +81,8 @@ export async function installRelease(here: ReleaseHere, version: string, ops: In
     throw new ContractError(`${JSON.stringify(version)} isn't an exact version of ${PACKAGE}, such as 0.12.0.`);
   }
   if (version.endsWith(WORKING)) {
-    throw new ContractError(`${version} ends in ${WORKING}, which names the install's own unfinished work in ` +
-      'releases/, so it can\'t be installed here.');
+    throw new ContractError(`${version} ends in ${WORKING}, which names unfinished work in releases/, so it ` +
+      'can\'t be installed here.');
   }
   if (version === here.release) throw new ContractError(`This host already runs ${version}.`);
   if (underWay !== null) {
@@ -153,8 +153,8 @@ async function installInto(tmp: string, running: string, version: string, ops: I
     const tail = output.length > OUTPUT_TAIL ? `…${output.slice(-OUTPUT_TAIL)}` : output;
     const how = status !== null ? `exited ${status}`
       : 'gave no exit status, so it couldn\'t start or was stopped by a signal' +
-        (manager === 'npm' ? ' (if its output says npm wasn\'t found, the service that runs the host needs a PATH that ' +
-          'has npm)' : '');
+        (manager === 'npm' ? ' (if its output says npm isn\'t in the PATH, as Bun\'s "Executable not found in $PATH" ' +
+          'does, the service that runs the host needs a PATH that has npm)' : '');
     throw new ContractError(`Installing ${version} failed, so it isn't installed: \`${command}\` ${how}. Its output ` +
       `ends:\n${tail.trimEnd()}`);
   }
@@ -230,15 +230,16 @@ async function syncTree(dir: string): Promise<void> {
  *  has damaged it. Then, or when one of them can't be read, it says so and
  *  removes only what cuts left, keeping the names it could read.
  *
- *  A `.tmp` nothing keeps is what an install or a removal cut off left.
- *  installRelease refuses a version so named, so only setup could make a
- *  release that is, and one that's kept stays. A release is renamed to one
- *  before its removal, and the rename synced, so a removal cut short never
- *  leaves part of a release under its own name; and releases/ is synced
- *  before a `.tmp` is removed, since its rename aside may not have been. A
- *  removal that fails is reported, and the install goes on, since nothing
- *  needs what it would have removed. Anything else in `releases/`, which
- *  nothing the update does puts there, is left alone. */
+ *  A `.tmp` nothing keeps is what an install, a removal or setup's first copy
+ *  cut off left, and is removed whatever it holds. installRelease refuses a
+ *  version so named, so only setup could make a release that is, and one
+ *  that's kept stays. A release is renamed to a `.tmp` before its removal,
+ *  and the rename synced, so a removal cut short never leaves part of a
+ *  release under its own name; and releases/ is synced before a `.tmp` is
+ *  removed, since its rename aside may not have been. A removal that fails
+ *  is reported where what's left stands, and the install goes on, since
+ *  nothing needs what it would have removed. Anything else in `releases/`,
+ *  which nothing the update does puts there, is left alone. */
 async function prune(here: ReleaseHere, version: string, ops: InstallOps): Promise<void> {
   const paths = installPaths(here.root);
   const keep = new Set([here.release, version]);
@@ -272,12 +273,15 @@ async function prune(here: ReleaseHere, version: string, ops: InstallOps): Promi
   for (const name of new Set([...cut, ...unneeded])) {
     const path = join(paths.releases, name);
     const aside = name.endsWith(WORKING) ? path : `${path}${WORKING}`;
+    // Where it stands, which a failure reports.
+    let at = path;
     try {
       if (aside !== path) renameSync(path, aside);
+      at = aside;
       syncPath(paths.releases);
       await fsp.rm(aside, { recursive: true, force: true });
     } catch (error) {
-      ops.report(`[update] ${path}, which nothing needs, couldn't be removed, and the next install tries again: ` +
+      ops.report(`[update] ${at}, which nothing needs, couldn't be removed, and the next install tries again: ` +
         errorText(error));
     }
   }
