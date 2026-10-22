@@ -5,8 +5,9 @@
     holds when the check of disk before them decided nothing, because the
     selected branch kept changing while it ran, and say to make the same
     call again. For a path the workspace doesn't hold, where that check
-    decided nothing, `delete`, `edit`, `edit_many` and `readBinary` now say
-    disk couldn't be checked, where they answered "File not found".
+    decided nothing, `delete`, `edit`, `edit_many` and the workspace's
+    `readBinary` method now say disk couldn't be checked, where they
+    answered "File not found".
   - **A turn's tool results share the readers' per-message bound** when they
     pass it together, each taking an equal share, where a later result was
     cut or left out without a word. A cut result's notice, which names the
@@ -17,12 +18,14 @@
     strategy renders it as the newest of its window, where it was injected
     whole, so one over `maxMessageTokens` or with more images than
     `maxLiveImages` no longer makes the next request differ from what the
-    live stream carried. A strategy without that render still gets the
-    message as stored, and nothing is injected mid-turn on the
-    `anthropic-xml` formatter. A message the next compile won't send among
-    its newest isn't injected: a stored `[not shown]` line tells the agent
-    who sent it, its size, and the `history--extract` call that reads it, or
-    its id where the agent isn't shown that tool.
+    live stream carried. On the `frontdesk` strategy, a server's message
+    that the server didn't attribute is still injected without the
+    provenance header the next compile adds (#423). A strategy without
+    that render still gets the message as stored, and nothing is injected
+    mid-turn on the `anthropic-xml` formatter. A message the next compile
+    won't send among its newest isn't injected: a stored `[not shown]` line
+    tells the agent who sent it, its size, and the `history--extract` call
+    that reads it, or its id where the agent isn't shown that tool.
   - **`channel_close` refuses a tuned-out channel,** as `channel_open` and
     `channel_decline` do, and says to cancel the tune-out first, which
     delivers what it diverted. A tune-out on record where there's no
