@@ -24,6 +24,7 @@ import {
 import { BranchPanel } from './Branches';
 import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone, quotaUnreadable } from './quota';
 import { planHealthAlerts } from './health-alerts';
+import { healthReadError } from '@conhost/web/health-lookup';
 import {
   AGENT_TREE_SCOPES,
   WEB_PROTOCOL_VERSION,
@@ -340,8 +341,8 @@ export function App() {
           setHealthErr('403');
           return;
         }
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `HTTP ${res.status}`);
+        const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+        throw new Error(healthReadError(res.status, body));
       }
       const h = (await res.json()) as HealthSnapshot;
       if (scope !== panelScope()) return; // scope switched mid-flight — stale

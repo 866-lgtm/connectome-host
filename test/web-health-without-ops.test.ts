@@ -8,7 +8,7 @@
  */
 import { describe, expect, test } from 'bun:test';
 import { CREDENTIAL_STRINGS, HEALTH_STRINGS, QUOTA_STRINGS, keepNamedStrings, type KeptStrings } from '../src/modules/web-ui-observers.js';
-import { credentialNote, healthEntry, lastActionText, readFailureLine } from '../src/web/health-lookup.js';
+import { credentialNote, healthEntry, healthReadError, lastActionText, readFailureLine } from '../src/web/health-lookup.js';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt } from '../src/web/compression-debt.js';
 import type { CallLedgerRow, QuotaSnapshotData } from '../src/web/protocol.js';
 import { planHealthAlerts } from '../web/src/health-alerts';
@@ -89,6 +89,13 @@ describe('the health panel, with health and without ops', () => {
     // it comes only with the message.
     expect(debtNextStep(debt(whole))).toBeDefined();
     expect(debtNextStep(debt(bare))).toBeUndefined();
+  });
+
+  test('a /healthz read that failed whole still shows as failed, by its status when its error comes empty', () => {
+    expect(healthReadError(500, { error: TEXT.read })).toBe(TEXT.read);
+    expect(healthReadError(500, { error: '' })).toBe('HTTP 500');
+    expect(healthReadError(502, null)).toBe('HTTP 502');
+    expect(healthReadError(503, { error: 7 })).toBe('HTTP 503');
   });
 
   test('a failed call is still a failed call, and a cache hit keeps its cause', () => {

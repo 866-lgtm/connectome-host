@@ -23,6 +23,13 @@ export function readFailureLine(section: string, message: string): string {
   return message ? `${section} couldn't be read: ${message}` : `${section} couldn't be read`;
 }
 
+/** What the panel says when /healthz answers with a failure: the answer's
+ *  error when it has words, and otherwise its status, since an observer
+ *  without 'ops' gets a failed read's error empty. */
+export function healthReadError(status: number, body: { error?: unknown } | null): string {
+  return typeof body?.error === 'string' && body.error ? body.error : `HTTP ${status}`;
+}
+
 /** The line under the credential's kind: its message, while the state isn't
  *  ok and the snapshot carries the text (an observer without 'ops' gets it
  *  empty, and then there's no line). */
