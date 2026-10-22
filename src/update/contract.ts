@@ -202,7 +202,7 @@ export interface Mark {
 }
 
 export const JOURNAL_STEPS = [
-  'lock', 'children-check', 'audit', 'copy', 'trial-start', 'commit', 'fallback', 'go-back', 'notes',
+  'lock', 'children-check', 'copy', 'trial-start', 'commit', 'fallback', 'go-back', 'notes',
 ] as const;
 export type JournalStep = typeof JOURNAL_STEPS[number];
 

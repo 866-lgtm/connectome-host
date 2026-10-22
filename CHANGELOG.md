@@ -6,6 +6,39 @@ release time — see [CONTRIBUTING.md](CONTRIBUTING.md#changelog).
 
 ## Unreleased
 
+## 0.12.1 — 2026-10-22
+
+### Fixed
+
+- Makeup panel: on provider `anthropic`, the exact `count_tokens` figure
+  counts earlier turns' server-tool blocks (web search and the like), which
+  membrane 0.6.0 sends back with every later request. 0.12.0's figure left
+  them out, so it ran low from a server-tool turn on.
+
+- A host notice that can't be posted because its channel isn't registered,
+  or its server is gone, connecting or down, or because the connection
+  refused it before writing anything, is kept and posted if the server
+  reconnects, as the notices module means to do while a chat server is
+  simply not up. It reads agent-framework's refusal `reason` for this,
+  since 0.24's refusals no longer say `not found`, which it matched before.
+  A notice refused while its server was down and being reconnected is now
+  kept, where it was dropped. A first post refused for any other reason is
+  logged and not kept, as before.
+
+- Lesson retrieval no longer picks lessons from messages in a tuned-out
+  channel. It reads the last ten messages the residents are shown, leaving
+  out those a tune-out holds from them, as it already left out writes the
+  framework still holds.
+
+- When a voice client reports an interruption, the TTS relay edits only a
+  message the agent's prose published, as agent-framework's
+  `inference:published` reports it. It took its edit targets from
+  `mcpl:speech-routed`, which also reports publishes that aren't the
+  agent's prose, such as the `sleep` tool's announcement and a
+  subconscious's `speak_in_channel`, so an interruption could edit one of
+  those, or trim nothing when the newest of them was a post with no message
+  id.
+
 ## 0.12.0 — 2026-10-22
 
 ### Breaking

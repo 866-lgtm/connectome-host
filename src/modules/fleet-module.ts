@@ -40,7 +40,7 @@ import { loadRecipe } from '../recipe.js';
 import { REDUCER_REQUIRED_EVENTS } from '../state/agent-tree-reducer.js';
 import { parseCommand } from '../command-name.js';
 import { unknownToolResult } from './unknown-tool.js';
-import { INSTALL_ROOT_ENV, readRecord, writeJsonAtomic, type ChildrenFile } from '../update/contract.js';
+import { INSTALL_ROOT_ENV, isChildEntry, readRecord, writeJsonAtomic, type ChildrenFile } from '../update/contract.js';
 
 /**
  * Cross-process telemetry the parent host needs from every child, on top of
@@ -279,8 +279,10 @@ function withLaunchFailure(failure: string, exit: string): string {
 /** A spawn's error as a record and the agent read it, with its code. Node's
  *  and Bun's ERR_INVALID_ARG_* messages end with the value they refused
  *  (" Received …"), which for an env value may be a secret, and exitReason is
- *  persisted, so the text stops before it, or is the code alone. */
-function spawnErrorText(err: unknown): string {
+ *  persisted, so the text stops before it, or is the code alone. The store
+ *  audit (src/update/audit-stores.ts) writes a child audit's spawn error by it
+ *  too. */
+export function spawnErrorText(err: unknown): string {
   const code = (err as NodeJS.ErrnoException | null)?.code;
   const message = err instanceof Error ? err.message : String(err);
   if (typeof code === 'string' && code.startsWith('ERR_INVALID_ARG')) {
@@ -315,13 +317,34 @@ function spawnCause(err: unknown): 'runtime' | 'configuration' | 'other' {
 // Module
 // ---------------------------------------------------------------------------
 
-/** Whether a children file's entry has a child's shape (ChildrenFile): a
- *  write reads only those as children, and keeps anything else as it is. */
-function isChildEntry(entry: unknown): entry is ChildrenFile['children'][number] {
-  if (typeof entry !== 'object' || entry === null) return false;
-  const e = entry as Record<string, unknown>;
-  return typeof e.name === 'string' && typeof e.dataDir === 'string' &&
-    (e.pid === null || typeof e.pid === 'number') && (e.bootId === null || typeof e.bootId === 'string');
+/** Where the fleet keeps a child's data: the dataDir its entry or launch
+ *  gives, or else `data/<name>`, resolved from the directory this host started
+ *  in. Resolved, so two spellings of one path, such as one with a trailing
+ *  slash or a `..`, are recorded and compared as one. Resolving is lexical: a
+ *  path through a symlink is another path. The store audit
+ *  (src/update/audit-stores.ts) finds a child's directory by it too. */
+export function fleetChildDataDir(child: { name: string; dataDir?: string }): string {
+  return resolve(process.cwd(), child.dataDir || join('data', child.name));
+}
+
+/** The environment the fleet starts a child with: this host's, the child's
+ *  own env over it (only a recipe's entry gives one), and the time zone and
+ *  data directory the fleet gives every child, without
+ *  CONNECTOME_INSTALL_ROOT. The child runs the parent's own entry, which is
+ *  an install's entry when the parent is the install's host; without the
+ *  variable, releaseHere finds no install, so the child neither commits a
+ *  release nor keeps the install's files (src/update/contract.ts), whoever
+ *  set it. The store audit (src/update/audit-stores.ts) audits a child's
+ *  stores in this environment too. */
+export function fleetChildEnv(
+  env: NodeJS.ProcessEnv,
+  childEnv: Record<string, string> | undefined,
+  timeZone: string,
+  dataDir: string,
+): NodeJS.ProcessEnv {
+  const childsEnv: NodeJS.ProcessEnv = { ...env, ...childEnv, AGENT_TIMEZONE: timeZone, DATA_DIR: dataDir };
+  delete childsEnv[INSTALL_ROOT_ENV];
+  return childsEnv;
 }
 
 export class FleetModule implements Module {
@@ -633,7 +656,8 @@ export class FleetModule implements Module {
     if (this.childrenFile === null) return [];
     let file: ChildrenFile | null;
     const fix = 'Replacing it would drop the children it lists, which an update reads to see which may still be ' +
-      'running, so every launch fails this way until whoever runs this host fixes it, or removes it once no child ' +
+      'running, so every launch that spawns a child fails this way until whoever runs this host fixes it, or ' +
+      'removes it once no child ' +
       'it lists is running';
     try {
       file = readRecord<ChildrenFile>(this.childrenFile, 'file');
@@ -1532,10 +1556,7 @@ export class FleetModule implements Module {
       // Recipe couldn't be loaded — defer to the natural spawn-time failure.
     }
 
-    // Resolved, so two spellings of one path, such as one with a trailing
-    // slash or a `..`, are recorded and compared as one. Resolving is
-    // lexical: a path through a symlink is another path.
-    const dataDir = resolve(process.cwd(), input.dataDir || join('data', input.name));
+    const dataDir = fleetChildDataDir(input);
 
     const socketPath = join(dataDir, 'ipc.sock');
     const subscription = input.subscription ?? this.config.defaultSubscription;
@@ -1754,17 +1775,6 @@ export class FleetModule implements Module {
     const { fd: startupFd, log: startupLog } = openStartupLog(join(dataDir, 'startup.log'),
       `\n--- launch ${new Date().toISOString()} recipe=${recipePath} pid=parent:${process.pid} ---\n`);
 
-    const env: NodeJS.ProcessEnv = {
-      ...process.env,
-      ...input.env,
-      AGENT_TIMEZONE: this.config.timeZone,
-      DATA_DIR: dataDir,
-    };
-    // Without the variable, a child finds no install though it runs its
-    // parent's entry, so it isn't the install's host: it neither commits a
-    // release nor keeps the install's files (src/update/contract.ts), whoever
-    // set the variable.
-    delete env[INSTALL_ROOT_ENV];
     let proc: ChildProcess | undefined;
     try {
       proc = spawnProcess(
@@ -1773,7 +1783,7 @@ export class FleetModule implements Module {
         {
           detached: true,
           stdio: startupFd !== null ? ['ignore', startupFd, startupFd] : 'ignore',
-          env,
+          env: fleetChildEnv(process.env, input.env, this.config.timeZone, dataDir),
         },
       );
     } catch (err) {

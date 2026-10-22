@@ -74,8 +74,8 @@ import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
 import { startFramework } from './start-framework.js';
-import { releaseHere, type ReleaseHere } from './update/host.js';
-import { childrenFilePath } from './update/contract.js';
+import { currentForStart, releaseHere, type ReleaseHere } from './update/host.js';
+import { childrenFilePath, trialPlaces } from './update/contract.js';
 import { switchSessionSteps } from './session-switch.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
@@ -94,12 +94,13 @@ import {
   resolveProvider,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, membraneCachingOverride, recipeModel } from './framework-agent-config.js';
 import { buildFrameworkStrategy, buildConversationsConfig } from './framework-strategy.js';
+import { AUDIT_STORES_FLAG, auditStoresFromEntry, checkActiveStore, placesOnTrial } from './update/audit-stores.js';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { quarantineAlarm, type QuarantineStatus } from './web/quarantine-alert.js';
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
-import { loadExtensions } from './extensions.js';
+import { loadExtensions, type ExtensionRegistry } from './extensions.js';
 import { QuotaMeter, AnthropicOAuthQuotaSource, CodexQuotaSource, quotaProviderHold } from './quota-meter.js';
 import { stopForSessionSwitch } from './session-switch-stop.js';
 
@@ -254,8 +255,7 @@ function stopAtSavedRecipe(failedTo: string, err: unknown): never {
 // ---------------------------------------------------------------------------
 
 function resolveModel(recipe: Recipe): string {
-  return config.model || recipe.agent.model ||
-    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+  return recipeModel(recipe, config.model);
 }
 
 /** The host's one NoticesModule, kept across session switches (see createFramework). */
@@ -276,6 +276,7 @@ async function createFramework(
   quotaMeter: QuotaMeter | null,
   credentials: CredentialMonitor | null,
   subscriptionUnmetered = false,
+  extensions?: ExtensionRegistry,
 ): Promise<AgentFramework> {
   const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
@@ -284,7 +285,10 @@ async function createFramework(
   // Load recipe extensions first — custom strategies must be registered
   // before buildFrameworkStrategy runs, and custom modules join the module
   // list below. The loader is a dumb local import; see src/extensions.ts.
-  const extensionRegistry = await loadExtensions(recipe);
+  // The start's own framework takes the ones main() loaded, which a trial's
+  // audit uses too; a session switch, once the framework before has stopped,
+  // loads them again.
+  const extensionRegistry = extensions ?? await loadExtensions(recipe);
 
   // -- Build module list --
   // SettingsModule is constructed in main() (before the adapter, so the
@@ -990,8 +994,16 @@ function countLines(path: string): number {
 let beforeFatalExit: (() => Promise<void>) | undefined;
 
 async function main() {
-  // Before anything else: a host an install's entry point started has to be
-  // one of that install's releases, or it refuses to start (releaseHere).
+  // The store audit runs in place of a host: it opens the stores of the data
+  // directories given as a start of this release would, and starts no agent.
+  // It exits as soon as what it wrote has gone out, since an extension the
+  // saved recipe names can keep the process alive, as a timer can.
+  if (process.argv[2] === AUDIT_STORES_FLAG) {
+    process.exit(await auditStoresFromEntry(process.argv.slice(3)));
+  }
+  // Before anything else a host does: a host an install's entry point started
+  // has to be one of that install's releases, or it refuses to start
+  // (releaseHere).
   installHere = releaseHere();
   const recipe = await resolveRecipe();
   const provider = resolveProvider(recipe);
@@ -1312,6 +1324,20 @@ async function main() {
   });
 
   const storePath = sessionManager.getStorePath(activeSession.id);
+  // On trial, while `current` names another release, the places its fallback
+  // puts back are settled, and the active session's store held to them,
+  // before the framework opens that store, since its open writes in place
+  // like any other: one that reaches past them ends the start having opened
+  // nothing. startFramework audits the rest before the commit.
+  let placesForTrial: string[] | null = null;
+  if (installHere !== null) {
+    const install = installHere;
+    const current = currentForStart(install.root);
+    if (current !== null && current !== install.release) {
+      placesForTrial = placesOnTrial(current, () => trialPlaces(install.root));
+      checkActiveStore(storePath, current, placesForTrial);
+    }
+  }
   // Credential monitor: one named state for the provider credential (spent
   // quota, expiring/expired/rejected token, pending device-code login) and
   // the operator actions that fit it, announced through the ops-alert
@@ -1348,7 +1374,12 @@ async function main() {
     adapter.onProviderSuccess = () => credentials.observeSuccess();
   }
 
-  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
+  // Loaded once for this start: its framework's modules come from them, and
+  // a trial's audit builds its strategies from them while that framework is
+  // alive, making no register() call of its own. (A fleet child's audit, like
+  // the child itself, is a process of its own, which loads its own.)
+  const extensions = await loadExtensions(recipe);
+  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate, extensions);
 
   // Build app context
   const app: AppContext = {
@@ -1416,7 +1447,12 @@ async function main() {
     };
   }
 
-  await startFramework(framework, installHere);
+  await startFramework(framework, installHere, {
+    dataDir: config.dataDir,
+    activeStore: storePath,
+    extensions,
+    places: () => placesForTrial ?? (installHere === null ? null : trialPlaces(installHere.root)),
+  });
   setupSynesthete(app);
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);
