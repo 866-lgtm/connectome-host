@@ -13,7 +13,7 @@
 
 import { readFileSync, writeFileSync, existsSync, lstatSync, statSync, mkdirSync, rmSync, chmodSync } from 'node:fs';
 import { dirname, isAbsolute, resolve } from 'node:path';
-import { WorkspaceModule, type CodeExecutionConfig, type MountConfig } from '@animalabs/agent-framework';
+import { resolveClockConfig, WorkspaceModule, type ClockConfig, type CodeExecutionConfig, type MountConfig } from '@animalabs/agent-framework';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
@@ -336,6 +336,16 @@ export interface RecipeAgent {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Default-off containment of whole-response prose wrappers for known tools. */
   toolWrapperProseGuard?: boolean;
+  /**
+   * Clock rows (agent-framework `AgentConfig.clock`; off when omitted): e.g.
+   * `{ "intervalMinutes": 10 }`, or `{ "intervalSeconds": 15 }` for clocks
+   * finer than a minute, with optional `"precision": "minutes" | "seconds"`.
+   * When a boundary of the interval on the agent's local wall clock (in
+   * `timezone`) has passed, the window takes one `Clock: 10:50 Europe/Berlin
+   * (UTC+02:00)` row before what it takes next, mid-turn after a tool
+   * round's results included.
+   */
+  clock?: ClockConfig;
   /**
    * Extra Anthropic beta flags sent as the `anthropic-beta` header on every
    * request (e.g. `["context-1m-2025-08-07"]` for the 1M context window on
@@ -1761,7 +1771,7 @@ const RECIPE_AGENT_KEYS = [
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',
   'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
-  'refusalHandling',
+  'refusalHandling', 'clock',
 ] as const;
 const RECIPE_AGENT_MOCK_KEYS = [
   'echoMode', 'defaultResponse', 'completeDelayMs', 'streamChunkDelayMs', 'streamChunkSize',
@@ -2052,6 +2062,22 @@ export function validateRecipe(raw: unknown): Recipe {
 
   if (agent.toolWrapperProseGuard !== undefined && typeof agent.toolWrapperProseGuard !== 'boolean') {
     throw new Error(`Recipe agent.toolWrapperProseGuard must be a boolean, got ${JSON.stringify(agent.toolWrapperProseGuard)}.`);
+  }
+
+  if (agent.clock !== undefined) {
+    if (!agent.clock || typeof agent.clock !== 'object' || Array.isArray(agent.clock)) {
+      throw new Error(`Recipe agent.clock must be an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
+    }
+    const unknown = Object.keys(agent.clock).filter((k) => !['intervalMinutes', 'intervalSeconds', 'precision'].includes(k));
+    if (unknown.length > 0) {
+      throw new Error(`Recipe agent.clock has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes intervalMinutes, intervalSeconds and precision.`);
+    }
+    // The framework's own rules, so a recipe fails here rather than at boot.
+    try {
+      resolveClockConfig('recipe', agent.clock);
+    } catch (err) {
+      throw new Error((err as Error).message.replace('Agent "recipe" clock', 'Recipe agent.clock'));
+    }
   }
 
   if (agent.timezone !== undefined) {

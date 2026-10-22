@@ -91,6 +91,18 @@ naming it.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
 
+`agent.clock` (off when omitted) gives the agent clock rows in that zone:
+with `{ "intervalMinutes": 10 }`, once a ten-minute boundary of its local
+wall clock has passed, the window takes one `Clock: 10:50 Europe/Berlin
+(UTC+02:00)` row before whatever it takes next: an incoming message, the
+start of a turn (a silent heartbeat tick too), or, mid-turn, the results of
+a tool round. Only the latest boundary is written. It reads the boundary's
+time where that boundary falls among the rows, and the time it is written
+where it can't (after a tool round that spanned it), and it shows the date
+when the day has changed. `{ "intervalSeconds": 15 }` gives clocks finer
+than a minute (read to the second; `"precision": "seconds"` asks for that
+at any interval).
+
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
 the autobiographical memory strategy with adaptive resolution, **kv-unified
 folding** (a cost-aware solver that weighs budget fit, prompt-cache cost and

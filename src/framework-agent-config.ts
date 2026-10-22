@@ -148,5 +148,6 @@ export function buildFrameworkAgentConfig(
     ...(recipe.agent.toolWrapperProseGuard !== undefined
       ? { toolWrapperProseGuard: recipe.agent.toolWrapperProseGuard }
       : {}),
+    ...(recipe.agent.clock !== undefined ? { clock: recipe.agent.clock } : {}),
   };
 }
