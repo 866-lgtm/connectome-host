@@ -85,19 +85,45 @@ describe('AgentTreeReducer', () => {
     expect(node.completedAt).toBe(ts(1));
   });
 
-  test('inference:exhausted from in-band stream abort also produces cancelled (P1 #3)', () => {
-    // Postmortem 2026-05-28 F1: AF used to emit inference:exhausted for
-    // budget-restart / stream-side cancel paths. Same semantics as aborted —
-    // benign termination, not a fault. AF PR #55 (≥ 0.6.5) suppresses the
-    // endTurn/budget-restart cases at the source, but genuine cancels and
-    // reboot-induced exhausted still arrive, and the mapping must keep
-    // handling streams from older AF.
+  test('inference:exhausted ends a node as failed, after a failure and alone', () => {
+    // From agent-framework 0.22.3 a stop and a shutdown end a turn with
+    // inference:aborted alone, so exhausted means the turn failed for good:
+    // its retries were spent, or its stream was aborted for another reason.
     const r = new AgentTreeReducer();
     r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
-    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'budget', timestamp: ts(1) });
-    const node = r.getNode('a')!;
+    r.applyEvent({ type: 'inference:failed', agentName: 'a', error: 'overloaded', timestamp: ts(1) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'overloaded', timestamp: ts(2) });
+    r.applyEvent({ type: 'inference:started', agentName: 'b', timestamp: ts(0) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'b', error: 'Stream aborted: timeout', timestamp: ts(1) });
+    for (const name of ['a', 'b']) {
+      const node = r.getNode(name)!;
+      expect(node.phase).toBe('failed');
+      expect(node.status).toBe('failed');
+    }
+    expect(r.getNode('a')!.completedAt).toBe(ts(2));
+  });
+
+  test('an inference:exhausted after inference:aborted leaves the stop cancelled until the next start', () => {
+    // Before agent-framework 0.22.3 a stop through abortInference sent
+    // inference:aborted and then inference:exhausted. A fleet child this host
+    // adopted may still run such a version, and the fleet tree folds its
+    // events through this reducer.
+    const r = new AgentTreeReducer();
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
+    r.applyEvent({ type: 'inference:aborted', agentName: 'a', reason: 'user', timestamp: ts(1) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'stream cancelled', timestamp: ts(2) });
+    let node = r.getNode('a')!;
     expect(node.phase).toBe('cancelled');
     expect(node.status).toBe('cancelled');
+    expect(node.completedAt).toBe(ts(1));
+    expect(node.lastEventAt).toBe(ts(2));
+    // The next turn starts afresh, so an exhausted there fails it.
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(3) });
+    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'overloaded', timestamp: ts(4) });
+    node = r.getNode('a')!;
+    expect(node.phase).toBe('failed');
+    expect(node.status).toBe('failed');
+    expect(node.completedAt).toBe(ts(4));
   });
 
   test('inference:turn_ended is terminal in its own right (AF PR #55: no trailing exhausted)', () => {
@@ -113,20 +139,6 @@ describe('AgentTreeReducer', () => {
     expect(node.phase).toBe('done');
     expect(node.status).toBe('completed');
     expect(node.completedAt).toBe(ts(1));
-  });
-
-  test('older AF: the exhausted trailing an endTurn re-terminates as cancelled (harmless)', () => {
-    // Pre-0.6.5 streams still deliver turn_ended followed by the spurious
-    // exhausted. The node flips completed → cancelled one event later; both
-    // are terminal-and-benign, so renderers stay correct either way. Pinned
-    // so the compat behavior is a documented choice, not an accident.
-    const r = new AgentTreeReducer();
-    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
-    r.applyEvent({ type: 'inference:turn_ended', agentName: 'a', timestamp: ts(1) });
-    r.applyEvent({ type: 'inference:exhausted', agentName: 'a', error: 'Stream aborted: user', timestamp: ts(2) });
-    const node = r.getNode('a')!;
-    expect(node.phase).toBe('cancelled');
-    expect(node.status).toBe('cancelled');
   });
 
   // Postmortem 2026-05-28 F1: the reducer never transitions status to 'completed'.
@@ -246,47 +258,54 @@ function hasCallIdSideEffect(eventType: string): boolean {
 
 describe('AgentTreeReducer (continued)', () => {
 
-  test('input tokens overwrite (current context size); output/cache accumulate', () => {
+  test('usage samples are running totals: each call counts once, and input is its prompt', () => {
+    // agent-framework forwards membrane's cumulative sample after each call
+    // (see stream-usage.ts); test/stream-usage.test.ts drives a real stream.
     const r = new AgentTreeReducer();
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
     r.applyEvent({
       type: 'inference:usage',
       agentName: 'a',
       tokenUsage: { input: 1000, output: 50, cacheRead: 200, cacheCreation: 100 },
-      timestamp: ts(0),
+      timestamp: ts(1),
     });
     r.applyEvent({
       type: 'inference:usage',
       agentName: 'a',
-      tokenUsage: { input: 1500, output: 80, cacheRead: 300, cacheCreation: 50 },
-      timestamp: ts(1),
+      tokenUsage: { input: 1500, output: 80, cacheRead: 300, cacheCreation: 150 },
+      timestamp: ts(2),
     });
     const tokens = r.getNode('a')!.tokens;
-    expect(tokens.input).toBe(1500);          // overwrite (current context size)
-    expect(tokens.output).toBe(130);          // accumulated
-    expect(tokens.cacheRead).toBe(500);       // accumulated
-    expect(tokens.cacheWrite).toBe(150);      // accumulated
+    expect(tokens.input).toBe(500 + 100 + 50); // the second call's prompt: fresh + cache read + cache write
+    expect(tokens.output).toBe(80);
+    expect(tokens.cacheRead).toBe(300);
+    expect(tokens.cacheWrite).toBe(150);
   });
 
-  test('inference:completed final tokenUsage applies same accumulation rules', () => {
+  test('inference:completed adds only what its usage holds beyond the last sample', () => {
     const r = new AgentTreeReducer();
+    r.applyEvent({ type: 'inference:started', agentName: 'a', timestamp: ts(0) });
     r.applyEvent({
       type: 'inference:usage',
       agentName: 'a',
       tokenUsage: { input: 500, output: 20, cacheRead: 0, cacheCreation: 0 },
-      timestamp: ts(0),
+      timestamp: ts(1),
     });
     r.applyEvent({
       type: 'inference:completed',
       agentName: 'a',
       durationMs: 100,
       tokenUsage: { input: 700, output: 30, cacheRead: 50, cacheCreation: 10 },
-      timestamp: ts(1),
+      timestamp: ts(2),
     });
     const tokens = r.getNode('a')!.tokens;
-    expect(tokens.input).toBe(700);
-    expect(tokens.output).toBe(50);
+    expect(tokens.input).toBe(200 + 50 + 10);
+    expect(tokens.output).toBe(30);
     expect(tokens.cacheRead).toBe(50);
     expect(tokens.cacheWrite).toBe(10);
+    // A completion that repeats the last sample, as agent-framework's does, changes nothing.
+    r.applyEvent({ type: 'inference:completed', agentName: 'a', durationMs: 100, tokenUsage: { input: 700, output: 30, cacheRead: 50, cacheCreation: 10 }, timestamp: ts(3) });
+    expect(r.getNode('a')!.tokens).toEqual(tokens);
   });
 
   test('subagent--spawn tool call creates a child node with parent edge', () => {
@@ -410,8 +429,10 @@ describe('AgentTreeReducer (continued)', () => {
     const snap = r.getSnapshot();
     snap.nodes[0]!.tokens.input = 999;
     snap.nodes[0]!.toolCallsCount = 999;
+    snap.nodes[0]!.streamUsage!.output = 999;
     expect(r.getNode('a')!.tokens.input).toBe(100);
     expect(r.getNode('a')!.toolCallsCount).toBe(0);
+    expect(r.getNode('a')!.streamUsage!.output).toBe(10);
   });
 
   test('reset clears everything', () => {

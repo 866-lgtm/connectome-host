@@ -11,7 +11,16 @@
 // usage, and content-block shape (type + size per block) on every call.
 //
 // Each line: { type: 'call'|'error', kind: 'complete'|'stream', timestamp,
-//   durationMs, requestSummary, response?, rawRequest?, error? }
+//   durationMs, requestSummary, response?, rawRequest?, error?, errorType?,
+//   httpStatus?, providerErrorCode?, retryable?, errorChars?, truncated? }
+// A failure's `error` is { name, message } with its text bounded, or a
+// non-Error's text (logging-error-fields.ts). A record whose request or
+// response couldn't be summarized keeps only the head fields and, for a
+// failure, the error (summaryUnavailable: true). Every line, newline
+// included, stays within the shared 16 MiB UTF-8 cap (logging-record.ts):
+// an oversized or unserializable record drops the raw request first, then
+// its summaries (`truncated` says what was dropped). Logging never changes
+// what the caller gets: it runs after the provider call, outside its try.
 
 import { BedrockAdapter } from '@animalabs/membrane';
 import type {
@@ -21,6 +30,8 @@ import type {
   StreamCallbacks,
 } from '@animalabs/membrane';
 import { appendFileSync } from 'node:fs';
+import { describeErrorObject } from './logging-error-fields.js';
+import { serializeRecord } from './logging-record.js';
 
 type BedrockConfig = ConstructorParameters<typeof BedrockAdapter>[0];
 
@@ -74,9 +85,45 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
 
   private log(record: Record<string, unknown>): void {
     try {
-      appendFileSync(this.logPath, JSON.stringify(record) + '\n');
+      appendFileSync(this.logPath, serializeRecord(record));
     } catch {
       // Logging must never break inference.
+    }
+  }
+
+  /**
+   * Record one call's outcome. A call failed exactly when `outcome` carries
+   * `error`, whatever its value: a rejection with undefined is a failure too.
+   * A record whose request or response can't be summarized is written
+   * minimal instead (`summaryUnavailable: true`), with its timing and, for a
+   * failure, the bounded error, so the call still has a record. Nothing here
+   * can replace the provider's response or its error.
+   */
+  private recordCall(
+    kind: 'complete' | 'stream',
+    request: ProviderRequest,
+    started: number,
+    rawRequest: unknown,
+    outcome: { response: ProviderResponse } | { error: unknown },
+  ): void {
+    try {
+      const errorFields = 'error' in outcome ? describeErrorObject(outcome.error, false) : undefined;
+      const head = {
+        type: errorFields ? 'error' : 'call', kind,
+        timestamp: new Date(started).toISOString(),
+        durationMs: Date.now() - started,
+      };
+      let record: Record<string, unknown>;
+      try {
+        record = 'response' in outcome
+          ? { ...head, requestSummary: summarizeRequest(request), response: summarizeResponse(outcome.response) }
+          : { ...head, requestSummary: summarizeRequest(request), rawRequest, ...errorFields };
+      } catch {
+        record = { ...head, summaryUnavailable: true, ...errorFields };
+      }
+      this.log(record);
+    } catch {
+      // Logging must never break inference, nor change what it returns or throws.
     }
   }
 
@@ -90,25 +137,16 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
       ...options,
       onRequest: (req) => { rawRequest = req; options?.onRequest?.(req); },
     };
+    let response: ProviderResponse;
     try {
-      const response = await super.complete(request, opts);
-      this.log({
-        type: 'call', kind: 'complete', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        response: summarizeResponse(response),
-      });
-      return response;
+      response = await super.complete(request, opts);
     } catch (error) {
-      this.log({
-        type: 'error', kind: 'complete', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        rawRequest,
-        error: error instanceof Error ? { message: error.message, name: error.name } : String(error),
-      });
+      this.recordCall('complete', request, started, rawRequest, { error });
       throw error;
     }
+    // Outside the try: a logging failure can't be taken for the provider's.
+    this.recordCall('complete', request, started, rawRequest, { response });
+    return response;
   }
 
   override async stream(
@@ -122,24 +160,15 @@ export class LoggingBedrockAdapter extends BedrockAdapter {
       ...options,
       onRequest: (req) => { rawRequest = req; options?.onRequest?.(req); },
     };
+    let response: ProviderResponse;
     try {
-      const response = await super.stream(request, callbacks, opts);
-      this.log({
-        type: 'call', kind: 'stream', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        response: summarizeResponse(response),
-      });
-      return response;
+      response = await super.stream(request, callbacks, opts);
     } catch (error) {
-      this.log({
-        type: 'error', kind: 'stream', timestamp: new Date(started).toISOString(),
-        durationMs: Date.now() - started,
-        requestSummary: summarizeRequest(request),
-        rawRequest,
-        error: error instanceof Error ? { message: error.message, name: error.name } : String(error),
-      });
+      this.recordCall('stream', request, started, rawRequest, { error });
       throw error;
     }
+    // Outside the try: a logging failure can't be taken for the provider's.
+    this.recordCall('stream', request, started, rawRequest, { response });
+    return response;
   }
 }

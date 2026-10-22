@@ -10,7 +10,7 @@
  *   inference:started                  → activation_start
  *   inference:tokens                   → chunk        (visible = blockType 'text')
  *   inference:content_block            → block_start / block_complete
- *   inference:completed                → activation_end reason 'complete'
+ *   inference:completed / :turn_ended  → activation_end reason 'complete'
  *   inference:aborted                  → activation_end reason 'abort'
  *   inference:failed / :exhausted      → activation_end reason 'error'
  *
@@ -45,6 +45,7 @@ import type {
   ToolResult,
   TraceEvent,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 
 // ---------------------------------------------------------------------------
 // Config
@@ -291,7 +292,7 @@ export class TtsRelayModule implements Module {
   getTools(): ToolDefinition[] { return []; }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -418,6 +419,9 @@ export class TtsRelayModule implements Module {
       }
 
       case 'inference:completed':
+      case 'inference:turn_ended':
+        // A turn a tool ended (skip_reply, sleep) ends as completely as one
+        // that streams to its end.
         this.endActivation(event.agentName, 'complete');
         break;
       case 'inference:aborted':

@@ -199,16 +199,36 @@ SESSION_SERVER_TOKEN=<same token the shell daemon was started with>
 HEARTBEAT_CONFIG_FILE=<abs>/data/heartbeat-config.json
 ```
 
-The host reads `.env`, but stdio MCPL servers see only what their recipe entry
-maps in `env` (plus a small system allowlist), e.g.
-`"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`. A variable left only in `.env` is
-unset for the server.
+The host reads `.env`, but a stdio MCPL server sees only what its entry maps
+in `env`, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`, plus a small
+system allowlist, the host's `AGENT_TIMEZONE`, and agent-framework's default
+`DISCORD_SUPPRESSED_REACTIONS_BASELINE` unless the entry sets one with tokens
+(with `inheritEnv: true`, one in the host's own environment counts too). For
+a server defined in `mcpl-servers.json`, that is the file's `env`: a recipe
+can't add env to a file server. A variable left only in `.env` is unset for
+the server, unless its entry (in the recipe or `mcpl-servers.json`) sets
+`inheritEnv: true`, which passes the host's whole environment, `.env` and
+every secret in it included, so prefer mapping the variables a server needs.
+An agent's own overlay can't set `inheritEnv`, `allowHostCommands`,
+`enabledCapabilities` or `toolLifecycle`: the boot leaves them out and
+the startup warnings say so, with where the operator sets each. Only a
+server the recipe defines itself, under an id `mcpl-servers.json` doesn't
+define, carries `allowHostCommands` or `enabledCapabilities`.
 
-**Run the host (headless), supervised:**
+**Run the host (headless), supervised,** from `<agent>-cm/`. Several things
+resolve from the working directory: Bun loads `.env` from it, `data/` is
+`./data` there unless `DATA_DIR` says otherwise, and the host reads
+`mcpl-servers.json` and the agent's `mcpl-servers.agent.json` from it. By
+hand:
 ```bash
+cd ~/connectome-local/<agent>-cm
 bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
   ~/connectome-local/<agent>-cm/recipes/<agent>.json --headless
 ```
+Under a supervisor, the command is the `bun …` line alone, and the unit sets
+the directory: launchd's `WorkingDirectory` key, systemd's
+`WorkingDirectory=`. Neither defaults to it: launchd starts jobs in `/`, and a
+systemd user unit in your home directory.
 - macOS: launchd agent (e.g. `cc.<agent>.agent`) — stop with `launchctl bootout`,
   restart with `launchctl kickstart -k gui/$(id -u)/<label>`.
 - Linux: systemd-user (e.g. `<agent>-agent.service`) —
@@ -218,8 +238,8 @@ bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
 
 ## 6. Runtimes
 
-- **bun** — runs the host (`bun src/index.ts …`).
-- **node ≥ 20** — runs the MCPL servers (node 22 also fine). nvm fine locally.
+- **bun ≥ 1.4.3** — runs the host (`bun src/index.ts …`).
+- **node ≥ 22.12** — builds the Web UI when the host installs, and runs the MCPL servers. nvm fine locally.
 - **Rust toolchain** — only to build `chronicle` from a checkout; the npm
   package ships prebuilt binaries.
 
@@ -251,7 +271,7 @@ bun ~/connectome-local/forking-knowledge-miner/src/index.ts \
   original design for host-owned output routing (why stickiness/`think` live in
   the framework, not in a surface adapter); kept verbatim as history.
 - Output routing: `agent-framework/src/framework.ts` (turn completion →
-  `ChannelRegistry.routeSpeech`), `src/mcpl/channel-registry.ts`.
+  `ChannelRegistry.routeSpeech`), `agent-framework/src/mcpl/channel-registry.ts`.
 - Wake gate: `agent-framework/src/gate/event-gate.ts` (+ recipe `modules.wake`).
 - Discord surface signals (`isExplicitMention` / `isReplyToBot` / `isBot`):
   `discord-mcpl/src/server.ts`.

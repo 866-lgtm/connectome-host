@@ -21,8 +21,8 @@ You watch it all from one terminal.
 
 | Tool / resource | Why | Install / obtain |
 |---|---|---|
-| [Node.js](https://nodejs.org/) 20+ | Runtime for the Zulip MCP server | `nvm install 20` or download from nodejs.org |
-| [Bun](https://bun.sh/) | Runs connectome-host itself | `curl -fsSL https://bun.sh/install \| bash` |
+| [Node.js](https://nodejs.org/) 22.12+ | Builds connectome-host's Web UI when it installs, and runs the Zulip MCP server | `nvm install 22` or download from nodejs.org |
+| [Bun](https://bun.sh/) 1.4.3+ | Runs connectome-host itself | `curl -fsSL https://bun.sh/install \| bash` |
 | [Anthropic API key](https://console.anthropic.com/) | LLM access for all four agents | Sign up at console.anthropic.com — note that four agents run concurrently, so expect proportionally higher API spend |
 | A Zulip account with admin access | Needed to create a bot and a dedicated channel | Your organization's Zulip |
 | Git | To clone connectome-host and the Zulip MCP server | Usually pre-installed |
@@ -183,7 +183,7 @@ To disable: remove the `gitlab` block from `recipes/knowledge-miner.json`. If yo
 
 ### Notion (optional, off by default)
 
-The recipe ships **without** a Notion server — the adapter it was developed against (`syncntn`) is not publicly available, so a default block would only produce a startup failure. The miner's system prompt still describes the `syncntn--*` tools; the agent simply won't have them until you wire a server in.
+The recipe ships **without** a Notion server — the adapter it was developed against (`syncntn`) is not publicly available, so a default block would only produce a startup failure. The miner's system prompt still describes the `mcpl--syncntn--*` tools; the agent simply won't have them until you wire a server in.
 
 To enable: install a Notion MCP server (any server whose tool names match what the prompt references — see [SETUP.md → Notion](./SETUP.md#notion-optional-via-an-mcp-server--not-included-by-default) for selection caveats), then add a block to `recipes/knowledge-miner.json` under `mcpServers`:
 
@@ -247,7 +247,7 @@ then add this block to `recipes/knowledge-miner.json` under `mcpServers`:
   "args": ["../scribe-mcp/src/index.ts"],
   "env": {
     "GEMINI_API_KEY": "${GEMINI_API_KEY}",
-    "NOTION_API_KEY": "${NOTION_API_KEY:-}",           // only scribe--scribe_notion_page needs it
+    "NOTION_API_KEY": "${NOTION_API_KEY:-}",           // only mcpl--scribe--scribe_notion_page needs it
     "SCRIBE_GLOSSARY_PATH": "./input/glossary.txt",
     "SCRIBE_GLOSSARY_URL": "${SCRIBE_GLOSSARY_URL:-}"  // optional domain glossary
   },
@@ -464,8 +464,8 @@ In any order:
 If a child goes red / crashed:
 
 1. `/fleet status <name>` — see the exit code and reason.
-2. `tail -n 50 data/<name>/headless.log` — the child's runtime log.
-3. `tail -n 50 data/<name>/startup.log` — earlier failures (API key check, recipe parse errors, etc.).
+2. `tail -n 50 data/<name>/startup.log` — the last console lines the child printed, under a `--- launch` line for each launch: an API key check, a recipe parse error, and any error it hits later. A failed launch's error quotes the end of that launch's lines.
+3. `tail -n 50 data/<name>/headless.log` — the headless runtime's own lines: its start, socket connections, shutdown.
 4. Fix whatever caused it.
 5. `/fleet restart <name>` — bring it back.
 

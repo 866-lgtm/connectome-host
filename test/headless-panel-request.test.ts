@@ -12,9 +12,10 @@ import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { connect as netConnect, type Socket } from 'node:net';
+import { type Socket } from 'node:net';
 import { join, resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { connectWhenAccepting } from './ipc-connect.js';
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(TEST_DIR, '..');
@@ -37,9 +38,10 @@ const MINIMAL_RECIPE = {
 
 function lineReader(socket: Socket): { events: Array<Record<string, unknown>>; stop: () => void } {
   const events: Array<Record<string, unknown>> = [];
+  socket.setEncoding('utf8');
   let buf = '';
-  const handler = (chunk: Buffer): void => {
-    buf += chunk.toString('utf-8');
+  const handler = (chunk: string): void => {
+    buf += chunk;
     let i: number;
     while ((i = buf.indexOf('\n')) >= 0) {
       const line = buf.slice(0, i).trim();
@@ -59,18 +61,6 @@ async function waitFor(check: () => boolean, timeoutMs: number, label: string): 
     await new Promise((r) => setTimeout(r, 50));
   }
   throw new Error(`waitFor timed out after ${timeoutMs}ms: ${label}`);
-}
-
-async function connectSocket(path: string, timeoutMs = 3_000): Promise<Socket> {
-  return new Promise((resolveConn, rejectConn) => {
-    const s = netConnect(path);
-    const timer = setTimeout(() => {
-      s.destroy();
-      rejectConn(new Error(`socket connect timeout: ${path}`));
-    }, timeoutMs);
-    s.once('connect', () => { clearTimeout(timer); resolveConn(s); });
-    s.once('error', (err) => { clearTimeout(timer); rejectConn(err); });
-  });
 }
 
 describe('headless daemon — panel-request / panel-response', () => {
@@ -114,7 +104,7 @@ describe('headless daemon — panel-request / panel-response', () => {
     );
 
     await waitFor(() => existsSync(socketPath), 15_000, 'socket file appears');
-    sock = await connectSocket(socketPath);
+    sock = await connectWhenAccepting(socketPath);
     reader = lineReader(sock);
     await waitFor(
       () => reader.events.some((e) => e.type === 'lifecycle' && (e as { phase?: string }).phase === 'ready'),
@@ -157,6 +147,30 @@ describe('headless daemon — panel-request / panel-response', () => {
     expect(Array.isArray(data.servers)).toBe(true);
     expect(Array.isArray(data.live)).toBe(true);
     expect(data.live.length).toBe(0); // minimal recipe opts into no MCPLs
+  });
+
+  test('op=tool-classes reports effective classes, host table included', async () => {
+    const res = await panel('tool-classes');
+    expect(res.ok).toBe(true);
+    const data = res.data as {
+      agent: string | null;
+      counts: Record<string, number>;
+      tools: Array<{ tool: string; class: string[]; source: string }>;
+    };
+    expect(data.agent).toBeNull();
+    expect(data.tools.length).toBeGreaterThan(0);
+    expect(Object.values(data.counts).reduce((a, b) => a + b, 0)).toBe(data.tools.length);
+    // index.ts hands this host's module table to the framework: the
+    // always-loaded time module is classed by it, not left unclassed.
+    expect(data.tools.find((t) => t.tool === 'time--now')).toMatchObject({ class: ['control'], source: 'host' });
+
+    const scoped = await panel('tool-classes', { agent: 'commander' });
+    expect(scoped.ok).toBe(true);
+    expect((scoped.data as { agent: string }).agent).toBe('commander');
+
+    const unknown = await panel('tool-classes', { agent: 'nonexistent' });
+    expect(unknown.ok).toBe(false);
+    expect(unknown.status).toBe(404);
   });
 
   test('op=pins returns a snapshot with candidates when asked', async () => {

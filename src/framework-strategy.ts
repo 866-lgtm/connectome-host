@@ -4,7 +4,9 @@ import {
   type ContextStrategy,
   type ConversationRouterConfig,
 } from '@animalabs/agent-framework';
-import type { Recipe, RecipeStrategy } from './recipe.js';
+import type { Recipe, RecipeKvUnifiedConfig, RecipeStrategy } from './recipe.js';
+import { anthropicCacheReadMultiplier, openaiCacheMultipliers } from './call-pricing.js';
+import { effectiveContextBudgetTokens, resolvePromptCaching } from './framework-agent-config.js';
 import { FrontdeskStrategy } from './strategies/frontdesk-strategy.js';
 import { isBuiltinStrategyType, type ExtensionRegistry } from './extensions.js';
 
@@ -59,6 +61,65 @@ const PASSTHROUGH_KEYS: ReadonlyArray<keyof RecipeStrategy> = [
   'identityReminderSilent',
 ];
 
+/** Verbatim tail for a recipe that omits `strategy.recentWindowTokens`, as a
+ *  share of the compile budget: 120k of the default 300k. */
+export const DEFAULT_RECENT_WINDOW_RATIO = 0.4;
+
+/**
+ * The kv-unified block a recipe gets when it selects kv-unified (or leaves
+ * the solver to the default) without writing one. The policy is the one
+ * every kv-unified production resident runs; only the cache prices vary,
+ * because they must match what the provider actually bills, as multiples of
+ * the model's base input price:
+ *  - Anthropic writes: 2x on the 1-hour cache, 1.25x on the 5-minute one
+ *    (Bedrock only has the 5-minute cache); reads: the model's rate from the
+ *    pricing table (0.025x Fable 5.1 / Mythos 5.1, 0.05x Opus 5.5, 0.1x
+ *    elsewhere). Sonnet 5.5 is billed 0.05x but takes 0.1x here, as the
+ *    table's Sonnet 5 entry explains;
+ *  - OpenAI: by model and transport (openaiCacheMultipliers): API writes
+ *    1.25x on the GPT-5.6 / GPT-6 families, 1x otherwise and on Codex;
+ *  - prompt caching off (`agent.promptCaching: false`, or a Bedrock model
+ *    without caching): 1 and 1, every token at the base price, so no layout
+ *    is preferred for cache savings the agent never gets.
+ */
+export function standardKvUnifiedConfig(recipe: Recipe, model: string): RecipeKvUnifiedConfig {
+  const provider = recipe.agent.provider;
+  const ttl = provider === 'bedrock' ? '5m' : (recipe.agent.cacheTtl ?? '1h');
+  const uncached = resolvePromptCaching(recipe, model) === false;
+  const prices = uncached
+    ? { read: 1, write: 1 }
+    : provider === 'openai-responses' || provider === 'openai-codex'
+      ? openaiCacheMultipliers(model, provider === 'openai-codex' ? 'codex' : 'api')
+      : { read: anthropicCacheReadMultiplier(model), write: ttl === '5m' ? 1.25 : 2 };
+  return {
+    policy: {
+      alpha: 0.7,
+      budgetLowRatio: 0.6,
+      budgetHighRatio: 0.85,
+      budgetUnderLambda: 1_000,
+      budgetOverLambda: 4_000,
+      cacheLambda: 1,
+      cacheScale: 100_000,
+      cacheReadPrice: prices.read,
+      cacheWritePrice: prices.write,
+      continuityLambda: 1,
+      continuityScale: 100_000,
+      continuityRecencyHalfLifeTokens: 100_000,
+      continuityRecencyFloor: 0.2,
+      continuityStableHalfLife: 16,
+      continuityStableFloor: 0.25,
+    },
+    tokenBucketSize: 50_000,
+    continuityBucketSize: 50_000,
+    fidelityBucketSize: 100_000,
+    labelCeiling: 100_000,
+    adoptEpsilon: 3_000,
+    treeifyNonContiguousSummaries: false,
+    preserveGapBearingSummaries: false,
+    hysteresisCertificate: true,
+  };
+}
+
 export function buildFrameworkStrategy(
   recipe: Recipe,
   model: string,
@@ -88,7 +149,8 @@ export function buildFrameworkStrategy(
   }
   const autobiographicalOpts: Record<string, unknown> = {
     headWindowTokens: strategyConfig?.headWindowTokens ?? 4000,
-    recentWindowTokens: strategyConfig?.recentWindowTokens ?? 30000,
+    recentWindowTokens: strategyConfig?.recentWindowTokens
+      ?? Math.round(effectiveContextBudgetTokens(recipe) * DEFAULT_RECENT_WINDOW_RATIO),
     compressionModel: strategyConfig?.compressionModel ?? model,
     ...(strategyConfig?.compressionMaxTokens !== undefined
       ? { compressionMaxTokens: strategyConfig.compressionMaxTokens }
@@ -119,11 +181,14 @@ export function buildFrameworkStrategy(
 
   // Reasonable memory defaults for recipes that omit strategy tuning:
   //
-  // - foldingStrategy 'kv-stable': the library's own fallback is
-  //   'flat-profile', which replans compile layouts without regard for
-  //   prompt-cache stability. Long-lived agents want cache-stable folds by
-  //   default; recipes can still pin 'flat-profile'/'oldest-first' explicitly.
-  //   (Only meaningful under adaptive resolution, so gate on it.)
+  // - foldingStrategy 'kv-unified', with the standard block: the cost-aware
+  //   solver every new resident runs. The library's own fallback is
+  //   'flat-profile', which replans layouts without regard for the prompt
+  //   cache. Residents built on kv-stable pin it explicitly. (Only meaningful
+  //   under adaptive resolution, so gate on it.)
+  // - a kv-unified selection without a kvUnified block gets the same standard
+  //   block. Context Manager stays fail-closed (no defaults of its own); the
+  //   host always hands it a complete one.
   // - summaryParticipant <agent name>: the library falls back to the literal
   //   'Claude', which voices self-recollections as a stranger for any agent
   //   not named Claude. Summaries should speak as the agent itself.
@@ -132,7 +197,10 @@ export function buildFrameworkStrategy(
     autobiographicalOpts.adaptiveResolution !== false &&
     autobiographicalOpts.foldingStrategy === undefined
   ) {
-    autobiographicalOpts.foldingStrategy = 'kv-stable';
+    autobiographicalOpts.foldingStrategy = 'kv-unified';
+  }
+  if (autobiographicalOpts.foldingStrategy === 'kv-unified' && autobiographicalOpts.kvUnified === undefined) {
+    autobiographicalOpts.kvUnified = standardKvUnifiedConfig(recipe, model);
   }
   if (autobiographicalOpts.summaryParticipant === undefined && recipe.agent.name) {
     autobiographicalOpts.summaryParticipant = recipe.agent.name;

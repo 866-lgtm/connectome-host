@@ -48,7 +48,7 @@ Start by reading [`../recipes/SETUP.md`](../recipes/SETUP.md) — it covers the 
 
 You need all of:
 
-- Bun, Node 20+, an Anthropic API key (from SETUP.md).
+- Bun 1.4.3+, Node 22.12+, an Anthropic API key (from SETUP.md).
 - **Zulip**: a bot account with API credentials, subscribed to the channel you want the Clerk to staff. Name that channel in `.env` as `ZULIP_CHANNEL` (e.g. `tracker-miner-f`) — `clerk.json` won't load without it. `.zuliprc` in the project directory.
 - **Zulip MCP server** built and reachable at `../zulip_mcp/build/index.js`, the path both recipes reference (see SETUP.md Step 2).
 - **Miner data sources**: the shipped miner recipe wires GitLab (set `GITLAB_TOKEN` / `GITLAB_API_URL` in `.env`, or remove the `gitlab` block) and DuckDuckGo web search (a sibling checkout). Notion and Scribe are opt-in — see SETUP.md.
@@ -166,7 +166,7 @@ cd connectome-host
 DATA_DIR=./data-reviewer bun src/index.ts recipes/knowledge-reviewer.json
 ```
 
-Order doesn't matter. The workspace's initial scan will catch any files that were written while an agent was offline: on startup each `watch: 'always'` mount does a one-shot `syncFromFs` diff against its Chronicle tree, firing `workspace:created` for files that are on disk but new to this session. So if the Miner was offline when the Clerk filed three tickets, the Miner will wake on those three tickets the moment it starts.
+Order doesn't matter. The workspace's catch-up scan will catch any files that were written while an agent was offline: on startup each `watch: 'always'` mount walks its directory against its Chronicle tree, firing `workspace:created` for files that are on disk but new to this session. So if the Miner was offline when the Clerk filed three tickets, the Miner will wake on those three tickets the moment it starts. That holds for a mount within agent-framework's walk cap, 5000 files, links and other entries that aren't directories: on a larger mount the catch-up scan takes its turn with the mount's syncs, each walking up to the cap from where the last stopped, so a file changed while the agent was offline can wait until the rotation reaches it.
 
 Nobody needs to type at the Miner or Reviewer, so you can run them with `--headless`: no TUI at all — the agent serves JSONL over `$DATA_DIR/ipc.sock` and logs to `$DATA_DIR/headless.log`. If you'd rather keep a prompt without OpenTUI taking over the terminal, `--no-tui` gives a plain readline interface instead.
 
@@ -223,7 +223,7 @@ Markers are written by the Miner, audited by the Reviewer (who looks especially 
 
 Three things must line up — the Zulip subscription, the channel being open in the host, and a wake policy:
 
-1. `zulip--listen { channels: ["new-stream"] }` — subscribes the bot to the Zulip stream (server-side state, persists across restarts).
+1. `mcpl--zulip--listen { channels: ["new-stream"] }` — subscribes the bot to the Zulip stream (server-side state, persists across restarts).
 2. Make sure the channel is open on the host side. The Clerk's `channelSubscription` allow-list only covers `zulip:${ZULIP_CHANNEL}`, so other channels start closed unless the server marks them open. `channel_list` shows each channel's state; `channel_open { channelId: "zulip:new-stream" }` opens it (the id form may differ — use the one `channel_list` shows).
 3. Add a wake policy with `wake_add_rule`:
 
@@ -237,11 +237,11 @@ Three things must line up — the Zulip subscription, the channel being open in 
 
 An open channel without a policy means messages arrive in context but don't wake the Clerk; a policy without an open, subscribed channel means nothing arrives at all. `wake_add_rule` applies immediately — no restart.
 
-The Clerk's own prompt covers steps 1 and 3 (`zulip--listen`, then `wake_add_rule`) but not step 2, so if you ask the Clerk to add a channel, check `channel_list` as well as `gate_status` afterwards. A rule added this way persists in the session's `gate.json` across restarts. A recipe rule (such as `tracker-channel`) removed this way comes back at the next startup, because reconciliation re-appends recipe policies missing from the file.
+The Clerk's own prompt covers steps 1 and 3 (`mcpl--zulip--listen`, then `wake_add_rule`) but not step 2, so if you ask the Clerk to add a channel, check `channel_list` as well as `gate_status` afterwards. A rule added this way persists in the session's `gate.json` across restarts. A recipe rule (such as `tracker-channel`) removed this way comes back at the next startup, because reconciliation re-appends recipe policies missing from the file.
 
 ### Removing a channel
 
-Reverse order: remove the wake policy first (`wake_remove_rule { name: "new-stream" }`), then `channel_close` the channel so its messages stop reaching context, then `zulip--unlisten` if the bot should leave the stream.
+Reverse order: remove the wake policy first (`wake_remove_rule { name: "new-stream" }`), then `channel_close` the channel so its messages stop reaching context, then `mcpl--zulip--unlisten` if the bot should leave the stream.
 
 **Do not** unsubscribe the Clerk from `#${ZULIP_CHANNEL}` or remove the `tracker-channel` policy without explicit confirmation — it silences the only channel the Clerk is supposed to staff.
 
@@ -275,7 +275,7 @@ Each data dir has its own `lessons.json`. The Miner's extracted lessons are not 
 | Clerk files tickets but Miner never wakes | Producer missing `autoMaterialize`, or consumer missing `watch: 'always'` + `wakeOnChange` | `ls knowledge-requests/` — files on disk? If yes, check Miner's recipe for those two flags. |
 | Miner wakes but never runs | Event reaching the gate but no policy matching it | In the Miner, run `gate_status`. If `defaultDecisions.byEventType["workspace:created"].skipped > 0` and no policy's `matchCount` went up, the policy's `mount` or `pathGlob` doesn't match. |
 | Fresh session sees empty directories | Gate initial-scan didn't run, or the mount isn't `watch: 'always'` | Check `workspace--status` — `initialSyncDone: false` means watchers haven't started. |
-| Clerk was silent through a known question | Zulip subscription, the channel's open state, or the `tracker-channel` policy was removed | `zulip--listen` with no args shows subscribed streams; `channel_list` shows whether `zulip:${ZULIP_CHANNEL}` is still open; `gate_status` shows the active policies. |
+| Clerk was silent through a known question | Zulip subscription, the channel's open state, or the `tracker-channel` policy was removed | `mcpl--zulip--listen` with no args shows subscribed streams; `channel_list` shows whether `zulip:${ZULIP_CHANNEL}` is still open; `gate_status` shows the active policies. |
 | An agent's context is flooded with Zulip chat it doesn't care about | Channels were opened earlier (by the agent, or seeded by an `"auto"` policy) and stay open | `channel_list` to see them, `channel_close` to close them. Changing `channelSubscription` in the recipe won't close channels in an existing session. |
 | Three-agent pipeline works on one machine, breaks on another | Agents launched from different working directories | All three must share `cwd`. `./knowledge-requests` resolves to three different paths otherwise. |
 | Tickets pile up, Miner is "busy" but never writes reports | Miner is context-saturated, or wedged on a long fork | `/status` in the Miner's TUI; `Tab` for fleet view to see if forks are actually progressing. |

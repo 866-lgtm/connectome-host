@@ -7,13 +7,17 @@
  *   2. Parent process, against `fleetModule.onChildEvent(name, ...)` — one
  *      reducer per fleet child, drives that child's subtree in the TUI.
  *   3. Inside each headless child, against its own `framework.onTrace()` —
- *      `describe` IPC handler returns `reducer.getTree()` over the wire.
+ *      `describe` IPC handler returns `reducer.getSnapshot()` over the wire.
  *
  * Mirrors the canonical fold currently scattered across:
- *   - tui.ts:1019-1037     (token aggregation on inference:usage / completed)
- *   - tui.ts:1280-1341     (phase transitions)
- *   - tui.ts:1100-1107     (parent-edge inference from subagent--spawn calls)
- *   - subagent-module.ts:262-340 (callId routing, live state tracking)
+ *   - tui.ts's noteUsageSample (token readouts on inference:usage / completed);
+ *     it, this reducer and subagent-module.ts all count through
+ *     foldUsageSample in stream-usage.ts
+ *   - tui.ts's subscribeSubagentStream (phase transitions)
+ *   - tui.ts's onTrace, at subagent--spawn and subagent--fork calls
+ *     (parent-edge inference)
+ *   - subagent-module.ts's setFramework trace subscription (callId routing,
+ *     live state tracking)
  *
  * The dispatch table EVENT_HANDLERS is the canonical source of truth: each
  * key is an event type the reducer acts on, and `REDUCER_REQUIRED_EVENTS`
@@ -24,6 +28,7 @@
  */
 
 import type { TraceEvent } from '@animalabs/agent-framework';
+import { emptyUsage, foldUsageSample, type UsageCounts, type UsageSample } from './stream-usage.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -38,10 +43,12 @@ export type AgentPhase =
   | 'done'
   | 'failed'
   // Terminal-but-benign: user cancel, zombie-reclaim, supersession, agent
-  // reboot, budget-restart. Postmortem 2026-05-28 P1 #3: renderers must
-  // treat this as neutral (not red) and terminal (not 'running'). It is the
-  // result of `inference:aborted` and reboot-induced `inference:exhausted`,
-  // both of which are NOT faults.
+  // reboot, budget-restart, and a turn agent-framework drops when its
+  // agent is replaced or removed, or the framework is stopping or restarted,
+  // unless another turn of its name has begun (then no end comes for it).
+  // Postmortem 2026-05-28 P1 #3: renderers must treat this as neutral (not
+  // red) and terminal (not 'running'). It is the result of
+  // `inference:aborted`, which is NOT a fault.
   | 'cancelled';
 
 export type AgentKind = 'framework' | 'subagent';
@@ -49,13 +56,14 @@ export type AgentKind = 'framework' | 'subagent';
 export type AgentStatus = 'running' | 'completed' | 'failed' | 'cancelled';
 
 export interface AgentTokens {
-  /** Last-seen input tokens. Represents *current context window size*, not cumulative. */
+  /** The latest provider call's prompt: fresh input plus cache reads and
+   *  writes. Represents *current context window size*, not cumulative. */
   input: number;
-  /** Cumulative output tokens across all rounds. */
+  /** Output tokens across all of the agent's provider calls, each counted once. */
   output: number;
-  /** Cumulative cache-read tokens. */
+  /** Cache-read tokens across all calls, each counted once. */
   cacheRead: number;
-  /** Cumulative cache-write (creation) tokens. */
+  /** Cache-write (creation) tokens across all calls, each counted once. */
   cacheWrite: number;
 }
 
@@ -73,6 +81,12 @@ export interface AgentNode {
   status: AgentStatus;
   phase: AgentPhase;
   tokens: AgentTokens;
+  /** Fold state, not for display: the current stream's usage as of its latest
+   *  sample, which `tokens` already counts. The next sample adds only what it
+   *  adds beyond this. It travels with the node, in snapshots too, so a reducer
+   *  that starts from a copy of this node keeps counting each call once.
+   *  Absent until the node sees a stream start or a sample. */
+  streamUsage?: UsageCounts;
   toolCallsCount: number;
   findingsCount: number;
   startedAt?: number;
@@ -95,6 +109,15 @@ export interface AgentTreeSnapshot {
 
 function freshTokens(): AgentTokens {
   return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+/** A copy that shares no mutable state with `node`. */
+function copyNode(node: AgentNode): AgentNode {
+  return {
+    ...node,
+    tokens: { ...node.tokens },
+    ...(node.streamUsage ? { streamUsage: { ...node.streamUsage } } : {}),
+  };
 }
 
 interface SpawnCallInput {
@@ -129,6 +152,8 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
     node.status = 'running';
     node.lastEventAt = ts;
     if (node.startedAt === undefined) node.startedAt = ts;
+    // A new stream: its usage samples count from zero.
+    node.streamUsage = emptyUsage();
   },
 
   'inference:tokens': (r, e, ts) => {
@@ -172,7 +197,7 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
   'inference:usage': (r, e, ts) => {
     if (!e.agentName) return;
     const node = r._ensureNode(e.agentName);
-    const usage = e.tokenUsage as { input?: number; output?: number; cacheRead?: number; cacheCreation?: number } | undefined;
+    const usage = e.tokenUsage as UsageSample | undefined;
     if (usage) r._applyTokenUsage(node, usage);
     node.lastEventAt = ts;
   },
@@ -189,7 +214,7 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
     node.status = 'completed';
     node.completedAt = ts;
     node.lastEventAt = ts;
-    const usage = e.tokenUsage as { input?: number; output?: number; cacheRead?: number; cacheCreation?: number } | undefined;
+    const usage = e.tokenUsage as UsageSample | undefined;
     if (usage) r._applyTokenUsage(node, usage);
   },
 
@@ -202,24 +227,38 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
     node.lastEventAt = ts;
   },
 
-  // inference:exhausted = retries exhausted / genuine stream cancel / reboot-
-  // induced. Postmortem 2026-05-28 P1 #3: not strictly a fault — flip both
-  // fields to the dedicated 'cancelled' terminal state so the renderer can
-  // distinguish "stopped on purpose" from "errored out". (AF PR #55 / ≥ 0.6.5
-  // stopped emitting this for endTurn and context-budget restarts — those are
-  // no longer terminal at all — but user cancels and reboots still land here,
-  // and older AF still sends the endTurn-trailing one.)
+  // inference:exhausted = the turn failed for good: its retries were spent,
+  // or its stream was aborted for a reason other than a stop. Before
+  // agent-framework 0.22.3 a stop sent it too: after its `inference:aborted`
+  // when the stop came through `abortInference`, and alone when it came
+  // through `Agent.cancelStream`. So it ended a node as 'cancelled'
+  // (Postmortem 2026-05-28 P1 #3). From 0.22.3 a stop sends
+  // `inference:aborted` alone, so a node it ends has failed, unless its turn
+  // was already stopped: a fleet child this host adopted may still run an
+  // older agent-framework, and its events come through here. A stopped turn
+  // stays stopped until its next inference:started. Such a child's
+  // `cancelStream` stop, as a subagent's, still ends its node as failed.
   'inference:exhausted': (r, e, ts) => {
     if (!e.agentName) return;
     const node = r._ensureNode(e.agentName);
-    node.phase = 'cancelled';
-    node.status = 'cancelled';
+    if (node.status === 'cancelled') {
+      node.lastEventAt = ts;
+      return;
+    }
+    node.phase = 'failed';
+    node.status = 'failed';
     node.completedAt = ts;
     node.lastEventAt = ts;
   },
 
-  // inference:aborted = user cancel / zombie-reclaim / supersession.
-  // Postmortem 2026-05-28 P1 #3: same as exhausted — terminal, but benign.
+  // inference:aborted = user cancel / zombie-reclaim / supersession, and,
+  // from agent-framework 0.22.2 (anima-research/agent-framework#338), a
+  // turn the framework dropped after its inference:started because its
+  // agent was replaced or removed, or the framework was stopping or had
+  // been stopped and started again; it sends none when another turn of the
+  // agent's name has already begun.
+  // Postmortem 2026-05-28 P1 #3: terminal, but benign, unlike exhausted,
+  // which from agent-framework 0.22.3 means the turn failed.
   'inference:aborted': (r, e, ts) => {
     if (!e.agentName) return;
     const node = r._ensureNode(e.agentName);
@@ -243,9 +282,8 @@ const EVENT_HANDLERS: Record<string, EventHandler> = {
   // terminal, same family as inference:completed. This event must be terminal
   // in its own right: agent-framework PR #55 (≥ 0.6.5) settles endTurn from
   // the state machine and no longer follows it with the spurious
-  // inference:exhausted that used to flip these nodes to 'cancelled'. On
-  // older AF the trailing exhausted still arrives and (harmlessly)
-  // re-terminates the node as cancelled one event later.
+  // inference:exhausted that used to flip these nodes to 'cancelled'. From
+  // 0.22.3 an inference:completed comes right before it.
   'inference:turn_ended': (r, e, ts) => {
     if (!e.agentName) return;
     const node = r._ensureNode(e.agentName);
@@ -332,10 +370,7 @@ export class AgentTreeReducer {
     this.callIdIndex.clear();
     for (const node of snapshot.nodes) {
       // Defensive copy so subsequent mutations don't escape into caller's data.
-      this.nodes.set(node.name, {
-        ...node,
-        tokens: { ...node.tokens },
-      });
+      this.nodes.set(node.name, copyNode(node));
     }
     for (const [callId, agentName] of Object.entries(snapshot.callIdIndex)) {
       this.callIdIndex.set(callId, agentName);
@@ -359,16 +394,13 @@ export class AgentTreeReducer {
 
   /** Returns a deep copy of all current nodes. */
   getNodes(): AgentNode[] {
-    return [...this.nodes.values()].map(n => ({
-      ...n,
-      tokens: { ...n.tokens },
-    }));
+    return [...this.nodes.values()].map(copyNode);
   }
 
   getNode(name: string): AgentNode | undefined {
     const n = this.nodes.get(name);
     if (!n) return undefined;
-    return { ...n, tokens: { ...n.tokens } };
+    return copyNode(n);
   }
 
   /** Returns the children of a given agent (one level deep).
@@ -376,7 +408,7 @@ export class AgentTreeReducer {
   getChildren(parentName: string): AgentNode[] {
     const out: AgentNode[] = [];
     for (const n of this.nodes.values()) {
-      if (n.parent === parentName) out.push({ ...n, tokens: { ...n.tokens } });
+      if (n.parent === parentName) out.push(copyNode(n));
     }
     return out;
   }
@@ -385,7 +417,7 @@ export class AgentTreeReducer {
   getRoots(): AgentNode[] {
     const out: AgentNode[] = [];
     for (const n of this.nodes.values()) {
-      if (n.parent === undefined) out.push({ ...n, tokens: { ...n.tokens } });
+      if (n.parent === undefined) out.push(copyNode(n));
     }
     return out;
   }
@@ -416,17 +448,16 @@ export class AgentTreeReducer {
   }
 
   /** @internal */
-  _applyTokenUsage(
-    node: AgentNode,
-    usage: { input?: number; output?: number; cacheRead?: number; cacheCreation?: number },
-  ): void {
-    // Input represents context window size at this round; overwrite, don't sum
-    // (summing inputs would double-count history that's already in the next round's input).
-    if (typeof usage.input === 'number') node.tokens.input = usage.input;
-    // Output / cache are per-round costs; accumulate.
-    if (typeof usage.output === 'number') node.tokens.output += usage.output;
-    if (typeof usage.cacheRead === 'number') node.tokens.cacheRead += usage.cacheRead;
-    if (typeof usage.cacheCreation === 'number') node.tokens.cacheWrite += usage.cacheCreation;
+  _applyTokenUsage(node: AgentNode, usage: UsageSample): void {
+    // A sample is the stream's usage so far (see stream-usage.ts), so only
+    // what it adds beyond the stream's previous sample is new. A completion
+    // that repeats the last sample adds nothing.
+    const step = foldUsageSample(node.streamUsage, usage);
+    node.streamUsage = step.total;
+    node.tokens.output += step.added.output;
+    node.tokens.cacheRead += step.added.cacheRead;
+    node.tokens.cacheWrite += step.added.cacheCreation;
+    if (step.prompt !== undefined) node.tokens.input = step.prompt;
   }
 
   // ----- private --------------------------------------------------------

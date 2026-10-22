@@ -1,7 +1,7 @@
 import { describe, test, expect } from 'bun:test';
-import { NativeFormatter } from '@animalabs/membrane';
+import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
 import type { NormalizedMessage } from '@animalabs/membrane';
-import { buildCountTokensPayload } from '../src/web/panel-data.js';
+import { buildContextMakeup, buildCountTokensPayload } from '../src/web/panel-data.js';
 
 // Regression: the makeup panel's exact count flattened every message to its
 // text blocks and sent no tool definitions, so signed thinking, tool_use and
@@ -16,7 +16,7 @@ const blocksOf = (m: unknown) => (m as { content: Block[] }).content;
 const roleOf = (m: unknown) => (m as { role: string }).role;
 
 describe('buildCountTokensPayload', () => {
-  test('is byte-identical to the NativeFormatter build inference would send', () => {
+  test('is byte-identical to the NativeFormatter build, with prompt caching off as the count sends it', () => {
     const messages: NormalizedMessage[] = [
       { participant: 'Lari', content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] },
       { participant: 'agent', content: [
@@ -37,11 +37,24 @@ describe('buildCountTokensPayload', () => {
     expect(payload.system).toEqual(reference.systemContent);
   });
 
-  test('prefixes every text block of a named user message in place — no standalone name block', () => {
-    const payload = buildCountTokensPayload({
-      messages: [{ participant: 'Lari', content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] }],
-    }, 'agent');
-    expect(blocksOf(payload.messages[0]).map((b) => b.text)).toEqual(['Lari: one', 'Lari: two']);
+  // The name rides in the message's own text, never as a block of its own,
+  // and the first text block carries it: that much any formatter must keep,
+  // and the test pins it. Which later blocks carry the name too is the
+  // formatter's choice: membrane 0.5.86 prefixes every one, and membrane's
+  // main (f857fff) only the first. So for the rest, the payload must equal
+  // the formatter's own output.
+  test('prefixes a named user message in place, as the formatter does — no standalone name block', () => {
+    const messages: NormalizedMessage[] = [{ participant: 'Lari', content: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }] }];
+    const payload = buildCountTokensPayload({ messages }, 'agent');
+    const blocks = blocksOf(payload.messages[0]);
+    expect(blocks.map((b) => b.type)).toEqual(['text', 'text']);
+    expect(blocks[0]!.text).toBe('Lari: one');
+    expect(blocks[1]!.text).toMatch(/^(Lari: )?two$/);
+    const reference = new NativeFormatter().buildMessages(messages, {
+      participantMode: 'multiuser', assistantParticipant: 'agent', toolMode: 'native',
+      promptCaching: false, cacheMarkers: 'membrane-system',
+    });
+    expect(payload.messages).toEqual(reference.messages as unknown[]);
   });
 
   test('a named message with no text gets no name block', () => {
@@ -88,4 +101,176 @@ describe('buildCountTokensPayload', () => {
     expect(payload.tools).toBeUndefined();
     expect(payload.system).toBeUndefined();
   });
+
+  // An anthropic-xml agent's count takes that formatter's path, prefill or
+  // not (buildContextMakeup), and the whole payload must equal its own build:
+  // system, messages and tools. The formatter sends the prefill first, in
+  // place of its default opener, whenever its request would otherwise open
+  // with the assistant's turn (the transcript), and so must the count; an
+  // image goes in a user turn of its own, so an image-first request gets none.
+  const xmlOptions = {
+    participantMode: 'multiuser' as const, assistantParticipant: 'agent', toolMode: 'xml' as const,
+    promptCaching: false, cacheMarkers: 'membrane-system' as const,
+  };
+  const xmlReference = (messages: NormalizedMessage[], extra: Record<string, unknown> = {}) => {
+    const built = new AnthropicXmlFormatter().buildMessages(messages, { ...xmlOptions, ...extra });
+    return { system: built.systemContent, messages: built.messages, tools: built.nativeTools };
+  };
+  const payloadParts = (payload: { system?: unknown; messages: unknown[]; tools?: unknown[] }) =>
+    ({ system: payload.system, messages: payload.messages, tools: payload.tools });
+
+  test('an anthropic-xml count is that formatter\'s build, with the prefill first', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const withPrefill = buildCountTokensPayload(
+      { messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(withPrefill)).toEqual(xmlReference(messages, { prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(withPrefill.messages[0])).toContain('PREFILL SCAFFOLD');
+    // Without a prefill, the formatter's own default opener leads instead.
+    const without = buildCountTokensPayload({ messages }, 'agent', new AnthropicXmlFormatter(), 'xml');
+    expect(payloadParts(without)).toEqual(xmlReference(messages) as never);
+    expect(JSON.stringify(without)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  test('an anthropic-xml count with a system prompt and a prefill matches the formatter', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const payload = buildCountTokensPayload(
+      { system: 'sys', messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(payload)).toEqual(xmlReference(messages, { systemPrompt: 'sys', prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(payload.messages[0])).toContain('PREFILL SCAFFOLD');
+  });
+
+  test('a request that opens with a user turn (an image) gets no prefill, in the count as in the formatter', () => {
+    const png = 'iVBORw0KGgo=';
+    const messages: NormalizedMessage[] = [
+      { participant: 'Lari', content: [
+        { type: 'text', text: 'look' },
+        { type: 'image', source: { type: 'base64', mediaType: 'image/png', data: png } } as never,
+      ] },
+      { participant: 'agent', content: [{ type: 'text', text: 'reply' }] },
+    ];
+    const payload = buildCountTokensPayload(
+      { messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent', new AnthropicXmlFormatter(), 'xml',
+    );
+    expect(payloadParts(payload)).toEqual(xmlReference(messages, { prefillUserMessage: 'PREFILL SCAFFOLD' }) as never);
+    expect(JSON.stringify(payload)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  // Since membrane 0.5.87 the native formatter uses prefillUserMessage as the
+  // synthetic user turn it puts before assistant-first history (it used to be
+  // `[continuing]` whatever the caller passed), so a native agent's count
+  // carries the prefill exactly where inference sends it.
+  test('a native agent\'s count carries a prefill where the native formatter puts it: the leading user turn', () => {
+    const messages: NormalizedMessage[] = [
+      { participant: 'agent', content: [{ type: 'text', text: 'earlier reply' }] },
+      { participant: 'Lari', content: [{ type: 'text', text: 'hello' }] },
+    ];
+    const reference = (extra: Record<string, unknown>) => new NativeFormatter().buildMessages(messages, {
+      participantMode: 'multiuser', assistantParticipant: 'agent', toolMode: 'native',
+      promptCaching: false, cacheMarkers: 'membrane-system', ...extra,
+    }).messages as unknown[];
+    const withPrefill = buildCountTokensPayload({ messages, prefillUserMessage: 'PREFILL SCAFFOLD' }, 'agent');
+    expect(withPrefill.messages).toEqual(reference({ prefillUserMessage: 'PREFILL SCAFFOLD' }));
+    expect(roleOf(withPrefill.messages[0])).toBe('user');
+    expect(blocksOf(withPrefill.messages[0]).map((b) => b.text)).toEqual(['PREFILL SCAFFOLD']);
+    const without = buildCountTokensPayload({ messages }, 'agent');
+    expect(without.messages).toEqual(reference({}));
+    expect(JSON.stringify(without)).not.toContain('PREFILL SCAFFOLD');
+  });
+
+  // An empty system, as text or as a list, and an empty tool list send
+  // neither field.
+  test('an empty system and an empty tool list leave both out of the payload', () => {
+    for (const system of ['', [] as never]) {
+      const payload = buildCountTokensPayload({
+        system, tools: [], messages: [{ participant: 'Lari', content: [{ type: 'text', text: 'hi' }] }],
+      }, 'agent');
+      expect('system' in payload).toBe(false);
+      expect('tools' in payload).toBe(false);
+    }
+  });
+});
+
+// #287: an anthropic-xml agent's tool definitions go into its system block when
+// its recipe has a system prompt and prompt caching, and into the transcript
+// otherwise, and the panel's exact count has to build the request it sends.
+for (const [label, systemPrompt, where] of [
+  ['with a system prompt, in the system block', 'You are agent.', 'system'],
+  ['with none, in the transcript', '', 'messages'],
+] as const) {
+  test(`an anthropic-xml agent's context count carries its tools where its request does: ${label}`, async () => {
+    const tools = [{ name: 'read_file', description: 'Read a file from the workspace', inputSchema: { type: 'object', properties: { path: { type: 'string' } } } }];
+    const messages: NormalizedMessage[] = Array.from({ length: 30 }, (_, i) => ({
+      participant: i % 2 === 1 ? 'agent' : 'user', content: [{ type: 'text', text: `message ${i}` }],
+    }));
+    const app = {
+      recipe: { agent: { name: 'agent', formatter: 'anthropic-xml', systemPrompt } },
+      framework: {
+        getAgent: () => ({ model: 'claude-haiku-4-5', getContextManager: () => ({ getRenderStats: () => ({}) }) }),
+        previewActivation: async () => ({ system: systemPrompt, messages, tools }),
+      },
+    };
+    const sent: Array<Record<string, unknown>> = [];
+    const realFetch = globalThis.fetch;
+    const priorModel = process.env.COUNT_TOKENS_MODEL;
+    process.env.COUNT_TOKENS_MODEL = 'claude-haiku-4-5';
+    globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+      sent.push(JSON.parse(init?.body ?? '{}'));
+      return new Response(JSON.stringify({ input_tokens: 1 }), { status: 200 });
+    }) as unknown as typeof fetch;
+    try {
+      await buildContextMakeup(app as never, 'agent');
+    } finally {
+      globalThis.fetch = realFetch;
+      if (priorModel === undefined) delete process.env.COUNT_TOKENS_MODEL;
+      else process.env.COUNT_TOKENS_MODEL = priorModel;
+    }
+    expect(sent).toHaveLength(1);
+    expect(JSON.stringify(sent[0]![where])).toContain('Read a file from the workspace');
+    expect(JSON.stringify(sent[0]![where === 'system' ? 'messages' : 'system'] ?? '')).not.toContain('Read a file from the workspace');
+  });
+}
+
+// The host's one Membrane places every agent's tools by the recipe's primary
+// agent and its model, so a subagent's count asks the same, whatever its own
+// model: here the subagent's model is one Bedrock's caching gate turns off, so
+// asking with it would give main's placement.
+test("a subagent's context count places its tools as the primary agent's model decides", async () => {
+  const tools = [{ name: 'read_file', description: 'Read a file from the workspace', inputSchema: { type: 'object', properties: {} } }];
+  const messages: NormalizedMessage[] = Array.from({ length: 30 }, (_, i) => ({
+    participant: i % 2 === 1 ? 'sub' : 'user', content: [{ type: 'text', text: `message ${i}` }],
+  }));
+  const models: Record<string, string> = { agent: 'anthropic.claude-sonnet-4-5-20250929-v1:0', sub: 'anthropic.claude-3-opus-20240229-v1:0' };
+  const app = {
+    recipe: { agent: { name: 'agent', formatter: 'anthropic-xml', provider: 'bedrock', systemPrompt: 'You are agent.' } },
+    framework: {
+      getAgent: (name: string) => ({ model: models[name], getContextManager: () => ({ getRenderStats: () => ({}) }) }),
+      previewActivation: async () => ({ system: 'You are sub.', messages, tools }),
+    },
+  };
+  const sent: Array<Record<string, unknown>> = [];
+  const realFetch = globalThis.fetch;
+  const priorModel = process.env.COUNT_TOKENS_MODEL;
+  process.env.COUNT_TOKENS_MODEL = 'claude-haiku-4-5';
+  globalThis.fetch = (async (_url: unknown, init?: { body?: string }) => {
+    sent.push(JSON.parse(init?.body ?? '{}'));
+    return new Response(JSON.stringify({ input_tokens: 1 }), { status: 200 });
+  }) as unknown as typeof fetch;
+  try {
+    await buildContextMakeup(app as never, 'sub');
+  } finally {
+    globalThis.fetch = realFetch;
+    if (priorModel === undefined) delete process.env.COUNT_TOKENS_MODEL;
+    else process.env.COUNT_TOKENS_MODEL = priorModel;
+  }
+  expect(sent).toHaveLength(1);
+  expect(JSON.stringify(sent[0]!.system)).toContain('Read a file from the workspace');
+  expect(JSON.stringify(sent[0]!.messages)).not.toContain('Read a file from the workspace');
 });
