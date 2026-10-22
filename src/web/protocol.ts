@@ -63,9 +63,13 @@ export interface WelcomeMessage {
    *  Clients fold live `trace` / `message-appended` events on top and page
    *  older messages via `request-history`. */
   messages: WelcomeMessageEntry[];
-  /** Paging metadata for `messages`. `startIndex` is the store slot index of
-   *  the first entry (== the number of older messages not shipped);
-   *  `totalCount` is the store size at snapshot time. */
+  /** Paging metadata for `messages`. `startIndex` is the store slot index
+   *  the tail window begins at (== the number of older messages not
+   *  shipped); an observer's first entry can come after it, past messages
+   *  its scopes empty. When its scopes empty the whole tail, an observer's
+   *  welcome reads back as a `history-page` does, and `startIndex` is where
+   *  that reading stopped. `totalCount` is the store size at snapshot
+   *  time. */
   history: {
     startIndex: number;
     totalCount: number;
@@ -597,14 +601,20 @@ export interface SettingsStateMessage {
 }
 
 /** A page of older history — response to `request-history`, routed only to
- *  the requesting client and correlated by `corrId`. */
+ *  the requesting client and correlated by `corrId`. An observer's page
+ *  leaves out the entries its scopes empty (an entry that had no blocks to
+ *  begin with stays), and reads back past windows that leave it none, for
+ *  at most ten windows of the request's size. So it comes back empty at the
+ *  start of history, or where those ten windows ran out. */
 export interface HistoryPageMessage {
   type: 'history-page';
   corrId: string;
   /** Entries in store order (oldest first), ending just before the
-   *  requested `beforeIndex`. */
+   *  requested `beforeIndex`, or, for an observer, before the messages
+   *  after them that its scopes empty. */
   entries: WelcomeMessageEntry[];
-  /** Slot index of the first entry — the next page's `beforeIndex`. */
+  /** Slot index where the reading stopped — the next page's `beforeIndex`.
+   *  An observer's first entry can come after it. */
   startIndex: number;
   /** Store size at read time. */
   totalCount: number;
@@ -1073,8 +1083,8 @@ export interface RequestWorkspaceFileMessage {
 
 /** Page older conversation history. Response is a `history-page` with the
  *  same `corrId` (or an `error`). Entries returned end just before
- *  `beforeIndex`; pass the previous page's `startIndex` to keep walking
- *  backward. */
+ *  `beforeIndex`, or, for an observer, before the messages its scopes
+ *  empty; pass the previous page's `startIndex` to keep walking backward. */
 export interface RequestHistoryMessage {
   type: 'request-history';
   corrId: string;

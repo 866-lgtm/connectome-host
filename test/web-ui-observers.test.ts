@@ -633,6 +633,23 @@ describe('scope filters', () => {
     expect(filterEntryForScopes(withImages, new Set<ObserverScope>(['messages', 'tools']))).toEqual(withImages);
   });
 
+  test('an entry whose every block the scopes remove is dropped, and one that had no blocks stays', () => {
+    const toolOnly: WelcomeMessageEntry = {
+      index: 2,
+      participant: 'assistant',
+      text: '',
+      blocks: [
+        { kind: 'thinking', text: 'private' } as never,
+        { kind: 'tool_use', id: 't1', name: 'shell', inputJson: '{}' } as never,
+      ],
+    };
+    expect(filterEntryForScopes(toolOnly, new Set<ObserverScope>(['messages']))).toBeNull();
+    expect(filterEntryForScopes(toolOnly, new Set<ObserverScope>(['messages', 'thinking']))!.blocks.map((b) => b.kind))
+      .toEqual(['thinking']);
+    const empty: WelcomeMessageEntry = { index: 3, participant: 'user', text: '', blocks: [] };
+    expect(filterEntryForScopes(empty, new Set<ObserverScope>(['messages']))).toEqual(empty);
+  });
+
   test('full interiority scopes → identical entry', () => {
     const f = filterEntryForScopes(entry, new Set<ObserverScope>(['messages', 'thinking', 'tools']));
     expect(f).toEqual(entry);
