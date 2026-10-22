@@ -13,7 +13,8 @@
 export interface CompressionDebt {
   state?: 'healthy' | 'degraded' | 'critical' | 'unknown';
   /** What happened, what it means and what to do: a line saying what
-   *  happened, then `Cause:`, `Effect:` and `Fix:` lines. */
+   *  happened, then `Cause:`, `Effect:` and `Fix:` lines. An observer
+   *  without 'ops' gets it empty. */
   error?: string;
   /** Which read failed, whenever `error` is set: the compression quarantine
    *  ledger, which compression needs, or the report itself. */

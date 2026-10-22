@@ -15,3 +15,10 @@
 export function healthEntry<T>(map: Record<string, T> | null | undefined, key: string): T | undefined {
   return map != null && Object.prototype.hasOwnProperty.call(map, key) ? map[key] : undefined;
 }
+
+/** The panel's line for a section an agent's read failed for, with what the
+ *  error said when the snapshot carries it: an observer without 'ops' gets
+ *  it empty. */
+export function readFailureLine(section: string, message: string): string {
+  return message ? `${section} couldn't be read: ${message}` : `${section} couldn't be read`;
+}

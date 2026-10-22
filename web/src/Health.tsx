@@ -18,8 +18,8 @@
 
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
-import { callOriginLabel, callOriginTone } from './call-origin';
-import { healthEntry } from '@conhost/web/health-lookup';
+import { callFailed, callOriginLabel, callOriginTone } from './call-origin';
+import { healthEntry, readFailureLine } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
 
@@ -145,7 +145,8 @@ export interface HealthSnapshot {
     transitionReason?: string;
   }>;
   /** Per-agent reads that threw, by agent and then section, with what the
-   *  error said. Present only when one threw. Such an agent is missing from
+   *  error said, which an observer without 'ops' gets empty. Present only
+   *  when one threw. Such an agent is missing from
    *  that section, as an agent with nothing to report there is, but only a
    *  failed read has an entry here. */
   readFailures?: Record<string, Record<string, string>>;
@@ -299,7 +300,7 @@ function CallStats(props: { rows: LedgerRow[] }) {
               {(r) => {
                 return (
                   <tr class={`border-b border-neutral-900 ${
-                    r.error || r.stopReason === 'refusal' ? 'bg-red-950/30' : ''
+                    callFailed(r) || r.stopReason === 'refusal' ? 'bg-red-950/30' : ''
                   }`}>
                     <td class="pr-2 text-neutral-500">{clock(r.timestamp)}</td>
                     <td class={`pr-2 ${callOriginTone(r.originEstimate)}`}>
@@ -322,7 +323,7 @@ function CallStats(props: { rows: LedgerRow[] }) {
                       <Show when={r.stopReason === 'refusal'}>
                         <span class="text-red-300"> refusal</span>
                       </Show>
-                      <Show when={r.error}>
+                      <Show when={callFailed(r)}>
                         <span class="text-red-300"> err</span>
                       </Show>
                     </td>
@@ -574,7 +575,7 @@ export function HealthPanel(props: {
                 <div class="text-rose-300/90">
                   <For each={Object.entries(f())}>
                     {([section, message]) => (
-                      <div class="truncate" title={message}>{section} couldn't be read: {message}</div>
+                      <div class="truncate" title={message || undefined}>{readFailureLine(section, message)}</div>
                     )}
                   </For>
                 </div>

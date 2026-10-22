@@ -7,7 +7,7 @@
  * observer only when its grant covers what the frame carries.
  */
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test';
-import { startObservedHost, type Connection, type ObservedHost } from './web-ui-observed-host.js';
+import { BASIC, startObservedHost, type Connection, type ObservedHost } from './web-ui-observed-host.js';
 
 describe('what each client is sent', () => {
   let host: ObservedHost;
@@ -17,6 +17,17 @@ describe('what each client is sent', () => {
   let ledgerUpdate: ((ledger: unknown) => void) | undefined;
   let transcript: Record<string, unknown>[] = [];
   let appended: ((event: { type: string; message?: unknown }) => void) | undefined;
+  let ledgerNow: unknown;
+  // Failure text, as each place in health that carries one would hold it.
+  const TEXT = {
+    call: 'overloaded_error: the provider is overloaded',
+    cooldown: 'cooling down after overloaded_error',
+    wait: 'the provider asked for a wait of 30s',
+    lastError: 'the last turn failed: overloaded_error',
+    debt: 'The compression report failed.\nCause: the store said no.',
+    read: 'the store refused the read',
+    quota: 'the usage endpoint answered 500',
+  };
   // The store's windowed reads, which the welcome and history pages take, and
   // its listener, which message-appended comes from.
   const cm = {
@@ -29,6 +40,17 @@ describe('what each client is sent', () => {
     },
     currentBranch: () => branch,
     getMessage: (id: string) => transcript.find((m) => m.id === id) ?? stored,
+    getStrategy: () => ({
+      getCompressionQuarantineStatus: () => ({
+        count: 1,
+        keys: ['q1'],
+        spans: [{ chunkSourceHash: 'h1', firstMessageId: 'm1', lastMessageId: 'm2', closedAgeMs: 1, quarantinedAt: 1, records: 1, answeredAttempts: 1, latestOutcome: 'refusal' }],
+      }),
+      getCompressionDebt: () => ({ state: 'unknown', error: TEXT.debt, failure: 'report', pendingChunks: null }),
+    }),
+    getRenderStats: () => {
+      throw new Error(TEXT.read);
+    },
   };
   const agent = { name: 'main', model: 'a-model', getContextManager: () => cm };
   // A child's panel answers, as a fleet child's panel ops give them.
@@ -61,17 +83,46 @@ describe('what each client is sent', () => {
         getAgent: (name: string) => (name === 'main' ? agent : undefined),
         getHostModeStatus: () => hostStatus,
         getAgentRuntimeSettings: () => ({ contextBudgetTokens: 1000, transition: 'stable' }),
+        // agent-framework's healthSnapshot, with a failure in each place it
+        // carries one.
+        healthSnapshot: () => ({
+          at: '2026-10-22T06:00:00.000Z',
+          uptimeSec: 5,
+          gate: { inferring: ['main'], bufferedEvents: 0, droppedBufferedEvents: 0, sleepUntil: 0 },
+          pendingRequests: 0,
+          activeStreams: ['main'],
+          agents: [{
+            name: 'main',
+            status: 'inferring',
+            consecutiveInferenceFailures: 1,
+            providerAdmission: {
+              primaryActive: true,
+              cooldownUntil: 2,
+              cooldownReason: TEXT.cooldown,
+              hostHold: false,
+              lastRecovery: null,
+              providerWaits: [{ model: 'a-model', until: '2026-10-22T06:05:00.000Z', reason: TEXT.wait, setAt: '2026-10-22T06:00:00.000Z' }],
+            },
+            lastInference: { startedAt: 1, failedAt: 2, lastError: TEXT.lastError },
+            refusalStats: { total: 1, byCategory: { policy: 1 }, lastAt: 3, lastCategory: 'policy' },
+          }],
+        }),
       },
       sessionManager: { getActiveSession: () => ({ id: 's1', name: 'Debugging the bridge', manuallyNamed: false }) },
       config: {
         callLedger: {
-          snapshot: () => undefined,
+          snapshot: () => ledgerNow,
           onUpdate: (update: (ledger: unknown) => void) => {
             ledgerUpdate = update;
             return () => {};
           },
         },
         credentials: { runAction: async () => ({ state: 'ok' }) },
+        quotaMeter: {
+          provider: 'anthropic',
+          refresh: async () => ({ provider: 'anthropic', windows: [], fetchedAt: 1, error: TEXT.quota }),
+          blockedUntil: () => null,
+        },
       },
     });
   });
@@ -267,6 +318,68 @@ describe('what each client is sent', () => {
     for (const conn of [c.reader, c.interior]) {
       expect(conn.framesOf('host-mode')).toEqual([]);
       expect(conn.framesOf('call-ledger')).toEqual([]);
+    }
+  });
+
+  test("a client that holds health and not ops gets health without failure text: the call ledger live and in the welcome, and /healthz and /quota, the host's and a child's", async () => {
+    const c = await everyone();
+    const row = { timestamp: '2026-10-22T06:00:00.000Z', kind: 'stream', originEstimate: 'turn~', model: 'a-model', messages: 3, durationMs: 10, cache: { ttls: ['5m'], effectiveTtl: '5m' } };
+    const ledger = {
+      rows: [
+        { ...row, id: 'c1', tokens: { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 }, verdict: 'ERROR', cause: TEXT.call, error: TEXT.call },
+        { ...row, id: 'c2', tokens: { input: 1, output: 1, cacheRead: 9, cacheWrite: 0 }, verdict: 'HIT', cause: '90% from cache', stopReason: 'end_turn' },
+      ],
+      summary: { calls: 2, input: 2, output: 1, cacheRead: 9, cacheWrite: 0, cacheHitRatio: 0.9, byVerdict: { ERROR: 1, HIT: 1 } },
+    };
+    // A failed call's cause is its error's text; a cache hit's is the host's own words.
+    const ledgerWithoutText = { ...ledger, rows: [{ ...ledger.rows[0]!, cause: '', error: '' }, ledger.rows[1]!] };
+    ledgerNow = ledger;
+    ledgerUpdate!(ledger);
+    await host.fence(Object.values(c));
+    const lastLedger = (conn: Connection) => conn.framesOf('call-ledger').at(-1)!.ledger;
+    const welcomeLedger = (conn: Connection) => conn.framesOf('welcome').at(-1)!.callLedger;
+    for (const conn of [c.operator, c.everything]) {
+      expect(lastLedger(conn)).toEqual(ledger);
+      expect(welcomeLedger(conn)).toEqual(ledger);
+    }
+    expect(lastLedger(c.dashboard)).toEqual(ledgerWithoutText);
+    expect(welcomeLedger(c.dashboard)).toEqual(ledgerWithoutText);
+
+    const get = async (path: string, who: Connection | null): Promise<Record<string, any>> => {
+      const token = who && (who.framesOf('observer-ack')[0] as { sessionToken: string }).sessionToken;
+      const res = await fetch(`http://127.0.0.1:${host.port}${path}`, { headers: token ? { cookie: `fkm_obs=${token}` } : { authorization: BASIC } });
+      expect(res.status).toBe(200);
+      return (await res.json()) as Record<string, any>;
+    };
+    // Which failure texts a body carries, as JSON writes them.
+    const texts = (body: unknown) => Object.entries(TEXT)
+      .filter(([, text]) => JSON.stringify(body).includes(JSON.stringify(text).slice(1, -1)))
+      .map(([place]) => place);
+    // A child answers with the snapshot and the quota it builds, as the host does.
+    panels.health = await get('/healthz', null);
+    panels.quota = await get('/quota', null);
+    for (const path of ['/healthz', '/healthz?scope=kid']) {
+      for (const who of [null, c.everything]) {
+        expect(texts(await get(path, who))).toEqual(['call', 'cooldown', 'wait', 'lastError', 'debt', 'read']);
+      }
+      const health = await get(path, c.dashboard);
+      expect(texts(health)).toEqual([]);
+      // Its names, codes, ids and times stay, and every key and list keeps its shape.
+      const main = health.agents[0];
+      expect(main).toMatchObject({ name: 'main', status: 'inferring', consecutiveInferenceFailures: 1, refusalStats: { lastCategory: 'policy', byCategory: { policy: 1 } } });
+      expect(main.providerAdmission).toMatchObject({ cooldownUntil: 2, cooldownReason: '' });
+      expect(main.providerAdmission.providerWaits).toEqual([{ model: 'a-model', until: '2026-10-22T06:05:00.000Z', reason: '', setAt: '2026-10-22T06:00:00.000Z' }]);
+      expect(main.lastInference).toEqual({ startedAt: 1, failedAt: 2, lastError: '' });
+      expect(health.gate.inferring).toEqual(['main']);
+      expect(health.compressionDebt.main).toEqual({ state: 'unknown', error: '', failure: 'report', pendingChunks: null });
+      expect(health.compressionQuarantine.main.spans).toEqual([{ chunkSourceHash: 'h1', firstMessageId: 'm1', lastMessageId: 'm2', closedAgeMs: 1, quarantinedAt: 1, records: 1, answeredAttempts: 1, latestOutcome: 'refusal' }]);
+      expect(health.readFailures).toEqual({ main: { contextComposition: '' } });
+      expect(health.runtimeSettings.main).toEqual({ contextBudgetTokens: 1000, transition: 'stable' });
+      expect(health.callLedger).toEqual(ledgerWithoutText);
+    }
+    for (const path of ['/quota', '/quota?scope=kid']) {
+      for (const who of [null, c.everything]) expect((await get(path, who)).error).toBe(TEXT.quota);
+      expect(await get(path, c.dashboard)).toMatchObject({ subscription: true, provider: 'anthropic', windows: [], fetchedAt: 1, error: '' });
     }
   });
 

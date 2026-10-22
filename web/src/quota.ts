@@ -107,12 +107,18 @@ export function quotaTone(q: QuotaSnapshotData): string {
   return worst >= 90 ? 'text-rose-400' : worst >= 75 ? 'text-amber-400' : 'text-emerald-300';
 }
 
+/** A subscription meter that has never read: no windows, and a failed read,
+ *  whose text an observer without 'ops' gets empty. */
+export function quotaUnreadable(q: QuotaSnapshotData | null): boolean {
+  return q?.subscription === true && q.windows.length === 0 && q.error !== undefined;
+}
+
 export function quotaTitle(q: QuotaSnapshotData): string {
   const lines = q.windows.map((w) =>
     `${w.label}: ${Math.floor(w.utilization)}% used`
     + (w.resetsAt ? ` · resets ${new Date(w.resetsAt).toLocaleString()}` : ''));
   const status = quotaStatus(q);
   if (status) lines.push(status);
-  if (q.error) lines.push(`Last refresh failed: ${q.error}`);
+  if (q.error !== undefined) lines.push(q.error ? `Last refresh failed: ${q.error}` : 'Last refresh failed');
   return `Subscription quota (${q.provider ?? 'provider'})\n${lines.join('\n')}`;
 }

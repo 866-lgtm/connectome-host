@@ -22,7 +22,7 @@ import {
   type OpsAlert, type HealthSnapshot, type CredentialInfo, type CredentialAction,
 } from './Health';
 import { BranchPanel } from './Branches';
-import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
+import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone, quotaUnreadable } from './quota';
 import { planHealthAlerts } from './health-alerts';
 import {
   AGENT_TREE_SCOPES,
@@ -2032,8 +2032,8 @@ function Header(props: {
         </Show>
         {/* A subscription meter that has never read (inference-only token,
             gateway without the usage path) must say so, not render nothing. */}
-        <Show when={props.quota?.subscription && props.quota.windows.length === 0 && props.quota.error}>
-          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable: ${props.quota!.error}`}>
+        <Show when={quotaUnreadable(props.quota ?? null)}>
+          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable${props.quota!.error ? `: ${props.quota!.error}` : ''}`}>
             quota: unreadable
           </span>
         </Show>

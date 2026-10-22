@@ -113,8 +113,10 @@ The module accepts three credentials:
   `tools`, `thinking`, `debug` — and gets a session cookie for the matching
   HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`
   and `/quota`, `messages` for `/media/…`, with `tools` as well for an image
-  a tool returned). Observers are read-only; `/files/…` and
-  `/debug/retrieval*` stay password-only.
+  a tool returned). An observer with `health` and without `ops` gets health
+  without the text of failures, which are `ops`'s: an error's or a reason's
+  words come empty, and its numbers, times, names and codes stay. Observers
+  are read-only; `/files/…` and `/debug/retrieval*` stay password-only.
 
 ## Caddy
 

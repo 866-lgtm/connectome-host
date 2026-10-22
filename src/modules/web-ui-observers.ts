@@ -611,7 +611,7 @@ export function sessionTokenFromRequest(req: Request): string | null {
 // unit-testable without the webui's process-level server singleton.
 // ---------------------------------------------------------------------------
 
-import { AGENT_TREE_SCOPES, type StreamEndedMessage, type WebUiServerMessage, type WelcomeMessage, type WelcomeMessageEntry } from '../web/protocol.js';
+import { AGENT_TREE_SCOPES, type CallLedgerSnapshot, type StreamEndedMessage, type WebUiServerMessage, type WelcomeMessage, type WelcomeMessageEntry } from '../web/protocol.js';
 import { STREAM_END_TRACES } from '../state/turn-trace.js';
 
 /** What a frame needs to go to full clients alone: what no grant covers. */
@@ -784,7 +784,8 @@ export function childEventScopes(event: { type?: unknown }): FrameScopes {
  *  reaches no observer until it's given a scope: today that's `pins-list` and
  *  `settings-state`, which no observer may request. `message-appended` isn't
  *  sent this way: each observer gets it projected through
- *  filterEntryForScopes. */
+ *  filterEntryForScopes. Nor, past this gate, is `call-ledger`: an observer
+ *  without 'ops' gets it without its failure text (LEDGER_STRINGS). */
 export function frameScopes(frame: WebUiServerMessage): FrameScopes {
   switch (frame.type) {
     case 'trace':
@@ -851,6 +852,107 @@ export function filterEntryForScopes(
   return { ...entry, blocks };
 }
 
+/**
+ * Where a health payload keeps its strings for a client that holds 'health'
+ * but not 'ops'. The grant tool gives 'health' liveness and usage and puts
+ * failures under 'ops', yet a failure's text reaches health in many places:
+ * a failed call's error, an agent's last error, a provider cooldown's or
+ * wait's reason, compression debt's error, a health read's failure, a quota
+ * read's error. A list of those would let the next one through, so the
+ * payload keeps its numbers, flags and nulls wherever they are, and its
+ * strings only where a spec names them: names, ids, codes and times. Any
+ * other string is emptied rather than removed, so keys and lists keep their
+ * shape: a read failure's key still says its section failed, a quarantine
+ * still counts its spans, and a field the wire type requires is still there.
+ * Map keys, such as agent names, are kept.
+ *
+ * A spec is `true`, which keeps the value there whole; a predicate, which
+ * keeps it when it holds of the object the value sits in; or an object
+ * naming the keys to descend into, with `*` for every key of a map. A list
+ * takes its spec for each item.
+ */
+export type KeptStrings =
+  | true
+  | ((holder: Readonly<Record<string, unknown>>) => boolean)
+  | { readonly [key: string]: KeptStrings };
+
+/** `value` with every string a spec doesn't keep emptied (KeptStrings). */
+export function keepNamedStrings(value: unknown, kept: KeptStrings | undefined): unknown {
+  if (kept === true) return value;
+  if (typeof value === 'string') return '';
+  if (value === null || typeof value !== 'object') return value;
+  const spec = typeof kept === 'object' ? kept : undefined;
+  if (Array.isArray(value)) return value.map((item) => keepNamedStrings(item, spec));
+  const holder = value as Record<string, unknown>;
+  // Keyed by whatever the payload holds, such as agent names, so with no
+  // prototype: any key is an own key.
+  const out: Record<string, unknown> = Object.create(null);
+  for (const [key, item] of Object.entries(holder)) {
+    let child = spec && (Object.hasOwn(spec, key) ? spec[key] : spec['*']);
+    if (typeof child === 'function') child = child(holder) ? true : undefined;
+    out[key] = keepNamedStrings(item, child);
+  }
+  return out;
+}
+
+/** The call ledger's strings that aren't failure text. A failed call's
+ *  `cause` is its error's text (classifyCall); every other verdict's is the
+ *  host's own account of the call's cache. */
+export const LEDGER_STRINGS: KeptStrings = {
+  rows: {
+    id: true,
+    timestamp: true,
+    kind: true,
+    originEstimate: true,
+    model: true,
+    cache: { ttls: true, effectiveTtl: true },
+    cost: { currency: true, grade: true, pricingVersion: true },
+    verdict: true,
+    cause: (row) => row.verdict !== 'ERROR',
+    stopReason: true,
+  },
+  summary: { cost: { currency: true, pricingVersion: true } },
+};
+
+/** `/healthz`'s strings that aren't failure text: agent-framework's
+ *  healthSnapshot, and what buildHealthSnapshot adds. The credential's state
+ *  goes whole, as health-tier telemetry (buildCredentialSnapshot). */
+export const HEALTH_STRINGS: KeptStrings = {
+  at: true,
+  gate: { inferring: true },
+  activeStreams: true,
+  agents: {
+    name: true,
+    status: true,
+    providerAdmission: {
+      lastRecovery: { stopReason: true },
+      providerWaits: { model: true, until: true, setAt: true },
+    },
+    refusalStats: { lastCategory: true },
+  },
+  credential: true,
+  compressionQuarantine: {
+    '*': {
+      keys: true,
+      spans: { chunkSourceHash: true, firstMessageId: true, lastMessageId: true, latestOutcome: true },
+    },
+  },
+  compressionDebt: { '*': { state: true, failure: true, mergeQuarantineKeys: true, mergeHeldIds: true } },
+  contextComposition: {
+    '*': { planVsActual: { solver: true, ceiling: true, foldDiff: { runs: { firstChunkId: true, lastChunkId: true } } } },
+  },
+  runtimeSettings: {
+    '*': { sameRoundThinkTextPolicy: true, sameRoundThinkTextPolicySource: true, transition: true, transitionReason: true },
+  },
+  callLedger: LEDGER_STRINGS,
+};
+
+/** `/quota`'s strings that aren't failure text: all but a read's `error`. */
+export const QUOTA_STRINGS: KeptStrings = {
+  provider: true,
+  windows: { key: true, label: true, model: true },
+};
+
 /** Project a welcome through an observer's scope mask. Without 'messages'
  *  the conversation's entries are emptied — a health/ops observer like the
  *  fleet hub gets structure and usage, never content — and so are the session's and
@@ -861,8 +963,10 @@ export function filterEntryForScopes(
  *  frames (`usage`, `call-ledger`, `host-mode`) are gated on 'health', and the
  *  welcome must refuse exactly what the stream refuses — otherwise a
  *  messages-only observer reads model IDs, per-call costs, and raw provider
- *  errors on connect that it is denied a second later. The agent trees go
- *  only with every scope their nodes need (TREES). */
+ *  errors on connect that it is denied a second later. With 'health' and
+ *  without 'ops', the call ledger comes without its failure text
+ *  (LEDGER_STRINGS), as its live frame does. The agent trees go only with
+ *  every scope their nodes need (TREES). */
 export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>): WelcomeMessage {
   const emptyTree = { asOfTs: Date.now(), nodes: [], callIdIndex: {} };
   const scoped: WelcomeMessage = { ...welcome };
@@ -874,6 +978,8 @@ export function scopeWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>
     // dropped (matches the emptied-not-deleted style of the fields below).
     scoped.usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
     scoped.agents = welcome.agents.map((agent) => ({ ...agent, model: '' }));
+  } else if (!scopes.has('ops') && welcome.callLedger) {
+    scoped.callLedger = keepNamedStrings(welcome.callLedger, LEDGER_STRINGS) as CallLedgerSnapshot;
   }
   if (!scopes.has('messages')) {
     return {

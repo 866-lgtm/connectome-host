@@ -121,7 +121,12 @@ import {
   clientHolds,
   frameScopes,
   filterEntryForScopes,
+  keepNamedStrings,
   scopeWelcome,
+  HEALTH_STRINGS,
+  LEDGER_STRINGS,
+  QUOTA_STRINGS,
+  type KeptStrings,
   type ObserverScope,
   type ObserverHelloIdentity,
   streamEndedFor,
@@ -253,6 +258,14 @@ const HTTP_PANEL_OPS: Record<string, string> = {
   '/quota': 'quota',
   '/credential': 'credential',
 };
+
+/** The health routes an observer without 'ops' gets without their failure
+ *  text, each keeping the strings its spec names (keepNamedStrings), whether
+ *  this process answers or a fleet child does. */
+const HEALTH_ROUTE_STRINGS: ReadonlyMap<string, KeptStrings> = new Map([
+  ['/healthz', HEALTH_STRINGS],
+  ['/quota', QUOTA_STRINGS],
+]);
 
 /** True when a wire `scope` field names a fleet child (vs the local process). */
 function isChildScope(scope: string | undefined): scope is string {
@@ -593,7 +606,7 @@ export class WebUiModule implements Module {
     // calls without polling the JSONL log.
     state.callLedgerDetacher = this.config.callLedger?.onUpdate((ledger) => {
       state.latestCallLedger = ledger;
-      this.broadcast({ type: 'call-ledger', ledger });
+      this.sendCallLedger(ledger);
     }) ?? null;
 
     console.log(`[webui] listening on ${webUiHttpUrl(host, boundPort)}`);
@@ -940,6 +953,26 @@ export class WebUiModule implements Module {
     }
   }
 
+  /** The call ledger to every client that may have it, as broadcast sends a
+   *  frame, but without its failure text to an observer without 'ops'
+   *  (LEDGER_STRINGS). That copy is made for the first such client, so a
+   *  ledger with none costs nothing more. */
+  private sendCallLedger(ledger: CallLedgerSnapshot): void {
+    if (!sharedServer) return;
+    const frame: WebUiServerMessage = { type: 'call-ledger', ledger };
+    const scopes = frameScopes(frame);
+    let withoutText: WebUiServerMessage | undefined;
+    for (const client of sharedServer.clients.values()) {
+      if (!client.welcomed || !clientHolds(client, scopes)) continue;
+      if (clientHolds(client, ['ops'])) {
+        this.send(client, frame);
+        continue;
+      }
+      withoutText ??= { type: 'call-ledger', ledger: keepNamedStrings(ledger, LEDGER_STRINGS) as CallLedgerSnapshot };
+      this.send(client, withoutText);
+    }
+  }
+
   private fanOutTrace(event: TraceEvent): void {
     sharedServer!.interrupts?.onTrace(event as unknown as { type: string; agentName?: unknown });
     // Update cached usage snapshot first so welcomes for late-connecting
@@ -1182,6 +1215,7 @@ export class WebUiModule implements Module {
     if ((url.pathname === '/healthz' || url.pathname === '/quota' || url.pathname === '/credential') && !httpAllowed('health')) {
       return this.unauthorized();
     }
+    const keptStrings = httpAllowed('ops') ? undefined : HEALTH_ROUTE_STRINGS.get(url.pathname);
     if (url.pathname.startsWith('/files/') && !basicOk) {
       // Workspace files stay basic-auth-only: mount contents are outside the
       // observer scope model (they are the agent's working files, not wire
@@ -1215,7 +1249,7 @@ export class WebUiModule implements Module {
     const scopeParam = url.searchParams.get('scope');
     if (scopeParam && scopeParam !== 'local') {
       const op = HTTP_PANEL_OPS[url.pathname];
-      if (op) return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url));
+      if (op) return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url), keptStrings);
       // Fall through: non-panel routes (static, /files) ignore the param.
     }
 
@@ -1276,7 +1310,8 @@ export class WebUiModule implements Module {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
       try {
-        return Response.json(buildHealthSnapshot(app));
+        const snapshot = buildHealthSnapshot(app);
+        return Response.json(keptStrings ? keepNamedStrings(snapshot, keptStrings) : snapshot);
       } catch (err) {
         const status = err instanceof PanelError ? err.status : 500;
         return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status });
@@ -1287,7 +1322,8 @@ export class WebUiModule implements Module {
     if (url.pathname === '/quota') {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      return Response.json(await buildQuotaSnapshot(app));
+      const quota = await buildQuotaSnapshot(app);
+      return Response.json(keptStrings ? keepNamedStrings(quota, keptStrings) : quota);
     }
 
     // Credential state (health-scoped, like /healthz); no token ever rides here.
@@ -1343,13 +1379,16 @@ export class WebUiModule implements Module {
       | FleetModule | undefined;
   }
 
-  /** Forward one panel op to a fleet child and answer with its JSON. Status
-   *  mapping comes from the child (PanelError.status travels the wire), with
-   *  502/504 supplied by requestPanel for unreachable/unresponsive children. */
+  /** Forward one panel op to a fleet child and answer with its JSON, keeping
+   *  only the strings `keptStrings` names when it's given (keepNamedStrings).
+   *  Status mapping comes from the child (PanelError.status travels the
+   *  wire), with 502/504 supplied by requestPanel for unreachable/unresponsive
+   *  children. */
   private async proxyPanelToChild(
     childName: string,
     op: string,
     params: Record<string, unknown>,
+    keptStrings?: KeptStrings,
   ): Promise<Response> {
     const fleet = this.fleetModule();
     if (!fleet) {
@@ -1362,7 +1401,7 @@ export class WebUiModule implements Module {
     if (!result.ok) {
       return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
     }
-    return Response.json(result.data);
+    return Response.json(keptStrings ? keepNamedStrings(result.data, keptStrings) : result.data);
   }
 
   /**
