@@ -71,6 +71,8 @@ describe('what each client is sent', () => {
     },
   };
   const agent = { name: 'main', model: 'a-model', getContextManager: () => cm };
+  // The framework's agents: a test empties it to bind a host with no agent store.
+  let agents = [agent];
   // A child's panel answers, as a fleet child's panel ops give them.
   const panels: Record<string, unknown> = {
     'pin-add': { agent: 'main', pins: [], pinsSupported: true, levelHonored: false, candidates: [{ id: 'm1', index: 0, participant: 'user', text: 'a pinned line' }] },
@@ -96,7 +98,7 @@ describe('what each client is sent', () => {
         everything: ['health', 'ops', 'messages', 'thinking', 'tools'],
       },
       framework: {
-        getAllAgents: () => [agent],
+        getAllAgents: () => agents,
         getAllModules: () => [fleet],
         getAgent: (name: string) => (name === 'main' ? agent : undefined),
         getHostModeStatus: () => hostStatus,
@@ -330,12 +332,11 @@ describe('what each client is sent', () => {
       const f = await conn.until('history-page', (p) => p.corrId === corrId);
       return { ids: ids(f.entries), startIndex: f.startIndex, totalCount: f.totalCount };
     };
-    // Where each page read began, for reads of `limit` slots: the welcome's
-    // reads take every slot, so they never match.
-    const readsOf = (limit: number) => {
-      const offsets: number[] = [];
-      onRead = (offset, size) => { if (size === limit) offsets.push(offset); };
-      return offsets;
+    // Each read from here on, as [where it began, how many slots it asked for].
+    const recordReads = () => {
+      const reads: [number, number][] = [];
+      onRead = (offset, size) => { reads.push([offset, size]); };
+      return reads;
     };
 
     test("doesn't reach a client in its welcome, live, or in a page, which reads back past such messages to one the client may see, or to the start", async () => {
@@ -354,10 +355,13 @@ describe('what each client is sent', () => {
         expect(ids(c.interior.framesOf('welcome')[0]!.messages)).toEqual(['m0', 'm1', 'm2', 'm3', 'm4', 'm5', 'm6']);
         // The reader may see nothing of 3 to 6, so its page reads back to the window holding 2.
         expect(await page(c.reader, 'r-back', 7)).toEqual({ ids: ['m2'], startIndex: 1, totalCount: 7 });
-        // Before 2 it may see nothing, and history starts two windows back: an empty page.
-        const reads = readsOf(1);
+        const backPage = c.reader.framesOf('history-page').find((f) => f.corrId === 'r-back')!;
+        expect((backPage.entries as { index: number }[])[0]!.index).toBe(2);
+        // Before 2 it may see nothing, and history starts two windows back: an
+        // empty page, and no read past the start.
+        const reads = recordReads();
         expect(await page(c.reader, 'r-start', 2, 1)).toEqual({ ids: [], startIndex: 0, totalCount: 7 });
-        expect(reads).toEqual([1, 0]);
+        expect(reads).toEqual([[1, 1], [0, 1]]);
         onRead = undefined;
         expect(await page(c.interior, 'i-back', 7)).toEqual({ ids: ['m5', 'm6'], startIndex: 5, totalCount: 7 });
         expect(await page(c.operator, 'o-back', 7)).toEqual({ ids: ['m5', 'm6'], startIndex: 5, totalCount: 7 });
@@ -389,9 +393,9 @@ describe('what each client is sent', () => {
       try {
         const c = await everyone();
         // The window asked for at 4 begins at the body's first shard, 2.
-        const reads = readsOf(2);
+        const reads = recordReads();
         expect(await page(c.reader, 'r-body', 6)).toEqual({ ids: ['m0'], startIndex: 0, totalCount: 6 });
-        expect(reads).toEqual([4, 0]);
+        expect(reads).toEqual([[4, 2], [0, 2]]);
         expect(await page(c.interior, 'i-body', 6)).toEqual({ ids: ['m2', 'm5'], startIndex: 2, totalCount: 6 });
       } finally {
         onRead = undefined;
@@ -417,8 +421,24 @@ describe('what each client is sent', () => {
         expect(c.reader.framesOf('welcome').length).toBe(2);
         expect(welcomed(c.reader)).toEqual({ ids: ['m0'], history: { startIndex: 0, totalCount: 251 } });
         expect(welcomed(c.interior)).toEqual({ ids: tail, history: { startIndex: 51, totalCount: 251 } });
+        // Past ten windows of 200 before the tail, the welcome comes empty, from where the reading stopped.
+        transcript = [say('m0', 'user', [{ type: 'text', text: 'a word' }]), ...Array.from({ length: 2300 }, (_, i) => toolUse(`m${i + 1}`, `t${i}`))];
+        await host.fence([c.reader, c.interior]);
+        expect(welcomed(c.reader)).toEqual({ ids: [], history: { startIndex: 101, totalCount: 2301 } });
+        expect(welcomed(c.interior).history).toEqual({ startIndex: 2101, totalCount: 2301 });
       } finally {
         transcript = [];
+      }
+    });
+
+    test("an observer's welcome still comes when the host has no agent store to read back from", async () => {
+      const c = await everyone();
+      agents = [];
+      try {
+        await host.fence([c.reader]);
+        expect(c.reader.framesOf('welcome').at(-1)!.messages).toEqual([]);
+      } finally {
+        agents = [agent];
       }
     });
 
@@ -426,9 +446,9 @@ describe('what each client is sent', () => {
       transcript = [say('m0', 'user', [{ type: 'text', text: 'a word' }]), ...Array.from({ length: 25 }, (_, i) => toolUse(`m${i + 1}`, `t${i}`))];
       try {
         const c = await everyone();
-        const reads = readsOf(2);
+        const reads = recordReads();
         expect(await page(c.reader, 'r-ten', 26)).toEqual({ ids: [], startIndex: 6, totalCount: 26 });
-        expect(reads.length).toBe(10);
+        expect(reads).toEqual([24, 22, 20, 18, 16, 14, 12, 10, 8, 6].map((offset) => [offset, 2]));
         expect(await page(c.reader, 'r-on', 6)).toEqual({ ids: ['m0'], startIndex: 0, totalCount: 26 });
       } finally {
         onRead = undefined;

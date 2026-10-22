@@ -308,9 +308,9 @@ const AUTOSTART_RECORD_WAIT_MS = 1_000;
 /** Default / max page size for request-history. */
 const HISTORY_PAGE_DEFAULT = 200;
 const HISTORY_PAGE_MAX = 500;
-/** The most windows of its own size an observer's request-history reads
- *  back past messages its scopes empty, so one request holds the host for
- *  at most about ten times what one page costs a full client. */
+/** The most windows of its own size an observer's page reads back past
+ *  messages its scopes empty (readHistory), each widened to whole bodies as
+ *  a full client's page is, so the reading one request starts is bounded. */
 const HISTORY_READ_BACK_WINDOWS = 10;
 
 /** Re-exported from the shared panel-data layer (moved there so headless
@@ -3258,9 +3258,10 @@ export class WebUiModule implements Module {
 
   /** The welcome as an observer with `scopes` gets it (scopeWelcome). When
    *  its scopes empty every message of the tail, it reads back as a history
-   *  page does (readHistory), so it opens on the last messages it may see,
-   *  and its `startIndex` is where the reading stopped. It reads in the same
-   *  turn the welcome was built in, so no message lands between them. */
+   *  page does (readHistory), so it opens on the last messages it may see
+   *  within those windows, and its `startIndex` is where the reading stopped.
+   *  It reads in the same turn the welcome was built in, so no message lands
+   *  between them. */
   private observerWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>): WelcomeMessage {
     const scoped = scopeWelcome(welcome, scopes);
     if (scoped.messages.length > 0 || !scopes.has('messages')) return scoped;
@@ -3754,43 +3755,6 @@ function flattenToolResultContent(content: unknown): string {
 }
 
 /**
- * A page of history ending just before `beforeIndex`: one window of about
- * `limit` slots, widened to whole bodies (alignToBodyGroups), for a full
- * client (`scopes` null). An observer's page leaves out the entries its
- * scopes empty, so a window of messages it may see nothing of comes back
- * empty, and the page takes an empty page for the start of history. So for
- * an observer it reads the window before, and the one before that, until a
- * window leaves it an entry or history starts, for at most
- * HISTORY_READ_BACK_WINDOWS windows. Past that the page is empty, and its
- * startIndex is where the reading stopped: the page still shows that older
- * messages remain, and its next request reads on from there.
- */
-function readHistory(
-  cmw: WindowCapableCm,
-  beforeIndex: number,
-  limit: number,
-  scopes: Set<ObserverScope> | null,
-): { entries: WelcomeMessageEntry[]; startIndex: number; totalCount: number } {
-  for (let windows = 1; ; windows++) {
-    const offset = Math.max(0, beforeIndex - limit);
-    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
-      resolveBlobs: false,
-      alignToBodyGroups: true,
-    });
-    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
-    if (scopes !== null) {
-      entries = entries
-        .map((e) => filterEntryForScopes(e, scopes))
-        .filter((e): e is WelcomeMessageEntry => e !== null);
-    }
-    if (entries.length > 0 || win.startIndex === 0 || windows === HISTORY_READ_BACK_WINDOWS) {
-      return { entries, startIndex: win.startIndex, totalCount: win.totalCount };
-    }
-    beforeIndex = win.startIndex;
-  }
-}
-
-/**
  * Coalesce consecutive shards of a bodyGroup (one large message chunked at
  * ingestion) into a single wire entry, then flatten everything. Shards are
  * contiguous by construction; within a run they're ordered by shardIndex.
@@ -3830,6 +3794,44 @@ function coalesceAndFlatten(messages: readonly MessageLike[], startIndex: number
     out.push(toWireEntry(merged, startIndex + runStart, { mediaRefs: false }));
   }
   return out;
+}
+
+/**
+ * A page of history ending just before `beforeIndex`: one window of about
+ * `limit` slots, widened to whole bodies (alignToBodyGroups), for a full
+ * client (`scopes` null). An observer's page leaves out the entries its
+ * scopes empty, so a window of messages it may see nothing of comes back
+ * empty, and the page takes an empty page for the start of history. So for
+ * an observer it reads the window before, and the one before that, until a
+ * window leaves it an entry or history starts, for at most
+ * HISTORY_READ_BACK_WINDOWS windows. Past that the page is empty, and its
+ * startIndex is where the reading stopped: the page still shows that older
+ * messages remain, a bulk load stops there, and the page's next request,
+ * such as a click on that row, reads on from there.
+ */
+function readHistory(
+  cmw: WindowCapableCm,
+  beforeIndex: number,
+  limit: number,
+  scopes: Set<ObserverScope> | null,
+): { entries: WelcomeMessageEntry[]; startIndex: number; totalCount: number } {
+  for (let windows = 1; ; windows++) {
+    const offset = Math.max(0, beforeIndex - limit);
+    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
+      resolveBlobs: false,
+      alignToBodyGroups: true,
+    });
+    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
+    if (scopes !== null) {
+      entries = entries
+        .map((e) => filterEntryForScopes(e, scopes))
+        .filter((e): e is WelcomeMessageEntry => e !== null);
+    }
+    if (entries.length > 0 || win.startIndex === 0 || windows === HISTORY_READ_BACK_WINDOWS) {
+      return { entries, startIndex: win.startIndex, totalCount: win.totalCount };
+    }
+    beforeIndex = win.startIndex;
+  }
 }
 
 /** The framework stores assistant turns under the agent's name (e.g.
