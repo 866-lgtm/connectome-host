@@ -50,44 +50,26 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
    *  (state/turn-trace.ts). */
   const streams = new Map<string, 'open' | 'failed'>();
   let settle: (() => void) | null = null;
-  /** Whether stdout's last line is unfinished, so that a line on stderr
-   *  ends it first, and what prints next on stdout, such as a batch's echo
-   *  of its next line, starts a line of its own. */
-  let lineOpen = false;
-  const write = (text: string): void => {
-    if (text === '') return;
-    out.write(text);
-    lineOpen = !text.endsWith('\n');
-  };
-  const log = (line: string): void => {
-    out.log(line);
-    lineOpen = false;
-  };
-  /** A line to stderr, after ending stdout's line if it's unfinished. */
-  const error = (line: string): void => {
-    if (lineOpen) write('\n');
-    out.error(line);
-  };
 
   function onTrace(event: { type: string; [key: string]: unknown }): void {
     const agent = typeof event.agentName === 'string' ? event.agentName : undefined;
     switch (event.type) {
       case 'inference:started':
         if (agent !== undefined) streams.set(agent, 'open');
-        write('\n');
+        out.write('\n');
         return;
       case 'inference:tokens':
-        if (typeof event.content === 'string') write(event.content);
+        if (typeof event.content === 'string' && event.content !== '') out.write(event.content);
         return;
       case 'inference:tool_calls_yielded': {
         const calls = (event.calls as Array<{ name: string }> | undefined) ?? [];
-        log(`\n[tools] ${calls.map((c) => c.name).join(', ')}`);
+        out.log(`\n[tools] ${calls.map((c) => c.name).join(', ')}`);
         return;
       }
       case 'tool:started': {
         const toolInput = event.input ? JSON.stringify(event.input) : '';
         const truncated = toolInput.length > 120 ? toolInput.slice(0, 120) + '...' : toolInput;
-        log(`[tool] ${String(event.tool)}${truncated ? ' ' + truncated : ''}`);
+        out.log(`[tool] ${String(event.tool)}${truncated ? ' ' + truncated : ''}`);
         return;
       }
     }
@@ -95,23 +77,30 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
     const state = streams.get(agent);
     if (state === undefined) return;
     const primary = agent === primaryAgentName;
-    // A stream's first end closes its prose line and says how the stream
-    // ended. A failure goes to stderr, for any agent: `failed`, and a lone
-    // `exhausted`, which from agent-framework 0.22.3 comes only from an
-    // abort whose reason isn't `user` and which the framework counts as a
-    // failure. The primary's stop, `aborted`, goes to stdout, since it isn't
+    // A stream's first end closes its prose line on stdout, so that what
+    // prints next, such as a batch's echo of its next line, starts a line of
+    // its own, and says how the stream ended. A failure goes to stderr, for
+    // any agent: `failed`, and a lone `exhausted`, which from agent-framework
+    // 0.22.3 comes only from an abort whose reason isn't `user` (each of its
+    // other `exhausted` emits follows a `failed`) and which the framework
+    // counts as a failure. Its newline goes to stdout rather than leading its
+    // stderr line, so a terminal showing both reads as before; where stdout's
+    // line had already ended, as after a tool's line, stdout gets an empty
+    // line. The primary's stop, `aborted`, goes to stdout, since it isn't
     // one. An end after an end, such as `exhausted` after `failed`, prints
     // nothing.
     if (state === 'open') {
       if (event.type === 'inference:failed') {
-        error(`Error: ${traceError(event)}`);
+        out.write('\n');
+        out.error(`Error: ${traceError(event)}`);
       } else if (event.type === 'inference:exhausted') {
-        error(`(turn ended: ${traceError(event)})`);
+        out.write('\n');
+        out.error(`(turn ended: ${traceError(event)})`);
       } else if (primary && event.type === 'inference:aborted') {
         const reason = typeof event.reason === 'string' && event.reason !== '' ? `: ${event.reason}` : '';
-        log(`\n(turn aborted${reason})`);
+        out.log(`\n(turn aborted${reason})`);
       } else {
-        write('\n');
+        out.write('\n');
       }
     }
     if (!TURN_SETTLED_TRACES.has(event.type)) {
@@ -135,7 +124,7 @@ export function createPipedTurns(primaryAgentName: string, out: PipedOutput): Pi
       const timer = setTimeout(() => {
         if (settle !== done) return;
         settle = null;
-        error(`(no answer after ${capMs / 1000} s: going on without it)`);
+        out.error(`(no answer after ${capMs / 1000} s: going on without it)`);
         resolve();
       }, capMs);
       const done = (): void => { clearTimeout(timer); resolve(); };

@@ -125,6 +125,8 @@ describe("a fleet child's peek log", () => {
     expect(formatWireEvent({ type: 'inference:exhausted', error: 'Stream aborted: timeout' } as never)).toEqual({
       text: '✗ turn ended: Stream aborted: timeout', color: '#cc0000',
     });
+    // A completion, which the subagent's peek doesn't show, keeps its own line.
+    expect(formatWireEvent({ type: 'inference:completed' } as never)).toEqual({ text: '─ inference completed ─', color: '#555555' });
   });
 
   test('a peek shows a failure in red, a stop in yellow and a turn a tool ended in grey', () => {
