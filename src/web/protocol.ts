@@ -230,8 +230,12 @@ export interface CallLedgerRow {
     effectiveTtl: '5m' | '1h';
   };
   verdict: CallLedgerVerdict;
+  /** Why the call got its verdict. A failed call's (`ERROR`) is its error's
+   *  text, which an observer without 'ops' gets empty. */
   cause: string;
   stopReason?: string;
+  /** Present exactly when the call failed: its error's text, which an
+   *  observer without 'ops' gets empty. */
   error?: string;
 }
 
@@ -304,6 +308,8 @@ export interface QuotaSnapshotData {
     advisory?: boolean;
   }>;
   fetchedAt?: number;
+  /** Present when the last read failed: what it said, which an observer
+   *  without 'ops' gets empty. */
   error?: string;
   /** Epoch ms at which the last spent window resets, else null. A spent
    *  window is not by itself a parked agent — see `parked`. */
@@ -545,6 +551,8 @@ export interface CredentialStateMessage {
   agent?: string;
   kind?: string;
   provider?: string;
+  /** The state's alert text, which can hold the provider's rejection detail
+   *  or a quota read's error: an observer without 'ops' gets it empty. */
   message?: string;
   since?: number;
   until?: number;
@@ -553,6 +561,8 @@ export interface CredentialStateMessage {
   expiresAt?: number;
   actions?: Array<{ id: string; label: string; hint?: string }>;
   login?: { verificationUrl: string; userCode: string };
+  /** The last operator action. Its `message`, which holds a failed action's
+   *  reason, an observer without 'ops' gets empty. */
   lastAction?: { id: string; at: number; ok: boolean; message: string };
 }
 
