@@ -96,7 +96,7 @@ import {
   resolveProvider,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig, membraneCachingOverride, recipeModel } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, membraneCachingOverride, recipeModel, autoContinueSupportWarning } from './framework-agent-config.js';
 import { buildFrameworkStrategy, buildConversationsConfig } from './framework-strategy.js';
 import { AUDIT_STORES_FLAG, auditStoresFromEntry, checkActiveStore, placesOnTrial } from './update/audit-stores.js';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
@@ -685,6 +685,10 @@ agents: [agentConfig],
       historyModule.bind(cm, framework.channels ?? undefined);
     }
   }
+
+  // agent.autoContinue only takes effect on a framework that has it.
+  const autoContinueWarning = autoContinueSupportWarning(recipe, framework.getAgent(agentName) ?? undefined);
+  if (autoContinueWarning) console.warn(autoContinueWarning);
 
   // Compression-quarantine klaxon → the framework's ops-alert channel
   // (failures.log + ops:alert trace + CONNECTOME_OPS_WEBHOOK). The strategy

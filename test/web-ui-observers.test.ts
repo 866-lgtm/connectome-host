@@ -685,6 +685,8 @@ describe('scope filters', () => {
     // The operator log's entry, as request-operator-log gives ops.
     expect(traceScopes({ type: 'operator:action' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:server-closed' })).toEqual(['ops']);
+    // A batched wake run without its gate line, which agent-framework adds after 0.26.0.
+    expect(traceScopes({ type: 'gate:wake-line-omitted' })).toEqual(['ops']);
     expect(traceScopes({ type: 'mcpl:speech-routed' })).toEqual(['messages', 'ops']);
     for (const type of ['inference:published', 'inference:published_complete']) {
       expect(traceScopes({ type })).toEqual(['messages']);
@@ -930,6 +932,7 @@ describe('scope filters', () => {
           },
         },
       },
+      contextCompositionNotKept: ['passthrough'],
       runtimeSettings: {
         main: {
           contextBudgetTokens: 1000, effectiveContextBudgetTokens: 1000, tailTokens: 10, transitionPaceTokens: 10,

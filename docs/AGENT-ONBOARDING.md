@@ -715,7 +715,8 @@ node is refused into the merge quarantine. Both show on `/healthz` as
 context-manager 0.12 or later — including one from a pre-0.12 context-manager, which has no
 audit script of its own — install the upgrade and, before starting the resident on it, run the
 new release's `--audit-stores` on its data directory right after a copy of it, as "Updating an
-install" in [DEPLOYMENTS.md](./DEPLOYMENTS.md) does: it opens every session's store, and its
+install" or "Updating checkouts" in [DEPLOYMENTS.md](./DEPLOYMENTS.md) does: it opens every
+session's store, and its
 recipe's fleet children's, but one that reaches past what an update copies (outside the data
 directory, or on a trial the trial's places, or holding a link out), of which it says why it
 wasn't opened, and one a session names that isn't there yet, which a start makes empty, under
@@ -841,7 +842,10 @@ blocks; expect folds to interact with this on the next model generation.
   — on a fresh copy of the stopped store, never hardlinks; §11.8 gives the drain and the swap
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
-  `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`,
+  `contextComposition` (head / raw / summaries / tail as the last live compile rendered them;
+  no entry for an agent with none, before its first live compile since its context was loaded
+  or for good where its strategy keeps none), `contextCompositionNotKept` (the names of the
+  agents whose strategy keeps none, present only when there are some), `runtimeSettings`,
   `loadRepair` (the latest load repair this session that dropped summaries holding text, as
   context-manager reported it; without `ops`, without its branch), and `readFailures`, present
   only when one of those reads threw: by agent, then section, what the error said, cut to 300
