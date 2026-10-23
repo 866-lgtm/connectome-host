@@ -63,6 +63,10 @@ describe('FleetModule.requestPanel', () => {
     expect((a.data as { op: string }).op).toBe('health');
     expect(b.ok).toBe(true);
     expect((b.data as { op: string }).op).toBe('pins');
+    // Answered, neither waits on the connection's close any longer.
+    const socket = fleet.getChildren().get('panelkid')!.socket!;
+    const waiting = (fleet as unknown as { waitingOn: WeakMap<object, Set<unknown>> }).waitingOn.get(socket);
+    expect(waiting?.size).toBe(0);
   });
 
   test('child-reported failure passes error and status through', async () => {
