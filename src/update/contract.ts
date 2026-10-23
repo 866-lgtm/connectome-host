@@ -245,9 +245,11 @@ export interface LockRecord {
  *  outlives the process, so a start can tell the switch's own quiesce, which
  *  it ends, from an operator's, which it leaves. Both releases of a switch
  *  read it, so it never changes. A release that writes a switch's mark (its
- *  Restart) ends this quiesce at its own start, and a Go back's target is
- *  always such a release, since only a switch takes the copy a Go back goes
- *  back from, so a Go back never starts a release that leaves it in place. */
+ *  Restart) ends this quiesce at its own start, and every switch's target is
+ *  such a release: an Update's switch goes only to a release newer than the
+ *  one running, cut from the same line, and a Go back only to the release
+ *  whose Restart took the copy it goes back from. So no switch starts a
+ *  release that leaves the quiesce in place. */
 export const SWITCH_QUIESCE_PREFIX = 'connectome-host update: ';
 
 /** The reason a switch to `to` quiesces under. */
