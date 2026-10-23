@@ -464,7 +464,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  Called for stream() only, as withEffort is: agent turns stream, and
    *  notes come only between tool calls. complete() carries one-shot calls
    *  (compression, retrieval, naming) that make none, so they have no notes
-   *  to keep and go out as the caller built them.
+   *  to keep, and this step leaves them alone (withReasoning still applies).
    *
    *  Needs membrane >= 0.7.0, which adds the
    *  `thinking-display-updates-2026-08-18` beta whenever the body it sends

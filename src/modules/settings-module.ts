@@ -10,9 +10,12 @@
  * was tool bloat for one boolean + number).
  *
  * The host's adapter wrapper (LoggingAnthropicAdapter) reads `getReasoning()`
- * on each call and injects `thinking: {type:'enabled', budget_tokens: N}` into
- * the outgoing Anthropic request when enabled — keeping the cross-cutting
- * "request mutator" plumbing out of every call site.
+ * on each call and injects `thinking: {type: 'adaptive', display}` into the
+ * outgoing Anthropic request when enabled, on a model that takes adaptive
+ * thinking (withReasoning) — keeping the cross-cutting "request mutator"
+ * plumbing out of every call site. On a streamed call to a model that
+ * returns its notes as thinking blocks, it then sends display 'updates'
+ * where the request would leave 'omitted' (withProgressNotes).
  *
  * Designed to be extensible: new domains add their own slice in
  * `SettingsState` + a few tools + a typed accessor. Bundled with the host;
@@ -41,6 +44,10 @@ export interface ReasoningSettings {
    * empty `thinking` field with only the encrypted signature. Models 4.7+
    * default to 'omitted' server-side — we default to 'summarized' to restore
    * the pre-4.7 behavior (visible reasoning in stores, webui, estimators).
+   * On the models modelReturnsNotesInThinking lists, a streamed call through
+   * the Anthropic adapter sends 'omitted' as 'updates', so the notes between
+   * tool calls come back as text while reasoning stays hidden
+   * (LoggingAnthropicAdapter.withProgressNotes).
    */
   display: 'summarized' | 'omitted';
   /**

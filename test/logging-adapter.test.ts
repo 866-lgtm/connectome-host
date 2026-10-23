@@ -198,10 +198,11 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
     }
   });
 
-  test('with reasoning off, the wire request still asks for updates, with the beta that needs (stream lane, through the real adapter)', async () => {
+  /** A real adapter whose SDK client records each streamed request's body and headers. */
+  const wireAdapter = (reasoning: () => { enabled: boolean; budgetTokens: number; display?: 'summarized' | 'omitted' }) => {
     const bodies: Array<Record<string, unknown>> = [];
     const headers: Array<Record<string, string> | undefined> = [];
-    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
+    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', reasoning);
     (live as unknown as { client: unknown }).client = {
       withOptions() { return this; },
       messages: {
@@ -211,7 +212,7 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
           return {
             controller: { abort() {} },
             async *[Symbol.asyncIterator]() {
-              yield { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 1 } } };
+              yield { type: 'message_start', message: { model: body.model, usage: { input_tokens: 1 } } };
               yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } };
               yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } };
               yield { type: 'content_block_stop', index: 0 };
@@ -221,15 +222,48 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
         },
       },
     };
-    const messages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }];
-    await live.stream({ ...opus55, messages } as ProviderRequest, { onChunk: () => {} });
-    await live.stream({ ...baseRequest, model: 'claude-opus-4-8', messages } as ProviderRequest, { onChunk: () => {} });
-    expect(bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'updates' });
-    // membrane >= 0.7.0 adds the beta 'updates' needs; without it the API refuses the value.
-    expect(headers[0]?.['anthropic-beta']?.split(',')).toContain('thinking-display-updates-2026-08-18');
+    const send = (model: string) => live.stream(
+      { ...baseRequest, model, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest,
+      { onChunk: () => {} },
+    );
+    const betas = (i: number) => (headers[i]?.['anthropic-beta'] ?? '').split(',').filter(Boolean);
+    return { bodies, betas, send };
+  };
+
+  test('with reasoning off, the wire request still asks for updates, with the beta that needs (stream lane, through the real adapter)', async () => {
+    const wire = wireAdapter(disabled);
+    await wire.send('claude-opus-5-5');
+    await wire.send('claude-fable-5-1');
+    await wire.send('claude-opus-4-8');
+    // Every call reached the client, so the other model's omissions below aren't vacuous.
+    expect(wire.bodies).toHaveLength(3);
+    for (const i of [0, 1]) {
+      expect(wire.bodies[i]?.thinking).toEqual({ type: 'adaptive', display: 'updates' });
+      // membrane >= 0.7.0 adds the beta 'updates' needs; without it the API refuses the value.
+      expect(wire.betas(i)).toContain('thinking-display-updates-2026-08-18');
+      // No binding controls were asked for, so none go, nor their beta.
+      expect(wire.betas(i)).not.toContain('thinking-binding-controls-2026-08-01');
+    }
     // Another model gets neither.
-    expect(bodies[1]?.thinking).toBeUndefined();
-    expect(headers[1]?.['anthropic-beta'] ?? '').not.toContain('thinking-display-updates');
+    expect(wire.bodies[2]?.thinking).toBeUndefined();
+    expect(wire.betas(2)).not.toContain('thinking-display-updates-2026-08-18');
+  });
+
+  test("with reasoning on, stream() applies the reasoning setting before the progress-note step", async () => {
+    // 'omitted' is turned into 'updates' only because withReasoning has run first.
+    const wire = wireAdapter(() => ({ enabled: true, budgetTokens: 0, display: 'omitted' as const }));
+    await wire.send('claude-opus-5-5');
+    await wire.send('claude-opus-4-8');
+    expect(wire.bodies).toHaveLength(2);
+    expect(wire.bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'updates' });
+    expect(wire.betas(0)).toContain('thinking-display-updates-2026-08-18');
+    // Elsewhere the chosen display goes as chosen.
+    expect(wire.bodies[1]?.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
+    // 'summarized' is left alone on the listed models.
+    const summarized = wireAdapter(() => ({ enabled: true, budgetTokens: 0, display: 'summarized' as const }));
+    await summarized.send('claude-opus-5-5');
+    expect(summarized.bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+    expect(summarized.betas(0)).not.toContain('thinking-display-updates-2026-08-18');
   });
 
   test("with reasoning on and display 'omitted', the composed request asks for updates", () => {
@@ -244,7 +278,7 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
       .toEqual({ type: 'adaptive', display: 'omitted' });
   });
 
-  test('complete() leaves one-shot calls as the caller built them: no notes to keep, no tool calls', async () => {
+  test('complete() gets no progress-note step: with reasoning off, a one-shot call goes with no thinking config', async () => {
     const bodies: Array<Record<string, unknown>> = [];
     const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
     (live as unknown as { client: unknown }).client = {
