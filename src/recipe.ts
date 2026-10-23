@@ -1808,6 +1808,10 @@ export const DEFAULT_RECIPE_CLOCK: ClockConfig = Object.freeze({ intervalMinutes
 
 /** `agent.autoContinue`'s keys, when it is an object. */
 const RECIPE_AGENT_AUTO_CONTINUE_KEYS = ['maxConsecutive'] as const;
+/** agent-framework's bounds for `agent.autoContinue.maxConsecutive`
+ *  (resolveAutoContinue, #744), until a framework release exports them. */
+const AUTO_CONTINUE_MIN = 1;
+const AUTO_CONTINUE_MAX = 20;
 
 /**
  * Refuse a nested recipe object's keys outside `known`: the framework reads
@@ -1856,7 +1860,8 @@ const recipeKeyListsInStep: [
   ListsExactly<keyof RecipeKvUnifiedConfig & string, typeof RECIPE_KV_UNIFIED_KEYS>,
   ListsExactly<keyof RecipeKvUnifiedConfig['policy'] & string, typeof RECIPE_KV_UNIFIED_POLICY_KEYS>,
   ListsExactly<keyof ClockConfig & string, typeof RECIPE_AGENT_CLOCK_KEYS>,
-] = [true, true, true, true, true, true, true];
+  ListsExactly<keyof RecipeAutoContinue & string, typeof RECIPE_AGENT_AUTO_CONTINUE_KEYS>,
+] = [true, true, true, true, true, true, true, true];
 void recipeKeyListsInStep;
 
 const RECIPE_WORKSPACE_KEYS = ['mounts', 'configMount'] as const;
@@ -2127,8 +2132,8 @@ export function validateRecipe(raw: unknown): Recipe {
     // framework release this host depends on yet; once it is, call it here
     // as the clock check below calls resolveClockConfig.
     const max = (value as RecipeAutoContinue).maxConsecutive;
-    if (max !== undefined && (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > 20)) {
-      throw new Error(`Recipe agent.autoContinue.maxConsecutive must be a whole number from 1 to 20, got ${JSON.stringify(max)}.`);
+    if (max !== undefined && (typeof max !== 'number' || !Number.isInteger(max) || max < AUTO_CONTINUE_MIN || max > AUTO_CONTINUE_MAX)) {
+      throw new Error(`Recipe agent.autoContinue.maxConsecutive must be a whole number from ${AUTO_CONTINUE_MIN} to ${AUTO_CONTINUE_MAX}, got ${JSON.stringify(max)}.`);
     }
   }
 
