@@ -215,8 +215,8 @@ it, and what has to happen first. A pull doesn't stop for it. So:
   agents write, and keep the copy as it was for as long as you might go
   back. Copy at every update, and once an update's copy is complete, let
   it replace the last: newer code can write a store, or the host's or a
-  library's other files, in a form older code can't read, and the entries
-  can miss saying so.
+  library's other files, in a form older code can't read, as chronicle
+  0.3.0's notes say of its own, and the entries can miss saying so.
   Then update
   the host and the libraries it loads together (`git switch main` first
   in a checkout left detached), since the host's code expects the library
@@ -231,13 +231,16 @@ it, and what has to happen first. A pull doesn't stop for it. So:
   its `.env`, with any variable its service sets for it exported: `bun
   <host checkout>/src/index.ts --audit-stores --recipe <recipe> <data
   directory>`, with the recipe its start names and its `DATA_DIR` as its
-  `.env` or service sets it, or `./data` there when neither does. Your
-  shell has neither unless you set them. The audit opens each store in
-  place, as a start of the new code would, so the copy is what puts them
-  back. A fleet child a launch started, which isn't in the recipe, needs a
-  run of its own on its data directory, without `--recipe`, which reads
-  the recipe its last start saved: `bun <host checkout>/src/index.ts
-  --audit-stores <its data directory>`. "Updating an install" says
+  `.env` or service sets it, or `./data` there when neither does; your
+  shell has neither unless you set them. For a start that names no
+  recipe, leave `--recipe` out, and the audit reads the one its last start
+  saved, or the default one, as that start would. The audit opens each
+  store in place, as a start of the new code would, so the copy is what
+  puts them back. A fleet child a launch started, which isn't in the
+  recipe, needs a run of its own on its data directory, without
+  `--recipe`, which reads the recipe its last start saved: `bun <host
+  checkout>/src/index.ts --audit-stores <its data directory>`. "Updating
+  an install" says
   what else the audit covers and what each line it prints asks of you; for
   a store it refused or couldn't audit, that's going back, below, or a
   repair or correction and the audit again. Then start the servers you
@@ -249,11 +252,12 @@ it, and what has to happen first. A pull doesn't stop for it. So:
   put back any recipe or `.env` change you made for the newer code. Then
   restore the copy of what each agent keeps in place of what's there now,
   not over it, so files the newer code added go too. That discards
-  everything the agents recorded since the copy was made. Where no copy
-  was taken before the commits you go back past, read their entries for
-  what going back does with what they stored, as agent-framework 0.22.1's
-  notes say for going back to 0.22.0. Then start the servers you stopped,
-  and the agents.
+  everything the agents recorded since the copy was made, and only that.
+  For the commits you go back past that the box ran before the copy, as
+  when going back past your last update, or for all of them where no copy
+  was taken, read their entries for what going back does with what they
+  stored, as agent-framework 0.22.1's notes say for going back to 0.22.0.
+  Then start the servers you stopped, and the agents.
 
 ## Updating an install
 
@@ -295,13 +299,8 @@ while a clone installs from its tag's `bun.lock`. So:
   what they say about going back. Read the same in the notes of any MCPL
   server you'll update, between the version you noted and the new one: its
   own changelog, or its commits if it keeps none. Then:
-  - **Copy what each agent keeps,** which "Updating checkouts" lists, as
-    full or reflinked copies, never hardlinks, which share files the agents
-    write, and keep the copy as it was for as long as you might go back.
-    Copy at every update, and once an update's copy is complete, let it
-    replace the last: a newer version can write a store, or the host's or a
-    library's other files, in a form an older one can't read, as chronicle
-    0.3.0's notes say of its own, and a version's notes can miss saying so.
+  - **Copy what each agent keeps** at every update: "Updating checkouts"
+    says what to copy, how, and why.
   - **Then run the new version's store audit,** after the copy and before
     starting any agent, with the agents and their fleet children still
     stopped. It opens each store in place, as the new version's start
