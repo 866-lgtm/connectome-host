@@ -70,8 +70,10 @@ describe('workspace mount keys', () => {
 
   test("refuses, in agent-framework's words, what it refuses on a direct mount, before the recipe can be saved", async () => {
     const direct = "^modules\\.workspace: Mount \"notes\" is direct, which reads disk as it is with no store, watcher or push: ";
+    // Only what agent-framework 0.24 refuses on a direct mount and
+    // anima-research/agent-framework#719, which makes a direct mount
+    // writable, refuses too: #719 takes `mode: 'read-write'`.
     for (const [extra, says] of [
-      [{ mode: 'read-write' }, "mode must be 'read-only', not \"read-write\""],
       [{ watch: 'always' }, "watch \"always\" would watch nothing \\(leave it out, or set 'never'\\)"],
       [{ watch: 'on-agent-action' }, "watch \"on-agent-action\" would watch nothing"],
       [{ watchDebounceMs: 50 }, 'watchDebounceMs would tune no watcher \\(leave it out\\)'],
@@ -82,10 +84,10 @@ describe('workspace mount keys', () => {
     ] as const) {
       expect(() => validateRecipe(recipe({ mounts: [mount({ backend: 'direct', mode: 'read-only', ...extra })] }))).toThrow(new RegExp(direct + says));
     }
-    // Each setting it refuses, all in one line.
+    // Each setting both refuse, all in one line.
     expect(() => validateRecipe(recipe({ mounts: [mount({
-      backend: 'direct', mode: 'read-write', watch: 'always', watchDebounceMs: 50, watchRootPollMs: 500, wakeOnChange: true, autoMaterialize: true,
-    })] }))).toThrow(new RegExp(direct + "mode must be 'read-only', not \"read-write\"; watch \"always\" would watch nothing \\(leave it out, or set 'never'\\); " +
+      backend: 'direct', mode: 'read-only', watch: 'always', watchDebounceMs: 50, watchRootPollMs: 500, wakeOnChange: true, autoMaterialize: true,
+    })] }))).toThrow(new RegExp(direct + "watch \"always\" would watch nothing \\(leave it out, or set 'never'\\); " +
       'watchDebounceMs would tune no watcher \\(leave it out\\); watchRootPollMs would tune no watcher \\(leave it out\\); ' +
       'wakeOnChange would never wake \\(leave it out\\); autoMaterialize would never push \\(leave it out\\)$'));
     // A recipe file is loaded, and the host saves it only once that returns
@@ -93,8 +95,8 @@ describe('workspace mount keys', () => {
     const dir = mkdtempSync(join(tmpdir(), 'mount-keys-'));
     try {
       const file = join(dir, 'recipe.json');
-      writeFileSync(file, JSON.stringify(recipe({ mounts: [mount({ backend: 'direct', mode: 'read-write' })] })));
-      await expect(loadRecipeDetailed(file)).rejects.toThrow(new RegExp(direct + "mode must be 'read-only'"));
+      writeFileSync(file, JSON.stringify(recipe({ mounts: [mount({ backend: 'direct', mode: 'read-only', watch: 'always' })] })));
+      await expect(loadRecipeDetailed(file)).rejects.toThrow(new RegExp(direct + 'watch "always" would watch nothing'));
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
