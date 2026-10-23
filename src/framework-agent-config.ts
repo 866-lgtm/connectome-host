@@ -150,6 +150,9 @@ export function buildFrameworkAgentConfig(
     ...(recipe.agent.toolWrapperProseGuard !== undefined
       ? { toolWrapperProseGuard: recipe.agent.toolWrapperProseGuard }
       : {}),
+    ...(recipe.agent.autoContinue !== undefined
+      ? { autoContinue: recipe.agent.autoContinue }
+      : {}),
     // Ten-minute clock rows unless the recipe names its own or turns them off (false).
     ...(recipe.agent.clock === false ? {} : { clock: recipe.agent.clock ?? { ...DEFAULT_RECIPE_CLOCK } }),
   };

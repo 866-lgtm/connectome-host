@@ -178,6 +178,21 @@ See Agent Framework's `docs/disabled-prose-routing.md`,
 `docs/explicit-prose-routing.md`, and `docs/hybrid-prose-routing.md` for the
 full semantics of each mode.
 
+`agent.autoContinue` (off when omitted) keeps an agent going until it says
+it's done: a turn the model ends itself, with prose or with nothing, is
+followed by another turn straight away instead of a pause until the next
+event. The run stops when the agent calls `skip_reply` (or another tool that
+ends the turn), ends on a `>>skip_reply` / `>>>skip_reply` envelope, or has
+continued `maxConsecutive` times in a row (default 3, 1 to 20). Each next turn
+reads a short `[continue]` row naming `skip_reply` as the way to stop, with
+the count once the cap is near, and speaks in the same locus. Every
+continuation is a full inference, and in `locus` mode its prose is published,
+so keep the cap low. See Agent Framework's `docs/auto-continue.md`.
+
+```json
+{ "agent": { "autoContinue": { "maxConsecutive": 3 } } }
+```
+
 ### Recipe loading
 
 | Command | Behavior |
