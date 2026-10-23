@@ -194,14 +194,16 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
     }
   });
 
-  test('with reasoning off, the wire request still asks for updates (stream lane, through the real adapter)', async () => {
+  test('with reasoning off, the wire request still asks for updates, with the beta that needs (stream lane, through the real adapter)', async () => {
     const bodies: Array<Record<string, unknown>> = [];
+    const headers: Array<Record<string, string> | undefined> = [];
     const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
     (live as unknown as { client: unknown }).client = {
       withOptions() { return this; },
       messages: {
-        stream: async (body: Record<string, unknown>) => {
+        stream: async (body: Record<string, unknown>, opts?: { headers?: Record<string, string> }) => {
           bodies.push(body);
+          headers.push(opts?.headers);
           return {
             controller: { abort() {} },
             async *[Symbol.asyncIterator]() {
@@ -215,11 +217,15 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
         },
       },
     };
-    await live.stream(
-      { ...opus55, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest,
-      { onChunk: () => {} },
-    );
+    const messages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }];
+    await live.stream({ ...opus55, messages } as ProviderRequest, { onChunk: () => {} });
+    await live.stream({ ...baseRequest, model: 'claude-opus-4-8', messages } as ProviderRequest, { onChunk: () => {} });
     expect(bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'updates' });
+    // membrane >= 0.7.0 adds the beta 'updates' needs; without it the API refuses the value.
+    expect(headers[0]?.['anthropic-beta']?.split(',')).toContain('thinking-display-updates-2026-08-18');
+    // Another model gets neither.
+    expect(bodies[1]?.thinking).toBeUndefined();
+    expect(headers[1]?.['anthropic-beta'] ?? '').not.toContain('thinking-display-updates');
   });
 
   test("with reasoning on and display 'omitted', the composed request asks for updates", () => {
