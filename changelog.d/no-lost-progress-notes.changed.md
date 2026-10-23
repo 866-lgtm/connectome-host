@@ -9,9 +9,10 @@
   one-shot `complete()` calls alone, since they make no tool calls; the reasoning setting still applies
   to them as before. Reasoning stays hidden as before, and the notes come back as text, in stores,
   logs and the web UI. A `'summarized'` config, which already returns them (mixed with reasoning
-  summaries), and other models are unchanged. On Fable and Mythos with reasoning off, a recipe's
-  `agent.thinking.display: 'summarized'` reaches the host with no config, since membrane sends that
-  family a thinking config only for binding controls or `'updates'`, so it now goes as `'updates'` too.
+  summaries), goes as it is, and other models are unchanged. With reasoning off, a recipe's
+  `agent.thinking.display` reaches the host only in the thinking config membrane builds from the
+  recipe's `thinking`. Where membrane builds none, as for a display alone on Fable and Mythos, the call
+  goes as `'updates'` like any other without a config, a recipe's `'summarized'` included.
   Needs membrane 0.7.0 or later, which adds the `thinking-display-updates-2026-08-18` beta that
   `'updates'` requires.
   - **Cache:** the first call after upgrading sends a thinking config where none or `'omitted'` went

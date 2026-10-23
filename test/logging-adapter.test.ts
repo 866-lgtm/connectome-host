@@ -1,6 +1,6 @@
 import { describe, test, expect } from 'bun:test';
 import { LoggingAnthropicAdapter } from '../src/logging-adapter.js';
-import { cacheLineageKey } from '@animalabs/membrane';
+import { cacheLineageKey, Membrane, NativeFormatter } from '@animalabs/membrane';
 import type { ProviderCallRecord } from '../src/call-ledger.js';
 import type { ProviderRequest, ProviderResponse } from '@animalabs/membrane';
 import type { ModuleContext } from '@animalabs/agent-framework';
@@ -227,7 +227,7 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
       { onChunk: () => {} },
     );
     const betas = (i: number) => (headers[i]?.['anthropic-beta'] ?? '').split(',').filter(Boolean);
-    return { bodies, betas, send };
+    return { bodies, betas, send, live };
   };
 
   test('with reasoning off, the wire request still asks for updates, with the beta that needs (stream lane, through the real adapter)', async () => {
@@ -259,40 +259,77 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
     expect(wire.betas(0)).toContain('thinking-display-updates-2026-08-18');
     // Elsewhere the chosen display goes as chosen.
     expect(wire.bodies[1]?.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
-    // 'summarized' is left alone on the listed models.
+    // 'summarized' is left alone on the listed models, Fable's included: with
+    // reasoning on, the setting's config goes in `extra`, which membrane doesn't drop.
     const summarized = wireAdapter(() => ({ enabled: true, budgetTokens: 0, display: 'summarized' as const }));
     await summarized.send('claude-opus-5-5');
-    expect(summarized.bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
-    expect(summarized.betas(0)).not.toContain('thinking-display-updates-2026-08-18');
+    await summarized.send('claude-fable-5-1');
+    expect(summarized.bodies).toHaveLength(2);
+    for (const i of [0, 1]) {
+      expect(summarized.bodies[i]?.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+      expect(summarized.betas(i)).not.toContain('thinking-display-updates-2026-08-18');
+    }
   });
 
-  test("with reasoning on and display 'omitted', the composed request asks for updates", () => {
-    const omitted = () => ({ enabled: true, budgetTokens: 0, display: 'omitted' as const });
-    const on = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null', omitted);
-    const internals = on as unknown as WithProgressNotes & { withReasoning(r: ProviderRequest): ProviderRequest };
-    expect(thinkingOf(internals.withProgressNotes(internals.withReasoning(opus55))))
-      .toEqual({ type: 'adaptive', display: 'updates' });
-    // Elsewhere 'omitted' still goes as chosen.
-    const opus48 = { ...baseRequest, model: 'claude-opus-4-8' };
-    expect(thinkingOf(internals.withProgressNotes(internals.withReasoning(opus48))))
-      .toEqual({ type: 'adaptive', display: 'omitted' });
+  test("through membrane, a recipe's 'summarized' goes as 'updates' wherever membrane sends no config for it, as chosen where it sends one, and the reasoning setting decides over it", async () => {
+    // membrane sends the Fable and Mythos family a thinking config only for
+    // binding controls or 'updates' (buildThinkingParam), and another model one
+    // only when the recipe's `enabled` is true. Where it sends none, the step
+    // adds 'updates' on the listed models. Mythos 5 isn't listed, so nothing
+    // goes there.
+    const recipeSend = (membrane: Membrane, model: string, enabled = true) => membrane.stream({
+      messages: [{ participant: 'user', content: [{ type: 'text', text: 'hi' }] }],
+      config: { model, maxTokens: 64, thinking: { enabled, type: 'adaptive', display: 'summarized' } },
+    }, { onChunk: () => {} });
+    const updates = { type: 'adaptive', display: 'updates' };
+    const off = wireAdapter(disabled);
+    const viaOff = new Membrane(off.live, { formatter: new NativeFormatter() });
+    for (const model of ['claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5-1']) await recipeSend(viaOff, model);
+    await recipeSend(viaOff, 'claude-opus-5-5', false);
+    await recipeSend(viaOff, 'claude-opus-5-5');
+    await recipeSend(viaOff, 'claude-mythos-5');
+    expect(off.bodies).toHaveLength(6);
+    for (const i of [0, 1, 2, 3]) {
+      expect(off.bodies[i]?.thinking).toEqual(updates);
+      expect(off.betas(i)).toContain('thinking-display-updates-2026-08-18');
+    }
+    expect(off.bodies[4]?.thinking).toEqual({ type: 'adaptive', display: 'summarized' });
+    expect(off.betas(4)).not.toContain('thinking-display-updates-2026-08-18');
+    expect(off.bodies[5]?.thinking).toBeUndefined();
+    // With reasoning on, the setting's display goes in place of the recipe's
+    // (on a model the step leaves alone, so only withReasoning acts).
+    const on = wireAdapter(() => ({ enabled: true, budgetTokens: 0, display: 'omitted' as const }));
+    await recipeSend(new Membrane(on.live, { formatter: new NativeFormatter() }), 'claude-opus-4-8');
+    expect(on.bodies).toHaveLength(1);
+    expect(on.bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
   });
 
-  test('complete() gets no progress-note step: with reasoning off, a one-shot call goes with no thinking config', async () => {
-    const bodies: Array<Record<string, unknown>> = [];
-    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
-    (live as unknown as { client: unknown }).client = {
-      withOptions() { return this; },
-      messages: {
-        create: async (body: Record<string, unknown>) => {
-          bodies.push(body);
-          return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'claude-opus-5-5', usage: { input_tokens: 1, output_tokens: 1 } };
+  test('complete() gets no progress-note step, and the reasoning setting still applies there', async () => {
+    const oneShot = (reasoning: () => { enabled: boolean; budgetTokens: number; display?: 'summarized' | 'omitted' }) => {
+      const bodies: Array<Record<string, unknown>> = [];
+      const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', reasoning);
+      (live as unknown as { client: unknown }).client = {
+        withOptions() { return this; },
+        messages: {
+          create: async (body: Record<string, unknown>) => {
+            bodies.push(body);
+            return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'claude-opus-5-5', usage: { input_tokens: 1, output_tokens: 1 } };
+          },
         },
-      },
+      };
+      const send = () => live.complete({ ...opus55, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest);
+      return { bodies, send };
     };
-    await live.complete({ ...opus55, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest);
-    expect(bodies).toHaveLength(1);
-    expect(bodies[0]?.thinking).toBeUndefined();
+    // With reasoning off, a one-shot call goes with no thinking config.
+    const off = oneShot(disabled);
+    await off.send();
+    expect(off.bodies).toHaveLength(1);
+    expect(off.bodies[0]?.thinking).toBeUndefined();
+    // With reasoning on, it carries the setting's config, 'omitted' left as chosen.
+    const on = oneShot(() => ({ enabled: true, budgetTokens: 0, display: 'omitted' as const }));
+    await on.send();
+    expect(on.bodies).toHaveLength(1);
+    expect(on.bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'omitted' });
   });
 });
 
