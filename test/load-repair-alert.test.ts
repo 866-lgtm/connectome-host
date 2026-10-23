@@ -4,7 +4,16 @@
  * left, how to read the old summaries back, the sentence for the agent, and
  * the alert the host sends for each report context-manager makes.
  */
-import { describe, expect, test } from 'bun:test';
+import { describe, expect, spyOn, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { AgentFramework, resolveTimeZone } from '@animalabs/agent-framework';
+import { Membrane, MockAdapter } from '@animalabs/membrane';
+import { buildFrameworkAgentConfig, recipeModel } from '../src/framework-agent-config.js';
+import { buildFrameworkStrategy } from '../src/framework-strategy.js';
+import { DEFAULT_RECIPE, validateRecipe } from '../src/recipe.js';
+import { makeRepairStore } from './load-repair-store.js';
 import {
   LOAD_REPAIR_KIND,
   loadRepairAlert,
@@ -252,9 +261,56 @@ describe('wireLoadRepairAlert', () => {
   });
 });
 
+describe("wireLoadRepairAlert after a start's load", () => {
+  // A start builds the recipe's strategy (buildFrameworkStrategy), and
+  // AgentFramework.create opens the agent's store with it; the host wires the
+  // alert only after create returns (src/index.ts). So the start-up load's
+  // report is made with no handler set, held by the strategy, and handed over
+  // when the alert sets one. This runs that order on the default recipe's
+  // strategy; src/index.ts's own call isn't run here.
+  test("a report the start's load made before the alert was wired is sent when it's wired", async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'load-repair-wire-'));
+    const path = join(dir, 'store');
+    try {
+      await makeRepairStore(path);
+      const recipe = validateRecipe(structuredClone(DEFAULT_RECIPE));
+      const model = recipeModel(recipe, undefined);
+      const strategy = buildFrameworkStrategy(recipe, model, resolveTimeZone(recipe.agent.timezone));
+      const framework = await AgentFramework.create({
+        storePath: path,
+        membrane: new Membrane(new MockAdapter()),
+        agents: [buildFrameworkAgentConfig(recipe, 'agent', model, strategy)],
+        modules: [],
+      });
+      try {
+        const latest = (strategy as { getLatestLoadRepairReport(): LoadRepairReport | null }).getLatestLoadRepairReport();
+        expect(latest?.dropped.map((d) => [d.id, d.reason])).toEqual([['L2-x', 'names-missing']]);
+        const sent: Array<{ kind: string; agent: string; message: string; data?: Record<string, unknown> }> = [];
+        const notify = spyOn(framework, 'notifyOps').mockImplementation((kind: string, agent: string, message: string, data?: Record<string, unknown>) => {
+          sent.push({ kind, agent, message, data });
+        });
+        try {
+          expect(wireLoadRepairAlert(strategy, framework, 'agent', path)).toBe(true);
+          const alert = loadRepairAlert(latest!, 'agent', path);
+          expect(sent).toEqual([{ kind: LOAD_REPAIR_KIND, agent: 'agent', message: alert.message, data: alert.data }]);
+          // Handed over once: nothing is held for a later handler.
+          expect(wireLoadRepairAlert(strategy, framework, 'agent', path)).toBe(true);
+          expect(sent).toHaveLength(1);
+        } finally {
+          notify.mockRestore();
+        }
+      } finally {
+        await framework.stop();
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('the health snapshot', () => {
-  // An agent with no `latest` has a strategy without the getter, as on a
-  // context-manager that doesn't report load repairs.
+  // An agent with no `latest` has a strategy without the getter, such as a
+  // passthrough strategy.
   function appWith(agents: Array<{ name: string; latest?: () => unknown }>): PanelAppRef {
     const framework = {
       agents: agents.map((a) => ({
