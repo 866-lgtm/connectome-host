@@ -144,6 +144,8 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
   test.each([
     'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5',
     'anthropic.claude-opus-5-5', 'anthropic/claude-sonnet-5-5', 'claude-opus-5-5[1m]',
+    // Dated snapshots, in the forms the repo uses elsewhere.
+    'claude-opus-5-5-20260301', 'claude-sonnet-5-5-20260101', 'claude-fable-5-1-20261001', 'claude-opus-5-5@20260301',
   ])('sends adaptive thinking with display updates to %s when no config would be sent', (model) => {
     const req = { ...baseRequest, model };
     expect(thinkingOf(notes(req))).toEqual({ type: 'adaptive', display: 'updates' });
@@ -153,6 +155,8 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
   test.each([
     'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-5-5', 'claude-haiku-4-5',
     'claude-mythos-5', 'claude-fable-5-2', 'claude-opus-5-6', 'claude-opus-5-50',
+    // A version after the listed one is another model, not a snapshot of it.
+    'claude-fable-5-10', 'claude-fable-5-1-1', 'claude-mythos-5-12',
   ])('leaves %s untouched (same reference)', (model) => {
     const req = { ...baseRequest, model };
     expect(notes(req)).toBe(req);
@@ -238,6 +242,23 @@ describe('LoggingAnthropicAdapter.withProgressNotes', () => {
     const opus48 = { ...baseRequest, model: 'claude-opus-4-8' };
     expect(thinkingOf(internals.withProgressNotes(internals.withReasoning(opus48))))
       .toEqual({ type: 'adaptive', display: 'omitted' });
+  });
+
+  test('complete() leaves one-shot calls as the caller built them: no notes to keep, no tool calls', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
+    (live as unknown as { client: unknown }).client = {
+      withOptions() { return this; },
+      messages: {
+        create: async (body: Record<string, unknown>) => {
+          bodies.push(body);
+          return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'claude-opus-5-5', usage: { input_tokens: 1, output_tokens: 1 } };
+        },
+      },
+    };
+    await live.complete({ ...opus55, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.thinking).toBeUndefined();
   });
 });
 

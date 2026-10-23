@@ -118,9 +118,12 @@ export function modelAcceptsAdaptiveThinking(model: string): boolean {
  *  can't be turned off on any of them, and under the default display
  *  ('omitted') those notes come back empty. A later model isn't assumed to
  *  accept 'updates': an unaccepted display is a 400 on every turn, the same
- *  fail-safe posture as modelAcceptsEffort. */
+ *  fail-safe posture as modelAcceptsEffort. So the ID may go on with a dated
+ *  snapshot (`-20260301`, `@20260301`) or a suffix such as `[1m]`, but not
+ *  with a version: a digit (`opus-5-50`) or a hyphen and one or two digits
+ *  (`fable-5-2`, `fable-5-10`). */
 export function modelReturnsNotesInThinking(model: string): boolean {
-  return /claude-(fable-5(-1)?|mythos-5-1|opus-5-5|sonnet-5-5)(?![-\d])/.test(model);
+  return /claude-(fable-5(-1)?|mythos-5-1|opus-5-5|sonnet-5-5)(?!\d|-\d{1,2}(?!\d))/.test(model);
 }
 export type ProviderCallObserver = (record: ProviderCallRecord) => void;
 
@@ -457,6 +460,11 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
    *  and a config of another type ('disabled', 'between_tools') is the
    *  caller's to keep, so both pass untouched, as does every other model.
    *  The config's other fields, such as block binding, are kept.
+   *
+   *  Called for stream() only, as withEffort is: agent turns stream, and
+   *  notes come only between tool calls. complete() carries one-shot calls
+   *  (compression, retrieval, naming) that make none, so they have no notes
+   *  to keep and go out as the caller built them.
    *
    *  Needs membrane >= 0.7.0, which adds the
    *  `thinking-display-updates-2026-08-18` beta whenever the body it sends
@@ -797,7 +805,7 @@ export class LoggingAnthropicAdapter extends AnthropicAdapter {
     options?: ProviderRequestOptions,
   ): Promise<ProviderResponse> {
     const t0 = Date.now();
-    const effective = this.withOAuthIdentity(this.withProgressNotes(this.withReasoning(request)));
+    const effective = this.withOAuthIdentity(this.withReasoning(request));
     const sink: { rawRequest: unknown } = { rawRequest: null };
     const wrapped = this.captureRawRequest(options, sink);
     let response: ProviderResponse;

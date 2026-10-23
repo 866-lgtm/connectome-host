@@ -1,8 +1,9 @@
 - **Agents on Fable 5/5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5:** the notes these models write between
   tool calls ("found X, checking Y next") come back as signed `thinking` blocks, empty under thinking
   display `'omitted'`, which is also what the API applies when no thinking config is sent. On these
-  models the host now sends `thinking: { type: 'adaptive', display: 'updates' }` wherever it would
-  have left display at `'omitted'`: with reasoning off (these models think anyway), and with
+  models (dated snapshot IDs included) the host now sends `thinking: { type: 'adaptive', display:
+  'updates' }` on agent turns (streamed calls; one-shot `complete()` calls make no tool calls and are
+  left as built) wherever it would have left display at `'omitted'`: with reasoning off (these models think anyway), and with
   `reasoning_display` or a recipe's `agent.thinking.display` set to `'omitted'`. Reasoning stays hidden
   as before, and the notes come back as text, in stores, logs and the web UI. `'summarized'`, which
   already returns them (mixed with reasoning summaries), and other models are unchanged. Needs
