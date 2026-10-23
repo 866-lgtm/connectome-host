@@ -805,8 +805,9 @@ export class WebUiModule implements Module {
 
     // Panel-op replies are consumed by FleetModule.requestPanel's own
     // corrId listener; they carry operator-panel payloads (settings, pins,
-    // health) and must never fan out as child-event telemetry.
-    if (eType === 'panel-response') return;
+    // health) and must never fan out as child-event telemetry. A switch's
+    // replies are requestSwitch's the same way.
+    if (eType === 'panel-response' || eType === 'update-response') return;
 
     // Roll up fleet-child session usage so the header total reflects every
     // process the operator is paying for, not just the parent. Children emit
