@@ -131,6 +131,137 @@ describe('LoggingAnthropicAdapter.withEffort', () => {
   });
 });
 
+// On Fable 5/5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5 the notes the model
+// writes between tool calls come back as signed thinking blocks, empty under
+// display 'omitted', the default. The host never leaves them empty there.
+describe('LoggingAnthropicAdapter.withProgressNotes', () => {
+  type WithProgressNotes = { withProgressNotes(r: ProviderRequest): ProviderRequest };
+  const adapter = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null');
+  const notes = (req: ProviderRequest) => (adapter as unknown as WithProgressNotes).withProgressNotes(req);
+  const thinkingOf = (req: ProviderRequest) => (req.extra as { thinking?: unknown } | undefined)?.thinking;
+  const opus55: ProviderRequest = { ...baseRequest, model: 'claude-opus-5-5' };
+
+  test.each([
+    'claude-fable-5', 'claude-fable-5-1', 'claude-mythos-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5',
+    'anthropic.claude-opus-5-5', 'anthropic/claude-sonnet-5-5', 'claude-opus-5-5[1m]',
+    // Dated snapshots, in the forms the repo uses elsewhere.
+    'claude-opus-5-5-20260301', 'claude-sonnet-5-5-20260101', 'claude-fable-5-1-20261001', 'claude-opus-5-5@20260301',
+  ])('sends adaptive thinking with display updates to %s when no config would be sent', (model) => {
+    const req = { ...baseRequest, model };
+    expect(thinkingOf(notes(req))).toEqual({ type: 'adaptive', display: 'updates' });
+    expect((req as { extra?: unknown }).extra).toBeUndefined();
+  });
+
+  test.each([
+    'claude-opus-4-8', 'claude-opus-5', 'claude-sonnet-5', 'claude-haiku-5-5', 'claude-haiku-4-5',
+    'claude-mythos-5', 'claude-fable-5-2', 'claude-opus-5-6', 'claude-opus-5-50',
+    // A version after the listed one is another model, not a snapshot of it.
+    'claude-fable-5-10', 'claude-fable-5-1-1', 'claude-mythos-5-12',
+  ])('leaves %s untouched (same reference)', (model) => {
+    const req = { ...baseRequest, model };
+    expect(notes(req)).toBe(req);
+  });
+
+  test("turns an explicit 'omitted', in extra or top-level, into 'updates', keeping the config's other fields", () => {
+    const viaExtra = { ...opus55, extra: { keep: 1, thinking: { type: 'adaptive', display: 'omitted' } } } as ProviderRequest;
+    const out = notes(viaExtra);
+    expect(thinkingOf(out)).toEqual({ type: 'adaptive', display: 'updates' });
+    expect((out.extra as Record<string, unknown>).keep).toBe(1);
+    const binding = { prefix_mismatch_behavior: 'drop_block' };
+    const topLevel = { ...opus55, thinking: { type: 'adaptive', display: 'omitted', block_binding: binding } } as ProviderRequest;
+    expect(thinkingOf(notes(topLevel))).toEqual({ type: 'adaptive', display: 'updates', block_binding: binding });
+    // A top-level config with no display is the default ('omitted') too.
+    const noDisplay = { ...opus55, thinking: { type: 'adaptive', block_binding: binding } } as ProviderRequest;
+    expect(thinkingOf(notes(noDisplay))).toEqual({ type: 'adaptive', block_binding: binding, display: 'updates' });
+  });
+
+  test('extra.thinking wins over request.thinking, as in the adapter', () => {
+    const req = {
+      ...opus55,
+      thinking: { type: 'adaptive', display: 'summarized' },
+      extra: { thinking: { type: 'adaptive', display: 'omitted' } },
+    } as ProviderRequest;
+    expect(thinkingOf(notes(req))).toEqual({ type: 'adaptive', display: 'updates' });
+  });
+
+  test("leaves 'summarized' and 'updates' alone: both return the notes", () => {
+    for (const display of ['summarized', 'updates']) {
+      const req = { ...opus55, extra: { thinking: { type: 'adaptive', display } } } as ProviderRequest;
+      expect(notes(req)).toBe(req);
+    }
+  });
+
+  test("leaves a config of another type alone ('disabled', 'between_tools')", () => {
+    for (const type of ['disabled', 'between_tools']) {
+      const req = { ...baseRequest, model: 'claude-sonnet-5-5', extra: { thinking: { type } } } as ProviderRequest;
+      expect(notes(req)).toBe(req);
+    }
+  });
+
+  test('with reasoning off, the wire request still asks for updates, with the beta that needs (stream lane, through the real adapter)', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const headers: Array<Record<string, string> | undefined> = [];
+    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
+    (live as unknown as { client: unknown }).client = {
+      withOptions() { return this; },
+      messages: {
+        stream: async (body: Record<string, unknown>, opts?: { headers?: Record<string, string> }) => {
+          bodies.push(body);
+          headers.push(opts?.headers);
+          return {
+            controller: { abort() {} },
+            async *[Symbol.asyncIterator]() {
+              yield { type: 'message_start', message: { model: 'claude-opus-5-5', usage: { input_tokens: 1 } } };
+              yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } };
+              yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'ok' } };
+              yield { type: 'content_block_stop', index: 0 };
+              yield { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 1 } };
+            },
+          };
+        },
+      },
+    };
+    const messages = [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }];
+    await live.stream({ ...opus55, messages } as ProviderRequest, { onChunk: () => {} });
+    await live.stream({ ...baseRequest, model: 'claude-opus-4-8', messages } as ProviderRequest, { onChunk: () => {} });
+    expect(bodies[0]?.thinking).toEqual({ type: 'adaptive', display: 'updates' });
+    // membrane >= 0.7.0 adds the beta 'updates' needs; without it the API refuses the value.
+    expect(headers[0]?.['anthropic-beta']?.split(',')).toContain('thinking-display-updates-2026-08-18');
+    // Another model gets neither.
+    expect(bodies[1]?.thinking).toBeUndefined();
+    expect(headers[1]?.['anthropic-beta'] ?? '').not.toContain('thinking-display-updates');
+  });
+
+  test("with reasoning on and display 'omitted', the composed request asks for updates", () => {
+    const omitted = () => ({ enabled: true, budgetTokens: 0, display: 'omitted' as const });
+    const on = new LoggingAnthropicAdapter({ apiKey: 'test' }, '/dev/null', omitted);
+    const internals = on as unknown as WithProgressNotes & { withReasoning(r: ProviderRequest): ProviderRequest };
+    expect(thinkingOf(internals.withProgressNotes(internals.withReasoning(opus55))))
+      .toEqual({ type: 'adaptive', display: 'updates' });
+    // Elsewhere 'omitted' still goes as chosen.
+    const opus48 = { ...baseRequest, model: 'claude-opus-4-8' };
+    expect(thinkingOf(internals.withProgressNotes(internals.withReasoning(opus48))))
+      .toEqual({ type: 'adaptive', display: 'omitted' });
+  });
+
+  test('complete() leaves one-shot calls as the caller built them: no notes to keep, no tool calls', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const live = new LoggingAnthropicAdapter({ apiKey: 'test', cacheKeepalive: { enabled: false } }, '/dev/null', disabled);
+    (live as unknown as { client: unknown }).client = {
+      withOptions() { return this; },
+      messages: {
+        create: async (body: Record<string, unknown>) => {
+          bodies.push(body);
+          return { content: [{ type: 'text', text: 'ok' }], stop_reason: 'end_turn', model: 'claude-opus-5-5', usage: { input_tokens: 1, output_tokens: 1 } };
+        },
+      },
+    };
+    await live.complete({ ...opus55, messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }] } as ProviderRequest);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.thinking).toBeUndefined();
+  });
+});
+
 describe('LoggingAnthropicAdapter initial recipe effort', () => {
   test('native index constructs settings with the recipe effort before dispatch', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'chost-initial-effort-'));
