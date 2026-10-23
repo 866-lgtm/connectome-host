@@ -19,7 +19,7 @@
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
 import { callFailed, callOriginLabel, callOriginTone } from './call-origin';
-import { healthComposition, lastInferenceLine } from './composition-text';
+import { healthComposition, lastInferenceLine, latestInferenceError } from './composition-text';
 import { credentialNote, healthEntry, lastActionText, readFailureLine } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
@@ -72,10 +72,8 @@ export const CREDENTIAL_ALERT_KINDS = [
   'quota-spent', 'quota-unreadable', 'auth-expiring', 'auth-expired', 'auth-rejected', 'auth-login-required',
 ] as const;
 
-/** Rendered composition of the agent's last live compile, or, for an agent
- *  whose strategy keeps no render stats, `{ statsKept: false }` alone. */
+/** Rendered composition of the agent's last live compile. */
 export interface ContextComposition {
-  statsKept?: false;
   head?: { messages: number; tokens: number };
   tail?: { messages: number; tokens: number };
   middleRaw?: { messages: number; tokens: number };
@@ -89,13 +87,17 @@ export type LedgerRow = CallLedgerRow;
 
 /** Shape of GET /healthz — framework healthSnapshot() plus the host's
  *  extensions: credential, the per-agent compressionQuarantine,
- *  compressionDebt, contextComposition and runtimeSettings, readFailures,
+ *  compressionDebt, contextComposition and runtimeSettings,
+ *  contextCompositionNotKept, readFailures,
  *  and callLedger. All fields optional and defensively read: health
  *  rendering must survive version skew. */
 export interface HealthSnapshot {
   at?: string;
   credential?: CredentialInfo;
   contextComposition?: Record<string, ContextComposition>;
+  /** The agents left out of contextComposition because their strategy keeps
+   *  no render stats; absent when there are none. */
+  contextCompositionNotKept?: string[];
   uptimeSec?: number;
   gate?: Record<string, unknown> | null;
   pendingRequests?: number;
@@ -125,7 +127,7 @@ export interface HealthSnapshot {
 
    * of closed-but-uncompressed chunks. Distinct from contextComposition:
 
-   * composition says what the last compile RENDERED (summaries L1 = 0 there
+   * composition says what the last live compile RENDERED (summaries L1 = 0 there
 
    * means "no L1 tokens in the window", often healthy consolidation);
 
@@ -474,12 +476,9 @@ export function HealthPanel(props: {
   const quarantine = (name: string) => healthEntry(props.health?.compressionQuarantine, name);
   const debt = (name: string) => healthEntry(props.health?.compressionDebt, name);
   const settings = (name: string) => healthEntry(props.health?.runtimeSettings, name);
-  const composition = (name: string) => healthEntry(props.health?.contextComposition, name);
+  const failures = (name: string) => healthEntry(props.health?.readFailures, name);
   // An agent's composition block, or the line in its place, if any.
-  const compositionView = (name: string) => healthComposition(composition(name), {
-    sectionRead: props.health?.contextComposition !== undefined,
-    readFailed: healthEntry(failures(name), 'contextComposition') !== undefined,
-  });
+  const compositionView = (name: string) => healthComposition(props.health, name);
   const compositionStats = (name: string) => {
     const view = compositionView(name);
     return view && 'stats' in view ? view.stats : undefined;
@@ -488,7 +487,6 @@ export function HealthPanel(props: {
     const view = compositionView(name);
     return view && 'line' in view ? view.line : undefined;
   };
-  const failures = (name: string) => healthEntry(props.health?.readFailures, name);
 
   const statusTone = (status?: string): string => {
     switch (status) {
@@ -558,10 +556,12 @@ export function HealthPanel(props: {
               </Show>
             </div>
 
-            <Show when={a.lastInference?.lastError}>
-              <div class="text-rose-300/80 truncate" title={a.lastInference!.lastError}>
-                last error: {a.lastInference!.lastError}
-              </div>
+            <Show when={latestInferenceError(a.lastInference)}>
+              {(error) => (
+                <div class="text-rose-300/80 truncate" title={error()}>
+                  last error: {error()}
+                </div>
+              )}
             </Show>
             <Show when={lastInferenceLine(a.lastInference, fmtAgo)}>
               {(line) => <div class="text-neutral-500">{line()}</div>}

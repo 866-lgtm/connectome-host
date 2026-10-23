@@ -839,8 +839,9 @@ blocks; expect folds to interact with this on the next model generation.
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
   `contextComposition` (head / raw / summaries / tail as the last live compile rendered them;
-  `{ "statsKept": false }` for an agent whose strategy keeps none, and no entry before an
-  agent's first live compile since its context was loaded), `runtimeSettings`, and
+  no entry for an agent with none, before its first live compile since its context was loaded
+  or for good where its strategy keeps none), `contextCompositionNotKept` (the names of the
+  agents whose strategy keeps none, present only when there are some), `runtimeSettings`, and
   `readFailures`, present only when one of those reads threw: by agent, then section, what the
   error said, cut to 300 characters
 - **Import guides:** [`claude-code-ingest.md`](./claude-code-ingest.md) ·

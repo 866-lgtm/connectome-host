@@ -816,14 +816,14 @@ function perAgentHealth(
   app: PanelAppRef,
   section: string,
   failures: Record<string, Record<string, string>>,
-  read: (agent: FrameworkAgent) => unknown,
+  read: (agent: FrameworkAgent, name: string) => unknown,
 ): Record<string, unknown> {
   // Keyed by agent name, so with no prototype: any name is an own key.
   const entries: Record<string, unknown> = Object.create(null);
   for (const agent of app.framework.getAllAgents()) {
     const name = (agent as unknown as { name: string }).name;
     try {
-      const value = read(agent);
+      const value = read(agent, name);
       if (value) entries[name] = value;
     } catch (error) {
       (failures[name] ??= {})[section] = describeReadFailure(error);
@@ -888,14 +888,19 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // Rendered context COMPOSITION per agent — head / raw middle / summaries
   // by level / tail, as the last live compile emitted it. Sourced from the
   // strategy's own render stats (already computed in-process), so it is
-  // safe on the 15s /healthz poll. An agent with none since its context was
-  // loaded is left out; one whose strategy keeps none gets
-  // `{ statsKept: false }`, so the two read apart.
+  // safe on the 15s /healthz poll. An agent with none is left out, and
+  // contextCompositionNotKept names, in the same read, each of those whose
+  // strategy keeps none, so the two read apart; it's left out when it would
+  // be empty. contextComposition's entries are all render stats.
   try {
-    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, 'contextComposition', readFailures, (agent) => {
+    const notKept: string[] = [];
+    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, 'contextComposition', readFailures, (agent, name) => {
       const cm = agent.getContextManager() as unknown as { getRenderStats?: () => unknown };
-      return cm.getRenderStats?.() ?? (keepsRenderStats(cm) ? undefined : { statsKept: false });
+      const stats = cm.getRenderStats?.();
+      if (stats == null && !keepsRenderStats(cm)) notKept.push(name);
+      return stats;
     });
+    if (notKept.length > 0) (snapshot as Record<string, unknown>).contextCompositionNotKept = notKept;
   } catch {
     // Health reads never throw.
   }
@@ -1415,7 +1420,8 @@ function curveVerdict(
  * response carries a verdict from the framework's feasibility preview, the
  * one the settings panel reports, so the plot says it won't fit. The
  * head/tail reservation check and the emission check still throw on a budget
- * that can't fit, as for a real compile. No inference, no message writes.
+ * that can't fit, as for a real compile. No inference of its own, no message
+ * writes.
  */
 export async function buildContextCurve(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
   requireAgent(app, agentName);
@@ -1686,8 +1692,8 @@ export function runContextPreview(
  * The membrane-normalized request the framework would hand to the model if
  * the agent were activated right now. Delegates to `framework.previewActivation`.
  *
- * Transparent by default: no inference, no Chronicle writes, no external
- * MCPL calls. Pass `injections: true` to gather dynamic injections
+ * Transparent by default: no inference of its own, no Chronicle writes, no
+ * external MCPL calls. Pass `injections: true` to gather dynamic injections
  * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
  * transparent: it can run inference and fire MCPL `beforeInference` hooks.
  */

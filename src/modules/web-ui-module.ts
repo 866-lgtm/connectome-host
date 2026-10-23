@@ -1253,7 +1253,8 @@ export class WebUiModule implements Module {
     }
 
     // Debug: the membrane-normalized request that WOULD be emitted if the
-    // agent were activated right now — no inference, no state mutation.
+    // agent were activated right now — no inference of its own, and no state
+    // change but the release of a compression hold whose deadline has passed.
     //   GET /debug/context[?agent=<name>][&hooks=false][&pretty=1]
     if (url.pathname === '/debug/context/makeup') {
       return this.handleContextMakeup(url);
@@ -1470,8 +1471,8 @@ export class WebUiModule implements Module {
    * hand to the model if the agent were activated right now. Auth is already
    * enforced by the caller (`handleHttp`).
    *
-   * Transparent by default: no inference, no Chronicle writes, no external
-   * MCPL calls. Pass `?injections=1` to gather the dynamic injections
+   * Transparent by default: no inference of its own, no Chronicle writes, no
+   * external MCPL calls. Pass `?injections=1` to gather the dynamic injections
    * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
    * transparent: it can run inference and fire MCPL `beforeInference` hooks.
    */
@@ -1496,7 +1497,8 @@ export class WebUiModule implements Module {
    * provenance of the live compiled window, with a feasibility verdict. The
    * compile is a dry run, so it commits no fold resolutions; the one effect
    * it keeps, releasing a compression hold whose deadline has passed, is
-   * described on buildContextCurve. No message writes.
+   * described on buildContextCurve. No inference of its own, no message
+   * writes.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
     const app = this.panelApp();

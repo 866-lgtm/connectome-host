@@ -1,6 +1,6 @@
 /**
  * Context panel — two figures from GET /debug/context/makeup (transparent:
- * previewActivation + count_tokens, no inference / no writes): the exact
+ * previewActivation + count_tokens, no inference or writes of its own): the exact
  * token count of the next request as a preview builds it, from the stored
  * history without what modules add at each turn, and the segment breakdown of the
  * agent's last live compile, which the autobiographical strategy records:
@@ -9,7 +9,7 @@
  */
 
 import { createEffect, createSignal, on, onCleanup, onMount, For, Show } from 'solid-js';
-import { noComposition, notCounted } from './composition-text';
+import { contextPageView } from './composition-text';
 
 interface Seg { messages: number; tokens: number }
 interface Stats {
@@ -174,9 +174,32 @@ export function ContextPanel(props: { scope?: string }) {
     onCleanup(() => window.clearInterval(timer));
   });
 
-  const estTotal = () => data()?.stats?.total.tokens ?? 0;
+  // What the page shows of the response (contextPageView): the next
+  // request's count or why there's none, and the composition or the line in
+  // its place.
+  const view = () => {
+    const d = data();
+    return d ? contextPageView(d) : null;
+  };
+  const counted = () => {
+    const count = view()?.count;
+    return count && 'tokens' in count ? count : undefined;
+  };
+  const notCountedReason = () => {
+    const count = view()?.count;
+    return count && 'reason' in count ? count.reason : undefined;
+  };
+  const compositionStats = () => {
+    const composition = view()?.composition;
+    return composition && 'stats' in composition ? composition.stats : undefined;
+  };
+  const compositionLine = () => {
+    const composition = view()?.composition;
+    return composition && 'line' in composition ? composition.line : undefined;
+  };
+  const estTotal = () => compositionStats()?.total.tokens ?? 0;
   const rows = () => {
-    const s = data()?.stats;
+    const s = compositionStats();
     return s ? rowsOf(s) : [];
   };
 
@@ -311,28 +334,28 @@ export function ContextPanel(props: { scope?: string }) {
 
       {/* The next request, as a preview builds it, counted exactly, or why
           it wasn't counted. */}
-      <Show when={data()}>
-        <Show
-          when={data()!.exactTotalTokens != null}
-          fallback={<div class="text-neutral-500">next request: {notCounted(data()!.countSource)}</div>}
-        >
+      <Show when={counted()}>
+        {(count) => (
           <div>
-            <div class="text-2xl text-neutral-100">{fmt(data()!.exactTotalTokens!)}</div>
+            <div class="text-2xl text-neutral-100">{fmt(count().tokens)}</div>
             <div class="text-neutral-500">tokens (exact): the next request as a preview builds it, without what modules add at each turn</div>
-            <div class="text-neutral-600">counted by count_tokens for {data()!.countModel}</div>
+            <div class="text-neutral-600">counted by count_tokens for {count().model}</div>
           </div>
-        </Show>
+        )}
+      </Show>
+      <Show when={notCountedReason()}>
+        {(reason) => <div class="text-neutral-500">next request: {reason()}</div>}
       </Show>
 
       {/* The last live compile's render stats, or which of the two reasons
           there are none. */}
-      <Show when={data() && !data()!.stats}>
-        <div class="text-neutral-500">{noComposition(data()!.statsKept !== false)}</div>
+      <Show when={compositionLine()}>
+        {(line) => <div class="text-neutral-500">{line()}</div>}
       </Show>
 
-      <Show when={data()?.stats}>
+      <Show when={compositionStats()}>
         <div class="text-neutral-500">
-          last live compile: {fmt(data()!.stats!.total.messages)} msgs · est {fmt(estTotal())} tokens
+          last live compile: {fmt(compositionStats()!.total.messages)} msgs · est {fmt(estTotal())} tokens
         </div>
 
         {/* proportional bar */}
@@ -376,7 +399,7 @@ export function ContextPanel(props: { scope?: string }) {
 
         <div class="text-neutral-500 space-y-0.5">
           <div>
-            pending compression: {data()!.stats!.pending.chunks} chunk(s), {data()!.stats!.pending.merges} merge(s)
+            pending compression: {compositionStats()!.pending.chunks} chunk(s), {compositionStats()!.pending.merges} merge(s)
           </div>
           <div>per-segment tokens are strategy estimates</div>
         </div>

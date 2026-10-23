@@ -74,7 +74,7 @@ GET /debug/context
 
 This is the important part. By default the endpoint:
 
-- runs **no inference** of its own (spends no tokens),
+- runs **no inference** of its own,
 - writes **no messages** to Chronicle,
 - contacts **no** external MCPL server.
 
@@ -84,7 +84,8 @@ the agent's next turn would, but dry: agent-framework's preview compiles with
 context-budget transition, and leaves the render stats the Context page shows
 as the last live compile left them. The
 one exception: like any compile, it releases a compression hold whose
-deadline has passed, and the compression that sets off was already due.
+deadline has passed. context-manager ends a hold at its deadline whoever
+looks, and releases it at any compile or hold query.
 
 The trade-off is fidelity: the default response **omits the dynamically
 gathered injections** (lessons, retrieval results, MCPL `beforeInference`
@@ -248,5 +249,7 @@ the send fails, `504` if it doesn't answer within 30 s.
 - **`"transparent": false` when you didn't expect it** — you passed an
   `injections` value other than `0`/`false` (even an empty `injections=`).
   Drop it for a transparent call.
-- **The response seems to be costing tokens** — only the `injections=1` path
-  spends tokens. The default never does.
+- **The response seems to be costing tokens** — the `injections=1` path
+  spends tokens on what it gathers. The default spends none of its own,
+  though like any compile it releases a compression hold whose deadline has
+  passed (see "Transparent by default").
