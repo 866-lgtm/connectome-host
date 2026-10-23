@@ -1,5 +1,6 @@
-- **Operators:** connectome-host now requires `@animalabs/agent-framework`
-  ^0.24.1 (was ^0.24.0). Besides clock rows (`agent.clock`), the changes
+- **Operators:** connectome-host's `@animalabs/agent-framework` minimum went
+  to ^0.24.1 (was ^0.24.0), and in this release on to ^0.26.0 (see its own
+  entry). Besides clock rows (`agent.clock`), the changes
   operators meet, in brief; agent-framework 0.24.1's notes give each in full:
   - **The workspace's `edit` and `edit_many` refuse** a file the workspace
     holds when the check of disk before them decided nothing, because the

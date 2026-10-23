@@ -257,14 +257,15 @@ export interface RecipeAgent {
    * prompting structure intact. */
   formatter?: 'native' | 'anthropic-xml';
   /**
-   * Membrane retry policy for this agent's provider calls. Membrane's default
-   * retries generic retryable errors ZERO times — only `529`/`overloaded_error`
-   * gets its dedicated patient schedule — so a transient 5xx from a
-   * non-Anthropic gateway (a 502 "Service temporarily unavailable") kills the
-   * turn on first failure. `{ "maxRetries": 4 }` rides out such blips with
-   * exponential backoff (retryDelayMs 1000, x2, capped at maxRetryDelayMs
-   * 30000 by default). Passed to Membrane verbatim; see membrane's
-   * `RetryConfigInput` for every field.
+   * Membrane retry policy for this agent's provider calls, over the host's
+   * default (`hostMembraneRetry`): membrane's base schedule (3 sends, 1 s then
+   * 2 s, for a retryable failure before anything was delivered) with its
+   * overloaded schedule off, so a 529 is retried as any other retryable
+   * failure. `{ "maxRetries": 4 }` rides out longer blips with exponential
+   * backoff (retryDelayMs 1000, x2, capped at maxRetryDelayMs 30000 by
+   * default), and `overloaded` brings back a patient schedule for 529s. Passed
+   * to Membrane over that default; see membrane's `RetryConfigInput` for every
+   * field.
    */
   retry?: import('@animalabs/membrane').MembraneConfig['retry'];
   /** Prefill scaffold user message appended after the conversation (e.g.

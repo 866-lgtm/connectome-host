@@ -25,6 +25,7 @@
 
 // First, so its warning about an old Bun prints before the modules below run.
 import './bun-floor-check.js';
+import { hostMembraneRetry } from './membrane-retry.js';
 import {
   BedrockAdapter,
   Membrane,
@@ -1308,10 +1309,11 @@ async function main() {
   const agentName = resolved.name;
 
   const membrane = new Membrane(adapter, {
-    // Recipe-level retry policy (agent.retry). Without it membrane's default
-    // gives generic retryable errors — e.g. a gateway 502 — zero retries; only
-    // 529/overloaded_error has a dedicated schedule.
-    ...(recipe.agent.retry ? { retry: recipe.agent.retry } : {}),
+    // Recipe-level retry policy (agent.retry) over the host's default, which
+    // retries a 529 as any other retryable failure rather than on membrane's
+    // ten-minute overloaded schedule inside each framework attempt (see
+    // membrane-retry.ts).
+    retry: hostMembraneRetry(recipe.agent.retry),
     formatter: recipeFormatter(recipe, provider, resolveModel(recipe)),
     // Caching default for internal callers (autobio compression,
     // executeMerge), which read Membrane's defaultPromptCaching rather
