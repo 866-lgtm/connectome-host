@@ -235,11 +235,19 @@ export class AnthropicOAuthCredentials implements CredentialSource {
   // ---------------------------------------------------------------------------
 
   private readFile(path: string): StoredCredential {
-    let parsed: unknown;
+    let text: string;
     try {
-      parsed = parseHandWrittenJson(readFileSync(path, 'utf8'));
+      text = readFileSync(path, 'utf8');
     } catch (err) {
       throw new Error(`cannot read Anthropic credentials file ${path}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = parseHandWrittenJson(text);
+    } catch {
+      // The parser's message can quote the file's text, which holds the
+      // token, so it isn't passed on.
+      throw new Error(`cannot read Anthropic credentials file ${path}: it isn't valid JSON`);
     }
     const root = (parsed ?? {}) as Record<string, unknown>;
     const nested = root.claudeAiOauth;

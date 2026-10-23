@@ -129,6 +129,15 @@ describe('auditPaths', () => {
     expect([audits.map((a) => a.recipeName), unreadable]).toEqual([['marked'], []]);
   });
 
+  test("follows a parent's fleet child that an editor saved with a byte order mark", () => {
+    const dir = tmp();
+    const parentPath = join(dir, 'parent.json');
+    writeFileSync(parentPath, JSON.stringify({ name: 'parent', agent: AGENT, modules: { fleet: { children: [{ recipe: 'child.json' }] } } }));
+    writeFileSync(join(dir, 'child.json'), '\uFEFF' + JSON.stringify({ name: 'child', agent: AGENT, modules: { lessons: true } }));
+    const { audits, unreadable } = auditPaths([parentPath]);
+    expect([audits.map((a) => a.recipeName).sort(), unreadable]).toEqual([['child', 'parent'], []]);
+  });
+
   test('finds dot-prefixed .recipe.json snapshots in scanned directories', () => {
     const dir = tmp();
     writeFileSync(

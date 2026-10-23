@@ -1557,14 +1557,27 @@ export async function loadRecipeDetailed(source: string, options: { fetchSystemP
   if (source.startsWith('http://') || source.startsWith('https://')) {
     const res = await fetch(source);
     if (!res.ok) throw new Error(`Failed to fetch recipe from ${source}: ${res.status} ${res.statusText}`);
-    raw = await res.json();
+    try {
+      raw = await res.json();
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new SyntaxError(`the recipe at ${source} isn't valid JSON`);
+      throw error;
+    }
     sourceBase = { kind: 'url', base: source };
   } else {
     const path = resolve(source);
     if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
+    const text = readFileSync(path, 'utf-8');
     // A response's json() already skips a leading byte order mark, as
     // UTF-8 decoding does; a file read as text keeps it.
-    raw = parseHandWrittenJson(readFileSync(path, 'utf-8'));
+    try {
+      raw = parseHandWrittenJson(text);
+    } catch (error) {
+      // The parser's message can quote the file's text, and a recipe can
+      // hold a key inline, so it isn't passed on, as for a saved recipe.
+      if (error instanceof SyntaxError) throw new SyntaxError(`${path} isn't valid JSON`);
+      throw error;
+    }
     sourceBase = { kind: 'file', dir: dirname(path) };
   }
 

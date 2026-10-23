@@ -11,7 +11,7 @@ import { mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseHandWrittenJson } from '../src/hand-written-json.js';
-import { loadRecipe } from '../src/recipe.js';
+import { loadRecipe, loadRecipeDetailed } from '../src/recipe.js';
 import { loadMcplServers, readAgentOverlayFile, readMcplServersFile, saveAgentOverlay, saveMcplServers } from '../src/mcpl-config.js';
 import { AnthropicOAuthCredentials } from '../src/anthropic-credentials.js';
 import { ObserverRegistry, readObserversFile } from '../src/modules/web-ui-observers.js';
@@ -159,5 +159,60 @@ describe('a running Web UI and a grants file saved with the mark', () => {
     } finally {
       registry.stop();
     }
+  });
+});
+
+describe("a recipe or credentials file that isn't JSON", () => {
+  // A value left unquoted, which the parser's message would quote.
+  const SECRET = 's3cretTokenValue';
+  const unquoted = (dir: string, name: string, text: string): string => {
+    const path = join(dir, name);
+    writeFileSync(path, text);
+    return path;
+  };
+  const refusal = async (load: () => unknown): Promise<string> => {
+    try {
+      await load();
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err);
+    }
+    throw new Error('it loaded');
+  };
+
+  test('a recipe file is refused in words that name it and never repeat the parser\'s message', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hand-written-json-'));
+    dirs.push(dir);
+    const recipe = unquoted(dir, 'recipe.json', `{ "name": "r", "agent": { "name": "a", "apiKey": ${SECRET} } }`);
+    const text = await refusal(() => loadRecipeDetailed(recipe));
+    expect(text).not.toContain(SECRET);
+    expect(text).toBe(`${recipe} isn't valid JSON`);
+  });
+
+  test('a credentials file is refused in words that name it and never repeat the parser\'s message', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hand-written-json-'));
+    dirs.push(dir);
+    const credentials = unquoted(dir, 'credentials.json', `{ "claudeAiOauth": { "accessToken": ${SECRET} } }`);
+    const text = await refusal(() => new AnthropicOAuthCredentials({ credentialsFile: credentials, autoRefresh: false }));
+    expect(text).not.toContain(SECRET);
+    expect(text).toBe(`cannot read Anthropic credentials file ${credentials}: it isn't valid JSON`);
+  });
+
+  test('fetched by URL, is refused in words that name the URL and never repeat the parser\'s message', async () => {
+    const server = Bun.serve({ port: 0, fetch: () => new Response(`{ "name": "r", "agent": { "apiKey": ${SECRET} } }`) });
+    try {
+      const url = `http://127.0.0.1:${server.port}/recipe.json`;
+      const text = await refusal(() => loadRecipeDetailed(url));
+      expect(text).not.toContain(SECRET);
+      expect(text).toBe(`the recipe at ${url} isn't valid JSON`);
+    } finally {
+      server.stop(true);
+    }
+  });
+
+  test('that can\'t be read keeps the read error\'s own words', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'hand-written-json-'));
+    dirs.push(dir);
+    const text = await refusal(() => new AnthropicOAuthCredentials({ credentialsFile: dir, autoRefresh: false }));
+    expect(text).toStartWith(`cannot read Anthropic credentials file ${dir}: EISDIR`);
   });
 });
