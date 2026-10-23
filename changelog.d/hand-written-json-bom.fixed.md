@@ -20,3 +20,5 @@
 - A recipe or an Anthropic credentials file that isn't valid JSON is now
   refused without repeating the JSON parser's message, which can quote the
   file's text; the refusal names the file, or a fetched recipe's URL.
+- Codex's `auth.json`, when it isn't valid JSON, is now refused without
+  the parser's error as its cause; a read error keeps its code.
