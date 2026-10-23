@@ -228,6 +228,13 @@ export interface RecipeKvUnifiedConfig {
   latentDemandMode?: 'individual' | 'joint';
 }
 
+/** `agent.autoContinue` as an object: agent-framework's `AutoContinueConfig`. */
+export interface RecipeAutoContinue {
+  /** Continuations in a row before the agent waits for the next event: a
+   *  whole number, 1 to 20. Default 3. */
+  maxConsecutive?: number;
+}
+
 export interface RecipeAgent {
   /** Opt-in presentation; absolute local JSON path and reserved generated workspace path. */
   toolPresentation?: { path: string; cataloguePath: string; defaults?: { source: string; path: string }[] };
@@ -339,6 +346,18 @@ export interface RecipeAgent {
   proseRouting?: 'locus' | 'explicit' | 'hybrid' | 'disabled';
   /** Default-off containment of whole-response prose wrappers for known tools. */
   toolWrapperProseGuard?: boolean;
+  /**
+   * Continue until skip_reply (agent-framework `AgentConfig.autoContinue`,
+   * docs/auto-continue.md; off when omitted): a turn the model ends itself,
+   * with prose or with nothing, is followed by another turn straight away,
+   * until the agent calls skip_reply (or another tool that ends the turn),
+   * ends on a `>>skip_reply` / `>>>skip_reply` envelope, or reaches
+   * `maxConsecutive` continuations in a row (default 3, 1 to 20). Each next
+   * turn reads a short system row saying so, which names skip_reply as the
+   * way to stop.
+   * `true` is `{}`. An agent-framework release without it ignores it.
+   */
+  autoContinue?: boolean | RecipeAutoContinue;
   /**
    * Clock rows (agent-framework `AgentConfig.clock`): every 10 minutes when
    * omitted (`DEFAULT_RECIPE_CLOCK`), `false` for none, or e.g.
@@ -1780,13 +1799,31 @@ const RECIPE_AGENT_KEYS = [
   'name', 'model', 'timezone', 'provider', 'baseUrl', 'formatter', 'retry', 'prefillUserMessage',
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',
-  'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
+  'toolWrapperProseGuard', 'autoContinue', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
   'refusalHandling', 'clock',
 ] as const;
 /** The clock an agent gets when its recipe omits `agent.clock`: a row every
  *  ten minutes. A recipe turns clock rows off with `agent.clock: false`. */
 export const DEFAULT_RECIPE_CLOCK: ClockConfig = Object.freeze({ intervalMinutes: 10 }) as ClockConfig;
 
+/** `agent.autoContinue`'s keys, when it is an object. */
+const RECIPE_AGENT_AUTO_CONTINUE_KEYS = ['maxConsecutive'] as const;
+/** agent-framework's bounds for `agent.autoContinue.maxConsecutive`
+ *  (resolveAutoContinue, #744), until a framework release exports them. */
+const AUTO_CONTINUE_MIN = 1;
+const AUTO_CONTINUE_MAX = 20;
+
+/**
+ * Refuse a nested recipe object's keys outside `known`: the framework reads
+ * only those and ignores any other, so a misspelling would load as no
+ * setting at all. The message names the keys it takes.
+ */
+function rejectUnknownKeys(path: string, value: object, known: readonly string[]): void {
+  const unknown = Object.keys(value).filter((k) => !known.includes(k));
+  if (unknown.length === 0) return;
+  const takes = known.length === 1 ? known[0] : `${known.slice(0, -1).join(', ')} and ${known[known.length - 1]}`;
+  throw new Error(`Recipe ${path} has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes ${takes}.`);
+}
 /** agent-framework's `ClockConfig` keys, the ones `agent.clock` takes: the
  *  framework reads only these and ignores any other, so the host refuses the
  *  rest rather than letting a misspelling load as no setting at all. */
@@ -1823,7 +1860,8 @@ const recipeKeyListsInStep: [
   ListsExactly<keyof RecipeKvUnifiedConfig & string, typeof RECIPE_KV_UNIFIED_KEYS>,
   ListsExactly<keyof RecipeKvUnifiedConfig['policy'] & string, typeof RECIPE_KV_UNIFIED_POLICY_KEYS>,
   ListsExactly<keyof ClockConfig & string, typeof RECIPE_AGENT_CLOCK_KEYS>,
-] = [true, true, true, true, true, true, true];
+  ListsExactly<keyof RecipeAutoContinue & string, typeof RECIPE_AGENT_AUTO_CONTINUE_KEYS>,
+] = [true, true, true, true, true, true, true, true];
 void recipeKeyListsInStep;
 
 const RECIPE_WORKSPACE_KEYS = ['mounts', 'configMount'] as const;
@@ -2083,15 +2121,27 @@ export function validateRecipe(raw: unknown): Recipe {
     throw new Error(`Recipe agent.toolWrapperProseGuard must be a boolean, got ${JSON.stringify(agent.toolWrapperProseGuard)}.`);
   }
 
+  if (agent.autoContinue !== undefined && typeof agent.autoContinue !== 'boolean') {
+    const value: unknown = agent.autoContinue;
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error(`Recipe agent.autoContinue must be true, false, or an object such as { "maxConsecutive": 3 }, got ${JSON.stringify(value)}.`);
+    }
+    rejectUnknownKeys('agent.autoContinue', value, RECIPE_AGENT_AUTO_CONTINUE_KEYS);
+    // The framework's own bounds (agent-framework resolveAutoContinue, #744),
+    // checked here so a recipe fails at load. It isn't exported by the
+    // framework release this host depends on yet; once it is, call it here
+    // as the clock check below calls resolveClockConfig.
+    const max = (value as RecipeAutoContinue).maxConsecutive;
+    if (max !== undefined && (typeof max !== 'number' || !Number.isInteger(max) || max < AUTO_CONTINUE_MIN || max > AUTO_CONTINUE_MAX)) {
+      throw new Error(`Recipe agent.autoContinue.maxConsecutive must be a whole number from ${AUTO_CONTINUE_MIN} to ${AUTO_CONTINUE_MAX}, got ${JSON.stringify(max)}.`);
+    }
+  }
+
   if (agent.clock !== undefined && agent.clock !== false) {
     if (!agent.clock || typeof agent.clock !== 'object' || Array.isArray(agent.clock)) {
       throw new Error(`Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
     }
-    const known: readonly string[] = RECIPE_AGENT_CLOCK_KEYS;
-    const unknown = Object.keys(agent.clock).filter((k) => !known.includes(k));
-    if (unknown.length > 0) {
-      throw new Error(`Recipe agent.clock has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes ${known.slice(0, -1).join(', ')} and ${known[known.length - 1]}.`);
-    }
+    rejectUnknownKeys('agent.clock', agent.clock, RECIPE_AGENT_CLOCK_KEYS);
     // The framework's own rules, so a recipe fails here rather than at boot.
     try {
       resolveClockConfig('recipe', agent.clock);
