@@ -119,9 +119,9 @@ export function modelAcceptsAdaptiveThinking(model: string): boolean {
  *  ('omitted') those notes come back empty. A later model isn't assumed to
  *  accept 'updates': an unaccepted display is a 400 on every turn, the same
  *  fail-safe posture as modelAcceptsEffort. So the ID may go on with a dated
- *  snapshot (`-20260301`, `@20260301`) or a suffix such as `[1m]`, but not
- *  with a version: a digit (`opus-5-50`) or a hyphen and one or two digits
- *  (`fable-5-2`, `fable-5-10`). */
+ *  snapshot (`-20260301`, `@20260301`) or a suffix such as the 1M-context
+ *  marker ([1m]), but not with a version: a digit (`opus-5-50`) or a hyphen
+ *  and one or two digits (`fable-5-2`, `fable-5-10`). */
 export function modelReturnsNotesInThinking(model: string): boolean {
   return /claude-(fable-5(-1)?|mythos-5-1|opus-5-5|sonnet-5-5)(?!\d|-\d{1,2}(?!\d))/.test(model);
 }
