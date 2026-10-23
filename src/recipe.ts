@@ -15,6 +15,7 @@ import { readFileSync, writeFileSync, existsSync, lstatSync, statSync, mkdirSync
 import { dirname, isAbsolute, resolve } from 'node:path';
 import { resolveClockConfig, WorkspaceModule, type ClockConfig, type CodeExecutionConfig, type MountConfig } from '@animalabs/agent-framework';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
+import { parseHandWrittenJson } from './hand-written-json.js';
 import { validateToolClassTable, validateToolLifecycle } from './tool-lifecycle-config.js';
 import { isLoopbackOrTailnetHost } from './history-semantic.js';
 import { REASONING_EFFORTS, type ReasoningEffort } from './modules/settings-module.js';
@@ -1561,7 +1562,9 @@ export async function loadRecipeDetailed(source: string, options: { fetchSystemP
   } else {
     const path = resolve(source);
     if (!existsSync(path)) throw new Error(`Recipe file not found: ${path}`);
-    raw = JSON.parse(readFileSync(path, 'utf-8'));
+    // A response's json() already skips a leading byte order mark, as
+    // UTF-8 decoding does; a file read as text keeps it.
+    raw = parseHandWrittenJson(readFileSync(path, 'utf-8'));
     sourceBase = { kind: 'file', dir: dirname(path) };
   }
 
