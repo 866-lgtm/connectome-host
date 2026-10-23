@@ -142,13 +142,14 @@ describe('what piped mode prints', () => {
     ]);
   });
 
-  test('another agent\'s aborted stream only closes its line, and its lone exhausted says on stderr that it failed', () => {
+  test('another agent\'s aborted stream only closes its line, and its lone exhausted prints an Error: line on stderr, as its failed does', () => {
     const { turns, out } = setUp();
     turns.onTrace({ type: 'inference:started', agentName: 'spawn-a' });
     turns.onTrace({ type: 'inference:aborted', agentName: 'spawn-a', reason: 'user' });
     turns.onTrace({ type: 'inference:started', agentName: 'spawn-b' });
     turns.onTrace({ type: 'inference:exhausted', agentName: 'spawn-b', error: 'Stream aborted: timeout' });
-    expect(out).toEqual(['out:\n', 'out:\n', 'out:\n', 'out:\n', 'err:(turn ended: Stream aborted: timeout)']);
+    // `(turn ended: …)` is the primary's line alone: it says this line's own turn ended.
+    expect(out).toEqual(['out:\n', 'out:\n', 'out:\n', 'out:\n', 'err:Error: Stream aborted: timeout']);
   });
 
   test('a turn that ends on stderr closes its prose line on stdout, so what prints next starts a line of its own', () => {
