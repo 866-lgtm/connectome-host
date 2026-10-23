@@ -208,11 +208,8 @@ export async function resumeIfSwitch(framework: QuiesceFramework): Promise<{ res
   } catch (error) {
     if (!framework.getHostModeStatus().quiesced) {
       // agent-framework ends the quiesce in memory before it writes that it
-      // has, so a write that fails leaves the host serving with its record
-      // still quiesced. The next start boots quiesced under the switch's
-      // reason, and ends it then.
-      const why = `it's serving, though agent-framework's resume failed after the quiesce ended (${said(error)}); ` +
-        'its record may still say quiesced, which the next start ends';
+      // has, so a write that fails leaves the host serving.
+      const why = `it's serving, though agent-framework's resume failed after the quiesce ended: ${said(error)}`;
       console.error(`[update] This host's switch quiesce ended, with an error: ${why}`);
       return { resumed: true, why };
     }

@@ -426,11 +426,11 @@ describe('resuming', () => {
     expect(mode().quiesced).toBe(true);
   });
 
-  test("a resume that fails once the host serves again says it's serving, and that the next start ends the record", async () => {
+  test("a resume that fails once the host serves again says it's serving", async () => {
     const { framework, mode } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: 'after' });
     const errors = spyOn(console, 'error').mockImplementation(() => {});
-    const why = "it's serving, though agent-framework's resume failed after the quiesce ended (EIO: the record of the quiesce's " +
-      "end couldn't be written); its record may still say quiesced, which the next start ends";
+    const why = "it's serving, though agent-framework's resume failed after the quiesce ended: EIO: the record of the quiesce's " +
+      "end couldn't be written";
     try {
       expect(await resumeIfSwitch(framework)).toEqual({ resumed: true, why });
       expect(errors.mock.calls.map((c) => String(c[0]))).toEqual([`[update] This host's switch quiesce ended, with an error: ${why}`]);

@@ -2820,9 +2820,10 @@ export class FleetModule implements Module {
    * fire-and-forget request* verbs above: HTTP proxy routes need to await a
    * body, and the WS handlers are simpler for it too.
    *
-   * Never rejects — a dead child, send failure, or timeout resolves as
-   * `{ok:false, error, status}` (502 unreachable, 504 timeout), so callers
-   * translate straight into a response without try/catch.
+   * Never rejects — a dead child, a send failure, a connection that closes
+   * before the answer, or a timeout resolves as `{ok:false, error, status}`
+   * (502 unreachable, 504 timeout), so callers translate straight into a
+   * response without try/catch.
    */
   requestPanel(
     childName: string,
@@ -2896,7 +2897,7 @@ export class FleetModule implements Module {
         finish({
           ok: false,
           error: `${what} got no answer, since the connection to child '${childName}' closed before one came, so it may or ` +
-            `may not have taken effect; fleet--status for '${childName}' shows its state`,
+            'may not have taken effect',
           status: 502,
         });
       };

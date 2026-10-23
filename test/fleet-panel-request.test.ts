@@ -3,7 +3,7 @@
  * fleet-scope routing rides on (WS panels and the HTTP ?scope= proxy).
  *
  * Uses the mock headless child, which answers panel-request with:
- *   op 'hang' → nothing (timeout path)
+ *   op 'hang' → nothing (the timeout path, or the closed-connection path)
  *   op 'fail' → {ok:false, error, status:418} (error passthrough)
  *   others    → {ok:true, data:{op, echo:params}}
  */
@@ -141,7 +141,7 @@ describe("the children a switch's quiesce reaches", () => {
         expect(answer).toEqual({
           ok: false,
           error: "panel op 'hang' got no answer, since the connection to child 'up' closed before one came, so it may or may " +
-            "not have taken effect; fleet--status for 'up' shows its state",
+            'not have taken effect',
           status: 502,
         });
       }
