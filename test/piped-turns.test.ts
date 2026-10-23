@@ -152,7 +152,7 @@ describe('what piped mode prints', () => {
   });
 
   test('a turn that ends on stderr closes its prose line on stdout, so what prints next starts a line of its own', () => {
-    const { emit, out } = setUp();
+    const { emit, out, turns } = setUp();
     emit('inference:started');
     emit('inference:tokens', { content: 'Partial answer' });
     emit('inference:exhausted', { error: 'Stream aborted: timeout' });
@@ -161,10 +161,25 @@ describe('what piped mode prints', () => {
     emit('inference:tokens', { content: 'Another' });
     emit('inference:failed', { error: 'bad request' });
     emit('inference:exhausted', { error: 'bad request' });
+    // Another agent's failure, too.
+    turns.onTrace({ type: 'inference:started', agentName: 'spawn-c' });
+    turns.onTrace({ type: 'inference:tokens', agentName: 'spawn-c', content: 'Half' });
+    turns.onTrace({ type: 'inference:failed', agentName: 'spawn-c', error: 'overloaded' });
     expect(out).toEqual([
       'out:\n', 'out:Partial answer', 'out:\n', 'err:(turn ended: Stream aborted: timeout)',
       'out:\n', 'out:Another', 'out:\n', 'err:Error: bad request',
+      'out:\n', 'out:Half', 'out:\n', 'err:Error: overloaded',
     ]);
+  });
+
+  test('a stop that cancels a failed attempt\'s retry prints nothing more', () => {
+    // agent-framework sends `failed`, then `aborted` when a stop cancels the
+    // retry or a quiesce abandons it (state/turn-trace.ts).
+    const { emit, out } = setUp();
+    emit('inference:started');
+    emit('inference:failed', { error: 'overloaded' });
+    emit('inference:aborted', { reason: 'quiesce_abandoned' });
+    expect(out).toEqual(['out:\n', 'out:\n', 'err:Error: overloaded']);
   });
 
   test('tool calls as before, a long input cut at 120 characters', () => {
