@@ -1,14 +1,15 @@
 /**
- * Context panel — the makeup of the agent's current compiled context.
- *
- * Reads GET /debug/context/makeup (transparent: previewActivation +
- * count_tokens, no inference / no writes) and shows the segment breakdown the
- * autobiographical strategy produced: head window, raw middle, summaries by
- * level (L1/L2/L3), and the recent verbatim tail — as a proportional bar plus
- * a per-segment table, with an exact total token count.
+ * Context panel — two figures from GET /debug/context/makeup (transparent:
+ * previewActivation + count_tokens, no inference / no writes): the exact
+ * token count of the next request as a preview builds it, from the stored
+ * history without what modules add at each turn, and the segment breakdown of the
+ * agent's last live compile, which the autobiographical strategy records:
+ * head window, raw middle, summaries by level (L1/L2/L3), and the recent
+ * verbatim tail — as a proportional bar plus a per-segment table.
  */
 
 import { createEffect, createSignal, on, onCleanup, onMount, For, Show } from 'solid-js';
+import { noComposition, notCounted } from './composition-text';
 
 interface Seg { messages: number; tokens: number }
 interface Stats {
@@ -21,7 +22,13 @@ interface Stats {
 }
 interface Makeup {
   agent: string;
+  /** The render stats of the agent's last live compile: null until one has
+   *  run since its context was loaded, or where its strategy keeps none. */
   stats: Stats | null;
+  /** Whether the agent's strategy keeps render stats at all. */
+  statsKept?: boolean;
+  /** The next request's exact token count, from a preview, or null where it
+   *  wasn't counted, as `countSource` says. */
   exactTotalTokens: number | null;
   countModel: string;
   countSource: string;
@@ -300,18 +307,32 @@ export function ContextPanel(props: { scope?: string }) {
         </section>
       </Show>
 
-      <Show when={data()?.stats} fallback={<Show when={!err()}><div class="text-neutral-500">loading…</div></Show>}>
-        {/* headline totals */}
-        <div class="flex gap-4">
+      <Show when={!data() && !err()}><div class="text-neutral-500">loading…</div></Show>
+
+      {/* The next request, as a preview builds it, counted exactly, or why
+          it wasn't counted. */}
+      <Show when={data()}>
+        <Show
+          when={data()!.exactTotalTokens != null}
+          fallback={<div class="text-neutral-500">next request: {notCounted(data()!.countSource)}</div>}
+        >
           <div>
-            <div class="text-2xl text-neutral-100">{fmt(data()!.exactTotalTokens ?? estTotal())}</div>
-            <div class="text-neutral-500">
-              {data()!.exactTotalTokens != null ? 'tokens (exact)' : 'tokens (est)'}
-            </div>
+            <div class="text-2xl text-neutral-100">{fmt(data()!.exactTotalTokens!)}</div>
+            <div class="text-neutral-500">tokens (exact): the next request as a preview builds it, without what modules add at each turn</div>
+            <div class="text-neutral-600">counted by count_tokens for {data()!.countModel}</div>
           </div>
-          <div class="self-end text-neutral-500">
-            {fmt(data()!.stats!.total.messages)} msgs · est {fmt(estTotal())}
-          </div>
+        </Show>
+      </Show>
+
+      {/* The last live compile's render stats, or which of the two reasons
+          there are none. */}
+      <Show when={data() && !data()!.stats}>
+        <div class="text-neutral-500">{noComposition(data()!.statsKept !== false)}</div>
+      </Show>
+
+      <Show when={data()?.stats}>
+        <div class="text-neutral-500">
+          last live compile: {fmt(data()!.stats!.total.messages)} msgs · est {fmt(estTotal())} tokens
         </div>
 
         {/* proportional bar */}
@@ -357,9 +378,7 @@ export function ContextPanel(props: { scope?: string }) {
           <div>
             pending compression: {data()!.stats!.pending.chunks} chunk(s), {data()!.stats!.pending.merges} merge(s)
           </div>
-          <div>
-            exact via count_tokens ({data()!.countModel}; same tokenizer) · per-segment tokens are strategy estimates
-          </div>
+          <div>per-segment tokens are strategy estimates</div>
         </div>
       </Show>
     </div>

@@ -19,6 +19,7 @@
 import { For, Show } from 'solid-js';
 import type { CallLedgerRow } from '@conhost/web/protocol';
 import { callFailed, callOriginLabel, callOriginTone } from './call-origin';
+import { healthComposition, lastInferenceLine } from './composition-text';
 import { credentialNote, healthEntry, lastActionText, readFailureLine } from '@conhost/web/health-lookup';
 import { quarantineHeld } from '@conhost/web/quarantine-alert';
 import { debtNextStep, debtSummary, debtTone, type CompressionDebt, type DebtTone } from '@conhost/web/compression-debt';
@@ -71,8 +72,10 @@ export const CREDENTIAL_ALERT_KINDS = [
   'quota-spent', 'quota-unreadable', 'auth-expiring', 'auth-expired', 'auth-rejected', 'auth-login-required',
 ] as const;
 
-/** Rendered composition of the last compile — what was actually SENT. */
+/** Rendered composition of the agent's last live compile, or, for an agent
+ *  whose strategy keeps no render stats, `{ statsKept: false }` alone. */
 export interface ContextComposition {
+  statsKept?: false;
   head?: { messages: number; tokens: number };
   tail?: { messages: number; tokens: number };
   middleRaw?: { messages: number; tokens: number };
@@ -103,7 +106,7 @@ export interface HealthSnapshot {
     consecutiveInferenceFailures?: number;
     lastInference?: {
       startedAt?: number;
-      completedAt?: number;
+      endedAt?: number;
       failedAt?: number;
       lastError?: string;
     } | null;
@@ -377,7 +380,7 @@ function CompositionBlock(props: { c: ContextComposition }) {
   return (
     <div>
       <div class="text-[10px] uppercase tracking-wider text-neutral-600 mb-1">
-        context composition (last compile)
+        context composition (last live compile)
       </div>
       <table class="w-full font-mono text-[10px]">
         <tbody>
@@ -472,6 +475,19 @@ export function HealthPanel(props: {
   const debt = (name: string) => healthEntry(props.health?.compressionDebt, name);
   const settings = (name: string) => healthEntry(props.health?.runtimeSettings, name);
   const composition = (name: string) => healthEntry(props.health?.contextComposition, name);
+  // An agent's composition block, or the line in its place, if any.
+  const compositionView = (name: string) => healthComposition(composition(name), {
+    sectionRead: props.health?.contextComposition !== undefined,
+    readFailed: healthEntry(failures(name), 'contextComposition') !== undefined,
+  });
+  const compositionStats = (name: string) => {
+    const view = compositionView(name);
+    return view && 'stats' in view ? view.stats : undefined;
+  };
+  const compositionLine = (name: string) => {
+    const view = compositionView(name);
+    return view && 'line' in view ? view.line : undefined;
+  };
   const failures = (name: string) => healthEntry(props.health?.readFailures, name);
 
   const statusTone = (status?: string): string => {
@@ -547,13 +563,8 @@ export function HealthPanel(props: {
                 last error: {a.lastInference!.lastError}
               </div>
             </Show>
-            <Show when={a.lastInference?.completedAt || a.lastInference?.failedAt}>
-              <div class="text-neutral-500">
-                last inference:{' '}
-                {a.lastInference?.completedAt
-                  ? `ok ${fmtAgo(a.lastInference.completedAt)}`
-                  : `failed ${fmtAgo(a.lastInference!.failedAt!)}`}
-              </div>
+            <Show when={lastInferenceLine(a.lastInference, fmtAgo)}>
+              {(line) => <div class="text-neutral-500">{line()}</div>}
             </Show>
 
             <Show when={quarantine(a.name) && (quarantine(a.name)!.count ?? 0) > 0}>
@@ -648,10 +659,22 @@ export function HealthPanel(props: {
               )}
             </Show>
 
-            {/* What was actually SENT, and how it split. Composition is
-                in-process render stats (free); call stats come from the ledger
-                the client already holds. */}
-            <Show when={composition(a.name)}>
+            {/* How the last live compile split. Composition is in-process
+                render stats (free), which context-manager keeps only from a
+                live compile since the agent's context was loaded, and only
+                for a strategy that keeps them, so where there's none a line
+                says which; a read that failed is named above. Call stats
+                come from the ledger the client already holds. */}
+            <Show
+              when={compositionStats(a.name)}
+              fallback={
+                <Show when={compositionLine(a.name)}>
+                  {(line) => (
+                    <div class="border-t border-neutral-900 pt-1.5 text-[10px] text-neutral-500">{line()}</div>
+                  )}
+                </Show>
+              }
+            >
               {(c) => (
                 <div class="border-t border-neutral-900 pt-1.5">
                   <CompositionBlock c={c()} />

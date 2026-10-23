@@ -838,7 +838,9 @@ blocks; expect folds to interact with this on the next model generation.
   — on a fresh copy of the stopped store, never hardlinks; §11.8 gives the drain and the swap
 - **Health:** `GET /healthz` — per-agent `compressionQuarantine`, `compressionDebt` (incl.
   `topologyViolations` / `topologyRefusals`),
-  `contextComposition` (head / raw / summaries / tail as last rendered), `runtimeSettings`, and
+  `contextComposition` (head / raw / summaries / tail as the last live compile rendered them;
+  `{ "statsKept": false }` for an agent whose strategy keeps none, and no entry before an
+  agent's first live compile since its context was loaded), `runtimeSettings`, and
   `readFailures`, present only when one of those reads threw: by agent, then section, what the
   error said, cut to 300 characters
 - **Import guides:** [`claude-code-ingest.md`](./claude-code-ingest.md) ·
