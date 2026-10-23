@@ -83,6 +83,9 @@ describe('framework FKM composition', () => {
         autoRewind: true,
         maxRewinds: 2,
       },
+      // The one FKM addition a recipe gets without naming it: ten-minute clock
+      // rows (DEFAULT_RECIPE_CLOCK), off only with agent.clock: false.
+      clock: { intervalMinutes: 10 },
     });
   });
 
