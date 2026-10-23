@@ -6,3 +6,6 @@
   next turn reads a short `[continue]` row. It takes effect with the
   agent-framework release that adds it; an earlier one ignores it. A value
   that isn't true, false or such an object is refused when the recipe loads.
+- **Operators:** a fork's or spawn's orientation lists `auto-continue` among the
+  agent settings a subagent stream doesn't take from its launch (`off` for
+  the stream, beside the parent's), since subagents don't inherit it.

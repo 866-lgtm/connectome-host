@@ -187,7 +187,12 @@ continued `maxConsecutive` times in a row (default 3, 1 to 20). Each next turn
 reads a short `[continue]` row naming `skip_reply` as the way to stop, with
 the count once the cap is near, and speaks in the same locus. Every
 continuation is a full inference, and in `locus` mode its prose is published,
-so keep the cap low. See Agent Framework's `docs/auto-continue.md`.
+so keep the cap low. Ephemeral subagents don't inherit it: their streams run
+with it off, and a fork's or spawn's orientation lists `auto-continue` beside
+the parent's. It takes effect only with the agent-framework release that adds
+`AgentConfig.autoContinue` (agent-framework#744); with an earlier one, as this
+host's dependency is until it moves, the key validates but turns don't
+continue. See Agent Framework's `docs/auto-continue.md`.
 
 ```json
 { "agent": { "autoContinue": { "maxConsecutive": 3 } } }
