@@ -16,8 +16,11 @@
   Needs membrane 0.7.0 or later, which adds the `thinking-display-updates-2026-08-18` beta that
   `'updates'` requires.
   - **Cache:** on these models the first call after upgrading also sends a thinking config where none
-    or `'omitted'` went before. That adds no write of its own: the `reasoning_display` description
-    change below already has the agent's whole cached prompt written again at that call.
+    or `'omitted'` went before. For an agent given `agent_settings`, that adds no write of its own:
+    the `reasoning_display` description change below already has its whole cached prompt written
+    again at that call. For other requests on these models, such as a subagent whose tools leave
+    `agent_settings` out or an MCPL server's streamed inference, the cached message prefix may be
+    written again, once.
   - **Bedrock:** an agent on `provider: 'bedrock'` goes through `LoggingBedrockAdapter`, which
     applies none of `agent_settings`' reasoning fields, this step included: its requests carry the
     thinking config membrane builds from the recipe, as before.
