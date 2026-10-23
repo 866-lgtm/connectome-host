@@ -30,6 +30,7 @@ import {
   appendJournal, childrenFilePath, copyItemName, copyLabelPath, installPaths, moveCurrent, readCurrent,
   writeJsonAtomic,
 } from '../src/update/contract.js';
+import { processEnded, waitForEnd } from './process-ended.js';
 
 const MODEL = { complete: async () => ({ stopReason: 'end_turn', content: [{ type: 'text', text: 'x' }] }) } as never;
 const INDEX_PATH = join(import.meta.dir, '..', 'src', 'index.ts');
@@ -1321,16 +1322,7 @@ describe("a fleet child's audit, in a process of its own", () => {
       "CONNECTOME_FLEET_CHILD_AUDIT_MINUTES in this host's environment gives it more minutes."]);
     expect(existsSync(pidFile), "the child's audit never reached its extension").toBe(true);
     const pid = Number(readFileSync(pidFile, 'utf8'));
-    let alive = true;
-    for (let waited = 0; alive && waited < 10_000; waited += 50) {
-      try {
-        alive = !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, 'utf8'));
-      } catch {
-        alive = false;
-      }
-      if (alive) await Bun.sleep(50);
-    }
-    expect(alive).toBe(false);
+    expect(await waitForEnd(pid, 10_000)).toBe(true);
   }, 60_000);
 
   test("a child's audit that can't be started says why without the value its spawn refused", async () => {
@@ -1425,20 +1417,13 @@ describe("a fleet child's audit, in a process of its own", () => {
     const { status, lines } = await audit([parent.dir]);
     expect(status).toBe(0);
     expect(lines).toContain(`${dirs.helper!.stores[0]} (agents/agent): opens`);
-    // Ended with the audit's group: gone, or a zombie its new parent hasn't
-    // reaped yet.
     const helper = Number(readFileSync(pidFile, 'utf8'));
-    const running = () => {
-      try {
-        return !/^State:\s+Z/m.test(readFileSync(`/proc/${helper}/status`, 'utf8'));
-      } catch {
-        return false;
-      }
-    };
-    for (let waited = 0; running() && waited < 10_000; waited += 50) await Bun.sleep(50);
-    const alive = running();
-    if (alive) process.kill(helper, 'SIGKILL');
-    expect(alive).toBe(false);
+    try {
+      // Ended with the audit's group.
+      expect(await waitForEnd(helper, 10_000)).toBe(true);
+    } finally {
+      try { process.kill(helper, 'SIGKILL'); } catch { /* it has ended */ }
+    }
   }, 90_000);
 });
 
@@ -1476,14 +1461,6 @@ describe("a fleet child's audit and what outlasts it", () => {
       return readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
     } catch {
       return null;
-    }
-  };
-  /** Whether the process runs, and isn't only waiting to be reaped. */
-  const isAliveHere = (pid: number): boolean => {
-    try {
-      return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, 'utf8'));
-    } catch {
-      return false;
     }
   };
 
@@ -1566,9 +1543,7 @@ describe("a fleet child's audit and what outlasts it", () => {
       "child's process."]);
     // The SIGKILL its limit sent ended it.
     const held = Number(readFileSync(heldFile, 'utf8'));
-    const ended = Date.now() + 10_000;
-    while (isAliveHere(held) && Date.now() < ended) await new Promise((wait) => setTimeout(wait, 50));
-    expect(isAliveHere(held)).toBe(false);
+    expect(await waitForEnd(held, 10_000)).toBe(true);
   }, 60_000);
 
   test("a child's audit has the minutes the audit's environment gives it, and 5 where it gives none it can use", async () => {
@@ -1659,7 +1634,7 @@ describe("a fleet child's audit and what outlasts it", () => {
         'extension that waits at its import, a recipe slow to load, or a store slow to open: ' +
         `${byHand(parent.dir)}, and shows where it stops, should it stop again. Where its stores need longer, ` +
         "CONNECTOME_FLEET_CHILD_AUDIT_MINUTES in this host's environment gives it more minutes."]);
-      expect(isAliveHere(pid)).toBe(true);
+      expect(processEnded(pid)).toBe(false);
       expect(JSON.parse(readFileSync(file, 'utf8')).children).toEqual([
         { name: "stuck's store audit", pid, bootId: bootNow(), dataDir: child.dir },
       ]);
@@ -1916,22 +1891,14 @@ describe("which fleet children an audit follows, and how", () => {
     await new Promise((done) => hostProcess.on('exit', done));
     expect(existsSync(opening), "the child's open never began").toBe(true);
     const pid = Number(readFileSync(opening, 'utf8'));
-    const alive = (): boolean => {
-      try {
-        return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, 'utf8'));
-      } catch {
-        return false;
-      }
-    };
     try {
       // The host has ended, and its child's audit, still in its open, is
       // listed as running, which the launcher's fallback waits for.
-      expect(alive(), "the child's audit ended with its host, before its open did").toBe(true);
+      expect(processEnded(pid), "the child's audit ended with its host, before its open did").toBe(false);
       const listed = JSON.parse(readFileSync(file, 'utf8')).children;
       expect(listed).toContainEqual(expect.objectContaining({ name: "kid's store audit", pid, dataDir: child.dir }));
       writeFileSync(release, '');
-      for (let waited = 0; alive() && waited < 20_000; waited += 50) await Bun.sleep(50);
-      expect(alive(), "the child's audit went on after its open").toBe(false);
+      expect(await waitForEnd(pid, 20_000), "the child's audit went on after its open").toBe(true);
     } finally {
       try { process.kill(-pid, 'SIGKILL'); } catch { /* gone */ }
     }
@@ -1985,25 +1952,12 @@ describe("which fleet children an audit follows, and how", () => {
     await new Promise((done) => hostProcess.on('exit', done));
     expect(existsSync(opening), "the child's open never began").toBe(true);
     const pid = Number(readFileSync(opening, 'utf8'));
-    const alive = (): boolean => {
-      try {
-        return !/^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, 'utf8'));
-      } catch {
-        return false;
-      }
-    };
     const helper = Number(readFileSync(helperPid, 'utf8'));
-    const helperAlive = (): boolean => {
-      try {
-        return !/^State:\s+Z/m.test(readFileSync(`/proc/${helper}/status`, 'utf8'));
-      } catch {
-        return false;
-      }
-    };
     try {
-      for (let waited = 0; alive() && waited < 20_000; waited += 50) await Bun.sleep(50);
-      expect(alive(), "the child's audit went on after its open").toBe(false);
-      expect(helperAlive(), "the helper outlived the child's audit").toBe(false);
+      expect(await waitForEnd(pid, 20_000), "the child's audit went on after its open").toBe(true);
+      // The group's SIGKILL, sent as the child's audit ended, lands on the
+      // helper in its own time.
+      expect(await waitForEnd(helper, 10_000), "the helper outlived the child's audit").toBe(true);
       // Let it write, were it there.
       writeFileSync(go, '');
       await Bun.sleep(500);
@@ -2219,16 +2173,8 @@ describe("which fleet children an audit follows, and how", () => {
     await new Promise((done) => starterProcess.on('exit', done));
     expect(existsSync(started), 'the import never began').toBe(true);
     const pid = Number(readFileSync(pidFile, 'utf8'));
-    const gone = (): boolean => {
-      try {
-        return /^State:\s+Z/m.test(readFileSync(`/proc/${pid}/status`, 'utf8'));
-      } catch {
-        return true;
-      }
-    };
-    for (let waited = 0; !gone() && waited < 20_000; waited += 50) await Bun.sleep(50);
     try {
-      expect(gone(), 'the child audit is still running').toBe(true);
+      expect(await waitForEnd(pid, 20_000), 'the child audit is still running').toBe(true);
       expect(statSync(log).size, "the store was opened, which cut its torn tail").toBe(size);
       expect(existsSync(built), 'the store was opened').toBe(false);
       expect(readFileSync(stderrFile, 'utf8')).not.toContain(': opens');
