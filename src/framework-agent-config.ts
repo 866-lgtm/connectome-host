@@ -27,6 +27,7 @@ export type FrameworkAgentConfig = AgentConfig & {
   // while remaining structurally compatible with older installs.
   refusalHandling?: Recipe['agent']['refusalHandling'];
   sameRoundThinkTextPolicy?: 'public' | 'private';
+  autoContinue?: Recipe['agent']['autoContinue'];
 };
 
 /**

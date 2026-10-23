@@ -11,7 +11,7 @@ const base = (value?: unknown) => ({
 });
 
 const built = (value?: unknown) =>
-  (buildFrameworkAgentConfig(validateRecipe(base(value)), 'a', 'm', { kind: 's' } as never) as { autoContinue?: unknown }).autoContinue;
+  buildFrameworkAgentConfig(validateRecipe(base(value)), 'a', 'm', { kind: 's' } as never).autoContinue;
 
 describe('autoContinue recipe wiring', () => {
   test('is off by omission and passes true, false and a cap through to AgentConfig', () => {
@@ -20,8 +20,11 @@ describe('autoContinue recipe wiring', () => {
     expect(built(false)).toBe(false);
     expect(built({})).toEqual({});
     expect(built({ maxConsecutive: 5 })).toEqual({ maxConsecutive: 5 });
+    // The bounds themselves are accepted.
+    expect(built({ maxConsecutive: 1 })).toEqual({ maxConsecutive: 1 });
+    expect(built({ maxConsecutive: 20 })).toEqual({ maxConsecutive: 20 });
     const reloaded = validateRecipe(JSON.parse(JSON.stringify(validateRecipe(base({ maxConsecutive: 2 })))));
-    expect((buildFrameworkAgentConfig(reloaded, 'b', 'm', { kind: 's' } as never) as { autoContinue?: unknown }).autoContinue)
+    expect(buildFrameworkAgentConfig(reloaded, 'b', 'm', { kind: 's' } as never).autoContinue)
       .toEqual({ maxConsecutive: 2 });
   });
 
@@ -29,6 +32,7 @@ describe('autoContinue recipe wiring', () => {
     for (const value of ['true', 1, null, [], { maxConsecutive: 0 }, { maxConsecutive: 21 }, { maxConsecutive: 1.5 }, { maxConsecutive: '3' }]) {
       expect(() => validateRecipe(base(value))).toThrow(/agent\.autoContinue/);
     }
-    expect(() => validateRecipe(base({ maxConsecutve: 3 }))).toThrow(/unknown key "maxConsecutve"; it takes maxConsecutive/);
+    expect(() => validateRecipe(base({ maxConsecutve: 3 }))).toThrow(/unknown key "maxConsecutve"; it takes maxConsecutive\./);
+    expect(() => validateRecipe(base({ max: 3, cap: 2 }))).toThrow(/unknown keys "max", "cap"; it takes maxConsecutive\./);
   });
 });

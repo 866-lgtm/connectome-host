@@ -1808,6 +1808,18 @@ export const DEFAULT_RECIPE_CLOCK: ClockConfig = Object.freeze({ intervalMinutes
 
 /** `agent.autoContinue`'s keys, when it is an object. */
 const RECIPE_AGENT_AUTO_CONTINUE_KEYS = ['maxConsecutive'] as const;
+
+/**
+ * Refuse a nested recipe object's keys outside `known`: the framework reads
+ * only those and ignores any other, so a misspelling would load as no
+ * setting at all. The message names the keys it takes.
+ */
+function rejectUnknownKeys(path: string, value: object, known: readonly string[]): void {
+  const unknown = Object.keys(value).filter((k) => !known.includes(k));
+  if (unknown.length === 0) return;
+  const takes = known.length === 1 ? known[0] : `${known.slice(0, -1).join(', ')} and ${known[known.length - 1]}`;
+  throw new Error(`Recipe ${path} has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes ${takes}.`);
+}
 /** agent-framework's `ClockConfig` keys, the ones `agent.clock` takes: the
  *  framework reads only these and ignores any other, so the host refuses the
  *  rest rather than letting a misspelling load as no setting at all. */
@@ -2109,11 +2121,11 @@ export function validateRecipe(raw: unknown): Recipe {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       throw new Error(`Recipe agent.autoContinue must be true, false, or an object such as { "maxConsecutive": 3 }, got ${JSON.stringify(value)}.`);
     }
-    const known: readonly string[] = RECIPE_AGENT_AUTO_CONTINUE_KEYS;
-    const unknown = Object.keys(value).filter((k) => !known.includes(k));
-    if (unknown.length > 0) {
-      throw new Error(`Recipe agent.autoContinue has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes maxConsecutive.`);
-    }
+    rejectUnknownKeys('agent.autoContinue', value, RECIPE_AGENT_AUTO_CONTINUE_KEYS);
+    // The framework's own bounds (agent-framework resolveAutoContinue, #744),
+    // checked here so a recipe fails at load. It isn't exported by the
+    // framework release this host depends on yet; once it is, call it here
+    // as the clock check below calls resolveClockConfig.
     const max = (value as RecipeAutoContinue).maxConsecutive;
     if (max !== undefined && (typeof max !== 'number' || !Number.isInteger(max) || max < 1 || max > 20)) {
       throw new Error(`Recipe agent.autoContinue.maxConsecutive must be a whole number from 1 to 20, got ${JSON.stringify(max)}.`);
@@ -2124,11 +2136,7 @@ export function validateRecipe(raw: unknown): Recipe {
     if (!agent.clock || typeof agent.clock !== 'object' || Array.isArray(agent.clock)) {
       throw new Error(`Recipe agent.clock must be false (no clock rows) or an object such as { "intervalMinutes": 10 }, got ${JSON.stringify(agent.clock)}.`);
     }
-    const known: readonly string[] = RECIPE_AGENT_CLOCK_KEYS;
-    const unknown = Object.keys(agent.clock).filter((k) => !known.includes(k));
-    if (unknown.length > 0) {
-      throw new Error(`Recipe agent.clock has unknown key${unknown.length > 1 ? 's' : ''} ${unknown.map((k) => JSON.stringify(k)).join(', ')}; it takes ${known.slice(0, -1).join(', ')} and ${known[known.length - 1]}.`);
-    }
+    rejectUnknownKeys('agent.clock', agent.clock, RECIPE_AGENT_CLOCK_KEYS);
     // The framework's own rules, so a recipe fails here rather than at boot.
     try {
       resolveClockConfig('recipe', agent.clock);
