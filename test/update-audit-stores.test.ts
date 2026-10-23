@@ -1418,11 +1418,17 @@ describe("a fleet child's audit, in a process of its own", () => {
     expect(status).toBe(0);
     expect(lines).toContain(`${dirs.helper!.stores[0]} (agents/agent): opens`);
     const helper = Number(readFileSync(pidFile, 'utf8'));
+    let ended = false;
     try {
       // Ended with the audit's group.
-      expect(await waitForEnd(helper, 10_000)).toBe(true);
+      ended = await waitForEnd(helper, 10_000);
+      expect(ended).toBe(true);
     } finally {
-      try { process.kill(helper, 'SIGKILL'); } catch { /* it has ended */ }
+      // Only one that hasn't ended: an ended helper's pid may be another
+      // process's by now.
+      if (!ended) {
+        try { process.kill(helper, 'SIGKILL'); } catch { /* it has ended since */ }
+      }
     }
   }, 90_000);
 });
