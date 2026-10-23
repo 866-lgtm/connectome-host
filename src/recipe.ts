@@ -393,7 +393,18 @@ export interface RecipeAgent {
     type?: 'enabled' | 'adaptive';
     /** 'summarized' returns readable reasoning summaries in `thinking`;
      * 'omitted' returns empty text + signature only. Models 4.7+ default
-     * to 'omitted' server-side. */
+     * to 'omitted' server-side. Through the Anthropic adapter, with
+     * reasoning_enabled on, a config carrying agent_settings'
+     * reasoning_display goes in place of this block's whole thinking
+     * config, binding controls included, on a model that takes adaptive
+     * thinking. On a streamed call through it to a model
+     * modelReturnsNotesInThinking lists, a request that would go with
+     * display 'omitted', or with no thinking config, goes with 'updates'
+     * instead, so the notes between tool calls come back as text
+     * (LoggingAnthropicAdapter.withProgressNotes). So there, with
+     * reasoning_enabled off, a 'summarized' goes as 'updates' too wherever
+     * membrane builds no config from this block, as for a display alone on
+     * Fable and Mythos. */
     display?: 'summarized' | 'omitted';
     /** Anthropic streaming effort baseline, independent of enabled. Explicit agent
      * settings override it until reset; compression calls are unaffected. Other
