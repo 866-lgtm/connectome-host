@@ -2810,6 +2810,9 @@ export class FleetModule implements Module {
 
   /** Monotonic corrId source for requestAnswer. */
   private panelSeq = 0;
+  /** The requests waiting on each child's connection, each ended at once
+   *  when it closes, through one listener for the connection. */
+  private readonly waitingOn = new WeakMap<Socket, Set<() => void>>();
 
   /**
    * Run one operator-panel op (see src/web/panel-data.ts) in a fleet child
@@ -2869,6 +2872,14 @@ export class FleetModule implements Module {
     }
     const corrId = `${corrPrefix}-${++this.panelSeq}-${Date.now().toString(36)}`;
     const socket = child.socket;
+    let waiting = this.waitingOn.get(socket);
+    if (!waiting) {
+      const onSocket = new Set<() => void>();
+      socket.once('close', () => { for (const end of [...onSocket]) end(); });
+      this.waitingOn.set(socket, onSocket);
+      waiting = onSocket;
+    }
+    const waitingHere = waiting;
     return new Promise((resolveAnswer) => {
       let settled = false;
       const finish = (result: { ok: boolean; data?: unknown; error?: string; status?: number }): void => {
@@ -2876,15 +2887,20 @@ export class FleetModule implements Module {
         settled = true;
         unsub();
         clearTimeout(timer);
-        socket.off('close', closed);
+        waitingHere.delete(closed);
         resolveAnswer(result);
       };
       // The child answers on the connection the request came by, so once that
       // closes, as when the child exits, no answer can come.
       const closed = (): void => {
-        finish({ ok: false, error: `${what} got no answer: the connection to child '${childName}' closed first`, status: 502 });
+        finish({
+          ok: false,
+          error: `${what} got no answer, since the connection to child '${childName}' closed before one came, so it may or ` +
+            `may not have taken effect; fleet--status for '${childName}' shows its state`,
+          status: 502,
+        });
       };
-      socket.once('close', closed);
+      waitingHere.add(closed);
       const unsub = this.onChildEvent(childName, (_name, evt) => {
         if (evt.type !== responseType) return;
         const e = evt as unknown as PanelResponseEvent | UpdateResponseEvent;

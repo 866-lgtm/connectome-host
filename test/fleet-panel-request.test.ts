@@ -122,17 +122,25 @@ describe("the children a switch's quiesce reaches", () => {
         gone.status = status;
         expect(fleet.runningChildren().some((c) => c.name === 'gone'), status).toBe(listed);
       }
-      // A request waiting on a child is answered as soon as its connection
-      // closes, rather than when its wait is up.
+      // The requests waiting on a child are answered as soon as its
+      // connection closes, rather than when their wait is up, through one
+      // listener on the connection however many there are.
       const up = fleet.getChildren().get('up')!;
-      const started = Date.now();
-      const pending = fleet.requestPanel('up', 'hang', undefined, 20_000);
+      const socket = up.socket!;
+      const listeners = socket.listenerCount('close');
+      const pending = Array.from({ length: 12 }, () => fleet.requestPanel('up', 'hang', undefined, 20_000));
+      expect(socket.listenerCount('close')).toBe(listeners + 1);
       // A ready child whose connection closes, its exit not yet seen, may be
       // mid-turn: the switch asks it, and hears why it can't answer.
-      up.socket!.destroy();
-      const early = await pending;
-      expect(Date.now() - started).toBeLessThan(5_000);
-      expect(early).toEqual({ ok: false, error: "panel op 'hang' got no answer: the connection to child 'up' closed first", status: 502 });
+      socket.destroy();
+      for (const answer of await Promise.all(pending)) {
+        expect(answer).toEqual({
+          ok: false,
+          error: "panel op 'hang' got no answer, since the connection to child 'up' closed before one came, so it may or may " +
+            "not have taken effect; fleet--status for 'up' shows its state",
+          status: 502,
+        });
+      }
       await new Promise<void>((done) => { const poll = setInterval(() => { if (up.socket === null) { clearInterval(poll); done(); } }, 5); });
       expect(fleet.runningChildren()).toEqual([{ name: 'up' }]);
       const answer = await fleet.requestSwitch('up', { op: 'quiesce', to: '9.9.9', waitMs: 0 }, 5_000);

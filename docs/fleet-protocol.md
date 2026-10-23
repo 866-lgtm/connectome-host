@@ -438,9 +438,9 @@ by a reducer.
   force-quits.
 - **WebUI `?scope=<child>`** — `/debug/context{,/makeup,/coverage,/curve,/preview,/maintenance}`,
   `/healthz`, `/quota` and `/media` accept `?scope=<child>` and are answered by
-  that child through `FleetModule.requestPanel()` (404 unknown child, 502 not
-  running, 504 after the 30 s default timeout; otherwise the child's own
-  status). WebSocket panel messages carry `scope` the same way, and the
+  that child through `FleetModule.requestPanel()` (404 unknown child, 502 for
+  a child it can't reach or whose connection closed before it answered, 504
+  after the 30 s default timeout; otherwise the child's own status). WebSocket panel messages carry `scope` the same way, and the
   sidebar's "inspecting:" selector drives it.
 
 ---

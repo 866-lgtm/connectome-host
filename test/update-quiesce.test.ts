@@ -21,7 +21,7 @@ const SWITCH = switchQuiesceReason('0.14.0');
  *  each quiesce as it's entered, one that fails included; `resumeBy` ends its
  *  quiesce from elsewhere after that many reads, and `reads` counts them. */
 function fakeFramework(options: {
-  quiesced?: boolean; reason?: string; holders?: string[]; drainAfter?: number; resumeFails?: true; quiesceFails?: Error;
+  quiesced?: boolean; reason?: string; holders?: string[]; drainAfter?: number; resumeFails?: 'before' | 'after'; quiesceFails?: Error;
   quiesceWaits?: Promise<void>; resumeBy?: number;
 } = {}) {
   const calls: string[] = [];
@@ -45,8 +45,9 @@ function fakeFramework(options: {
     },
     resume: async () => {
       calls.push('resume');
-      if (options.resumeFails) throw new Error('resume refused: the feasibility gate refused it');
+      if (options.resumeFails === 'before') throw new Error('resume refused: the feasibility gate refused it');
       mode = { quiesced: false, reason: undefined };
+      if (options.resumeFails === 'after') throw new Error("EIO: the record of the quiesce's end couldn't be written");
       return status();
     },
     getHostModeStatus: () => {
@@ -393,7 +394,7 @@ describe('resuming', () => {
   });
 
   test("try later on a host whose resume is refused says why, as it says of a child", async () => {
-    const { framework } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: true });
+    const { framework } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: 'before' });
     const errors = spyOn(console, 'error').mockImplementation(() => {});
     try {
       expect(await resumeAfterSwitchQuiesce(framework, null)).toEqual({
@@ -413,7 +414,7 @@ describe('resuming', () => {
   });
 
   test("a resume the framework refuses leaves the switch's quiesce, says why and logs it", async () => {
-    const { framework, mode } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: true });
+    const { framework, mode } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: 'before' });
     const errors = spyOn(console, 'error').mockImplementation(() => {});
     const why = 'it stays quiesced, since agent-framework refused its resume (resume refused: the feasibility gate refused it); a later resume, such as try later or the next start, can succeed once that is resolved';
     try {
@@ -423,6 +424,20 @@ describe('resuming', () => {
       errors.mockRestore();
     }
     expect(mode().quiesced).toBe(true);
+  });
+
+  test("a resume that fails once the host serves again says it's serving, and that the next start ends the record", async () => {
+    const { framework, mode } = fakeFramework({ quiesced: true, reason: SWITCH, resumeFails: 'after' });
+    const errors = spyOn(console, 'error').mockImplementation(() => {});
+    const why = "it's serving, though agent-framework's resume failed after the quiesce ended (EIO: the record of the quiesce's " +
+      "end couldn't be written); its record may still say quiesced, which the next start ends";
+    try {
+      expect(await resumeIfSwitch(framework)).toEqual({ resumed: true, why });
+      expect(errors.mock.calls.map((c) => String(c[0]))).toEqual([`[update] This host's switch quiesce ended, with an error: ${why}`]);
+    } finally {
+      errors.mockRestore();
+    }
+    expect(mode().quiesced).toBe(false);
   });
 });
 

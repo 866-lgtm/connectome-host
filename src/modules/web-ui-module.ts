@@ -1386,8 +1386,8 @@ export class WebUiModule implements Module {
   /** Forward one panel op to a fleet child and answer with its JSON, keeping
    *  only the strings `keptStrings` names when it's given (keepNamedStrings).
    *  Status mapping comes from the child (PanelError.status travels the
-   *  wire), with 502/504 supplied by requestPanel for unreachable/unresponsive
-   *  children. */
+   *  wire), with 502/504 supplied by requestPanel for a child it can't reach
+   *  or whose answer didn't come in time. */
   private async proxyPanelToChild(
     childName: string,
     op: string,

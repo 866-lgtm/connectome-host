@@ -197,7 +197,7 @@ export async function answerSwitchRequest(framework: QuiesceFramework, request: 
 
 /** End a quiesce that is the switch's own, and leave any other. A resume
  *  agent-framework refuses leaves the host quiesced, says why and logs it,
- *  with `refused` set. */
+ *  with `refused` set; one that fails after the host serves again says so. */
 export async function resumeIfSwitch(framework: QuiesceFramework): Promise<{ resumed: boolean; why?: string; refused?: true }> {
   const status = framework.getHostModeStatus();
   if (!status.quiesced) return { resumed: false, why: 'it was serving' };
@@ -206,6 +206,16 @@ export async function resumeIfSwitch(framework: QuiesceFramework): Promise<{ res
     await framework.resume();
     return { resumed: true };
   } catch (error) {
+    if (!framework.getHostModeStatus().quiesced) {
+      // agent-framework ends the quiesce in memory before it writes that it
+      // has, so a write that fails leaves the host serving with its record
+      // still quiesced. The next start boots quiesced under the switch's
+      // reason, and ends it then.
+      const why = `it's serving, though agent-framework's resume failed after the quiesce ended (${said(error)}); ` +
+        'its record may still say quiesced, which the next start ends';
+      console.error(`[update] This host's switch quiesce ended, with an error: ${why}`);
+      return { resumed: true, why };
+    }
     const why = `it stays quiesced, since agent-framework refused its resume (${said(error)}); a later resume, ` +
       'such as try later or the next start, can succeed once that is resolved';
     console.error(`[update] This host's switch quiesce didn't end: ${why}`);
