@@ -2847,9 +2847,10 @@ export class FleetModule implements Module {
   }
 
   /** Send a child the command `command` builds with a new corrId, and await
-   *  the `responseType` event carrying it. A dead child, a failed send or no
-   *  answer within `timeoutMs` resolves as `{ok:false, error, status}` (502
-   *  unreachable, 504 timeout, 404 unknown). */
+   *  the `responseType` event carrying it. A dead child, a failed send, a
+   *  connection that closes before the answer, or no answer within
+   *  `timeoutMs` resolves as `{ok:false, error, status}` (502 unreachable,
+   *  504 timeout, 404 unknown). */
   private requestAnswer(
     childName: string,
     corrPrefix: string,
@@ -2867,6 +2868,7 @@ export class FleetModule implements Module {
       });
     }
     const corrId = `${corrPrefix}-${++this.panelSeq}-${Date.now().toString(36)}`;
+    const socket = child.socket;
     return new Promise((resolveAnswer) => {
       let settled = false;
       const finish = (result: { ok: boolean; data?: unknown; error?: string; status?: number }): void => {
@@ -2874,8 +2876,15 @@ export class FleetModule implements Module {
         settled = true;
         unsub();
         clearTimeout(timer);
+        socket.off('close', closed);
         resolveAnswer(result);
       };
+      // The child answers on the connection the request came by, so once that
+      // closes, as when the child exits, no answer can come.
+      const closed = (): void => {
+        finish({ ok: false, error: `${what} got no answer: the connection to child '${childName}' closed first`, status: 502 });
+      };
+      socket.once('close', closed);
       const unsub = this.onChildEvent(childName, (_name, evt) => {
         if (evt.type !== responseType) return;
         const e = evt as unknown as PanelResponseEvent | UpdateResponseEvent;

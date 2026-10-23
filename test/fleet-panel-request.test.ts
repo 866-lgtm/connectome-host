@@ -122,10 +122,17 @@ describe("the children a switch's quiesce reaches", () => {
         gone.status = status;
         expect(fleet.runningChildren().some((c) => c.name === 'gone'), status).toBe(listed);
       }
+      // A request waiting on a child is answered as soon as its connection
+      // closes, rather than when its wait is up.
+      const up = fleet.getChildren().get('up')!;
+      const started = Date.now();
+      const pending = fleet.requestPanel('up', 'hang', undefined, 20_000);
       // A ready child whose connection closes, its exit not yet seen, may be
       // mid-turn: the switch asks it, and hears why it can't answer.
-      const up = fleet.getChildren().get('up')!;
       up.socket!.destroy();
+      const early = await pending;
+      expect(Date.now() - started).toBeLessThan(5_000);
+      expect(early).toEqual({ ok: false, error: "panel op 'hang' got no answer: the connection to child 'up' closed first", status: 502 });
       await new Promise<void>((done) => { const poll = setInterval(() => { if (up.socket === null) { clearInterval(poll); done(); } }, 5); });
       expect(fleet.runningChildren()).toEqual([{ name: 'up' }]);
       const answer = await fleet.requestSwitch('up', { op: 'quiesce', to: '9.9.9', waitMs: 0 }, 5_000);
