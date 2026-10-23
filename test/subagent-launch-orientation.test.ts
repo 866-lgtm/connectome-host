@@ -983,6 +983,9 @@ describe('each agent setting is read from its own field', () => {
       [{ autoContinue: { maxConsecutive: 1 } }, 'auto-continue', 'on (up to 1 in a row)'],
     ];
     expect(new Set(cases.map(([, name]) => name))).toStrictEqual(new Set(Object.keys(base)));
+    // An agent-framework release without Agent.autoContinue leaves the field
+    // out, which reads as off.
+    expect(base['auto-continue']).toBe('off');
     for (const [agent, name, value] of cases) {
       const moved = agentSettingsOf(agent);
       expect(moved[name]).toBe(value);

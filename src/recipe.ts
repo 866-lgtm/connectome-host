@@ -348,13 +348,13 @@ export interface RecipeAgent {
   toolWrapperProseGuard?: boolean;
   /**
    * Continue until skip_reply (agent-framework `AgentConfig.autoContinue`,
-   * docs/auto-continue.md; off when omitted): a turn the model ends itself,
-   * with prose or with nothing, is followed by another turn straight away,
-   * until the agent calls skip_reply (or another tool that ends the turn),
-   * ends on a `>>skip_reply` / `>>>skip_reply` envelope, or reaches
-   * `maxConsecutive` continuations in a row (default 3, 1 to 20). Each next
-   * turn reads a short system row saying so, which names skip_reply as the
-   * way to stop.
+   * agent-framework's docs/auto-continue.md; off when omitted): a turn the
+   * model ends itself, with prose or with nothing, is followed by another
+   * turn straight away, until the agent calls skip_reply (or another tool
+   * that ends the turn), ends on a `>>skip_reply` / `>>>skip_reply`
+   * envelope, or reaches `maxConsecutive` continuations in a row (default
+   * 3, 1 to 20). Each next turn reads a short system row saying so, which
+   * names skip_reply as the way to stop.
    * `true` is `{}`. An agent-framework release without it ignores it.
    */
   autoContinue?: boolean | RecipeAutoContinue;
@@ -1809,7 +1809,8 @@ export const DEFAULT_RECIPE_CLOCK: ClockConfig = Object.freeze({ intervalMinutes
 /** `agent.autoContinue`'s keys, when it is an object. */
 const RECIPE_AGENT_AUTO_CONTINUE_KEYS = ['maxConsecutive'] as const;
 /** agent-framework's bounds for `agent.autoContinue.maxConsecutive`
- *  (resolveAutoContinue, #744), until a framework release exports them. */
+ *  (resolveAutoContinue, agent-framework#744), until a framework release
+ *  exports them. */
 const AUTO_CONTINUE_MIN = 1;
 const AUTO_CONTINUE_MAX = 20;
 
@@ -2127,7 +2128,7 @@ export function validateRecipe(raw: unknown): Recipe {
       throw new Error(`Recipe agent.autoContinue must be true, false, or an object such as { "maxConsecutive": 3 }, got ${JSON.stringify(value)}.`);
     }
     rejectUnknownKeys('agent.autoContinue', value, RECIPE_AGENT_AUTO_CONTINUE_KEYS);
-    // The framework's own bounds (agent-framework resolveAutoContinue, #744),
+    // The framework's own bounds (resolveAutoContinue, agent-framework#744),
     // checked here so a recipe fails at load. It isn't exported by the
     // framework release this host depends on yet; once it is, call it here
     // as the clock check below calls resolveClockConfig.
