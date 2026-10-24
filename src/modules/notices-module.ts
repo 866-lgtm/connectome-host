@@ -22,7 +22,8 @@
  * Episode semantics (not time debounce): an episode opens on the first
  * qualifying alert and holds every kind active since; a kind leaves on its
  * `-clear` alert — or, for framework kinds that have no clear (`hard-down`,
- * refusals), on the agent's next completed inference — and the episode closes
+ * refusals), on the agent's next turn that completes or that a tool ends
+ * (skip_reply, sleep) — and the episode closes
  * when no kind remains, so a lesser alert landing mid-outage neither mutes the
  * outage nor, on its own clear, announces a false recovery. One notice
  * per (episode, channel); a channel is told again only when the announced end
@@ -33,12 +34,13 @@
  * what remains. Replies never wait — a human is.
  *
  * The chat MCPL server may itself be down. Channel ids are opaque here and
- * resolved at post time through the ChannelRegistry; a notice that fails
- * because the channel or server is absent is parked on the episode and
- * re-admitted when a server (re)connects while the episode is still open, else
- * dropped silently. A clear or "back" line that fails the same way is owed to
- * the channel and retried on reconnect regardless, so no channel is left
- * carrying a warning nobody will clear.
+ * resolved at post time through the ChannelRegistry; a notice refused because
+ * the channel or server isn't there to take it (the reasons in
+ * PARKED_REFUSALS) is parked on the episode and re-admitted when a server
+ * (re)connects while the episode is still open, else dropped silently. A
+ * clear or "back" line refused the same way is owed to the channel and
+ * retried on reconnect regardless, so no channel is left carrying a warning
+ * nobody will clear. A first post's other failures are logged and dropped.
  */
 
 import type {
@@ -47,12 +49,15 @@ import type {
   ModuleContext,
   ProcessEvent,
   ProcessState,
+  PublishRefusalReason,
   EventResponse,
   ToolDefinition,
   ToolCall,
   ToolResult,
   TraceEvent,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
+import { addressedPush } from './addressed-push.js';
 
 export type NoticeTier = 'silent' | 'status' | 'reply';
 
@@ -104,12 +109,14 @@ export const DEFAULT_TIERS: Readonly<Record<string, NoticeTier>> = Object.freeze
   'refusal-offpath': 'status',
   'context-maintenance-failed': 'status',
   'compression-quarantine': 'status',
+  'instructions-unavailable': 'status',
   // Normal operation noise.
   'refusal': 'silent',
 });
 
-/** Framework kinds with no `-clear` producer: a completed inference by the
- *  agent is the recovery signal. Everything else waits for its clear. */
+/** Framework kinds with no `-clear` producer: the agent's next turn that
+ *  completes, or that a tool ends, is the recovery signal, since the model
+ *  answered either way. Everything else waits for its clear. */
 const CLOSES_ON_SUCCESS: ReadonlySet<string> = new Set([
   'hard-down', 'context-refusal', 'refusal', 'refusal-offpath', 'context-maintenance-failed',
 ]);
@@ -118,6 +125,9 @@ const CLOSES_ON_SUCCESS: ReadonlySet<string> = new Set([
  *  agent. They get their own episode, status tier at most, and close when
  *  that component reconnects. */
 const COMPONENT_KINDS: ReadonlySet<string> = new Set(['mcpl-down']);
+
+/** The two markers an episode can write; see markerForm. */
+type MarkerForm = 'unanswered' | 'status';
 
 const DEFAULT_QUIET_MS = 60_000;
 /** Owed clear lines kept per channel whose server stays absent. */
@@ -166,7 +176,8 @@ interface Episode {
   /** Pending quiet-deadline timer handle and the time it is aimed at. */
   quietTimer?: unknown;
   quietDue?: number;
-  markerWritten: boolean;
+  /** The markers this episode has written: one of each form. */
+  markedForms: Set<MarkerForm>;
 }
 
 /** A clear / "back" line owed to a channel whose server was absent. `key`
@@ -258,8 +269,30 @@ export function statusClearText(subject: string, kind: string, message: string, 
 }
 
 interface Registry {
-  publishForAgent?: (channelId: string, text: string, agentName: string) => Promise<{ success: boolean; error?: string }>;
+  publishForAgent?: (channelId: string, text: string, agentName: string) => Promise<PublishResult>;
 }
+
+type PublishResult = { success: boolean; error?: string; reason?: PublishRefusalReason };
+
+/**
+ * The refusals that mean the chat server may simply not be up, for which
+ * post() parks a notice or owes a line until a reconnect or a server's
+ * return: the channel isn't registered (yet), its server is gone, connecting
+ * or down, or its connection refused the request before writing anything.
+ * agent-framework names each refusal's cause in `reason`. post() logs any
+ * other refusal (a channel that takes no posts, a publish the host isn't
+ * permitted), a failure with no reason and a thrown error, and neither parks
+ * nor owes it, since nothing here waits for those to change. A line already
+ * owed is retried at each reconnect whatever its replay's refusal
+ * (flushOwed).
+ */
+const PARKED_REFUSALS: ReadonlySet<PublishRefusalReason> = new Set<PublishRefusalReason>([
+  'channel-not-registered',
+  'server-gone',
+  'server-connecting',
+  'server-down',
+  'not-sent',
+]);
 
 export class NoticesModule implements Module {
   readonly name = 'notices';
@@ -385,13 +418,17 @@ export class NoticesModule implements Module {
   getTools(): ToolDefinition[] { return []; }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return { success: false, isError: true, error: `Unknown tool: ${call.name}` };
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
     if (event.type === 'mcpl:channel-incoming') {
       const e = event as unknown as { channelId: string };
       await this.replyIfDown(e.channelId);
+    } else {
+      // A person's mention in a closed channel, reply or first DM arrives as a push.
+      const pushed = addressedPush(event);
+      if (pushed) await this.replyIfDown(pushed.channelId);
     }
     return {};
   }
@@ -410,6 +447,11 @@ export class NoticesModule implements Module {
         if (!mine) return;
         this.currentWake = typeof event.channelId === 'string' ? event.channelId : undefined;
         return;
+      case 'inference:aborted':
+        // An aborted turn hasn't failed: no channel is told it died.
+        if (!mine) return;
+        this.currentWake = undefined;
+        return;
       case 'inference:exhausted':
         if (!mine) return;
         if (this.currentWake) {
@@ -420,6 +462,7 @@ export class NoticesModule implements Module {
         }
         return;
       case 'inference:completed':
+      case 'inference:turn_ended':
         if (!mine) return;
         this.failedWake = undefined;
         {
@@ -495,7 +538,7 @@ export class NoticesModule implements Module {
     }
     const ep: Episode = {
       key, kinds: new Map([[kind, { message, tier, until, at: this.now(), seq: 0 }]]), since: this.now(),
-      notified: new Map(), replyPosting: new Set(), pending: new Set(), statusHeard: new Map(), statusPosting: new Map(), statusOwedClear: new Map(), nextSeq: 1, markerWritten: false,
+      notified: new Map(), replyPosting: new Set(), pending: new Set(), statusHeard: new Map(), statusPosting: new Map(), statusOwedClear: new Map(), nextSeq: 1, markedForms: new Set(),
     };
     this.episodes.set(key, ep);
     this.scheduleStatus(ep);
@@ -605,7 +648,8 @@ export class NoticesModule implements Module {
 
   // --------------------------------------------------------------- replies
 
-  /** Incoming traffic on a channel while the agent is down: say so, once. */
+  /** Traffic on a channel while the agent is down (incoming traffic, or a
+   *  person's message addressed to it as a push): say so, once. */
   private async replyIfDown(channelId: string): Promise<void> {
     const ep = this.agentEpisode();
     if (!ep || episodeTier(ep) !== 'reply') return;
@@ -770,9 +814,9 @@ export class NoticesModule implements Module {
   }
 
   /**
-   * Publish as the host. On a "channel/server not found" failure — the chat
-   * server may simply not be up — a tracked notice parks its channel on the
-   * episode for re-admission on reconnect, and an untracked clear / "back"
+   * Publish as the host. On a refusal a reconnect can undo (PARKED_REFUSALS),
+   * since the chat server may simply not be up, a tracked notice parks its
+   * channel on the episode for re-admission on reconnect, and an untracked clear / "back"
    * line is owed to the channel and retried on reconnect regardless. `reflush`
    * tells the caller that a reconnect happened during this attempt, so the
    * flush it triggered was deduplicated against this post's claim and another
@@ -787,7 +831,7 @@ export class NoticesModule implements Module {
     const registry = this.framework?.channels as Registry | undefined;
     if (!registry?.publishForAgent) return { ok: false, reflush: false };
     const epoch = this.reconnectEpoch;
-    let result: { success: boolean; error?: string };
+    let result: PublishResult;
     try {
       result = await registry.publishForAgent(channelId, text, this.config.agentName ?? 'host');
     } catch (err) {
@@ -795,13 +839,16 @@ export class NoticesModule implements Module {
     }
     if (result.success) {
       ep?.pending.delete(channelId);
-      if (ep && opts.track && opts.kind !== undefined && !ep.markerWritten) {
-        ep.markerWritten = true;
-        this.writeMarker(ep, channelId, text, opts.kind);
+      if (ep && opts.track && opts.kind !== undefined && !COMPONENT_KINDS.has(opts.kind)) {
+        const form = this.markerForm(opts.kind);
+        if (!ep.markedForms.has(form)) {
+          ep.markedForms.add(form);
+          this.writeMarker(ep, channelId, text, opts.kind, form);
+        }
       }
       return { ok: true, reflush: false };
     }
-    const absent = /not found/i.test(result.error ?? '');
+    const absent = result.reason !== undefined && PARKED_REFUSALS.has(result.reason);
     if (!absent) {
       console.error(`[notices] post to ${channelId} failed: ${result.error ?? 'unknown error'}`);
       return { ok: false, reflush: false };
@@ -818,18 +865,33 @@ export class NoticesModule implements Module {
     return { ok: false, reflush: false };
   }
 
-  /** One chronicle marker per episode so the agent learns, on recovery,
-   *  that the host spoke in its channel while it could not. System-flagged:
-   *  no inference is requested (same as the framework's own markers). */
-  private writeMarker(ep: Episode, channelId: string, text: string, kind: string): void {
-    if (!this.config.agentName || COMPONENT_KINDS.has(kind)) return;
+  /** Which marker a kind gets: "unanswered" when it means the agent couldn't
+   *  answer, as a reply-tier kind does and as a kind that closes on the
+   *  agent's own next inference does (its own turns were failing);
+   *  otherwise "status", a notice for whoever runs the host (a credential
+   *  expiring, say) with nothing in it for the agent to do. */
+  private markerForm(kind: string): MarkerForm {
+    return this.tierFor(kind) === 'reply' || CLOSES_ON_SUCCESS.has(kind) ? 'unanswered' : 'status';
+  }
+
+  /** One chronicle marker per episode and form, so the agent learns, on
+   *  recovery, that the host spoke in its channel while it could not; an
+   *  episode with a kind of each form gets both. Component kinds get none.
+   *  System-flagged: no inference is requested (same as the framework's own
+   *  markers). */
+  private writeMarker(ep: Episode, channelId: string, text: string, kind: string, form: MarkerForm): void {
+    if (!this.config.agentName) return;
+    const marker = form === 'unanswered'
+      ? `[host-notice] While you could not respond (${kind}), the host posted this in ${channelId}: "${text}"`
+      : `[host-notice] The host posted this status notice in ${channelId} about ${kind}, for whoever runs ` +
+        `it; nothing in it needs you to act: "${text}"`;
     try {
       const agent = this.framework?.getAgent(this.config.agentName);
       agent?.getContextManager().addMessage(
         'user',
         [{
           type: 'text',
-          text: `[host-notice] While you could not respond (${kind}), the host posted this in ${channelId}: "${text}"`,
+          text: marker,
         }],
         { system: true, kind: 'host-notice', alertKind: kind, channelId } as unknown as Record<string, unknown>,
       );

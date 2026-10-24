@@ -44,6 +44,17 @@ describe('buildWorkspaceMounts', () => {
     expect(mounts[1].autoMaterialize).toBeUndefined();
   });
 
+  test("a mount's walkCap passes through, and a mount that sets none leaves agent-framework's default", () => {
+    const mounts = buildWorkspaceMounts({
+      mounts: [
+        { name: 'corpus', path: './corpus', walkCap: 20_000 },
+        { name: 'refs', path: './refs' },
+      ],
+    }, '/store')!;
+    expect(mounts[0]!.walkCap).toBe(20_000);
+    expect('walkCap' in mounts[1]!).toBe(false);
+  });
+
   test('_config mount (configMount: true) is read-write and NOT auto-materialized', () => {
     // THE contract behind rejecting `_config/...` as an instructions path:
     // the host materializes this mount only after branch-changing commands,
@@ -56,6 +67,9 @@ describe('buildWorkspaceMounts', () => {
     expect(config.autoMaterialize).toBeUndefined();
     expect(config.path).toBe(resolve('/store/config'));
     expect(config.watch).toBe('always');
+    // Undo and redo rewind it through materializeMount, which only a
+    // chronicle mount has history for, whatever the framework's default.
+    expect(config.backend).toBe('chronicle');
   });
 
   test('configMount composes with the implicit default mounts only in object form', () => {

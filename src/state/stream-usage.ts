@@ -21,8 +21,10 @@
  * adapter `cache-inclusive`, a Gemini cache hit likely reads high here.
  */
 
-/** A usage sample as the trace events carry it. Membrane leaves a cache count
- *  out until a call in the stream reports one. */
+/** A usage sample as the trace events carry it. membrane 0.5.87 leaves a
+ *  cache count out until a call in the stream reports a nonzero one;
+ *  membrane #104 keeps a reported 0, and leaves out only a count no call
+ *  reported. The fold reads a missing count and 0 alike, as no tokens. */
 export interface UsageSample {
   input?: number;
   output?: number;

@@ -193,6 +193,59 @@ describe('agent_settings extension (channel_idle_limits)', () => {
     expect(() => ext.update('agent', { channel_idle_limits: ['A'] })).toThrow(/object/);
   });
 
+  test('every bad entry is named at once, with an empty channel id, and none is applied', async () => {
+    const mod = new SubscriptionGcModule();
+    const { ctx, getState } = mockCtx();
+    await mod.start(ctx);
+    const ext = mod.getAgentSettingsExtension();
+    ext.update('agent', { channel_idle_limits: { Z: 5000 } });
+    const refusal = (patch: Record<string, unknown>) => {
+      try {
+        ext.update('agent', patch);
+      } catch (err) {
+        return (err as Error).message;
+      }
+      throw new Error('applied');
+    };
+    const rule = 'neither a positive number, "off", nor "default"/null (a number given as text is digits only)';
+    const others = 'Other settings given in the same call may not all have been applied: agent_settings with action "get" shows each as it stands.';
+    expect(refusal({ channel_idle_limits: { A: 5000, B: -3, C: '5.5', '': 10 } })).toBe(
+      "channel_idle_limits wasn't changed, and none of its entries were applied. " +
+        `These entries are ${rule}: "B": -3, "C": "5.5". ` +
+        `A channel id is empty: give each channel by its id. The other entry was fine as given. ${others}`,
+    );
+    expect(refusal({ channel_idle_limits: { A: 5000, C: 'off', '': 10 } })).toBe(
+      "channel_idle_limits wasn't changed, and none of its entries were applied. " +
+        `A channel id is empty: give each channel by its id. The other 2 entries were fine as given. ${others}`,
+    );
+    // An empty id with a bad value is named as empty, not as a bad entry.
+    expect(refusal({ channel_idle_limits: { A: 5000, '': 'soon' } })).toBe(
+      "channel_idle_limits wasn't changed, and none of its entries were applied. " +
+        `A channel id is empty: give each channel by its id. The other entry was fine as given. ${others}`,
+    );
+    expect(refusal({ channel_idle_limits: { B: 0 } })).toBe(
+      "channel_idle_limits wasn't changed, and none of its entries were applied. " +
+        `This entry is ${rule}: "B": 0. ${others}`,
+    );
+    expect(refusal({ channel_idle_limits: 'off' })).toBe(
+      "channel_idle_limits wasn't changed: it must be an object mapping channel ids to a " +
+        `positive number, "off", or "default"/null, not "off". ${others}`,
+    );
+    expect(ext.get('agent').channel_idle_limits).toEqual({ Z: 5000 });
+    const persisted = getState() as { overrides: Record<string, unknown> } | null;
+    expect(persisted?.overrides ?? {}).toEqual({ Z: 5000 });
+  });
+
+  test('a name the module doesn\'t have points to agent_settings', async () => {
+    const mod = new SubscriptionGcModule();
+    await mod.start(mockCtx().ctx);
+    const r = await mod.handleToolCall({ id: 't1', name: 'set_idle_limit', input: {} });
+    expect(r.error).toBe(
+      'There\'s no tool "subscription-gc--set_idle_limit", so nothing ran. The subscription-gc module has no tools of its own; call one of the tools listed for you. ' +
+        'Idle-limit controls live in agent_settings (field channel_idle_limits).',
+    );
+  });
+
   test('a partially-invalid patch applies nothing', async () => {
     const mod = new SubscriptionGcModule();
     const { ctx, getState } = mockCtx();
@@ -348,6 +401,46 @@ describe('close provenance + explicit-open protection (issue #5)', () => {
     // Next ambient message counts from zero rather than instantly re-firing.
     await m.onProcess(ambient('c1', 'ab'), PS);
     expect(toolCalls.length).toBe(1);
+
+    await m.stop();
+  });
+
+  test('a tuned-out refusal under a configured budget stands down without a retry loop', async () => {
+    const m = new SubscriptionGcModule({ defaultLimitChars: 10, serverId: 'discord' });
+    const { ctx, toolCalls, getState } = mockCtx();
+    (ctx as unknown as { callTool: unknown }).callTool = async (call: { name: string; input: Record<string, unknown> }) => {
+      toolCalls.push(call);
+      // As agent-framework refuses a close of a tuned-out channel, even one
+      // that certifies an idle lease.
+      return {
+        success: false,
+        isError: false,
+        error: 'tuned out',
+        data: { refusal: 'tuned-out', channelId: 'discord:g1:c1' },
+      };
+    };
+    await m.start(ctx);
+    await m.handleToolCall({
+      id: 't1',
+      name: 'set_channel_idle_limit',
+      input: { channelId: 'discord:g1:c1', limit: 8 },
+    });
+
+    const r = await m.onProcess(ambient('c1', 'abcdefghij'), PS); // 10 > 8, under the lease
+    expect(toolCalls.length).toBe(1);
+    expect(toolCalls[0].input.overrideExplicitOpen).toBe(true);
+    // No context message and no counter restored: the janitor stands down.
+    expect(r.addMessages).toBeUndefined();
+    const counters = (getState() as { counters: Record<string, number> }).counters;
+    expect(counters['discord:g1:c1']).toBeUndefined();
+
+    // The next ambient message counts from zero rather than trying the close
+    // again, so the next try is a full budget away.
+    await m.onProcess(ambient('c1', 'ab'), PS);
+    expect(toolCalls.length).toBe(1);
+    // A full budget later (2 + 7 > 8), it tries once more.
+    await m.onProcess(ambient('c1', 'abcdefg'), PS);
+    expect(toolCalls.length).toBe(2);
 
     await m.stop();
   });

@@ -21,6 +21,7 @@ import type {
   ToolCall,
   ToolResult,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
 import type { Membrane, NormalizedRequest } from '@animalabs/membrane';
 import type { ContextInjection } from '@animalabs/context-manager';
 import type { LessonsModule, Lesson } from './lessons-module.js';
@@ -108,8 +109,8 @@ export class RetrievalModule implements Module {
     return [];
   }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    return { success: false, error: 'RetrievalModule has no tools', isError: true };
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -163,8 +164,10 @@ export class RetrievalModule implements Module {
         return [];
       }
 
+      // A lesson with no content has nothing to inject, though its tags
+      // could still match: it would be injected as a blank entry.
       lessons = lessonsModule.getLessons().filter(
-        l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3)
+        l => !l.deprecated && l.confidence >= (this.config.minConfidence ?? 0.3) && l.content.trim() !== ''
       );
       if (lessons.length === 0) {
         trace?.finish('no-eligible-lessons');
@@ -450,12 +453,18 @@ export class RetrievalModule implements Module {
   private getRecentContext(): RecentRetrievalContext | null {
     if (!this.ctx) return null;
 
-    // Get the last few messages from the conversation.
+    // Get the last few messages of the conversation the residents see. A row
+    // marked `held: true` is a write the framework still holds: it reaches the
+    // agent at a later boundary, not in the request these lessons go into. A
+    // row marked `heldFromResidents` arrived in a tuned-out channel, and no
+    // resident is shown it. So the window keeps to the stored rows the
+    // residents are shown.
     const { messages } = this.ctx.queryMessages({});
-    if (messages.length === 0) return null;
+    const shown = messages.filter(m => m.held !== true && m.heldFromResidents !== true);
+    if (shown.length === 0) return null;
 
-    // Take the last 10 messages for context.
-    const recent = messages.slice(-10);
+    // Take the last 10 of them for context.
+    const recent = shown.slice(-10);
     const text = recent
       .map(m => {
         const messageText = m.content

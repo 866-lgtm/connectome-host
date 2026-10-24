@@ -9,16 +9,17 @@
  * NOT as standalone tools (the former reasoning_status/enable/disable trio
  * was tool bloat for one boolean + number).
  *
- * Both adapter wrappers read `getReasoning()` on each call and mutate the
- * outgoing request when enabled — keeping the cross-cutting "request mutator"
- * plumbing out of every call site:
- *   - LoggingAnthropicAdapter injects `thinking: {type:'adaptive'}`.
- *   - LoggingProviderAdapter (openai-compatible) strips the recipe's
- *     `reasoning` param when disabled. Magnitude for that path is the recipe's
- *     `agent.responses.reasoningEffort`, deliberately NOT mirrored into this
- *     state — one source of truth for effort, no chronicle-persisted override
- *     silently shadowing the recipe.
- * `budgetTokens` therefore applies to the Anthropic path only.
+ * The host's adapter wrappers read `getReasoning()` on each call:
+ *   - LoggingAnthropicAdapter injects `thinking: {type: 'adaptive', display}`
+ *     into the outgoing Anthropic request when enabled, on a model that takes
+ *     adaptive thinking (withReasoning). On a streamed call to a model that
+ *     returns its notes as thinking blocks, it then sends display 'updates'
+ *     where the request would leave 'omitted' (withProgressNotes).
+ *   - LoggingProviderAdapter (openai-compatible, openai-responses) strips the
+ *     recipe's `reasoning` param when disabled. Magnitude on those paths is
+ *     the recipe's `agent.responses.reasoningEffort`, not mirrored into this
+ *     state, so no persisted override shadows the recipe.
+ * Keeping the cross-cutting "request mutator" plumbing out of every call site.
  *
  * Designed to be extensible: new domains add their own slice in
  * `SettingsState` + a few tools + a typed accessor. Bundled with the host;
@@ -35,6 +36,8 @@ import type {
   ToolCall,
   ToolResult,
 } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
+import { shown } from './shown.js';
 
 export interface ReasoningSettings {
   enabled: boolean;
@@ -45,6 +48,10 @@ export interface ReasoningSettings {
    * empty `thinking` field with only the encrypted signature. Models 4.7+
    * default to 'omitted' server-side — we default to 'summarized' to restore
    * the pre-4.7 behavior (visible reasoning in stores, webui, estimators).
+   * On the models modelReturnsNotesInThinking lists, a streamed call through
+   * the Anthropic adapter sends 'omitted' as 'updates', so the notes between
+   * tool calls come back as text while reasoning stays hidden
+   * (LoggingAnthropicAdapter.withProgressNotes).
    */
   display: 'summarized' | 'omitted';
   /**
@@ -82,25 +89,25 @@ export class SettingsModule implements Module {
 
   private ctx: ModuleContext | null = null;
   private state: SettingsState = clone(DEFAULTS);
+  private effortOverride: ReasoningEffort | undefined;
+
+  constructor(private readonly initialEffort: ReasoningEffort = 'default') {
+    this.state.reasoning.effort = initialEffort;
+  }
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
-    const saved = ctx.getState<Partial<SettingsState>>();
-    if (saved) {
-      // Per field, so fields added later fall back to defaults for state
-      // persisted by older versions, and invalid saved values do too.
-      this.state = {
-        reasoning: restoreReasoning(saved.reasoning),
-        schemaVersion: SCHEMA_VERSION,
-      };
-      // Pre-v2 state was written while the default was `enabled: false` and no
-      // non-Anthropic adapter read it, so a persisted `false` there carries no
-      // intent — it is indistinguishable from "never touched". Re-apply the new
-      // default once rather than let a dead flag keep thinking switched off.
-      if ((saved.schemaVersion ?? 1) < 2) {
-        this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
-      }
-      ctx.setState(this.state);
+    const saved = ctx.getState<{ reasoning?: unknown; schemaVersion?: number }>();
+    const baseline = { ...DEFAULTS.reasoning, effort: this.initialEffort };
+    this.state = { reasoning: restoreReasoning(saved?.reasoning, baseline), schemaVersion: SCHEMA_VERSION };
+    this.effortOverride = savedEffortOverride(saved?.reasoning);
+    // Pre-v2 state was written while the default was `enabled: false` and no
+    // non-Anthropic adapter read it, so a persisted `false` there carries no
+    // intent: it is indistinguishable from "never touched". Re-apply the new
+    // default once rather than let a dead flag keep reasoning switched off.
+    if (saved && (saved.schemaVersion ?? 1) < SCHEMA_VERSION) {
+      this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
+      this.persist();
     }
   }
 
@@ -121,13 +128,12 @@ export class SettingsModule implements Module {
   }
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
-    return {
-      success: false,
-      error:
-        `Unknown tool: ${call.name}. Reasoning controls moved into agent_settings ` +
-        `(fields reasoning_enabled / reasoning_budget_tokens).`,
-      isError: true,
-    };
+    return unknownToolResult(
+      this,
+      call.name,
+      'Reasoning is set through agent_settings, in its fields reasoning_enabled, reasoning_budget_tokens, ' +
+      'reasoning_display and reasoning_effort.',
+    );
   }
 
   /**
@@ -164,7 +170,11 @@ export class SettingsModule implements Module {
           description:
             "How your thinking is returned: 'summarized' (a readable summary of your reasoning " +
             "is recorded alongside the signature) or 'omitted' (signature only, slightly faster " +
-            'first token; your reasoning is not visible to anyone, including you on replay).',
+            'first token; no readable summary is recorded). Either way, when a thinking block is ' +
+            'sent back to you, you get your full reasoning, not the summary: this changes only what ' +
+            'is recorded as readable text. On Fable 5/5.1, Mythos 5.1, Opus 5.5 and Sonnet 5.5, the ' +
+            "notes you write between tool calls come back as thinking blocks, so 'omitted' is sent " +
+            "as 'updates' there: your reasoning stays unrecorded, and those notes are kept as text.",
         },
         reasoning_effort: {
           type: 'string',
@@ -172,7 +182,7 @@ export class SettingsModule implements Module {
           description:
             "How much effort you put into your own turns (thinking depth and overall token spend): " +
             "'low', 'medium', 'high', 'xhigh', 'max', or 'default' (the model's own default). " +
-            'Takes effect on your next inference call and persists across restarts. Changing it ' +
+            'Takes effect on your next inference call and persists across restarts; reset restores the recipe effort. Changing it ' +
             'makes the next call re-read your whole context uncached (one-time cost). Levels your ' +
             'model does not support are not sent. Memory compression is unaffected.',
         },
@@ -180,34 +190,51 @@ export class SettingsModule implements Module {
       keys: ['reasoning_enabled', 'reasoning_budget_tokens', 'reasoning_display', 'reasoning_effort'],
       get: () => this.reasoningSettingsView(),
       update: (_agentName, patch) => {
+        // Every field is checked before any applies, and every problem is
+        // named, so one refusal shows all there is to fix.
         const next = { ...this.state.reasoning };
+        const problems: string[] = [];
         if (patch.reasoning_enabled !== undefined) {
           if (typeof patch.reasoning_enabled !== 'boolean') {
-            throw new Error('reasoning_enabled must be a boolean');
+            problems.push(`reasoning_enabled must be true or false, not ${shown(patch.reasoning_enabled)}`);
+          } else {
+            next.enabled = patch.reasoning_enabled;
           }
-          next.enabled = patch.reasoning_enabled;
         }
         if (patch.reasoning_budget_tokens !== undefined) {
-          const budget = Number(patch.reasoning_budget_tokens);
-          if (!Number.isFinite(budget)) {
-            throw new Error('reasoning_budget_tokens must be a number');
+          const budget = patch.reasoning_budget_tokens;
+          if (typeof budget !== 'number' || !Number.isFinite(budget)) {
+            problems.push(
+              `reasoning_budget_tokens must be a number of tokens, not ${shown(budget)} ` +
+              '(the least it takes is 1024, and a smaller number counts as 1024)',
+            );
+          } else {
+            next.budgetTokens = Math.max(1024, Math.round(budget));
           }
-          next.budgetTokens = Math.max(1024, Math.round(budget));
         }
         if (patch.reasoning_display !== undefined) {
           if (patch.reasoning_display !== 'summarized' && patch.reasoning_display !== 'omitted') {
-            throw new Error("reasoning_display must be 'summarized' or 'omitted'");
+            problems.push(`reasoning_display must be "summarized" or "omitted", not ${shown(patch.reasoning_display)}`);
+          } else {
+            next.display = patch.reasoning_display;
           }
-          next.display = patch.reasoning_display;
         }
         if (patch.reasoning_effort !== undefined) {
           if (!REASONING_EFFORTS.includes(patch.reasoning_effort as ReasoningEffort)) {
-            throw new Error(`reasoning_effort must be one of: ${REASONING_EFFORTS.join(', ')}`);
+            problems.push(
+              `reasoning_effort must be one of ${REASONING_EFFORTS.map((e) => `"${e}"`).join(', ')}, ` +
+              `not ${shown(patch.reasoning_effort)}`,
+            );
+          } else {
+            next.effort = patch.reasoning_effort as ReasoningEffort;
           }
-          next.effort = patch.reasoning_effort as ReasoningEffort;
+        }
+        if (problems.length > 0) {
+          throw new Error(`The reasoning settings weren't changed: ${problems.join('; ')}.`);
         }
         this.state.reasoning = next;
-        this.ctx?.setState(this.state);
+        if (patch.reasoning_effort !== undefined) this.effortOverride = next.effort;
+        this.persist();
         return this.reasoningSettingsView();
       },
       reset: (_agentName, keys) => {
@@ -222,12 +249,25 @@ export class SettingsModule implements Module {
           this.state.reasoning.display = DEFAULTS.reasoning.display;
         }
         if (all || keys?.includes('reasoning_effort')) {
-          this.state.reasoning.effort = DEFAULTS.reasoning.effort;
+          this.state.reasoning.effort = this.initialEffort;
+          this.effortOverride = undefined;
         }
-        this.ctx?.setState(this.state);
+        this.persist();
         return this.reasoningSettingsView();
       },
     };
+  }
+
+  /** Persist agent choices, leaving recipe-derived effort out of saved state. */
+  private persist(): void {
+    const { effort: _effort, ...reasoning } = this.state.reasoning;
+    this.ctx?.setState({
+      schemaVersion: SCHEMA_VERSION,
+      reasoning: {
+        ...reasoning,
+        ...(this.effortOverride === undefined ? {} : { effort: this.effortOverride, effortExplicit: true }),
+      },
+    });
   }
 
   /** The extension's wire view of reasoning state (flat agent_settings keys). */
@@ -251,14 +291,15 @@ export class SettingsModule implements Module {
  * older version or a hand edit can leave a value the API rejects, and since
  * display and effort are sent on every turn, one bad value would fail every
  * turn, leaving the agent no turn to fix the setting with. Such a value falls
- * back to its default, and the host says so.
+ * back to the baseline, which is the default except for an effort the recipe
+ * sets, and the host logs the value it uses instead.
  */
-function restoreReasoning(saved: unknown): ReasoningSettings {
-  const restored = clone(DEFAULTS.reasoning);
+function restoreReasoning(saved: unknown, baseline = DEFAULTS.reasoning): ReasoningSettings {
+  const restored = clone(baseline);
   if (!saved || typeof saved !== 'object') return restored;
   const s = saved as Record<string, unknown>;
-  const ignore = (field: string, value: unknown) => console.error(
-    `[settings] ignoring saved reasoning.${field}=${JSON.stringify(value)}: not a valid value; using the default`,
+  const ignore = (field: keyof ReasoningSettings, value: unknown) => console.error(
+    `[settings] ignoring saved reasoning.${field}=${JSON.stringify(value)}: not a valid value; using ${JSON.stringify(restored[field])}`,
   );
   if (s.enabled !== undefined) {
     if (typeof s.enabled === 'boolean') restored.enabled = s.enabled;
@@ -273,10 +314,19 @@ function restoreReasoning(saved: unknown): ReasoningSettings {
     else ignore('display', s.display);
   }
   if (s.effort !== undefined) {
-    if (REASONING_EFFORTS.includes(s.effort as ReasoningEffort)) restored.effort = s.effort as ReasoningEffort;
-    else ignore('effort', s.effort);
+    if (REASONING_EFFORTS.includes(s.effort as ReasoningEffort)) {
+      restored.effort = savedEffortOverride(s) ?? baseline.effort;
+    } else ignore('effort', s.effort);
   }
   return restored;
+}
+
+/** Legacy nondefault effort was an agent choice; legacy default means unset. */
+function savedEffortOverride(saved: unknown): ReasoningEffort | undefined {
+  if (!saved || typeof saved !== 'object') return undefined;
+  const s = saved as Record<string, unknown>;
+  if (!REASONING_EFFORTS.includes(s.effort as ReasoningEffort)) return undefined;
+  return s.effort !== 'default' || s.effortExplicit === true ? s.effort as ReasoningEffort : undefined;
 }
 
 function clone<T>(x: T): T {

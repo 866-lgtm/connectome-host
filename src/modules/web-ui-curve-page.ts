@@ -10,6 +10,11 @@
  * Born 2026-07-12 during the mythos inversion incident: the curve makes a
  * misallocated resolution profile visible at a glance (an inversion reads as
  * a flat shelf right before the tail; depth debt as a too-steep middle).
+ *
+ * This is a template literal, which would take a backslash escape or a ${ in
+ * it before the browser saw it, so it holds neither, and the page is served
+ * as written. test/web-ui-page-scripts.test.ts checks that its text is the
+ * template as written, and parses its script.
  */
 export const CURVE_PAGE_HTML = `<!doctype html>
 <html lang="en">
@@ -132,9 +137,9 @@ document.getElementById('meta').textContent =
   Math.round((payload.budget.maxTokens - payload.budget.reserveForResponse) / 1000) + 'k)' +
   // A dry compile plots a plan that won't fit instead of failing, so say so.
   (V && V.fitsRequested === false && typeof V.plannedTokens === 'number'
-    ? ' · OVER BUDGET' + (V.atDescentTarget ? ' at the descent\'s target' : '') + ': plan ' +
+    ? ' · OVER BUDGET' + (V.atDescentTarget ? " at the descent's target" : '') + ': plan ' +
       Math.round(V.plannedTokens / 1000) + 'k > ' + Math.round(V.effectiveBudgetTokens / 1000) + 'k' +
-      (V.atDescentTarget ? ' (compiles run at the live budget until the descent completes)'
+      (V.atDescentTarget ? ' (compiles still run at the live budget)'
         : V.withinGrace === false ? ', past the grace margin: the next real compile will refuse it'
         : V.withinGrace === true ? ', within the grace margin' : '')
     : '');

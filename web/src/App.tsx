@@ -3,10 +3,10 @@ import { createStore, produce } from 'solid-js/store';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
 import { createWireClient, type WireClient } from './wire';
-import { displayName } from './display';
 import { createTreeStore, type StreamSource, type UiNode } from './tree';
 import { TreeSidebar } from './TreeSidebar';
-import { StreamPanel, formatStreamEvent, type StreamLine } from './Stream';
+import { StreamPanel } from './Stream';
+import { formatStreamEvent, withStreamLines, type StreamLine } from '@conhost/web/stream-lines';
 import { UsagePanel } from './Usage';
 import { LessonsPanel, type LessonRow } from './Lessons';
 import { McplPanel, type McplServerRow, type McplLiveRow, type ToolClassRow } from './Mcpl';
@@ -23,8 +23,11 @@ import {
 } from './Health';
 import { BranchPanel } from './Branches';
 import { ConversationGraphPanel } from './ConversationGraph';
-import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone } from './quota';
+import { createQuotaPoll, quotaReadout, quotaTitle, quotaTone, quotaUnreadable } from './quota';
+import { planHealthAlerts } from './health-alerts';
+import { healthReadError } from '@conhost/web/health-lookup';
 import {
+  AGENT_TREE_SCOPES,
   WEB_PROTOCOL_VERSION,
   type WebUiServerMessage,
   type WelcomeMessage,
@@ -40,6 +43,9 @@ import {
   type SurgeryResultMessage,
   type OperatorLogEntryWire,
 } from '@conhost/web/protocol';
+import {
+  applyStreamEnded, applyTrace, conversationAgentOf, streamEventFor, toolCallState, treesShownFor,
+} from '@conhost/web/agent-streams';
 import {
   Lightbox,
   MediaView,
@@ -61,7 +67,7 @@ type UiBlock =
       durationMs?: number;
     }
   | { kind: 'tool_result'; toolUseId: string; text: string; isError?: boolean; truncated?: boolean }
-  | { kind: 'media'; mediaType: string; ref?: string }
+  | { kind: 'media'; mediaType: string; ref?: string; toolUseId?: string }
   /** Client-only: a tool call being written live (raw partial JSON from
    *  blockType 'tool_call' token deltas). Replaced by the parsed tool_use
    *  blocks when inference:tool_calls_yielded lands. */
@@ -120,6 +126,8 @@ function entryToMessage(e: WelcomeMessageEntry): Message {
 export function App() {
   const wire = createWireClient();
   const treeStore = createTreeStore();
+  /** Whether this page builds and shows the agent trees (treesShownFor). */
+  const treesShown = (): boolean => treesShownFor(wire.observerState(), wire.observer()?.scopes ?? null);
 
   // Use a store rather than a signal so the streaming token append can
   // mutate the last message's `text` in place. Replacing the message object
@@ -304,7 +312,7 @@ export function App() {
   };
 
   /** /healthz snapshot — feeds the Health tab and reconciles durable-state
-   *  alerts (quarantine, hard-down) so a page opened mid-incident alarms
+   *  alerts (quarantine, inference-exhausted) so a page opened mid-incident alarms
    *  without waiting for the next klaxon re-fire. */
   const [health, setHealth] = createSignal<HealthSnapshot | null>(null);
   const [healthErr, setHealthErr] = createSignal<string | null>(null);
@@ -312,34 +320,10 @@ export function App() {
 
   const reconcileHealthAlerts = (h: HealthSnapshot): void => {
     applyCredentialState(h.credential, 'local');
-    const quarantine = h.compressionQuarantine ?? {};
-    for (const [agent, q] of Object.entries(quarantine)) {
-      const key = `${agent}:compression-quarantine`;
-      if ((q.count ?? 0) > 0) {
-        if (!opsAlerts().has(key)) {
-          upsertOpsAlert('compression-quarantine', agent,
-            `${q.count} chunk(s) in compression quarantine — spans stay raw and will eventually exhaust the context budget.`,
-            false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
-    }
-    for (const a of h.agents ?? []) {
-      const key = `${a.name}:inference-exhausted`;
-      const streak = a.consecutiveInferenceFailures ?? 0;
-      if (streak >= 3) {
-        const message = `${streak} consecutive inference failures — agent is down.`
-          + (a.lastInference?.lastError ? ` Last: ${a.lastInference.lastError}` : '');
-        // Only touch the entry when the condition actually changed —
-        // rewriting `at` every poll would show a perpetual "5s ago" and
-        // re-sort the strip on every cycle.
-        if (opsAlerts().get(key)?.message !== message) {
-          upsertOpsAlert('inference-exhausted', a.name, message, false);
-        }
-      } else {
-        removeOpsAlert(key);
-      }
+    const plan = planHealthAlerts(h, opsAlerts());
+    for (const key of plan.remove) removeOpsAlert(key);
+    for (const u of plan.upsert) {
+      upsertOpsAlert(u.kind, u.agent, u.message, false);
     }
   };
 
@@ -362,8 +346,8 @@ export function App() {
           setHealthErr('403');
           return;
         }
-        const body = (await res.json().catch(() => null)) as { error?: string } | null;
-        throw new Error(body?.error ?? `HTTP ${res.status}`);
+        const body = (await res.json().catch(() => null)) as { error?: unknown } | null;
+        throw new Error(healthReadError(res.status, body));
       }
       const h = (await res.json()) as HealthSnapshot;
       if (scope !== panelScope()) return; // scope switched mid-flight — stale
@@ -383,7 +367,7 @@ export function App() {
   };
 
   /** Local-alert reconciliation when the panel scope is parked on a child:
-   *  the strip's durable-state alerts (quarantine, hard-down) are host-level
+   *  the strip's durable-state alerts (quarantine, inference-exhausted) are host-level
    *  and must keep reconciling regardless of what the Health tab inspects. */
   const reconcileLocalAlerts = async (): Promise<void> => {
     if (healthDenied) return;
@@ -442,7 +426,7 @@ export function App() {
   const [opLogLoading, setOpLogLoading] = createSignal(false);
 
   const previewOf = (m: Message): string => {
-    const who = m.participant === 'assistant' ? (welcome()?.agents[0]?.name ?? 'assistant') : m.participant;
+    const who = m.participant === 'assistant' ? (conversationAgentOf(welcome()) ?? 'assistant') : m.participant;
     const body = (m.text || (m.blocks ?? []).map((b) => b.kind === 'tool_use' ? `⚙ ${b.name}` : b.kind === 'media' ? `📎 ${b.mediaType}` : '').filter(Boolean).join(' ')).replace(/\s+/g, ' ').trim();
     return `${who}: ${body.slice(0, 90)}${body.length > 90 ? '…' : ''}`;
   };
@@ -702,8 +686,8 @@ export function App() {
 
   /** Per-childName ring buffer of recent child-event payloads. Used to
    *  backfill the stream pane when an operator opens a fleet child / agent
-   *  view — events fan out to every connected client regardless of focus, so
-   *  we capture them as they pass through. */
+   *  view — events fan out to every connected client whose scopes allow
+   *  them, regardless of focus, so we capture them as they pass through. */
   const FLEET_BACKFILL_LIMIT = 80;
   const childEventBuffers = new Map<string, Array<{ type: string; [k: string]: unknown }>>();
   const recordChildEvent = (childName: string, event: { type: string; [k: string]: unknown }): void => {
@@ -867,6 +851,10 @@ export function App() {
     if (welcomeSessionId !== null && msg.session.id !== welcomeSessionId) {
       clearMcpl();
       if (sidebarTab() === 'mcp') refreshMcpl();
+      // An open panel shows the old session: a node of its tree, or its
+      // branches. A node of the new tree can carry an old node's name, and
+      // its stream would join the old lines. So the panel closes.
+      closePanel();
     }
     welcomeSessionId = msg.session.id;
     const key = `${msg.session.id}/${msg.branch.id}`;
@@ -1050,12 +1038,12 @@ export function App() {
     streamTokenBuffer = streamTokenBuffer.slice(newlineIdx + 1);
     if (completed) {
       const lines = completed.split('\n').filter(s => s.length > 0);
-      setStreamLines((prev) => [...prev, ...lines.map(s => ({
+      setStreamLines((prev) => withStreamLines(prev, lines.map(s => ({
         id: streamLineId(),
         kind: 'token' as const,
         text: s,
         color: 'text-cyan-200',
-      }))]);
+      }))));
     }
   };
 
@@ -1063,12 +1051,12 @@ export function App() {
     if (streamTokenBuffer.length === 0) return;
     const text = streamTokenBuffer;
     streamTokenBuffer = '';
-    setStreamLines((prev) => [...prev, {
+    setStreamLines((prev) => withStreamLines(prev, [{
       id: streamLineId(),
       kind: 'token' as const,
       text,
       color: 'text-cyan-200',
-    }]);
+    }]));
   };
 
   /** Tear down any peek subscription tied to the currently focused node.
@@ -1223,7 +1211,7 @@ export function App() {
 
   onMount(() => {
     const detach = wire.onMessage((msg) => {
-      treeStore.ingest(msg);
+      if (treesShown()) treeStore.ingest(msg);
       autoExpandNewFleetChildren();
       // Capture child-events into the per-childName ring buffer so a future
       // openStream() can backfill the panel from local history.
@@ -1303,6 +1291,7 @@ export function App() {
         onTurnSettled: () => {
           if (features().has('quiesce') && hostMode()?.mode === 'quiescing') wire.send({ type: 'request-host-mode' });
         },
+        conversationAgent: () => conversationAgentOf(welcome()),
         onSurgeryResult,
         setOperatorLog: (entries, path) => { setOpLog(entries); setOpLogPath(path); setOpLogLoading(false); },
         onOperatorAction: () => { if (panelMode() === 'branches') refreshOpLog(); },
@@ -1313,7 +1302,7 @@ export function App() {
       wire.close();
     });
 
-    // Health poll: durable-state alerts (quarantine, hard-down) must not
+    // Health poll: durable-state alerts (quarantine, inference-exhausted) must not
     // depend on being connected when the klaxon fired. 15s keeps the strip
     // honest without meaningful load (counts-only JSON). With the scope on a
     // fleet child, loadHealth feeds the Health tab from that child and a
@@ -1327,34 +1316,13 @@ export function App() {
   });
 
   /** Route a server message into the stream pane *if* it matches the focused
-   *  node's StreamSource. Each kind has its own match rule. */
+   *  node's StreamSource (streamEventFor holds each kind's match rule). */
   const handleStreamMessage = (msg: WebUiServerMessage): void => {
     if (panelMode() !== 'stream') return;
     const node = focusedNode();
     if (!node) return;
-    const src = node.streamSource;
-    if (src.kind === 'none') return;
-
-    if (src.kind === 'peek' && msg.type === 'peek' && msg.scope === src.scope) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
-
-    if (msg.type !== 'child-event') return;
-
-    if (src.kind === 'child-event-all' && msg.childName === src.childName) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
-
-    if (
-      src.kind === 'child-event-agent'
-      && msg.childName === src.childName
-      && (msg.event as { agentName?: string }).agentName === src.agentName
-    ) {
-      ingestStreamEvent(msg.event);
-      return;
-    }
+    const event = streamEventFor(node.streamSource, msg as Parameters<typeof streamEventFor>[1]);
+    if (event) ingestStreamEvent(event);
   };
 
   const ingestStreamEvent = (event: { type: string; [k: string]: unknown }): void => {
@@ -1364,7 +1332,7 @@ export function App() {
     }
     flushStreamBuffer();
     const line = formatStreamEvent(event);
-    if (line) setStreamLines((prev) => [...prev, line]);
+    if (line) setStreamLines((prev) => withStreamLines(prev, [line]));
   };
 
   const submit = (): void => {
@@ -1630,7 +1598,7 @@ export function App() {
             const node = focusedNode()!;
             return (
               <StreamPanel
-                label={displayName(node.label)}
+                label={node.label}
                 scopeHint={streamHint(node.streamSource)}
                 lines={streamLines()}
                 onClose={closePanel}
@@ -1712,7 +1680,12 @@ export function App() {
             onChange={changePanelScope}
           />
           <div class="flex-1 min-h-0">
-            <Show when={sidebarTab() === 'tree'}>
+            <Show when={sidebarTab() === 'tree' && !treesShown() && wire.observer() !== null}>
+              <div class="p-4 text-xs text-neutral-500">
+                The agent tree shows for a grant with every scope but debug ({AGENT_TREE_SCOPES.join(', ')}).
+              </div>
+            </Show>
+            <Show when={sidebarTab() === 'tree' && treesShown()}>
               <TreeSidebar
                 roots={treeStore.build()}
                 selectedId={focusedId()}
@@ -1814,6 +1787,7 @@ export function App() {
 function streamHint(src: StreamSource): string | undefined {
   switch (src.kind) {
     case 'peek': return 'subagent';
+    case 'trace-agent': return 'agent';
     case 'child-event-all': return 'fleet child';
     case 'child-event-agent': return `agent in ${src.childName}`;
     default: return undefined;
@@ -1877,6 +1851,9 @@ interface HandlerHooks {
   requestHostMode: () => void;
   /** A turn ended — refresh host mode if a quiesce was still draining. */
   onTurnSettled: () => void;
+  /** The agent whose conversation the main view shows: the welcome's first
+   *  (conversationAgentOf, src/web/agent-streams.ts). */
+  conversationAgent: () => string | undefined;
   onSurgeryResult: (result: SurgeryResultMessage) => void;
   setOperatorLog: (entries: OperatorLogEntryWire[], path?: string) => void;
   /** An operator:action trace landed — refresh the log if it is on screen. */
@@ -1925,61 +1902,12 @@ function handleServerMessage(
     case 'call-ledger':
       hooks.setCallLedger(msg.ledger);
       return;
-    case 'trace': {
-      const e = msg.event;
-      switch (e.type) {
-        case 'inference:tokens': {
-          const content = e.content;
-          if (typeof content === 'string') {
-            hooks.appendStreamToken(content, typeof e.blockType === 'string' ? e.blockType : undefined);
-          }
-          return;
-        }
-        case 'inference:content_block': {
-          if (typeof e.phase === 'string') hooks.handleContentBlock(e.phase);
-          return;
-        }
-        case 'inference:completed':
-        case 'inference:failed':
-          hooks.finishStream();
-          // A quiesce that was still draining may have just settled; the
-          // framework emits no trace for "drained", so re-pull the snapshot.
-          hooks.onTurnSettled();
-          return;
-        case 'inference:tool_calls_yielded': {
-          const calls = (e.calls as Array<{ id: string; name: string; input?: unknown }> | undefined) ?? [];
-          if (calls.length === 0) return;
-          hooks.appendToolUseBlocks(calls);
-          return;
-        }
-        case 'tool:completed': {
-          if (typeof e.callId === 'string') {
-            hooks.updateToolStatus(e.callId, 'done',
-              typeof e.durationMs === 'number' ? e.durationMs : undefined);
-          }
-          return;
-        }
-        case 'tool:failed': {
-          if (typeof e.callId === 'string') {
-            hooks.updateToolStatus(e.callId, 'failed',
-              typeof e.durationMs === 'number' ? e.durationMs : undefined);
-          }
-          return;
-        }
-        case 'ops:alert':
-          hooks.onOpsAlert(e);
-          return;
-        case 'operator:action':
-          hooks.onOperatorAction();
-          return;
-        default:
-          // Host serving-state transitions (host:quiesce / host:resume /
-          // host:quiesced_boot) may originate elsewhere (Discord host
-          // command, API) — pull a fresh snapshot rather than parsing them.
-          if (typeof e.type === 'string' && e.type.startsWith('host:')) hooks.requestHostMode();
-          return;
-      }
-    }
+    case 'trace':
+      if (typeof msg.event.type === 'string') applyTrace(msg.event, hooks, hooks.conversationAgent());
+      return;
+    case 'stream-ended':
+      applyStreamEnded(msg.agentName, hooks, hooks.conversationAgent());
+      return;
     case 'command-result': {
       hooks.appendMessage({
         id: nextMessageId(),
@@ -1996,11 +1924,11 @@ function handleServerMessage(
     case 'branches-list':
       hooks.setBranchesList(msg.branches, msg.currentId);
       return;
-    // The server follows a session switch with a full re-welcome (setApp
-    // re-flushes every client), which resets all session-scoped state.
     case 'conversation-graph':
       hooks.setConversationGraph(msg.nodes);
       return;
+    // The server follows a session switch with a full re-welcome (setApp
+    // re-flushes every client), which resets all session-scoped state.
     case 'session-changed':
       return;
     case 'inbound-trigger': {
@@ -2147,8 +2075,8 @@ function Header(props: {
         </Show>
         {/* A subscription meter that has never read (inference-only token,
             gateway without the usage path) must say so, not render nothing. */}
-        <Show when={props.quota?.subscription && props.quota.windows.length === 0 && props.quota.error}>
-          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable: ${props.quota!.error}`}>
+        <Show when={quotaUnreadable(props.quota ?? null)}>
+          <span class="ml-3 text-amber-400" title={`Subscription quota unreadable${props.quota!.error ? `: ${props.quota!.error}` : ''}`}>
             quota: unreadable
           </span>
         </Show>
@@ -2577,12 +2505,12 @@ function ToolBlockView(props: {
   const kind = (): string => `tool:${props.block.name}`;
   const open = (): boolean => isBlockOpen(props.blockKey, kind());
   const allOpen = (): boolean => expandedKinds().has(kind());
-  const dot = (): string => {
-    if (props.block.status === 'running') return 'bg-amber-400 animate-pulse';
-    if (props.block.status === 'failed' || props.result?.isError) return 'bg-rose-500';
-    if (props.block.status === 'done' || props.result) return 'bg-emerald-500';
-    return 'bg-neutral-600';
-  };
+  const dot = (): string => ({
+    running: 'bg-amber-400 animate-pulse',
+    failed: 'bg-rose-500',
+    done: 'bg-emerald-500',
+    unknown: 'bg-neutral-600',
+  })[toolCallState(props.block.status, props.result)];
   const duration = (): string => {
     const ms = props.block.durationMs;
     if (ms === undefined) return '';

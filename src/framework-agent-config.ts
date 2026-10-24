@@ -1,13 +1,48 @@
 import { AgentFramework } from '@animalabs/agent-framework';
 import type { Recipe } from './recipe.js';
+import { DEFAULT_RECIPE_CLOCK } from './recipe.js';
 
 type AgentConfig = Parameters<typeof AgentFramework.create>[0]['agents'][number];
+
+/** Compile budget for a recipe that omits `agent.contextBudgetTokens`. Sized
+ *  for the 1M-window models; a recipe on a smaller window must set its own
+ *  (budget + maxTokens has to fit under the window). */
+export const DEFAULT_CONTEXT_BUDGET_TOKENS = 300_000;
+
+/** The model a recipe's agent runs: `envModel`, the environment's `MODEL`,
+ *  when it's set, else the recipe's own, else its provider's default. */
+export function recipeModel(recipe: Recipe, envModel: string | undefined): string {
+  return envModel || recipe.agent.model ||
+    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+}
+
+/** The compile budget the recipe configures: its own, else the default. A
+ *  runtime override (agent settings) can still move the live budget. */
+export function effectiveContextBudgetTokens(recipe: Recipe): number {
+  return recipe.agent.contextBudgetTokens ?? DEFAULT_CONTEXT_BUDGET_TOKENS;
+}
+
+/**
+ * A startup warning for a recipe that turns `agent.autoContinue` on while the
+ * installed agent-framework predates the setting (agent-framework#744): the
+ * key passes through, the framework builds the agent without it, and turns
+ * end as before with no other sign. `agent` is the built agent
+ * (framework.getAgent); a framework that supports the setting gives it
+ * `autoContinue`, resolved. Undefined when the setting is off or supported.
+ */
+export function autoContinueSupportWarning(recipe: Recipe, agent: object | undefined): string | undefined {
+  if (!recipe.agent.autoContinue || !agent) return undefined;
+  if ((agent as { autoContinue?: unknown }).autoContinue !== undefined) return undefined;
+  return '[agent-settings] agent.autoContinue is set, but the installed agent-framework predates it ' +
+    '(agent-framework#744): turns end as before, without continuing, until it is upgraded.';
+}
 
 export type FrameworkAgentConfig = AgentConfig & {
   // Forward recipe fields that newer Agent Framework releases understand
   // while remaining structurally compatible with older installs.
   refusalHandling?: Recipe['agent']['refusalHandling'];
   sameRoundThinkTextPolicy?: 'public' | 'private';
+  autoContinue?: Recipe['agent']['autoContinue'];
 };
 
 /**
@@ -64,14 +99,28 @@ export function buildFrameworkAgentConfig(
   strategy: FrameworkAgentConfig['strategy'],
 ): FrameworkAgentConfig {
   const promptCaching = resolvePromptCaching(recipe, model);
+  let thinking: FrameworkAgentConfig['thinking'];
+  if (recipe.agent.thinking) {
+    // Effort is a host setting sent as output_config.effort, never as thinking.effort.
+    const { effort: _hostEffort, ...providerThinking } = recipe.agent.thinking;
+    thinking = providerThinking;
+  }
   return {
     name: agentName,
     ...(recipe.agent.toolPresentation ? {toolPresentation: recipe.agent.toolPresentation} : {}),
     model,
     systemPrompt: recipe.agent.systemPrompt,
+    ...(recipe.agent.allowedTools !== undefined
+      ? { allowedTools: recipe.agent.allowedTools }
+      : {}),
     maxTokens: recipe.agent.maxTokens ?? 16384,
-    maxStreamTokens: recipe.agent.maxStreamTokens ?? 150000,
-    contextBudgetTokens: recipe.agent.contextBudgetTokens,
+    // An omitted maxStreamTokens follows the budget (+20k) only when the
+    // budget is the host default too. A recipe that sets its own budget may be
+    // on a 200k-window model, where budget + 20k would let a stream grow past
+    // the window; it keeps the framework's historical 150k.
+    maxStreamTokens: recipe.agent.maxStreamTokens
+      ?? (recipe.agent.contextBudgetTokens === undefined ? DEFAULT_CONTEXT_BUDGET_TOKENS + 20_000 : 150_000),
+    contextBudgetTokens: effectiveContextBudgetTokens(recipe),
     // cacheTtl is withheld at the HOST layer on bedrock: the transport
     // only has the default 5m cache, and older membrane releases forward
     // the ttl field Bedrock rejects. Note this is not the whole story —
@@ -81,7 +130,9 @@ export function buildFrameworkAgentConfig(
     // pre-adapter config is NOT cache-TTL telemetry; the wire truth lives
     // at the adapter.
     ...(recipe.agent.cacheTtl && recipe.agent.provider !== 'bedrock'
-      && { cacheTtl: recipe.agent.cacheTtl }),
+      // '24h' (OpenAI prompt_cache_retention) is understood by the patched
+      // membrane/agent-framework only; released ones type the field as 5m/1h.
+      && { cacheTtl: recipe.agent.cacheTtl as AgentConfig['cacheTtl'] }),
     ...(promptCaching !== undefined && { promptCaching }),
     // Prefill scaffold (anthropic-xml formatter), e.g. chapterx CLI-sim's
     // '<cmd>cat untitled.txt</cmd>' — part of migrating prefill-era bots.
@@ -144,7 +195,7 @@ export function buildFrameworkAgentConfig(
       },
     }),
     strategy,
-    ...(recipe.agent.thinking && { thinking: recipe.agent.thinking }),
+    ...(thinking && { thinking }),
     ...(recipe.agent.refusalHandling && { refusalHandling: recipe.agent.refusalHandling }),
     ...(recipe.agent.sameRoundThinkTextPolicy !== undefined
       ? { sameRoundThinkTextPolicy: recipe.agent.sameRoundThinkTextPolicy }
@@ -155,5 +206,10 @@ export function buildFrameworkAgentConfig(
     ...(recipe.agent.toolWrapperProseGuard !== undefined
       ? { toolWrapperProseGuard: recipe.agent.toolWrapperProseGuard }
       : {}),
+    ...(recipe.agent.autoContinue !== undefined
+      ? { autoContinue: recipe.agent.autoContinue }
+      : {}),
+    // Ten-minute clock rows unless the recipe names its own or turns them off (false).
+    ...(recipe.agent.clock === false ? {} : { clock: recipe.agent.clock ?? { ...DEFAULT_RECIPE_CLOCK } }),
   };
 }

@@ -19,9 +19,10 @@
  */
 
 import type { AgentFramework } from '@animalabs/agent-framework';
-import { NativeFormatter, AnthropicXmlFormatter } from '@animalabs/membrane';
+import { NativeFormatter } from '@animalabs/membrane';
 import type { ContentBlock, NormalizedMessage, NormalizedRequest, ToolDefinition } from '@animalabs/membrane';
-import type { Recipe } from '../recipe.js';
+import { resolveProvider, type Recipe } from '../recipe.js';
+import { anthropicXmlFormatter, xmlToolsInSystem } from '../recipe-formatter.js';
 import type { CallLedger } from '../call-ledger.js';
 import type { QuotaMeter } from '../quota-meter.js';
 import type { CredentialMonitor, CredentialActionId } from '../credential-state.js';
@@ -35,6 +36,7 @@ import {
   type ToolClassRow,
   type ToolClassSource,
 } from '../tool-lifecycle-config.js';
+import { effectiveContextBudgetTokens } from '../framework-agent-config.js';
 
 /** Minimal slice of AppContext the panel layer needs. Both the WebUI host
  *  and the headless child runtime satisfy this structurally. */
@@ -711,18 +713,6 @@ export function applyPinRemove(app: PanelAppRef, agentName: string, pinId: strin
 // Health
 // ---------------------------------------------------------------------------
 
-/**
- * Liveness/health snapshot — the /healthz assembly. framework.healthSnapshot
- * plus compression quarantine, rendered context composition, per-agent
- * runtime settings, and (when a ledger is wired) recent provider calls.
- * Everything is read-only and cheap: no compile, no count_tokens.
- */
-/**
- * Subscription quota windows. The request IS the poll: a client asks only
- * while its page is visible, and the meter's refresh floor keeps any number
- * of viewers down to one provider read per interval. `subscription: false`
- * tells the client to keep showing dollars.
- */
 /** Whether the framework is actually holding an agent on a host verdict. A
  *  spent window alone parks nothing: the hold arms on a 429, and only on a
  *  framework that has the `providerHold` hook. null = framework cannot say. */
@@ -740,6 +730,12 @@ function hostHoldActive(app: PanelAppRef): boolean | null {
   }
 }
 
+/**
+ * Subscription quota windows. The request IS the poll: a client asks only
+ * while its page is visible, and the meter's refresh floor keeps any number
+ * of viewers down to one provider read per interval. `subscription: false`
+ * tells the client to keep showing dollars.
+ */
 export async function buildQuotaSnapshot(app: PanelAppRef): Promise<Record<string, unknown>> {
   if (!app.quotaMeter) return { subscription: app.subscriptionUnmetered === true, windows: [] };
   const snapshot = await app.quotaMeter.refresh();
@@ -748,7 +744,8 @@ export async function buildQuotaSnapshot(app: PanelAppRef): Promise<Record<strin
     provider: app.quotaMeter.provider,
     windows: snapshot?.windows ?? [],
     fetchedAt: snapshot?.fetchedAt ?? 0,
-    ...(snapshot?.error ? { error: snapshot.error } : {}),
+    // A failed read is one with an error, whatever its text, even none.
+    ...(snapshot?.error !== undefined ? { error: snapshot.error } : {}),
     blockedUntil: app.quotaMeter.blockedUntil(app.recipe.agent.model) ?? null,
     parked: hostHoldActive(app),
   };
@@ -775,12 +772,83 @@ export async function applyCredentialAction(app: PanelAppRef, params: Record<str
   return { subscription: true, agent: resolveAgent(app), ...state };
 }
 
+type FrameworkAgent = ReturnType<AgentFramework['getAllAgents']>[number];
+
+/** A failed health read's message, cut to a length a health poll can carry. */
+const READ_FAILURE_MAX_CHARS = 300;
+/** What readFailures says for a thrown value that yields no message. */
+const READ_FAILURE_UNDESCRIBED = "the read failed, and its error couldn't be described";
+
+/** What a thrown value says, for readFailures: an object's `message`, such
+ *  as an Error's, or a thrown primitive as a string, cut to its first 300
+ *  code points, so no code point is split. An object with no
+ *  non-empty string message, such as an Error with an empty one or a plain
+ *  object with none, gets a fixed text, and so does anything whose reading
+ *  throws: describing a failure can't throw, so a strange throw still loses
+ *  only its agent. */
+function describeReadFailure(error: unknown): string {
+  try {
+    const message = typeof error === 'object' && error !== null
+      ? (error as { message?: unknown }).message
+      : String(error);
+    if (typeof message === 'string' && message.length > 0) {
+      // Walk only as far as the cut, however long the message is.
+      let kept = '';
+      let count = 0;
+      for (const codePoint of message) {
+        if (count++ === READ_FAILURE_MAX_CHARS) break;
+        kept += codePoint;
+      }
+      return kept;
+    }
+  } catch {
+    // Fall through to the fixed text.
+  }
+  return READ_FAILURE_UNDESCRIBED;
+}
+
+/** One health section's entries by agent name. Each agent is read on its own,
+ *  so an agent whose read throws (such as one whose context manager a store
+ *  surgery left uninitialized) doesn't hide the others. Its failure goes in
+ *  `failures`, under its name and the section's, so a reader can tell it from
+ *  an agent with nothing to report, which is simply left out. */
+function perAgentHealth(
+  app: PanelAppRef,
+  section: string,
+  failures: Record<string, Record<string, string>>,
+  read: (agent: FrameworkAgent, name: string) => unknown,
+): Record<string, unknown> {
+  // Keyed by agent name, so with no prototype: any name is an own key.
+  const entries: Record<string, unknown> = Object.create(null);
+  for (const agent of app.framework.getAllAgents()) {
+    const name = (agent as unknown as { name: string }).name;
+    try {
+      const value = read(agent, name);
+      if (value) entries[name] = value;
+    } catch (error) {
+      (failures[name] ??= {})[section] = describeReadFailure(error);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Liveness/health snapshot, the /healthz assembly: framework.healthSnapshot
+ * plus the credential state (on a subscription); by agent, compression
+ * quarantine, compression debt, the latest load repair that dropped
+ * summaries holding text, rendered context composition and runtime
+ * settings, each read on its own (perAgentHealth), with readFailures naming
+ * the reads that threw; and (when a ledger is wired) recent provider calls.
+ * Everything is read-only and cheap: no compile, no count_tokens.
+ */
 export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   const fw = app.framework as unknown as { healthSnapshot?: () => Record<string, unknown> };
   if (typeof fw.healthSnapshot !== 'function') {
     throw new PanelError('framework lacks healthSnapshot()', 501);
   }
   const snapshot = fw.healthSnapshot();
+  // Per-agent reads that threw, by agent and then section (see perAgentHealth).
+  const readFailures: Record<string, Record<string, string>> = Object.create(null);
   // Credential state rides along so a WebUI opened mid-incident (or the
   // fleet hub / doctor) sees an expired token or spent quota without waiting
   // for the next alert transition. Health reads never throw.
@@ -796,52 +864,57 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
   // here so the fleet hub and connectome-doctor can alarm on it — it
   // must never be observable only in agent.log.
   try {
-    const quarantine: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const strategy = (agent.getContextManager() as unknown as {
+    (snapshot as Record<string, unknown>).compressionQuarantine = perAgentHealth(app, 'compressionQuarantine', readFailures, (agent) =>
+      (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionQuarantineStatus?: () => unknown };
-      }).getStrategy?.();
-      const status = strategy?.getCompressionQuarantineStatus?.();
-      if (status) quarantine[(agent as unknown as { name: string }).name] = status;
-    }
-    (snapshot as Record<string, unknown>).compressionQuarantine = quarantine;
+      }).getStrategy?.()?.getCompressionQuarantineStatus?.());
   } catch {
     // Health reads never throw.
   }
   // Compression DEBT per agent — the single-authority reduction from cm
-  // (healthy / degraded / critical + the numbers behind it). Every wedge of
+  // (healthy / degraded / critical, or unknown when it couldn't read what it
+  // reports, + the numbers behind it). Every wedge of
   // the 2026-08-06 five-resident day was weeks of silently-failing
   // compression surfacing as a sudden budget crisis; this block is what
   // lets fleet-watch (and later the resident notice, af #99) catch the
   // debt while it is still cheap.
   try {
-    const debt: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const strategy = (agent.getContextManager() as unknown as {
+    (snapshot as Record<string, unknown>).compressionDebt = perAgentHealth(app, 'compressionDebt', readFailures, (agent) =>
+      (agent.getContextManager() as unknown as {
         getStrategy?: () => { getCompressionDebt?: () => unknown };
-      }).getStrategy?.();
-      const d = strategy?.getCompressionDebt?.();
-      if (d) debt[(agent as unknown as { name: string }).name] = d;
-    }
-    (snapshot as Record<string, unknown>).compressionDebt = debt;
+      }).getStrategy?.()?.getCompressionDebt?.());
+  } catch {
+    // Health reads never throw.
+  }
+  // The latest load repair that dropped summaries holding text, per agent:
+  // memory that changed at a load, which happens at starts, when nobody is
+  // usually watching the live alert. The strategy keeps it for its own life,
+  // so a session switch starts it fresh. Absent where no load dropped a
+  // summary holding text.
+  try {
+    (snapshot as Record<string, unknown>).loadRepair = perAgentHealth(app, 'loadRepair', readFailures, (agent) =>
+      (agent.getContextManager() as unknown as {
+        getStrategy?: () => { getLatestLoadRepairReport?: () => unknown };
+      }).getStrategy?.()?.getLatestLoadRepairReport?.());
   } catch {
     // Health reads never throw.
   }
   // Rendered context COMPOSITION per agent — head / raw middle / summaries
-  // by level / tail, as actually emitted by the last compile. Sourced from
-  // the strategy's own render stats (already computed in-process), so it is
-  // safe on the 15s /healthz poll.
+  // by level / tail, as the last live compile emitted it. Sourced from the
+  // strategy's own render stats (already computed in-process), so it is
+  // safe on the 15s /healthz poll. An agent with none is left out, and
+  // contextCompositionNotKept names, in the same read, each of those whose
+  // strategy keeps none, so the two read apart; it's left out when it would
+  // be empty. contextComposition's entries are all render stats.
   try {
-    const composition: Record<string, unknown> = {};
-    for (const agent of app.framework.getAllAgents()) {
-      const name = (agent as unknown as { name: string }).name;
-      const cm = agent.getContextManager() as unknown as {
-        getRenderStats?: () => unknown;
-      };
-      const rs = cm.getRenderStats?.();
-      if (rs) composition[name] = rs;
-    }
-    (snapshot as Record<string, unknown>).contextComposition = composition;
+    const notKept: string[] = [];
+    (snapshot as Record<string, unknown>).contextComposition = perAgentHealth(app, 'contextComposition', readFailures, (agent, name) => {
+      const cm = agent.getContextManager() as unknown as { getRenderStats?: () => unknown };
+      const stats = cm.getRenderStats?.();
+      if (stats == null && !keepsRenderStats(cm)) notKept.push(name);
+      return stats;
+    });
+    if (notKept.length > 0) (snapshot as Record<string, unknown>).contextCompositionNotKept = notKept;
   } catch {
     // Health reads never throw.
   }
@@ -853,16 +926,16 @@ export function buildHealthSnapshot(app: PanelAppRef): Record<string, unknown> {
     const fw2 = app.framework as unknown as {
       getAgentRuntimeSettings?: (name: string) => unknown;
     };
-    if (typeof fw2.getAgentRuntimeSettings === 'function') {
-      const settings: Record<string, unknown> = {};
-      for (const agent of app.framework.getAllAgents()) {
-        const name = (agent as unknown as { name: string }).name;
-        settings[name] = fw2.getAgentRuntimeSettings(name);
-      }
-      (snapshot as Record<string, unknown>).runtimeSettings = settings;
+    const getSettings = fw2.getAgentRuntimeSettings;
+    if (typeof getSettings === 'function') {
+      (snapshot as Record<string, unknown>).runtimeSettings = perAgentHealth(app, 'runtimeSettings', readFailures, (agent) =>
+        getSettings.call(app.framework, (agent as unknown as { name: string }).name));
     }
   } catch {
     // Health reads never throw.
+  }
+  if (Object.keys(readFailures).length > 0) {
+    (snapshot as Record<string, unknown>).readFailures = readFailures;
   }
   // Recent provider calls. The WebUI host streams these over its own WS;
   // for a fleet child this snapshot is the only path, so ship them here.
@@ -1083,7 +1156,11 @@ export type CountFormatter = Pick<NativeFormatter, 'buildMessages'>;
  * Tool pairs are normalized and same-role runs merged by the formatter
  * itself, and every block the formatter sends is counted: for the native
  * formatter that includes signed `thinking` / `redacted_thinking`,
- * `tool_use`, `tool_result` and images.
+ * `tool_use`, `tool_result` and images, and, when `anthropicServerBlocks` is
+ * true, an assistant turn's Anthropic server-tool blocks (web search and the
+ * like). Membrane sends those only through an adapter that replays them,
+ * which only its Anthropic API adapter does, so the caller passes whether
+ * inference does.
  *
  * The previous version flattened each message to its text blocks and sent no
  * tool definitions: on a keep-all model (Opus >= 4.5, Sonnet >= 4.6, Fable)
@@ -1100,6 +1177,7 @@ export function buildCountTokensPayload(
   agentName: string,
   formatter: CountFormatter = new NativeFormatter(),
   toolMode: 'native' | 'xml' = 'native',
+  anthropicServerBlocks = false,
 ): CountTokensPayload {
   const built = formatter.buildMessages(preview.messages ?? [], {
     participantMode: 'multiuser',
@@ -1115,6 +1193,7 @@ export function buildCountTokensPayload(
     ...(preview.prefillUserMessage ? { prefillUserMessage: preview.prefillUserMessage } : {}),
     promptCaching: false,
     cacheMarkers: 'membrane-system',
+    anthropicServerBlocks,
   });
   const tools = Array.isArray(built.nativeTools) ? built.nativeTools : undefined;
   const system = built.systemContent;
@@ -1150,29 +1229,52 @@ export function buildContextCoverage(app: PanelAppRef, agentName: string): Conte
   return buildContextCoverageSnapshot(agentName, agent.getContextManager());
 }
 
+/** Whether a context manager's strategy keeps render stats at all, as
+ *  context-manager's own `isRenderStatsCapable` asks (not exported): one
+ *  that doesn't, such as `PassthroughStrategy`, has `getRenderStats()` null
+ *  for good. */
+function keepsRenderStats(cm: unknown): boolean {
+  const strategy = (cm as { getStrategy?: () => unknown }).getStrategy?.();
+  return typeof (strategy as { getRenderStats?: unknown } | undefined)?.getRenderStats === 'function';
+}
+
 /**
- * Context makeup: the segment breakdown of the agent's current compiled
- * context — head window, raw middle, summaries by level (L1/L2/L3), and the
- * recent verbatim tail — from the strategy's RenderStats, plus an exact
- * total token count via the model's count_tokens endpoint. Transparent:
- * previewActivation + count_tokens only; no inference, no Chronicle writes.
+ * Context makeup: the segment breakdown of the agent's last live compile,
+ * head window, raw middle, summaries by level (L1/L2/L3) and the recent
+ * verbatim tail, from its render stats, beside an exact token count of the
+ * next request as the default preview builds it, without what modules add at
+ * each turn, counted through the model's count_tokens endpoint. The preview
+ * is a dry compile, which leaves getRenderStats() as the last live compile
+ * left it. So `stats` are null until a live compile has run since the
+ * agent's context was loaded, and for good where its strategy keeps none,
+ * which `statsKept` tells apart. Transparent: previewActivation + at most
+ * one count_tokens call; no inference or Chronicle writes of its own, though
+ * like any compile the preview releases a compression hold whose deadline
+ * has passed, as buildContextCurve says.
  */
 export async function buildContextMakeup(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
   const agent = requireAgent(app, agentName);
-  // Populates the strategy's render stats as a side-effect of compiling.
   const request = await app.framework.previewActivation(agentName);
   const cm = (agent as unknown as { getContextManager: () => { getRenderStats: () => unknown } }).getContextManager();
   const stats = cm.getRenderStats();
+  const statsKept = keepsRenderStats(cm);
 
   // Count through the formatter the agent's recipe names: an anthropic-xml
   // agent's count takes the XML scaffold, prefill or not; everyone else the
-  // native shape.
+  // native shape. The host's one Membrane decides where an XML agent's tools
+  // go from the recipe's primary agent and its model, for every agent it runs,
+  // so the count asks the same.
   const xml = app.recipe.agent.formatter === 'anthropic-xml';
   const payload = buildCountTokensPayload(
     request as unknown as CountablePreview,
     agentName,
-    xml ? new AnthropicXmlFormatter() : new NativeFormatter(),
+    xml ? anthropicXmlFormatter({ toolsInSystem: xmlToolsInSystem(app.recipe, requireAgent(app, resolveAgent(app)).model) }) : new NativeFormatter(),
     xml ? 'xml' : 'native',
+    // Membrane replays an assistant turn's server-tool blocks only through an
+    // adapter that declares replaysAnthropicServerBlocks, and of the host's
+    // adapters only LoggingAnthropicAdapter (an AnthropicAdapter) does, which
+    // the host builds for provider `anthropic` (index.ts), for every agent.
+    resolveProvider(app.recipe) === 'anthropic',
   );
   // What the provider actually billed for the last call (fresh + cache read +
   // cache creation): exact, free, and independent of the count below — the
@@ -1188,7 +1290,7 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
     || anthropicCountModel((agent as { model?: string }).model);
   let countSource = 'count_tokens';
   if (!countModel) {
-    return { agent: agentName, stats, exactTotalTokens, lastBilledInputTokens, countModel, countSource: 'count_tokens_unsupported_model' };
+    return { agent: agentName, stats, statsKept, exactTotalTokens, lastBilledInputTokens, countModel, countSource: 'count_tokens_unsupported_model' };
   }
   try {
     const base = (process.env.ANTHROPIC_BASE_URL || 'https://api.anthropic.com').replace(/\/$/, '');
@@ -1220,7 +1322,7 @@ export async function buildContextMakeup(app: PanelAppRef, agentName: string): P
     countSource = 'count_tokens_error';
   }
 
-  return { agent: agentName, stats, exactTotalTokens, lastBilledInputTokens, countModel, countSource };
+  return { agent: agentName, stats, statsKept, exactTotalTokens, lastBilledInputTokens, countModel, countSource };
 }
 
 /**
@@ -1321,19 +1423,19 @@ function curveVerdict(
  * resolutions and queues no compression from the plan. Once context-manager's
  * thinking binding (#160) is released, a committed compile that's never sent
  * would also fence the replies the resident is streaming; a dry run won't.
- * With context-manager 0.13 a dry compile isn't free of every effect: the
- * adaptive select still records its estimate and arms calibration, and
- * overwrites the frontier, the transition status and the render stats that
- * the Context panel reads, until the next real compile (context-manager #161
- * restores them after a dry select). Like any hold query, a dry compile also
- * releases a compression hold whose deadline has passed, never one that
- * hasn't: that release, and the work it sets off, was already due.
+ * Since context-manager 0.14 a dry compile leaves what its select would
+ * change, the hot settings (the frontier, prepared, blocked), calibration and
+ * the render stats the Context panel reads, as the last committing compile
+ * left them. Like any hold query, a dry compile still releases a compression
+ * hold whose deadline has passed, never one that hasn't: that release, and
+ * the work it sets off, was already due.
  *
  * A plan over budget at the plan check is plotted rather than thrown, and the
  * response carries a verdict from the framework's feasibility preview, the
  * one the settings panel reports, so the plot says it won't fit. The
  * head/tail reservation check and the emission check still throw on a budget
- * that can't fit, as for a real compile. No inference, no message writes.
+ * that can't fit, as for a real compile. No inference of its own, no message
+ * writes.
  */
 export async function buildContextCurve(app: PanelAppRef, agentName: string): Promise<Record<string, unknown>> {
   requireAgent(app, agentName);
@@ -1344,7 +1446,7 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
   // app.recipe here plotted the wrong curve on any agent whose budget had
   // ever been changed at runtime. Fall back to the recipe only if the live
   // read is unavailable.
-  let maxTokens = app.recipe.agent.contextBudgetTokens ?? 200_000;
+  let maxTokens = effectiveContextBudgetTokens(app.recipe);
   let transition: string | undefined;
   try {
     const settings = (app.framework as unknown as {
@@ -1415,11 +1517,19 @@ export async function buildContextCurve(app: PanelAppRef, agentName: string): Pr
     if (sum) {
       const leafIds = leaves(sum).filter((id) => msgById.has(id));
       const rawCovered = leafIds.reduce((a, id) => a + estimate(msgById.get(id)!), 0);
-      const dates = leafIds.map((id) => msgById.get(id)!.timestamp).filter(Boolean).sort();
+      // The store gives each timestamp as a Date, which the default sort orders
+      // by its text, weekday first. Take the earliest and latest by time, of
+      // the timestamps that are times.
+      const times = leafIds.map((id) => msgById.get(id)!.timestamp)
+        .filter((t) => t !== undefined && t !== null)
+        .map((t) => new Date(t as Date | string | number).getTime())
+        .filter((t) => Number.isFinite(t))
+        .sort((a, b) => a - b);
       entries.push({
         i: i++, kind: `L${sum.level}`, id: sum.id, participant: e.participant,
         rendered, rawCovered, msgCount: leafIds.length, nImages,
-        dateFirst: dates[0] ?? null, dateLast: dates[dates.length - 1] ?? null, text,
+        dateFirst: times.length > 0 ? new Date(times[0]) : null,
+        dateLast: times.length > 0 ? new Date(times[times.length - 1]) : null, text,
       });
     } else {
       const src = e.sourceMessageId ? msgById.get(e.sourceMessageId) : null;
@@ -1596,8 +1706,8 @@ export function runContextPreview(
  * The membrane-normalized request the framework would hand to the model if
  * the agent were activated right now. Delegates to `framework.previewActivation`.
  *
- * Transparent by default: no inference, no Chronicle writes, no external
- * MCPL calls. Pass `injections: true` to gather dynamic injections
+ * Transparent by default: no inference of its own, no Chronicle writes, no
+ * external MCPL calls. Pass `injections: true` to gather dynamic injections
  * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
  * transparent: it can run inference and fire MCPL `beforeInference` hooks.
  */
@@ -1609,6 +1719,7 @@ export async function buildDebugContext(
   requireAgent(app, agentName);
   const injections = params.injections === true;
   const request = await app.framework.previewActivation(agentName, { injections });
+  // The presentation captured with this request, or null for an agent without one.
   return { agent: agentName, injections, transparent: !injections, request,
     toolPresentation: app.framework.getRequestToolPresentation(request) };
 }

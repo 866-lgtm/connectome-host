@@ -36,7 +36,11 @@ import type {
   ToolResult,
   TraceEvent,
   SessionUsageSnapshot,
+  WorkspaceModule,
 } from '@animalabs/agent-framework';
+import { WorkspaceReadError } from '@animalabs/agent-framework';
+import { unknownToolResult } from './unknown-tool.js';
+import { workspaceReadFields } from '../workspace-read-result.js';
 import type { ServerWebSocket } from 'bun';
 import { existsSync } from 'node:fs';
 import { readFile, stat } from 'node:fs/promises';
@@ -52,6 +56,7 @@ import type { CredentialMonitor } from '../credential-state.js';
 import { handleCommand } from '../commands.js';
 import { AgentTreeReducer, type AgentTreeSnapshot } from '../state/agent-tree-reducer.js';
 import { FleetTreeAggregator } from '../state/fleet-tree-aggregator.js';
+import { TurnInterrupts, interruptAgents, interruptSubagents } from '../state/turn-interrupt.js';
 import type { FleetModule } from './fleet-module.js';
 import type { WireEvent } from './fleet-types.js';
 import {
@@ -113,12 +118,21 @@ import { loadRecipe } from '../recipe.js';
 import {
   ObserverRegistry,
   ObserverSessions,
+  closeConnectionsWithoutGrant,
   sessionTokenFromRequest,
-  traceRequiredScope,
+  clientHolds,
+  frameScopes,
   filterEntryForScopes,
+  frameWithoutFailureText,
+  keepNamedStrings,
   scopeWelcome,
+  CREDENTIAL_STRINGS,
+  HEALTH_STRINGS,
+  QUOTA_STRINGS,
+  type KeptStrings,
   type ObserverScope,
   type ObserverHelloIdentity,
+  streamEndedFor,
 } from './web-ui-observers.js';
 
 /**
@@ -149,7 +163,7 @@ export interface WebUiModuleConfig {
    * literal credentials to a recipe.
    */
   basicAuth?: { username: string; password: string };
-  /** Path to the SPA build output. Default: `<cwd>/dist/web`. */
+  /** Path to the SPA build output. Default: this package's own `dist/web`. */
   staticDir?: string;
   /**
    * Origin allowlist for the WebSocket upgrade. Browsers do not enforce
@@ -212,6 +226,10 @@ interface ClientState {
   /** Observer grant label (key-authenticated clients) — the requester name
    *  recorded in the operator log for any action this client takes. */
   label?: string;
+  /** The grant a key-authenticated client connected with; each check of the
+   *  grants file closes the connection once that grant is gone, expired or
+   *  narrowed. */
+  observerKey?: string;
   /** Kills pending connections that never complete the hello. */
   authTimer?: ReturnType<typeof setTimeout>;
   /** Open peek subscriptions for this client, keyed by scope. Each entry
@@ -222,6 +240,11 @@ interface ClientState {
 
 /** Default port — picked to be memorable and unlikely to collide. */
 const DEFAULT_PORT = 7340;
+
+/** What to do about a missing bundle: a checkout builds it, and the npm
+ *  package carries it built, without the web/ sources to build it from. */
+const BUNDLE_REMEDY =
+  'In a checkout, run `npm run build:web` (the postinstall runs it); an installed package carries it built, so reinstall the package.';
 
 /** HTTP route → panel op, for ?scope=<child> proxying. /curve (the HTML
  *  page) is deliberately absent: it is served locally and its own fetch of
@@ -238,6 +261,15 @@ const HTTP_PANEL_OPS: Record<string, string> = {
   '/quota': 'quota',
   '/credential': 'credential',
 };
+
+/** The health routes an observer without 'ops' gets without their failure
+ *  text, each keeping the strings its spec names (keepNamedStrings), whether
+ *  this process answers or a fleet child does. */
+const HEALTH_ROUTE_STRINGS: ReadonlyMap<string, KeptStrings> = new Map<string, KeptStrings>([
+  ['/healthz', HEALTH_STRINGS],
+  ['/quota', QUOTA_STRINGS],
+  ['/credential', CREDENTIAL_STRINGS],
+]);
 
 /** True when a wire `scope` field names a fleet child (vs the local process). */
 function isChildScope(scope: string | undefined): scope is string {
@@ -291,9 +323,16 @@ function panelParamsFromUrl(url: URL): Record<string, unknown> {
 
 /** Messages shipped in the welcome frame (the tail window). */
 const WELCOME_HISTORY_LIMIT = 200;
+/** How long the welcomes of a bind wait, together, for the autoStart
+ *  launches under way at setApp to record their children (autoStartRecords). */
+const AUTOSTART_RECORD_WAIT_MS = 1_000;
 /** Default / max page size for request-history. */
 const HISTORY_PAGE_DEFAULT = 200;
 const HISTORY_PAGE_MAX = 500;
+/** The most windows of its own size an observer's page reads back past
+ *  messages its scopes empty (readHistory), each widened to whole bodies as
+ *  a full client's page is, so the reading one request starts is bounded. */
+const HISTORY_READ_BACK_WINDOWS = 10;
 
 /** Re-exported from the shared panel-data layer (moved there so headless
  *  fleet children serve the same snapshot over the fleet IPC). */
@@ -365,6 +404,13 @@ const DEFAULT_HOST = '0.0.0.0';
  */
 interface SharedServerState {
   server: ReturnType<typeof Bun.serve>;
+  /** The interrupt's turn follower for the app's framework: fed every trace
+   *  (fanOutTrace), made again with each framework (setApp). */
+  interrupts?: TurnInterrupts;
+  /** Ends the fan-out's subscription to the framework setApp last followed,
+   *  so a switched-away framework's late traces reach no client and no
+   *  follower. */
+  stopFollowing?: () => void;
   port: number;
   host: string;
   staticRoot: string;
@@ -411,9 +457,20 @@ interface SharedServerState {
    *  and cleared in stop(). */
   messageListenerDetacher: (() => void) | null;
   /** Cached child recipe summaries keyed by recipe path. Recipes are
-   *  static-ish per host run (re-spawn doesn't change the file), so we
-   *  parse once and reuse on every welcome. Cleared on session switch. */
+   *  static-ish per host run (re-spawn doesn't change the file), so a summary
+   *  once loaded is reused by every later welcome, for the life of the host.
+   *  Welcomes loading at the same time may each load it, and a load that
+   *  fails isn't kept, so the next welcome loads it again. */
   childRecipeCache: Map<string, { name: string; description?: string; version?: string; agentModel?: string }>;
+  /** What every welcome since setApp waits for before it reads the fleet's
+   *  children: the autoStart launches under way at setApp recording theirs,
+   *  for AUTOSTART_RECORD_WAIT_MS at most. Null when none were under way.
+   *  It is one wait for the whole bind, so a client that connects during a
+   *  stalled launch, once the wait is over, doesn't wait again. */
+  autoStartRecords: Promise<void> | null;
+  /** Counts setApp's binds, so a welcome that a newer bind has superseded
+   *  while it waited sends nothing: that bind welcomes every client again. */
+  bindGeneration: number;
   /** corrId → originating client + request kind, for routing scoped panel
    *  query responses (lessons / workspace) back to the requesting client.
    *  Entries are deleted on response or pruned by TTL. */
@@ -421,6 +478,42 @@ interface SharedServerState {
 }
 
 let sharedServer: SharedServerState | null = null;
+
+/**
+ * The Web UI's interrupt: the subagents' turns, then their runs stopped
+ * (interruptSubagents), then every other agent's turn (interruptAgents), each
+ * aborted at once if it can be, else as soon as it can be. Returns the reply.
+ */
+export function interruptPage(
+  agentNames: readonly string[],
+  isSubagent: (agentName: string) => boolean,
+  interrupts: Pick<TurnInterrupts, 'interrupt'> | undefined,
+  stopRuns: () => number,
+): string {
+  if (!interrupts) return interruptReply(stopRuns(), [], []);
+  const reason = 'interrupted from the Web UI';
+  // Split before the runs stop, which can change what isSubagent answers.
+  const others = agentNames.filter((name) => !isSubagent(name));
+  const subagents = interruptSubagents(agentNames, isSubagent, interrupts, stopRuns, reason);
+  const rest = interruptAgents(others, interrupts, reason);
+  return interruptReply(subagents.stopped, [...subagents.aborted, ...rest.aborted], [...subagents.deferred, ...rest.deferred]);
+}
+
+/** The Web UI interrupt's reply: the subagents it stopped, and the agents
+ *  whose turns stop only once they can be aborted, or, when it aborted,
+ *  kept and stopped nothing, that it interrupted no turn. */
+export function interruptReply(
+  subagentsStopped: number,
+  aborted: readonly string[],
+  deferred: readonly string[],
+): string {
+  const parts = [
+    ...(subagentsStopped > 0 ? [`${subagentsStopped} subagent(s) stopped`] : []),
+    ...(deferred.length > 0 ? [`${deferred.join(', ')} stopping as soon as ${deferred.length === 1 ? 'its turn' : 'their turns'} can be aborted`] : []),
+  ];
+  if (parts.length > 0) return `interrupted — ${parts.join('; ')}`;
+  return aborted.length > 0 ? 'interrupted' : 'no turn interrupted';
+}
 
 /** An openable URL for a bind address: IPv6 literals (the `::1` loopback
  *  bind, say) need brackets, or the port reads as part of the address. */
@@ -483,12 +576,24 @@ export class WebUiModule implements Module {
       callLedgerDetacher: null,
       pendingFleetRequests: new Map(),
       childRecipeCache: new Map(),
+      autoStartRecords: null,
+      bindGeneration: 0,
       app: null,
       treeAggregator: null,
       fleetEventDetacher: null,
       messageListenerDetacher: null,
     };
-    state.observers?.start();
+    // Each check also ends the sessions of grants that are gone or expired,
+    // narrows the rest, and closes the open connections of grants that are
+    // gone, expired or narrowed.
+    const observers = state.observers;
+    observers?.start(() => {
+      const ended = state.observerSessions.narrowToGrants((key) => observers.liveScopes(key));
+      const closed = closeConnectionsWithoutGrant(state.clients.values(), observers);
+      if (closed > 0 || ended > 0) {
+        console.error(`[webui-observers] closed ${closed} observer connection(s) whose grant is gone, expired or narrowed, and ended ${ended} observer session(s) whose grant is gone, expired or keeps none of their scopes`);
+      }
+    });
     state.server = Bun.serve({
       port,
       hostname: host,
@@ -513,12 +618,12 @@ export class WebUiModule implements Module {
     sharedServer = state;
     // A missing bundle otherwise shows at run time only as a 503 to whoever
     // opens the page. Say it once, where the operator starting the host
-    // looks. This also covers a skipped postinstall (e.g. `--ignore-scripts`),
-    // which can't report anything itself.
+    // looks. This also covers a checkout's skipped postinstall (e.g.
+    // `--ignore-scripts`), which can't report anything itself.
     if (!existsSync(join(state.staticRoot, 'index.html'))) {
       console.warn(
         `[webui] bundle not found at ${state.staticRoot}: the Web UI will answer 503 until it is built. ` +
-        `Run \`npm run build:web\` (or postinstall) to produce it.`,
+        BUNDLE_REMEDY,
       );
     }
 
@@ -528,11 +633,7 @@ export class WebUiModule implements Module {
     // calls without polling the JSONL log.
     state.callLedgerDetacher = this.config.callLedger?.onUpdate((ledger) => {
       state.latestCallLedger = ledger;
-      const msg: WebUiServerMessage = { type: 'call-ledger', ledger };
-      for (const client of state.clients.values()) {
-        if (!client.welcomed) continue;
-        if (client.scopes === null || client.scopes.has('health')) this.send(client, msg);
-      }
+      this.broadcast({ type: 'call-ledger', ledger });
     }) ?? null;
 
     console.log(`[webui] listening on ${webUiHttpUrl(host, boundPort)}`);
@@ -562,8 +663,8 @@ export class WebUiModule implements Module {
 
   getTools(): ToolDefinition[] { return []; }
 
-  async handleToolCall(_call: ToolCall): Promise<ToolResult> {
-    return { success: false, error: 'WebUiModule has no tools', isError: true };
+  async handleToolCall(call: ToolCall): Promise<ToolResult> {
+    return unknownToolResult(this, call.name);
   }
 
   async onProcess(_event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -578,6 +679,7 @@ export class WebUiModule implements Module {
     if (!sharedServer) return;
     const ss = sharedServer;
     ss.app = app;
+    ss.interrupts = new TurnInterrupts((agentName, reason) => app.framework.abortInference(agentName, reason));
 
     // Tear down any previous aggregator (session-switch path).
     ss.fleetEventDetacher?.();
@@ -586,6 +688,8 @@ export class WebUiModule implements Module {
     ss.messageListenerDetacher = null;
     ss.treeAggregator?.dispose();
     ss.treeAggregator = null;
+    ss.autoStartRecords = null;
+    ss.bindGeneration++;
 
     // Live message pushes: assistant turns and tool results never surface as
     // `message:added` traces (those fire only for external/MCPL sources), so
@@ -634,11 +738,13 @@ export class WebUiModule implements Module {
     // Only clear if the entire app reference changed in a way that matters —
     // for now, retain across setApp (keeps welcome fast).
 
-    // Single fan-out listener. The framework's `onTrace` does not return a
-    // detacher, so per-client subscriptions would leak across reconnects.
-    // Instead, one listener iterates the live client set and the WS lifecycle
-    // owns membership. Cheap as long as the client count stays small (admin UI).
-    app.framework.onTrace((event: TraceEvent) => this.fanOutTrace(event));
+    // Single fan-out listener, which iterates the live client set while the
+    // WS lifecycle owns membership. Cheap as long as the client count stays
+    // small (admin UI). The framework this module followed before a session
+    // switch is stopped but keeps its listeners, so its subscription ends
+    // here, and the new framework's begins.
+    ss.stopFollowing?.();
+    ss.stopFollowing = app.framework.onTrace((event: TraceEvent) => this.fanOutTrace(event));
 
     // Fleet integration: if FleetModule is mounted, spin up a private
     // FleetTreeAggregator and start forwarding child events to clients. The
@@ -651,11 +757,25 @@ export class WebUiModule implements Module {
     if (fleetMod) {
       const agg = new FleetTreeAggregator(fleetMod);
       ss.treeAggregator = agg;
-      // Register existing children up front. autoStart launches finish before
-      // setApp() runs, so this catches everything currently up.
-      for (const childName of fleetMod.getChildren().keys()) {
+      // Register the children the fleet has now, and the autoStart children
+      // it's launching: those launches begin as the agents start, just before
+      // this, and record their children only once they've tried to load their
+      // recipes. A client takes its scopes from welcomes alone, so naming them
+      // here keeps them in the welcomes this sends below, a session switch's
+      // included. Registering a name only subscribes to its events; its tree
+      // arrives once it's ready.
+      const launching = fleetMod.autoStartLaunching();
+      for (const childName of new Set([...fleetMod.getChildren().keys(), ...launching])) {
         agg.registerChild(childName);
       }
+      // A welcome takes a child's recipe from the fleet's record of it, so the
+      // welcomes wait for those launches to record their children, all on one
+      // wait of a second at most: a recipe fetched from a URL has no time
+      // limit of its own. A launch still under way after that is listed by
+      // name, and its recipe comes with the first welcome begun after its
+      // launch records it. The welcome's own load of a recorded child's recipe
+      // isn't bounded here, as before this wait.
+      if (launching.size > 0) ss.autoStartRecords = within(fleetMod.autoStartRecorded(), AUTOSTART_RECORD_WAIT_MS);
 
       // One subscription on '*' — fan out to clients AND register newly-seen
       // children with the aggregator. This avoids a polling loop and keeps the
@@ -706,8 +826,9 @@ export class WebUiModule implements Module {
 
     // Panel-op replies are consumed by FleetModule.requestPanel's own
     // corrId listener; they carry operator-panel payloads (settings, pins,
-    // health) and must never fan out as child-event telemetry.
-    if (eType === 'panel-response') return;
+    // health) and must never fan out as child-event telemetry. A switch's
+    // replies are requestSwitch's the same way.
+    if (eType === 'panel-response' || eType === 'update-response') return;
 
     // Roll up fleet-child session usage so the header total reflects every
     // process the operator is paying for, not just the parent. Children emit
@@ -747,17 +868,15 @@ export class WebUiModule implements Module {
 
     if (sharedServer!.clients.size === 0) return;
     // Forward the verbatim event so the SPA can fold it into its own
-    // per-child AgentTreeReducer for live updates.
-    const msg: WebUiServerMessage = {
+    // per-child AgentTreeReducer for live updates. A client that may not
+    // have a child's stream-end trace learns that the stream ended.
+    const ended = streamEndedFor(event as unknown as { type: string; agentName?: unknown });
+    this.broadcast({
       type: 'child-event',
       childName,
       event: event as unknown as { type: string; [k: string]: unknown },
-    };
-    for (const client of sharedServer!.clients.values()) {
-      if (!client.welcomed) continue;
-      this.send(client, msg);
-      if (usageMsg) this.send(client, usageMsg);
-    }
+    }, ended ? { type: 'child-event', childName, event: { ...ended } } : null);
+    if (usageMsg) this.broadcast(usageMsg);
   }
 
   /** Translate a child snapshot event back into the matching wire message
@@ -840,16 +959,41 @@ export class WebUiModule implements Module {
 
   // -------------------------------------------------------------------------
   // Observer scope filtering — event-family masks (docs/observability.md §4).
-  // Full clients (scopes === null) bypass everything: historical behavior.
+  // Full clients get every frame: historical behavior.
   // Pure projections live in web-ui-observers.ts (unit-tested there).
   // -------------------------------------------------------------------------
 
-  private clientAllowsTrace(client: ClientState, event: { type: string }): boolean {
-    if (client.scopes === null) return true;
-    return client.scopes.has(traceRequiredScope(event));
+  /** Send `frame` to every welcomed client that may have it: every full
+   *  client, and each observer holding what the frame needs (frameScopes).
+   *  Every frame that goes whole to more than one client goes this way, so
+   *  the live stream refuses an observer what its welcome and its requests
+   *  do. `message-appended` goes to each observer projected through
+   *  filterEntryForScopes instead. An observer that may have `frame` but
+   *  doesn't hold 'ops' gets it without its failure text
+   *  (frameWithoutFailureText), a copy made for the first such observer. A
+   *  client that may not have `frame` gets `standIn` in its place, if it may
+   *  have that. */
+  private broadcast(frame: WebUiServerMessage, standIn?: WebUiServerMessage | null): void {
+    if (!sharedServer) return;
+    const scopes = frameScopes(frame);
+    const fallback = standIn ? { frame: standIn, scopes: frameScopes(standIn) } : null;
+    let withoutText: WebUiServerMessage | undefined;
+    for (const client of sharedServer.clients.values()) {
+      if (!client.welcomed) continue;
+      if (clientHolds(client, scopes)) {
+        this.send(client, clientHolds(client, ['ops']) ? frame : (withoutText ??= frameWithoutFailureText(frame)));
+      } else if (fallback && clientHolds(client, fallback.scopes)) this.send(client, fallback.frame);
+    }
+  }
+
+  /** Send `frame` to one client that may have it, as broadcast sends it:
+   *  without its failure text to an observer without 'ops'. */
+  private sendScoped(client: ClientState, frame: WebUiServerMessage): void {
+    this.send(client, clientHolds(client, ['ops']) ? frame : frameWithoutFailureText(frame));
   }
 
   private fanOutTrace(event: TraceEvent): void {
+    sharedServer!.interrupts?.onTrace(event as unknown as { type: string; agentName?: unknown });
     // Update cached usage snapshot first so welcomes for late-connecting
     // clients get a current value.
     if (event.type === 'usage:updated') {
@@ -872,25 +1016,20 @@ export class WebUiModule implements Module {
     }
 
     if (sharedServer!.clients.size === 0) return;
-    const traceMsg: WebUiServerMessage = {
+    // A page that holds the conversation but not what a stream-end trace
+    // carries still learns that the stream ended.
+    this.broadcast({
       type: 'trace',
       event: event as unknown as { type: string; [k: string]: unknown },
-    };
-    const usageMsg: WebUiServerMessage | null = event.type === 'usage:updated'
-      ? {
-          type: 'usage',
-          usage: sharedServer!.latestUsage,
-          ...(sharedServer!.latestPerAgentCost.length > 0
-            ? { perAgentCost: sharedServer!.latestPerAgentCost }
-            : {}),
-        }
-      : null;
-    for (const client of sharedServer!.clients.values()) {
-      if (!client.welcomed) continue;
-      if (this.clientAllowsTrace(client, event)) this.send(client, traceMsg);
-      if (usageMsg && (client.scopes === null || client.scopes.has('health'))) {
-        this.send(client, usageMsg);
-      }
+    }, streamEndedFor(event as unknown as { type: string; agentName?: unknown }));
+    if (event.type === 'usage:updated') {
+      this.broadcast({
+        type: 'usage',
+        usage: sharedServer!.latestUsage,
+        ...(sharedServer!.latestPerAgentCost.length > 0
+          ? { perAgentCost: sharedServer!.latestPerAgentCost }
+          : {}),
+      });
     }
   }
 
@@ -994,10 +1133,7 @@ export class WebUiModule implements Module {
       text,
       timestamp: storedMsg.timestamp.getTime(),
     };
-    for (const client of sharedServer.clients.values()) {
-      if (!client.welcomed) continue;
-      this.send(client, msg);
-    }
+    this.broadcast(msg);
   }
 
   // -------------------------------------------------------------------------
@@ -1098,6 +1234,7 @@ export class WebUiModule implements Module {
     if ((url.pathname === '/healthz' || url.pathname === '/quota' || url.pathname === '/credential') && !httpAllowed('health')) {
       return this.unauthorized();
     }
+    const keptStrings = httpAllowed('ops') ? undefined : HEALTH_ROUTE_STRINGS.get(url.pathname);
     if (url.pathname.startsWith('/files/') && !basicOk) {
       // Workspace files stay basic-auth-only: mount contents are outside the
       // observer scope model (they are the agent's working files, not wire
@@ -1124,10 +1261,12 @@ export class WebUiModule implements Module {
 
     // Fleet-scope proxying: every debug/health route accepts ?scope=<child>.
     // The request is forwarded to that fleet child over the panel IPC verb
-    // and the child's JSON comes back verbatim — same URLs, same payloads,
-    // whether the process answering is this one or a child. Keeps these
-    // endpoints curl-able for operators / connectome-doctor / the fleet hub
-    // without teaching any of them a second transport.
+    // and the child's JSON comes back as it sent it — same URLs, same
+    // payloads, whether the process answering is this one or a child, and an
+    // observer without 'ops' gets a health route's answer without its failure
+    // text from either (HEALTH_ROUTE_STRINGS). Keeps these endpoints
+    // curl-able for operators / connectome-doctor / the fleet hub without
+    // teaching any of them a second transport.
     const scopeParam = url.searchParams.get('scope');
     if (scopeParam && scopeParam !== 'local') {
       const op = HTTP_PANEL_OPS[url.pathname];
@@ -1135,13 +1274,14 @@ export class WebUiModule implements Module {
         const replacer = op === 'debug-context' && url.searchParams.get('media') === '0'
           ? stripBase64Media
           : undefined;
-        return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url), replacer);
+        return this.proxyPanelToChild(scopeParam, op, panelParamsFromUrl(url), keptStrings, replacer);
       }
       // Fall through: non-panel routes (static, /files) ignore the param.
     }
 
     // Debug: the membrane-normalized request that WOULD be emitted if the
-    // agent were activated right now — no inference, no state mutation.
+    // agent were activated right now — no inference of its own, and no state
+    // change but the release of a compression hold whose deadline has passed.
     //   GET /debug/context[?agent=<name>][&hooks=false][&pretty=1][&media=0]
     if (url.pathname === '/debug/context/makeup') {
       return this.handleContextMakeup(url);
@@ -1185,10 +1325,15 @@ export class WebUiModule implements Module {
       return this.handleToolClasses(url);
     }
 
-    // Inline image bytes for transcript media refs (see serveMedia). Same
-    // sensitivity tier as the transcript itself.
+    // Inline image bytes for transcript media refs (see serveMedia). A
+    // message's own image, at a top-level block path (`<n>`), is the same
+    // sensitivity tier as the transcript itself. Any other path, such as a
+    // nested one (`<n>.<m>`), which buildMediaBlock resolves only inside a
+    // tool's result, is the tool result's tier.
     if (url.pathname.startsWith('/media/')) {
       if (!httpAllowed('messages')) return this.unauthorized();
+      const blockPath = url.pathname.slice('/media/'.length).split('/').slice(1).join('/');
+      if (!/^\d+$/.test(blockPath) && !httpAllowed('tools')) return this.unauthorized();
       return this.serveMedia(url);
     }
 
@@ -1199,10 +1344,13 @@ export class WebUiModule implements Module {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
       try {
-        return Response.json(buildHealthSnapshot(app));
+        const snapshot = buildHealthSnapshot(app);
+        return Response.json(keptStrings ? keepNamedStrings(snapshot, keptStrings) : snapshot);
       } catch (err) {
         const status = err instanceof PanelError ? err.status : 500;
-        return Response.json({ error: err instanceof Error ? err.message : String(err) }, { status });
+        // A read that failed whole is still a failed read without its text.
+        const failed = { error: err instanceof Error ? err.message : String(err) };
+        return Response.json(keptStrings ? keepNamedStrings(failed, keptStrings) : failed, { status });
       }
     }
 
@@ -1210,20 +1358,24 @@ export class WebUiModule implements Module {
     if (url.pathname === '/quota') {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      return Response.json(await buildQuotaSnapshot(app));
+      const quota = await buildQuotaSnapshot(app);
+      return Response.json(keptStrings ? keepNamedStrings(quota, keptStrings) : quota);
     }
 
     // Credential state (health-scoped, like /healthz); no token ever rides here.
     if (url.pathname === '/credential') {
       const app = this.panelApp();
       if (!app) return Response.json({ error: 'app not bound yet' }, { status: 503 });
-      return Response.json(buildCredentialSnapshot(app));
+      const credential = buildCredentialSnapshot(app);
+      return Response.json(keptStrings ? keepNamedStrings(credential, keptStrings) : credential);
     }
 
     // Workspace file passthrough: /files/<mount>/<path...>
-    // Resolves through WorkspaceModule.resolveAbsolutePath, which enforces
-    // mount-relative containment and the mount's read-permission. We never
-    // serve a path the agent framework's mount layer wouldn't itself serve.
+    // Reads through WorkspaceModule.readFileFromDisk, which refuses a file
+    // that is itself a link unless the mount follows links (and, from
+    // agent-framework's release with anima-research/agent-framework#468, a
+    // link among its directories too), and reads a file only if its
+    // canonical path lies inside the mount.
     if (url.pathname.startsWith('/files/')) {
       return this.serveWorkspaceFile(url.pathname.slice('/files/'.length));
     }
@@ -1264,13 +1416,16 @@ export class WebUiModule implements Module {
       | FleetModule | undefined;
   }
 
-  /** Forward one panel op to a fleet child and answer with its JSON. Status
-   *  mapping comes from the child (PanelError.status travels the wire), with
-   *  502/504 supplied by requestPanel for unreachable/unresponsive children. */
+  /** Forward one panel op to a fleet child and answer with its JSON, keeping
+   *  only the strings `keptStrings` names when it's given (keepNamedStrings).
+   *  Status mapping comes from the child (PanelError.status travels the
+   *  wire), with 502/504 supplied by requestPanel for a child it can't reach
+   *  or whose answer didn't come in time. */
   private async proxyPanelToChild(
     childName: string,
     op: string,
     params: Record<string, unknown>,
+    keptStrings?: KeptStrings,
     /** Serialize the child's payload through this (e.g. `media=0` stripping). */
     replacer?: (key: string, value: unknown) => unknown,
   ): Promise<Response> {
@@ -1283,12 +1438,14 @@ export class WebUiModule implements Module {
     }
     const result = await fleet.requestPanel(childName, op, params);
     if (!result.ok) {
-      return Response.json({ error: result.error ?? 'panel request failed' }, { status: result.status ?? 502 });
+      const failed = { error: result.error ?? 'panel request failed' };
+      return Response.json(keptStrings ? keepNamedStrings(failed, keptStrings) : failed, { status: result.status ?? 502 });
     }
+    const data = keptStrings ? keepNamedStrings(result.data, keptStrings) : result.data;
     if (replacer) {
-      return new Response(JSON.stringify(result.data, replacer), { headers: { 'content-type': 'application/json' } });
+      return new Response(JSON.stringify(data, replacer), { headers: { 'content-type': 'application/json' } });
     }
-    return Response.json(result.data);
+    return Response.json(data);
   }
 
   /**
@@ -1354,8 +1511,8 @@ export class WebUiModule implements Module {
    * hand to the model if the agent were activated right now. Auth is already
    * enforced by the caller (`handleHttp`).
    *
-   * Transparent by default: no inference, no Chronicle writes, no external
-   * MCPL calls. Pass `?injections=1` to gather the dynamic injections
+   * Transparent by default: no inference of its own, no Chronicle writes, no
+   * external MCPL calls. Pass `?injections=1` to gather the dynamic injections
    * (lessons/retrieval/MCPL context) for full fidelity, which is NOT
    * transparent: it can run inference and fire MCPL `beforeInference` hooks.
    */
@@ -1381,9 +1538,10 @@ export class WebUiModule implements Module {
   /**
    * Context curve (GET /debug/context/curve[?agent=<name>]): per-entry
    * provenance of the live compiled window, with a feasibility verdict. The
-   * compile is a dry run, so it commits no fold resolutions; its remaining
-   * effects with context-manager 0.13 are listed on buildContextCurve. No
-   * inference, no message writes.
+   * compile is a dry run, so it commits no fold resolutions; the one effect
+   * it keeps, releasing a compression hold whose deadline has passed, is
+   * described on buildContextCurve. No inference of its own, no message
+   * writes.
    */
   private async handleContextCurve(url: URL): Promise<Response> {
     const app = this.panelApp();
@@ -1430,9 +1588,9 @@ export class WebUiModule implements Module {
   }
 
   /**
-   * Context makeup: the segment breakdown of the agent's current compiled
-   * context, plus an exact total via count_tokens. Transparent:
-   * previewActivation + count_tokens only; no inference, no Chronicle writes.
+   * Context makeup: the segment breakdown of the agent's last live compile,
+   * beside an exact count of the next request as a preview builds it, via
+   * count_tokens (buildContextMakeup, which says what the preview does).
    *
    *   GET /debug/context/makeup[?agent=<name>]
    */
@@ -1459,18 +1617,39 @@ export class WebUiModule implements Module {
     const inMountPath = decoded.slice(slash + 1);
     const mountPrefixed = `${mount}/${inMountPath}`;
 
-    const ws = sharedServer.app.framework.getModule('workspace');
-    if (!ws || !('resolveAbsolutePath' in ws)) {
-      return new Response('Workspace not mounted', { status: 503 });
-    }
-    const abs = (ws as { resolveAbsolutePath: (p: string) => string | null }).resolveAbsolutePath(mountPrefixed);
-    if (!abs) return new Response('Forbidden', { status: 403 });
-
+    const ws = sharedServer.app.framework.getModule('workspace') as WorkspaceModule | undefined;
+    if (!ws) return new Response('Workspace not mounted', { status: 503 });
     try {
-      const data = await readFile(abs);
-      return new Response(data, { headers: { 'content-type': mimeFor(abs) } });
-    } catch {
-      return new Response('Not found', { status: 404 });
+      const { bytes, realPath } = await ws.readFileFromDisk(mountPrefixed);
+      // The read's bytes sit on an ordinary ArrayBuffer, never shared memory,
+      // so they're a BodyInit as they are: the assertion tells the types so,
+      // without copying the file. The type comes from the file the read
+      // opened, so a path spelt with a trailing slash keeps its extension's.
+      return new Response(bytes as Uint8Array<ArrayBuffer>, { headers: { 'content-type': mimeFor(realPath) } });
+    } catch (err) {
+      // A path no mount holds or one leading out of its mount, one in another
+      // mount's directory nested in it or reached through a link into one
+      // (`other_mount`, from anima-research/agent-framework#460 and, for a
+      // link, the release with anima-research/agent-framework#468), a file
+      // that is itself a link the mount doesn't follow or one reached through
+      // such a link among its directories (`parent_symlink`, from that
+      // release), and one whose canonical path lies outside the mount are
+      // forbidden. A mount the read refuses as unavailable
+      // (`mount_unavailable`) is the server's fault, as no workspace is, and
+      // says nothing about the file. Anything else the read can't give is not
+      // found, such as a file that changed while it was read. A mount whose
+      // directory has gone is not found on agent-framework 0.22.3, whose read
+      // finds no file in it, and unavailable from the release with
+      // anima-research/agent-framework#533, whose read checks the mount's
+      // root. The body is the read's message, which says why, names no host
+      // path, and for a nested mount names the path to use there; the status
+      // says forbidden, unavailable or not found.
+      const read = err instanceof WorkspaceReadError ? err : null;
+      if (read && ['unknown_mount', 'traversal', 'other_mount', 'symlink', 'parent_symlink', 'escape'].includes(read.code)) {
+        return new Response(read.message, { status: 403 });
+      }
+      if (read?.code === 'mount_unavailable') return new Response(read.message, { status: 503 });
+      return new Response(read?.message ?? 'Not found', { status: 404 });
     }
   }
 
@@ -1510,7 +1689,7 @@ export class WebUiModule implements Module {
         return new Response(data, { headers: { 'content-type': 'text/html', 'cache-control': cacheControlFor(indexPath) } });
       } catch {
         return new Response(
-          `WebUI bundle not found at ${sharedServer!.staticRoot}. Run \`npm run build:web\` (or postinstall) to produce it.`,
+          `WebUI bundle not found at ${sharedServer!.staticRoot}. ${BUNDLE_REMEDY}`,
           { status: 503, headers: { 'content-type': 'text/plain' } },
         );
       }
@@ -1557,10 +1736,11 @@ export class WebUiModule implements Module {
     client.auth = 'observer';
     client.scopes = result.scopes;
     client.label = result.grant.label;
+    client.observerKey = result.grant.key;
     this.send(client, {
       type: 'observer-ack',
       scopes: [...result.scopes],
-      sessionToken: sharedServer!.observerSessions.mint(result.scopes),
+      sessionToken: sharedServer!.observerSessions.mint(result.scopes, { key: result.grant.key }),
       label: result.grant.label,
     });
     console.error(`[webui-observers] observer connected: ${result.grant.label} scopes=[${[...result.scopes].join(',')}]`);
@@ -1634,7 +1814,7 @@ export class WebUiModule implements Module {
   private broadcastHostMode(): void {
     const hostMode = this.hostModeSnapshot();
     if (!hostMode) return;
-    this.broadcastToWelcomed({ type: 'host-mode', hostMode });
+    this.broadcast({ type: 'host-mode', hostMode });
   }
 
   /**
@@ -1691,7 +1871,7 @@ export class WebUiModule implements Module {
         messagesRemoved: r.messagesRemoved, lastVisible: r.lastVisible ?? null,
       });
       // Same follow-through as a /checkout: config mount, branch chip,
-      // fresh tail for every welcomed client.
+      // fresh tail for every welcomed client, as its scopes allow.
       await this.materializeConfigMount();
       this.broadcastBranchChanged();
       this.refreshAllWelcomes();
@@ -1784,7 +1964,10 @@ export class WebUiModule implements Module {
    * `/media/<messageId>/<blockPath>` — one inline image, streamed as bytes.
    * Transcript frames carry only a `ref`; the browser fetches on render, so
    * multi-MB base64 never rides the WebSocket and never inflates a welcome.
-   * Observer sessions need the `messages` scope (same tier as the transcript).
+   * Observer sessions need the `messages` scope (same tier as the transcript)
+   * for a message's own image, at a top-level block path, and `tools` as well
+   * for any other path, such as a tool result's image; the route checks both
+   * before a fleet child's request is sent on.
    */
   private async serveMedia(url: URL): Promise<Response> {
     const rest = url.pathname.slice('/media/'.length);
@@ -1906,21 +2089,16 @@ export class WebUiModule implements Module {
       case 'interrupt': {
         if (!sharedServer?.app) return;
         const fw = sharedServer.app.framework;
-        // Cancel any in-process subagents so their results propagate.
         const subMod = fw.getAllModules().find((m) => m.name === 'subagent') as
-          | { cancelAll(): number }
+          | { cancelAll(): number; isSubagentAgent(frameworkAgentName: string): boolean }
           | undefined;
-        const cancelled = subMod?.cancelAll() ?? 0;
-        for (const agent of fw.getAllAgents()) {
-          try { agent.cancelStream(); } catch { /* idempotent */ }
-        }
-        this.send(client, {
-          type: 'command-result',
-          lines: [{
-            text: cancelled > 0 ? `interrupted — ${cancelled} subagent(s) stopped` : 'interrupted',
-            style: 'system',
-          }],
-        });
+        const reply = interruptPage(
+          fw.getAllAgents().map((a) => a.name),
+          (name) => subMod?.isSubagentAgent(name) ?? false,
+          sharedServer.interrupts,
+          () => subMod?.cancelAll() ?? 0,
+        );
+        this.send(client, { type: 'command-result', lines: [{ text: reply, style: 'system' }] });
         return;
       }
 
@@ -2203,13 +2381,13 @@ export class WebUiModule implements Module {
       case 'request-credential': {
         if (isChildScope(parsed.scope)) {
           void this.requestChildPanel(client, parsed.scope!, 'credential', {}).then((data) => {
-            if (data !== null) this.send(client, { type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+            if (data !== null) this.sendScoped(client, { type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
           });
           return;
         }
         const app = this.panelApp();
         if (!app) return;
-        this.send(client, { type: 'credential-state', scope: 'local', ...buildCredentialSnapshot(app) } as WebUiServerMessage);
+        this.sendScoped(client, { type: 'credential-state', scope: 'local', ...buildCredentialSnapshot(app) } as WebUiServerMessage);
         return;
       }
 
@@ -2219,14 +2397,14 @@ export class WebUiModule implements Module {
         const params = { action: parsed.action, ...(parsed.token !== undefined ? { token: parsed.token } : {}) };
         if (isChildScope(parsed.scope)) {
           void this.requestChildPanel(client, parsed.scope!, 'credential-action', params).then((data) => {
-            if (data !== null) this.broadcastCredentialState({ type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
+            if (data !== null) this.broadcast({ type: 'credential-state', scope: parsed.scope, ...(data as object) } as WebUiServerMessage);
           });
           return;
         }
         const app = this.panelApp();
         if (!app) return;
         void applyCredentialAction(app, params)
-          .then((data) => this.broadcastCredentialState({ type: 'credential-state', scope: 'local', ...data } as WebUiServerMessage))
+          .then((data) => this.broadcast({ type: 'credential-state', scope: 'local', ...data } as WebUiServerMessage))
           .catch((err) => this.send(client, {
             type: 'error',
             message: `credential-action failed: ${err instanceof Error ? err.message : String(err)}`,
@@ -2373,12 +2551,12 @@ export class WebUiModule implements Module {
    *  keeps the SPA decoupled from module implementation details. */
 
   private async workspaceMod(): Promise<
-    | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+    | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; structured?: unknown; error?: string }> }
     | undefined
   > {
     if (!sharedServer?.app) return undefined;
     return sharedServer.app.framework.getAllModules().find((m) => m.name === 'workspace') as
-      | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; error?: string }> }
+      | { handleToolCall(call: { name: string; input: unknown; id?: string }): Promise<{ success: boolean; data?: unknown; structured?: unknown; error?: string }> }
       | undefined;
   }
 
@@ -2453,13 +2631,7 @@ export class WebUiModule implements Module {
         this.send(client, { type: 'error', message: `read ${path} failed: ${result.error ?? 'unknown'}` });
         return;
       }
-      const data = (result.data ?? {}) as {
-        path?: string;
-        totalLines?: number;
-        fromLine?: number;
-        toLine?: number;
-        content?: string;
-      };
+      const data = workspaceReadFields(result);
       const totalLines = data.totalLines ?? 0;
       const reportedToLine = data.toLine ?? totalLines;
       let content = data.content ?? '';
@@ -2583,7 +2755,7 @@ export class WebUiModule implements Module {
         const text = message.content
           .filter((block): block is { type: 'text'; text: string } => block.type === 'text')
           .map((block) => block.text)
-          .join('\\n')
+          .join('\n')
           .trim();
         return {
           id: message.id,
@@ -2649,9 +2821,10 @@ export class WebUiModule implements Module {
     return out;
   }
 
-  /** Defer SIGTERM so the WS frame flushes, then trigger the existing
-   *  graceful-shutdown handler. process.exit fallback covers the case where
-   *  no SIGTERM listener is registered (e.g. TUI mode). */
+  /** Defer SIGTERM so the WS frame flushes. The signal runs the host's own
+   *  stop: headless mode's graceful shutdown, or in TUI mode the TUI's quit,
+   *  since OpenTUI ends the TUI on it. Readline and batch mode register no
+   *  SIGTERM listener. The exit covers a kill that throws. */
   private scheduleShutdown(): void {
     setTimeout(() => {
       try { process.kill(process.pid, 'SIGTERM'); }
@@ -2723,7 +2896,8 @@ export class WebUiModule implements Module {
    * forward each event as a `peek` message scoped to the subagent name.
    *
    * For fleet children we don't need a separate subscription — child events
-   * already flow to all welcomed clients via handleFleetEvent. Returning
+   * already flow to every welcomed client whose scopes allow them, via
+   * handleFleetEvent; an observer may not subscribe to a peek. Returning
    * "fleet child" here is enough to confirm the panel can rely on the
    * existing stream.
    */
@@ -3042,10 +3216,10 @@ export class WebUiModule implements Module {
   }
 
   /** Run pin-add / pin-remove in a fleet child; the op returns the fresh
-   *  pins snapshot, which BROADCASTS (pins alter the next compile's fold
-   *  plan — two operators must not hold divergent views, same rule as the
-   *  local path). A `warning` in the data (stale pin-remove) goes back to
-   *  the requester only. */
+   *  pins snapshot, which BROADCASTS to full clients (pins alter the next
+   *  compile's fold plan — two operators must not hold divergent views, same
+   *  rule as the local path; no observer may request pins). A `warning` in
+   *  the data (stale pin-remove) goes back to the requester only. */
   private async applyScopedPinMutation(
     client: ClientState,
     scope: string,
@@ -3058,7 +3232,7 @@ export class WebUiModule implements Module {
     if (typeof warning === 'string') {
       this.send(client, { type: 'error', message: warning });
     }
-    this.broadcastToWelcomed({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
+    this.broadcast({ type: 'pins-list', scope, ...(data as object) } as WebUiServerMessage);
   }
 
   private broadcastPinsList(agentName: string): void {
@@ -3066,7 +3240,7 @@ export class WebUiModule implements Module {
     if (!app) return;
     try {
       const snap = buildPinsSnapshot(app, agentName);
-      this.broadcastToWelcomed({ type: 'pins-list', scope: 'local', ...snap });
+      this.broadcast({ type: 'pins-list', scope: 'local', ...snap });
     } catch { /* pins unsupported — nothing to broadcast */ }
   }
 
@@ -3090,7 +3264,7 @@ export class WebUiModule implements Module {
 
   /** Run a settings mutation in a fleet child. The op applies the change AND
    *  returns the fresh state in one round trip; like the local path, the
-   *  result broadcasts to every welcomed client. */
+   *  result broadcasts to every full client. */
   private async applyScopedSettingsMutation(
     client: ClientState,
     scope: string,
@@ -3099,32 +3273,17 @@ export class WebUiModule implements Module {
   ): Promise<void> {
     const data = await this.requestChildPanel(client, scope, op, params);
     if (data === null) return;
-    this.broadcastToWelcomed({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
+    this.broadcast({ type: 'settings-state', scope, ...(data as object) } as WebUiServerMessage);
   }
 
-  /** Fan out to every welcomed client — settings are live process state. */
+  /** Fan out to every full client — settings are live process state, and no
+   *  observer may request them. */
   private broadcastSettingsState(agentName: string): void {
     const app = this.panelApp();
     if (!app) return;
     const msg = buildSettingsState(app, agentName);
     if (!msg) return;
-    this.broadcastToWelcomed({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
-  }
-
-  /** Credential state goes to operators and to observers holding the
-   *  'health' scope — the same gate as /healthz and the usage frame. */
-  private broadcastCredentialState(msg: WebUiServerMessage): void {
-    if (!sharedServer) return;
-    for (const c of sharedServer.clients.values()) {
-      if (c.welcomed && (c.scopes === null || c.scopes.has('health'))) this.send(c, msg);
-    }
-  }
-
-  private broadcastToWelcomed(msg: WebUiServerMessage): void {
-    if (!sharedServer) return;
-    for (const c of sharedServer.clients.values()) {
-      if (c.welcomed) this.send(c, msg);
-    }
+    this.broadcast({ type: 'settings-state', scope: 'local', ...msg } as WebUiServerMessage);
   }
 
   /**
@@ -3146,9 +3305,10 @@ export class WebUiModule implements Module {
     }
     const result = await fleet.requestPanel(childName, op, params);
     if (!result.ok) {
+      // What the child's failure said is ops's, as broadcast and sendScoped send it.
       this.send(client, {
         type: 'error',
-        message: `${op} on '${childName}' failed: ${result.error ?? 'unknown error'}`,
+        message: `${op} on '${childName}' failed` + (clientHolds(client, ['ops']) ? `: ${result.error ?? 'unknown error'}` : ''),
       });
       return null;
     }
@@ -3160,13 +3320,10 @@ export class WebUiModule implements Module {
     const cm = sharedServer?.app.framework.getAllAgents()[0]?.getContextManager();
     if (!cm) return;
     const branch = cm.currentBranch();
-    const msg: WebUiServerMessage = {
+    this.broadcast({
       type: 'branch-changed',
       branch: { id: branch.id, name: branch.name },
-    };
-    for (const c of sharedServer!.clients.values()) {
-      if (c.welcomed) this.send(c, msg);
-    }
+    });
   }
 
   private refreshAllWelcomes(): void {
@@ -3186,27 +3343,50 @@ export class WebUiModule implements Module {
     // pending connections get their welcome from handleObserverHello.
     if (client.auth === 'pending') return;
 
-    // The one await comes first. From building the welcome to marking the
-    // client welcomed nothing yields, so no event falls between what the
-    // welcome copies and the client's stream (a client skips live events
-    // until it's welcomed). That covers the fleet children's trees, which the
-    // welcome copies. It names the parent's agents without their trace state
-    // (see buildWelcome), so the client's parent nodes start from the live
-    // stream, and a parent trace before the welcome, during this await
-    // included, reaches the client in neither.
+    // The awaits come first: the bind's wait for its autoStart launches to
+    // record their children (setApp), then the recipes. From building the
+    // welcome to marking the client welcomed nothing yields, so no event falls
+    // between what the welcome copies and the client's stream (a client skips
+    // live events until it's welcomed). That covers the fleet children's
+    // trees, which the welcome copies. It names the parent's agents without
+    // their trace state (see buildWelcome), so the client's parent nodes start
+    // from the live stream, and a parent trace before the welcome, during
+    // these awaits included, reaches the client in neither. A welcome that a
+    // newer bind superseded during them sends nothing, since that bind
+    // welcomes every client again after its own wait.
+    const generation = sharedServer.bindGeneration;
+    const current = (): boolean => !!sharedServer?.app && sharedServer.bindGeneration === generation;
+    const autoStartRecords = sharedServer.autoStartRecords;
+    if (autoStartRecords) await autoStartRecords;
+    if (!current()) return;
     const childRecipes = await this.loadWelcomeRecipes();
-    if (!sharedServer?.app) return;
+    if (!current()) return;
     const welcome = this.buildWelcome(childRecipes);
-    this.send(client, client.scopes === null ? welcome : scopeWelcome(welcome, client.scopes));
+    this.send(client, client.scopes === null ? welcome : this.observerWelcome(welcome, client.scopes));
     client.welcomed = true;
     // Live trace forwarding is driven by the single fan-out listener
     // installed in setApp(); membership is implicit in `sharedServer!.clients`.
   }
 
+  /** The welcome as an observer with `scopes` gets it (scopeWelcome). When
+   *  its scopes empty every message of the tail, it reads back as a history
+   *  page does (readHistory), so it opens on the last messages it may see
+   *  within those windows, and its `startIndex` is where the reading stopped.
+   *  It reads in the same turn the welcome was built in, so no message lands
+   *  between them. */
+  private observerWelcome(welcome: WelcomeMessage, scopes: Set<ObserverScope>): WelcomeMessage {
+    const scoped = scopeWelcome(welcome, scopes);
+    if (scoped.messages.length > 0 || !scopes.has('messages')) return scoped;
+    const cmw = sharedServer?.app?.framework.getAllAgents()[0]?.getContextManager() as unknown as WindowCapableCm | undefined;
+    if (typeof cmw?.getMessageWindow !== 'function') return scoped;
+    const { entries, startIndex } = readHistory(cmw, scoped.history.startIndex, WELCOME_HISTORY_LIMIT, scopes);
+    return { ...scoped, messages: entries, history: { ...scoped.history, startIndex } };
+  }
+
   /**
-   * Serve a page of older history ending just before `beforeIndex`. Windowed
-   * read with bodyGroup alignment; the reply carries the same corrId so the
-   * SPA can match it to its in-flight scroll request.
+   * Serve a page of older history ending just before `beforeIndex`
+   * (readHistory); the reply carries the same corrId so the SPA can match it
+   * to its in-flight scroll request.
    */
   private handleRequestHistory(client: ClientState, req: RequestHistoryMessage): void {
     const cm = sharedServer?.app?.framework.getAllAgents()[0]?.getContextManager();
@@ -3224,24 +3404,7 @@ export class WebUiModule implements Module {
     }
     const limit = Math.min(req.limit ?? HISTORY_PAGE_DEFAULT, HISTORY_PAGE_MAX);
     const beforeIndex = Math.min(req.beforeIndex, cmw.getMessageCount());
-    const offset = Math.max(0, beforeIndex - limit);
-    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
-      resolveBlobs: false,
-      alignToBodyGroups: true,
-    });
-    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
-    if (client.scopes !== null) {
-      entries = entries
-        .map((e) => filterEntryForScopes(e, client.scopes!))
-        .filter((e): e is WelcomeMessageEntry => e !== null);
-    }
-    this.send(client, {
-      type: 'history-page',
-      corrId: req.corrId,
-      entries,
-      startIndex: win.startIndex,
-      totalCount: win.totalCount,
-    });
+    this.send(client, { type: 'history-page', corrId: req.corrId, ...readHistory(cmw, beforeIndex, limit, client.scopes) });
   }
 
   /** Each fleet child's recipe, for its tree in the welcome. sendWelcome
@@ -3319,7 +3482,12 @@ export class WebUiModule implements Module {
     // either way the live event stream keeps it current.
     const childTrees: WelcomeMessage['childTrees'] = [];
     if (sharedServer?.treeAggregator) {
+      const fleetMod = fw.getAllModules().find((m) => m.name === 'fleet') as FleetModule | undefined;
       for (const name of sharedServer.treeAggregator.getAllChildNames()) {
+        // setApp registers the autoStart children the fleet is launching. One
+        // whose launch has ended without a record, as a refused one does, is
+        // no child of this fleet, so it isn't listed.
+        if (fleetMod && !fleetMod.getChildren().has(name) && !fleetMod.autoStartLaunching().has(name)) continue;
         const nodes = sharedServer.treeAggregator.getChildNodes(name);
         // A child that registered while the recipes loaded is sent without
         // its recipe, like one that registers after the welcome: a client
@@ -3472,6 +3640,13 @@ export class WebUiModule implements Module {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** `promise`, or the end of `ms`, whichever comes first; the timer doesn't outlive it. */
+function within(promise: Promise<void>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([promise, new Promise<void>((done) => { timer = setTimeout(done, ms); })])
+    .finally(() => clearTimeout(timer));
+}
 
 /**
  * Default Origin allowlist for the WebSocket upgrade. Covers the recommended
@@ -3630,7 +3805,7 @@ function toWireEntry(
                 : null;
               if (!mt || !mt.startsWith('image/')) continue;
               const ref = mediaRef(`${bi}.${ii}`, mt);
-              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}) });
+              blocks.push({ kind: 'media', mediaType: mt, ...(ref ? { ref } : {}), toolUseId: b.toolUseId });
             }
           }
         }
@@ -3735,6 +3910,44 @@ function coalesceAndFlatten(messages: readonly MessageLike[], startIndex: number
     out.push(toWireEntry(merged, startIndex + runStart, { mediaRefs: false }));
   }
   return out;
+}
+
+/**
+ * A page of history ending just before `beforeIndex`: one window of about
+ * `limit` slots, widened to whole bodies (alignToBodyGroups), for a full
+ * client (`scopes` null). An observer's page leaves out the entries its
+ * scopes empty, so a window of messages it may see nothing of comes back
+ * empty, and the page takes an empty page for the start of history. So for
+ * an observer it reads the window before, and the one before that, until a
+ * window leaves it an entry or history starts, for at most
+ * HISTORY_READ_BACK_WINDOWS windows. Past that the page is empty, and its
+ * startIndex is where the reading stopped: the page still shows that older
+ * messages remain, a bulk load stops there, and the page's next request,
+ * such as a click on that row, reads on from there.
+ */
+function readHistory(
+  cmw: WindowCapableCm,
+  beforeIndex: number,
+  limit: number,
+  scopes: Set<ObserverScope> | null,
+): { entries: WelcomeMessageEntry[]; startIndex: number; totalCount: number } {
+  for (let windows = 1; ; windows++) {
+    const offset = Math.max(0, beforeIndex - limit);
+    const win = cmw.getMessageWindow(offset, beforeIndex - offset, {
+      resolveBlobs: false,
+      alignToBodyGroups: true,
+    });
+    let entries = coalesceAndFlatten(win.messages as unknown as MessageLike[], win.startIndex);
+    if (scopes !== null) {
+      entries = entries
+        .map((e) => filterEntryForScopes(e, scopes))
+        .filter((e): e is WelcomeMessageEntry => e !== null);
+    }
+    if (entries.length > 0 || win.startIndex === 0 || windows === HISTORY_READ_BACK_WINDOWS) {
+      return { entries, startIndex: win.startIndex, totalCount: win.totalCount };
+    }
+    beforeIndex = win.startIndex;
+  }
 }
 
 /** The framework stores assistant turns under the agent's name (e.g.
@@ -3875,27 +4088,33 @@ function mimeFor(path: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// The server's end, and a test helper
 // ---------------------------------------------------------------------------
 //
-// The HTTP server lives at module scope (process-level singleton). Tests need
-// to read the actual bound port when they pass `port: 0`, and they need to
-// shut the server down between files even though normal lifecycle keeps it
-// running across session switches. These helpers exist solely for tests; they
-// are not part of the public module API.
+// The HTTP server lives at module scope (process-level singleton), and normal
+// lifecycle keeps it running across session switches. stopWebUiServer ends
+// it: the host calls it once its TUI has ended, a session switch may call it
+// once the TUI's stop has begun (switchSessionSteps), and tests call it
+// between files. Tests also need to read the actual bound port when they pass
+// `port: 0`; that helper exists solely for tests and is not part of the
+// public module API.
 
 /** Return the bound listener port, or null if the singleton hasn't started. */
 export function __getSharedServerPortForTests(): number | null {
   return sharedServer?.port ?? null;
 }
 
-/** Forcibly tear down the shared HTTP server and clear the singleton, so a
- *  subsequent `start()` boots a fresh one. Tests only. */
-export async function __resetSharedServerForTests(): Promise<void> {
+/** Tear down the shared HTTP server and clear the singleton, so the process
+ *  can end and a later `start()` boots a fresh one. */
+export async function stopWebUiServer(): Promise<void> {
   if (!sharedServer) return;
   try { sharedServer.server.stop(true); } catch { /* ignore */ }
-  // Detach any fleet listener / aggregator so the next start runs clean.
+  // The grants file's checks, and the sweep that runs after each, end too.
+  sharedServer.observers?.stop();
+  // Detach any fleet listener / aggregator, and the framework's trace
+  // subscription, so the next start runs clean.
   sharedServer.fleetEventDetacher?.();
   sharedServer.treeAggregator?.dispose();
+  sharedServer.stopFollowing?.();
   sharedServer = null;
 }

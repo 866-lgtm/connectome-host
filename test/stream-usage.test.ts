@@ -18,7 +18,7 @@ import type { Module, ToolCall } from '@animalabs/agent-framework';
 import { Membrane, NativeFormatter } from '@animalabs/membrane';
 import type { ProviderAdapter, ProviderRequest, ProviderResponse, StreamCallbacks } from '@animalabs/membrane';
 import { AgentTreeReducer } from '../src/state/agent-tree-reducer.js';
-import { emptyUsage, foldUsageSample, type UsageCounts } from '../src/state/stream-usage.js';
+import { emptyUsage, foldUsageSample, type UsageCounts, type UsageSample } from '../src/state/stream-usage.js';
 import { SubagentModule, type SubagentStreamEvent } from '../src/modules/subagent-module.js';
 
 interface CallUsage { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
@@ -136,7 +136,12 @@ async function runStream(name: string, script: CallUsage[] = CALLS, agentConfig:
     await h.framework.runEphemeralToCompletion(agent, contextManager);
     await new Promise<void>((resolve) => setImmediate(resolve));
     const mine = h.traces.filter((e) => e.agentName === name);
-    const tracked = h.framework.getSessionUsage().byAgent.find((a) => a.agentName === name)?.usage;
+    const byAgent = h.framework.getSessionUsage().byAgent;
+    // agent-framework #558 counts every ephemeral agent in one shared entry,
+    // marked ephemeral; before it, each had an entry under its own name. This
+    // harness runs one ephemeral agent, so either entry is its tally.
+    const tracked = (byAgent.find((a) => a.agentName === name)
+      ?? byAgent.find((a) => (a as { ephemeral?: true }).ephemeral === true))?.usage;
     return { calls: h.adapter.calls, events: mine, tracked };
   } finally {
     await h.cleanup();
@@ -152,10 +157,14 @@ describe('usage samples from a real stream', () => {
   test('membrane emits one running total per call, and the completion repeats the last', async () => {
     const run = await runStream('worker');
     expect(run.calls).toBe(3);
-    const usage = run.events.filter((e) => e.type === 'inference:usage').map((e) => e.tokenUsage);
-    expect(usage).toEqual([
-      // No call has read the cache yet, so membrane leaves cacheRead out.
-      { input: 120, output: 30, cacheCreation: 4000, cacheRead: undefined },
+    const usage = run.events.filter((e) => e.type === 'inference:usage').map((e) => e.tokenUsage as UsageSample);
+    // In this stream no call has read the cache by the first sample. There,
+    // membrane 0.5.87, which this repository locks, leaves cacheRead out,
+    // and membrane #104 reports 0, so the first sample takes either until the
+    // membrane floor rises to a release with #104, which pins 0.
+    expect([undefined, 0]).toContain(usage[0]?.cacheRead);
+    expect(usage.map((u, i) => (i === 0 ? { ...u, cacheRead: 0 } : u))).toEqual([
+      { input: 120, output: 30, cacheCreation: 4000, cacheRead: 0 },
       { input: 200, output: 55, cacheCreation: 4150, cacheRead: 4000 },
       { input: 260, output: 95, cacheCreation: 4240, cacheRead: 8150 },
     ]);

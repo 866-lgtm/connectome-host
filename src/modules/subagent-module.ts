@@ -10,9 +10,13 @@
  * results as user messages + inference-request events. Pass `sync: true`
  * to block until completion.
  *
- * Sync tasks are detachable: user can push them to background mid-flight
- * via Ctrl+B in TUI, or they auto-detach after `timeoutMs` if specified.
- * Both spawn and fork accept `timeoutMs` for per-task execution deadlines.
+ * Sync tasks are detachable: the user can push one to the background
+ * mid-flight with Ctrl+B in the TUI, and one still running at its `timeoutMs`
+ * (default maxExecutionMs, 600 s) moves there itself. A run in the background
+ * goes on until it ends and delivers its result as a message. An async
+ * task's `timeoutMs` is a hard limit on its whole run, retries included,
+ * counted from when it holds a concurrency slot; async tasks have none by
+ * default.
  */
 
 import type {
@@ -27,17 +31,26 @@ import type {
   TraceEvent,
   ContextManager,
 } from '@animalabs/agent-framework';
-import type { AgentFramework } from '@animalabs/agent-framework';
+import type { Agent, AgentFramework } from '@animalabs/agent-framework';
 import { KnowledgeStrategy } from '@animalabs/agent-framework';
 import { isToolResultContent, isToolUseContent } from '@animalabs/membrane';
 import type { ContentBlock } from '@animalabs/membrane';
 import { emptyUsage, foldUsageSample, type UsageCounts, type UsageSample } from '../state/stream-usage.js';
+import { traceError } from '../state/turn-trace.js';
+import { shown } from './shown.js';
+import { unknownToolResult } from './unknown-tool.js';
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface SubagentModuleConfig {
+  /** The provider transport the host built (recipe.ts resolveProvider).
+   *  One adapter serves every stream in the process, so this is what every
+   *  subagent runs on too; launch descriptions state it. Optional, so the
+   *  module still builds with no config: absent, descriptions say the host
+   *  didn't state it. */
+  provider?: string;
   /** Maximum fork/spawn depth (default: 3) */
   maxDepth?: number;
   /** Current depth (incremented for child subagent modules) */
@@ -123,6 +136,129 @@ export class SubagentTerminated extends Error {
   }
 }
 
+/**
+ * A subagent's failure that the module accounts for itself, such as its
+ * prompt over the module's limit, a launch whose stream wouldn't read all
+ * that the launch gives it, its run past its own time limit, or no
+ * concurrency slot in time. Running the subagent again as it stands can't
+ * change it, so the retry loop ends on one without reading its words.
+ * (Before, the classifiers read these messages too, so a name or a number
+ * in them could make one count as transient or as a rate limit: a subagent
+ * named "migrate" holds "rate", a 1500 ms limit holds "500".) `why` says
+ * what ended it and `remedy` what to do; failedRun puts them into the
+ * account the agent reads, by whether anything ran.
+ */
+class SubagentFailure extends Error {
+  override readonly name = 'SubagentFailure';
+  constructor(readonly why: string, readonly remedy = '') {
+    super(why);
+  }
+}
+
+/** setTimeout's longest delay; a longer one fires at once. */
+const MAX_TIMER_MS = 2_147_483_647;
+const timerDelay = (ms: number): number => Math.min(MAX_TIMER_MS, Math.max(0, ms));
+/** How early a timer may fire, by Date.now(): Node's timers can fire up to
+ *  1 ms before the time they were set for (Bun 1.4.3's didn't, in a probe
+ *  of 2,000). */
+const TIMER_SLACK_MS = 2;
+
+/** How long a running subagent may show no activity, with no stream, tool
+ *  call or request in flight, before the reaper reclaims its slot and peek
+ *  calls it a zombie. Postmortem 2026-05-28 F3: bumped from 30_000ms — 30s
+ *  was too tight for Opus on 100–165K-token contexts with rate-limited MCP
+ *  tools; single-round TTFT routinely exceeds it. The `requestInFlightSince`
+ *  guard is the primary defence; the threshold bump is belt-and-braces for
+ *  legitimate post-request pauses. */
+const ZOMBIE_THRESHOLD_MS = 120_000;
+
+/** A length of time as the agent reads it: milliseconds below a second,
+ *  seconds from there. */
+function duration(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${Math.round(ms / 100) / 10} s`;
+}
+
+/** What a call refused for its inputs leaves undone, to open its refusal. */
+const NOT_DONE: Record<string, string> = {
+  spawn: 'Nothing was started',
+  fork: 'Nothing was started',
+  hud: "The fleet HUD wasn't changed",
+  concurrency: "The concurrency limit wasn't changed",
+  peek: 'Nothing was shown',
+  return: 'Nothing was returned',
+};
+
+/** What to give for an input a call needs and didn't give, by tool. */
+const GIVE_MISSING: Record<string, Record<string, string>> = {
+  spawn: {
+    name: 'give the subagent a short name',
+    systemPrompt: "give the new subagent's system prompt (a spawn has no default; subagent--fork starts from your own prompt and conversation)",
+    task: "give the subagent's task",
+  },
+  fork: {
+    name: 'give the fork a short name',
+    task: 'give the intention the fork pursues',
+  },
+  hud: {
+    enabled: 'give true to show the fleet status summary before each inference, or false to hide it',
+  },
+};
+
+/** The type a tool's schema declares for an input: the module's schemas use
+ *  text, a number, a boolean, and one list, `tools`, of names. */
+type DeclaredType = 'string' | 'number' | 'boolean' | 'array';
+
+/** Whether `value` is of the type its schema declares. A number JSON can't
+ *  hold (a JSON 1e400 parses as Infinity) isn't one, and the list holds
+ *  names, so text. */
+function isDeclaredType(value: unknown, declared: DeclaredType): boolean {
+  switch (declared) {
+    case 'string': return typeof value === 'string';
+    case 'number': return typeof value === 'number' && Number.isFinite(value);
+    case 'boolean': return typeof value === 'boolean';
+    case 'array': return Array.isArray(value) && value.every((item) => typeof item === 'string');
+  }
+}
+
+/** What an input of a declared type must be, as a refusal says it. */
+const TYPE_WORDS: Record<DeclaredType, string> = {
+  string: 'text',
+  number: 'a number',
+  boolean: 'true or false',
+  array: 'a list of names',
+};
+
+/** A call's inputs: an object, with any input given as null left out, so
+ *  that wherever the module reads an input, null reads as not given. No
+ *  input at all, or null for the whole input, gives {}. For a whole input
+ *  that isn't an object, such as "go", it returns null: that names no
+ *  input, so the call is refused rather than read as giving none. */
+function inputsOf(input: unknown): Record<string, unknown> | null {
+  if (input === undefined || input === null) return {};
+  if (typeof input !== 'object' || Array.isArray(input)) return null;
+  return Object.fromEntries(Object.entries(input).filter(([, value]) => value !== null));
+}
+
+/** The label a stopped run's result opens with. */
+function stopLabel(reason: SubagentTerminated['reason']): string {
+  switch (reason) {
+    case 'cancelled': return 'Stopped by user';
+    case 'zombie': return `Stopped: it showed no activity for over ${duration(ZOMBIE_THRESHOLD_MS)}, so the host reclaimed its slot`;
+    default: return 'Stopped';
+  }
+}
+
+/** The number every agent name the module makes ends in: the time in ms, or
+ *  one past the last name's number once that has caught up with the time.
+ *  agent-framework refuses to create an agent under a name it has seen in
+ *  the framework's life, and a retry, or a new run under a name an earlier
+ *  run used, can start in the same millisecond as an earlier attempt. */
+let lastNameStamp = 0;
+function nameStamp(): number {
+  lastNameStamp = Math.max(Date.now(), lastNameStamp + 1);
+  return lastNameStamp;
+}
+
 /** Persisted subagent state (stored in Chronicle module state).
  *  'cancelled' = terminal-but-benign (user cancel, zombie reclaim, supersession).
  *  Postmortem 2026-05-28 P1 #4: separated from 'failed' so the TUI subagent
@@ -199,7 +335,10 @@ export type SubagentStreamEvent =
   | { type: 'tool:completed'; tool: string; durationMs: number }
   | { type: 'tool:failed'; tool: string; error: string }
   | { type: 'inference:completed' }
+  | { type: 'inference:turn_ended' }
+  | { type: 'inference:aborted'; reason?: string }
   | { type: 'inference:failed'; error: string }
+  | { type: 'inference:exhausted'; error: string }
   | { type: 'stream_resumed' }
   | { type: 'done'; summary: string; lastInputTokens?: number };
 
@@ -227,8 +366,9 @@ export interface SubagentPeekSnapshot {
 // ---------------------------------------------------------------------------
 
 /**
- * Build the tool_result text the fork stream sees in place of the generic
- * "Subagent X forked. Running in background." that the parent stream sees.
+ * Build the tool_result text the fork stream sees in place of the launch
+ * receipt the parent stream sees (launchReceipt: accepted as a fork,
+ * starting or waiting for a slot, then the launch description).
  *
  * The wording frames the fork as a parallel continuation of the same self
  * rather than a separate agent — both streams inherit everything, the fork
@@ -243,6 +383,26 @@ export function buildIntentionFramedForkResult(
   task: string,
   depth: number,
   maxDepth: number,
+  /** What this stream runs on (describeSubagentLaunch + the tool surface),
+   *  stated before its first inference. */
+  orientation?: string,
+): string {
+  return `${intentionFramedHead(depth, maxDepth, orientation)}\n\nYour intention for this stream: ${task}`;
+}
+
+/**
+ * Everything in a fork's intention-framed result before the restated
+ * intention: the dual-stream framing, the depth, the orientation and the
+ * return instruction. A stream's message cap keeps a message's beginning,
+ * so this part leads the result, and it must reach the stream whole: a cut
+ * anywhere in it refuses the launch. Only the restated intention can be cut
+ * without that, since the fork's own call (a tool call, which the cap
+ * passes whole) carries all of it.
+ */
+export function intentionFramedHead(
+  depth: number,
+  maxDepth: number,
+  orientation?: string,
 ): string {
   const depthLine = depth < maxDepth
     ? `You are at depth ${depth} of ${maxDepth} (${maxDepth - depth} sub-fork levels remaining).`
@@ -251,10 +411,707 @@ export function buildIntentionFramedForkResult(
     `Two parallel streams of you continue from this point, both inheriting everything you've done so far. ` +
     `An instance of you still runs as the parent stream, carrying on the broader agenda; ` +
     `the self reading this is the fork — set aside that broader agenda and focus exclusively on the intention ` +
-    `you set for this stream: ${task}\n\n` +
+    `you set for this stream in your subagent--fork call, restated at the end of this result.\n\n` +
     `${depthLine}\n\n` +
+    (orientation ? `${orientation}\n\n` : '') +
     `When this intention is complete, return your findings via subagent--return so the parent stream can integrate them.`
   );
+}
+
+// ---------------------------------------------------------------------------
+// Launch descriptions
+// ---------------------------------------------------------------------------
+
+/** Every subagent stream runs a fresh knowledge strategy with these windows,
+ *  under this stream budget. They are launch inputs like any other: the
+ *  caller's receipt and the stream's own first context both state them. */
+const SUBAGENT_STRATEGY = {
+  name: 'knowledge',
+  headWindowTokens: 2_000,
+  recentWindowTokens: 80_000,
+  maxMessageTokens: 10_000,
+} as const;
+const SUBAGENT_STREAM_TOKENS = 500_000;
+
+/**
+ * What a launch must deliver to its stream, in the shape it composed it.
+ * Each message in a stream's context is capped alone (SUBAGENT_STRATEGY's
+ * maxMessageTokens): the cap counts its text and string tool results and
+ * keeps its beginning; past the budget it cuts or drops text, and cuts a
+ * string tool result or replaces it with an omission notice, while tool
+ * calls and structured results pass whole. So what was stored can still be
+ * missing from what the stream reads. A launch's check compiles the stream's
+ * context the way its first inference will: the launch sets no context
+ * budget, so both use the context manager's default, and both cap and
+ * select the stored messages before any injection is added. What it reads
+ * is the launch's own compile. Between the two, only the stream's own
+ * compression can change what's selected, and it can reach a fork's call
+ * and result only when their result message, with what's added after it
+ * before the first request, is longer than the stream's recent window,
+ * which context-manager 0.14.1 counts newest-first in its store's
+ * estimates, raw until the stream's first call calibrates them
+ * (getUnheldRecentWindowStart). agent-framework 0.22.3 adds up to two such
+ * messages at the stream's first start: the prose-routing primer under
+ * explicit or hybrid routing (maybePrimeProseMode), and a one-line routing
+ * notice under locus or hybrid routing once the stream's channel resolves
+ * (announceLocusIfChanged). A fork's restated task nearly as long as the
+ * window would make that so.
+ */
+export type LaunchDelivery =
+  /** A spawn's or a parentless fork's own first messages: the orientation,
+   *  then the text that carries the task, each its own message and whole. */
+  | { kind: 'message'; orientation: string; taskBlock: string }
+  /** A fork's intention-framed result, found by its call's id: it begins
+   *  with its head (framing, orientation and return instruction) whole, and
+   *  that call carries the whole task. */
+  | { kind: 'fork-result'; callId: string; head: string; task: string };
+
+/**
+ * What a launch promises that a stream's compiled first context lacks:
+ * 'orientation' when the orientation isn't there whole: for a fork, when
+ * its result is there but doesn't begin with its whole head (framing,
+ * orientation and return instruction); 'task' when a spawn's or parentless
+ * fork's task text isn't; 'call' when a fork's own call, which carries its
+ * whole task, isn't there with that task, or its result isn't there at
+ * all. Empty when everything arrived.
+ */
+export function undeliveredLaunchParts(
+  messages: ReadonlyArray<{ content: ContentBlock[] }>,
+  delivery: LaunchDelivery,
+): Array<'orientation' | 'task' | 'call'> {
+  const blocks = messages.flatMap((message) => message.content as unknown[]);
+  const cut: Array<'orientation' | 'task' | 'call'> = [];
+  if (delivery.kind === 'message') {
+    const texts = blocks.flatMap((b) => {
+      const block = b as { type?: unknown; text?: unknown };
+      return block.type === 'text' && typeof block.text === 'string' ? [block.text] : [];
+    });
+    if (!texts.includes(delivery.orientation)) cut.push('orientation');
+    if (!texts.includes(delivery.taskBlock)) cut.push('task');
+    return cut;
+  }
+  const result = blocks.find((b) => {
+    const block = b as { type?: unknown; toolUseId?: unknown };
+    return block.type === 'tool_result' && block.toolUseId === delivery.callId;
+  }) as { content?: unknown } | undefined;
+  const resultText = typeof result?.content === 'string'
+    ? result.content
+    : Array.isArray(result?.content)
+      ? (result.content as Array<{ type?: unknown; text?: unknown }>)
+          .map((c) => (c.type === 'text' && typeof c.text === 'string' ? c.text : '')).join('')
+      : '';
+  // A fork's call and its result arrive or go together in a launch's first
+  // compile (context-manager 0.14.1): the head window doesn't end between a
+  // tool call and its result (getHeadWindowEnd, whose anchorHeadToCoverage
+  // keeps that boundary while nothing owns a message, as in a launch's new
+  // store), the recent window doesn't start at a tool result
+  // (getUnheldRecentWindowStart) and drops a leading result whose call it
+  // left out (emitRecentNewestFirst), and the cap passes a tool call whole
+  // and keeps every tool result, cut or replaced by an omission notice. So
+  // only the cap cuts a result that is there, and a result that isn't there
+  // is the call's part to say.
+  if (result !== undefined && !resultText.startsWith(delivery.head)) cut.push('orientation');
+  const call = blocks.find((b) => {
+    const block = b as { type?: unknown; id?: unknown };
+    return block.type === 'tool_use' && block.id === delivery.callId;
+  }) as { input?: { task?: unknown } } | undefined;
+  if (result === undefined || call?.input?.task !== delivery.task) cut.push('call');
+  return cut;
+}
+const FALLBACK_SUBAGENT_MODEL = 'claude-haiku-4-5-20251001';
+const NO_PARENT_SYSTEM_PROMPT = 'You are a research assistant.';
+
+type ProseRouting = 'locus' | 'explicit' | 'hybrid' | 'disabled';
+
+/** What each prose-routing mode does with a stream's plain text, as
+ *  agent-framework documents the mode (AgentConfig.proseRouting). As terse
+ *  as AF's own mode primer, since a spawn's orientation is a user-role
+ *  message: explicit's is the primer's own (agent-framework 0.22.3
+ *  proseModePrimer), whose prose_help pointer proseRoutingEffect adds only
+ *  for a stream that is shown the tool. */
+const PROSE_ROUTING_EFFECT: Record<ProseRouting, string> = {
+  locus: 'plain text is published to the channel the framework infers for each turn, if there is one',
+  explicit: 'plain text is delivered only with a destination prefix line, such as ">>#channel"',
+  hybrid: 'unprefixed plain text is published to the channel the framework infers for each turn, if there is one; ' +
+    'a leading ">>>destination" envelope routes that text to the destination it names instead',
+  disabled: 'plain text is never published, even with a prefix; only explicit send tools reach a channel',
+};
+
+/** What a mode does to the stream's plain text, naming the prose_help tool
+ *  only where the stream is shown it: the framework shows it under explicit
+ *  routing only to a stream whose rules allow it. */
+function proseRoutingEffect(mode: ProseRouting, shownHelp: boolean): string {
+  return PROSE_ROUTING_EFFECT[mode] + (mode === 'explicit' && shownHelp ? '; the prose_help tool shows the syntax' : '');
+}
+
+/** How long a launch waits for a concurrency slot before it ends with an error. */
+const SLOT_TIMEOUT_MS = 120_000;
+
+/**
+ * What a forked or spawned stream is launched with, resolved once at the
+ * call, its tool rules included, and kept through the slot wait and every
+ * retry. The stream is created from these inputs, and both the caller's
+ * receipt and the stream's own first context render them, so the two can't
+ * describe different launches. The parent's values are as they
+ * were at the call; a value the parent doesn't report stays undefined and
+ * is said to be uncompared, never assumed equal.
+ */
+export interface SubagentLaunch {
+  kind: 'fork' | 'spawn';
+  name: string;
+  /** Depth the new stream runs at, and the module's maximum. */
+  depth: number;
+  maxDepth: number;
+  /** The fork call's tool_use id (forks only). */
+  forkPoint?: string;
+  /** Absent when the host didn't state it (SubagentModuleConfig.provider). */
+  provider?: string;
+  model: string;
+  systemPrompt: string;
+  systemPromptSource: 'parent' | 'override' | 'caller' | 'default';
+  maxTokens: number;
+  maxStreamTokens: number;
+  strategy: {
+    name: string;
+    headWindowTokens: number;
+    recentWindowTokens: number;
+    maxMessageTokens: number;
+    compressionModel: string;
+  };
+  /** The calling stream's prose routing, which the stream inherits;
+   *  undefined when there is no calling stream, so the framework's default
+   *  applies (stated when the stream starts). */
+  proseRouting?: ProseRouting;
+  /** The tool rules the stream is created with, resolved at the call by
+   *  filterToolNames; the stream's first context then states the surface
+   *  they actually produced. */
+  tools: {
+    /** What the stream is created with: the calling stream's own rules
+     *  (see `parent`), narrowed by a spawn's list, less the subagent tools at
+     *  the depth limit, with subagent--return; 'all' only for a launch
+     *  without a list, short of the depth limit, whose calling stream is
+     *  unrestricted or absent. */
+    allowed: 'all' | string[];
+    /** The spawn caller's own list, as given: `allowed` is what gets
+     *  subagent--return. */
+    requested?: string[];
+    /** The names of `allowed` the process offers at the call, which is
+     *  what the description can say the stream gets; present when `allowed`
+     *  is a list. Short of the depth limit `allowed` keeps every name, so a
+     *  tool registered later still reaches the stream. */
+    granted?: string[];
+    /** At the sub-fork depth limit: only what the process offers at the
+     *  call, and no subagent tools but subagent--return. */
+    depthLimited: boolean;
+  };
+  /** The calling stream as it was at the call: the caller, else the
+   *  configured parent agent; null when there is neither, or when the
+   *  configured parent agent isn't registered. */
+  parent: null | {
+    stream: string;
+    model: string;
+    maxTokens: number;
+    maxStreamTokens: number;
+    /** Its runtime settings' context budget. */
+    contextBudgetTokens: number;
+    /** Its strategy's recent raw tail, when the strategy reports one. */
+    tailTokens?: number;
+    /** Its strategy's name and message cap, when the strategy reports them. */
+    strategy?: string;
+    maxMessageTokens?: number;
+    allowedTools: 'all' | string[];
+  };
+  /** The calling stream's agent as resolved at the call (not rendered): a
+   *  fork compiles this agent's context, never another later registered
+   *  under its name. Null when there is none. */
+  parentAgent: Agent | null;
+}
+
+/** What happened when the stream was created: known only then, so stated
+ *  only in the stream's own first context, after the launch block. */
+export interface SubagentStart {
+  inherited:
+    | { kind: 'cut-at-call' }
+    | { kind: 'compiled-at-start'; reason: 'call-not-in-context' | 'no-call-id' }
+    | { kind: 'none'; reason: 'no-parent' | 'spawn' };
+  /** The stream's runtime settings' context budget, as created. */
+  contextBudgetTokens: number;
+  /** The stream's prose routing, as created; stated here only when the
+   *  launch didn't set it. */
+  proseRouting: ProseRouting;
+  /** The tools the stream is shown, as the board stands when the launch
+   *  composes its first context. */
+  tools: string[];
+  /** What the calling stream (`SubagentLaunch.parent`) is shown now;
+   *  undefined when it can't be read, or when the launch has no calling
+   *  stream. */
+  parentTools?: string[];
+  /** The agent settings the stream was created with, each rendered. */
+  agentSettings: AgentSettings;
+  /** The parent's (a fork's) or the caller's (a spawn's) agent settings at
+   *  the start, each rendered, read from the agent the launch resolved at
+   *  the call even once it has left the framework; undefined only when the
+   *  launch has no calling stream (`SubagentLaunch.parent` is null). */
+  parentAgentSettings?: AgentSettings;
+}
+
+/**
+ * The agent settings a stream's agent doesn't take from its launch. It's
+ * built from the launch alone (ephemeralAgentConfig), so each is the
+ * framework's default, whatever the parent's or caller's is. Each is
+ * rendered without values that could be
+ * long or private: the prefill message as set or not, provider parameters by
+ * their keys.
+ */
+export type AgentSettings = Record<string, string>;
+
+/** How a setting that couldn't be read is rendered. */
+const UNREADABLE = 'unreadable';
+
+export function agentSettingsOf(agent: {
+  thinking?: { enabled?: boolean; type?: string } | undefined;
+  providerParams?: Record<string, unknown> | undefined;
+  promptCaching?: boolean;
+  cacheTtl?: string;
+  prefillUserMessage?: string | undefined;
+  refusalHandling?: unknown;
+  toolResultGuard?: { enabled?: boolean };
+  toolWrapperProseGuard?: boolean;
+  /** agent-framework's resolved `AgentConfig.clock` (`Agent.clock`). */
+  clock?: { intervalSeconds: number; precision?: string } | undefined;
+  /** agent-framework's resolved `AgentConfig.autoContinue` (`Agent.autoContinue`,
+   *  agent-framework#744): the framework stores it resolved, `{ maxConsecutive }`
+   *  with the default filled in, never the recipe's raw `true` or `{}`.
+   *  Absent on releases without it, which read as off. */
+  autoContinue?: { maxConsecutive: number } | undefined;
+  getRuntimeSettings?(): { sameRoundThinkTextPolicy?: string };
+}): AgentSettings {
+  const onOff = (v: boolean | undefined) => (v ? 'on' : 'off');
+  const keys = Object.keys(agent.providerParams ?? {}).sort();
+  let thinkText: string | undefined;
+  try { thinkText = agent.getRuntimeSettings?.().sameRoundThinkTextPolicy; } catch { thinkText = UNREADABLE; }
+  return {
+    'extended thinking': agent.thinking?.enabled ? (agent.thinking.type ?? 'enabled') : 'off',
+    'provider parameters': keys.length > 0 ? `set (${joinAll(keys)})` : 'none',
+    'prompt caching': onOff(agent.promptCaching),
+    'prompt-cache TTL': agent.cacheTtl ?? 'unset',
+    'prefill user message': agent.prefillUserMessage ? 'set' : 'none',
+    'same-round think-text policy': thinkText ?? 'unset',
+    'refusal handling': agent.refusalHandling ? 'set' : 'none',
+    'tool-result guard': onOff(agent.toolResultGuard?.enabled),
+    'tool-wrapper prose guard': onOff(agent.toolWrapperProseGuard),
+    'clock rows': agent.clock ? clockRows(agent.clock) : 'off',
+    'auto-continue': agent.autoContinue ? `on (up to ${agent.autoContinue.maxConsecutive} in a row)` : 'off',
+  };
+}
+
+/** A clock setting as the orientation names it: its interval, in minutes
+ *  when it is whole minutes, else in seconds, since `Agent.clock` keeps only
+ *  seconds and the unit the recipe gave can't be told; and ", read to the
+ *  second" where its precision is seconds at a whole-minute interval, the one
+ *  precision that isn't its interval's default (agent-framework's
+ *  resolveClockConfig). */
+function clockRows(clock: { intervalSeconds: number; precision?: string }): string {
+  const seconds = clock.intervalSeconds;
+  if (seconds % 60 !== 0) return `every ${seconds === 1 ? '1 second' : `${seconds} seconds`}`;
+  const minutes = seconds / 60;
+  const every = `every ${minutes === 1 ? '1 minute' : `${minutes} minutes`}`;
+  return clock.precision === 'seconds' ? `${every}, read to the second` : every;
+}
+
+const formatTokens = (n: number): string => `${n.toLocaleString('en-US')} tokens`;
+
+/** Whether two tool-rule lists hold the same names, whatever their order or
+ *  repeats. */
+function sameNames(a: readonly string[], b: readonly string[]): boolean {
+  const x = new Set(a);
+  const y = new Set(b);
+  return x.size === y.size && [...x].every((name) => y.has(name));
+}
+
+/** "a", "a and b", "a, b and c" */
+function joinAll(items: readonly string[]): string {
+  if (items.length <= 1) return items.join('');
+  return `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`;
+}
+
+/** A partial list: up to SOME_NAMES named and the rest counted ("a, b, …
+ *  and 890 more"). It's for the caller's restriction and the caller's
+ *  rules a stream isn't given, which describe another stream, and for the
+ *  tools a fork has beyond its parent's, which its request defines in full
+ *  anyway. Everything else an orientation lists is named in full with
+ *  joinAll: a spawn's or parentless fork's whole surface, the names a
+ *  spawn's caller listed, and the parent's tools a fork lacks. So a spawn's
+ *  long orientation comes from its own tools, and a shorter tools list
+ *  shortens it. */
+const SOME_NAMES = 10;
+function joinSome(items: readonly string[]): string {
+  if (items.length <= SOME_NAMES) return joinAll(items);
+  return `${items.slice(0, SOME_NAMES).join(', ')} and ${items.length - SOME_NAMES} more`;
+}
+
+/** How a fork's tools differ from its parent's: every tool it lacks, since
+ *  its inherited context may show the parent using them, and the tools it
+ *  has beyond the parent's in part, since its request defines them all. */
+export function toolDifferences(extra: readonly string[], missing: readonly string[]): string {
+  const parts: string[] = [];
+  if (extra.length > 0) parts.push(`it also has ${joinSome(extra)}`);
+  if (missing.length > 0) parts.push(`it doesn't have ${joinAll(missing)}`);
+  return parts.join(', and ');
+}
+
+/**
+ * The launch inputs as one neutral block, rendered identically in the
+ * caller's receipt and in the stream's first context. Each setting names
+ * the stream's value and the caller's at the call, or says the caller's
+ * isn't reported. A fork's summary sorts every setting into differs, same,
+ * and not compared, so no equality is claimed that wasn't checked.
+ */
+export function describeSubagentLaunch(launch: SubagentLaunch): string {
+  const fork = launch.kind === 'fork';
+  const p = launch.parent;
+  const them = fork ? 'the parent' : 'the caller';
+  const call = fork ? 'subagent--fork' : 'subagent--spawn';
+  const s = launch.strategy;
+  const lines: string[] = [
+    `Launch of ${launch.kind} '${launch.name}', as resolved at its ${call} call${launch.forkPoint ? ` (${launch.forkPoint})` : ''}:`,
+  ];
+
+  if (!p) {
+    lines.push(fork
+      ? `- Lineage: no parent stream, so this fork inherits no context; depth ${launch.depth} of ${launch.maxDepth}.`
+      : `- Lineage: no calling stream; depth ${launch.depth} of ${launch.maxDepth}.`);
+  } else if (fork) {
+    lines.push(
+      `- Lineage: forked from stream "${p.stream}"; depth ${launch.depth} of ${launch.maxDepth}. ` +
+        "When the fork starts, it inherits that stream's compiled context, even if the stream has ended by then: " +
+        "through this call's exchange if the call is in that context then, and otherwise all of it as it is then.",
+    );
+  } else {
+    lines.push(
+      `- Lineage: spawned by stream "${p.stream}" as a separate agent with its own system prompt and task; ` +
+        `it inherits none of the caller's context; depth ${launch.depth} of ${launch.maxDepth}.`,
+    );
+  }
+
+  // Every setting in one list, in reading order. With a calling stream,
+  // each is compared (same: true/false) or says why it isn't (uncompared).
+  type Setting = { name: string; line: string; same?: boolean; uncompared?: 'unreported' | 'at-start' };
+  const settings: Setting[] = [];
+  const tokens = (name: string, label: string, mine: number, theirs: number | undefined): void => {
+    if (!p) {
+      settings.push({ name, line: `- ${label}: ${formatTokens(mine)}.` });
+    } else if (theirs === undefined) {
+      settings.push({ name, uncompared: 'unreported', line: `- ${label}: ${formatTokens(mine)} (${them}'s isn't reported).` });
+    } else {
+      const same = mine === theirs;
+      settings.push({
+        name,
+        same,
+        line: `- ${label}: ${formatTokens(mine)}${same ? `, the same as ${them}'s` : ` (${them}'s: ${formatTokens(theirs)})`}.`,
+      });
+    }
+  };
+
+  if (p) {
+    const same = launch.model === p.model;
+    settings.push({ name: 'model', same, line: `- Model: ${launch.model}${same ? `, the same as ${them}'s` : ` (${them}'s: ${p.model})`}.` });
+    // One membrane adapter serves every stream in the process, so the
+    // connection is the same by construction.
+    settings.push({ name: 'provider connection', same: true, line: `- Provider: ${launch.provider ?? 'not stated by the host'}, on the same connection as ${them}'s.` });
+  } else {
+    settings.push({ name: 'model', line: `- Model: ${launch.model}.` });
+    settings.push({ name: 'provider connection', line: `- Provider: ${launch.provider ?? 'not stated by the host'}.` });
+  }
+
+  const promptText: Record<SubagentLaunch['systemPromptSource'], string> = {
+    parent: "- System prompt: the parent's.",
+    // A fork with no parent has no prompt to override.
+    override: p ? '- System prompt: overridden for this fork.' : '- System prompt: set for this fork.',
+    caller: '- System prompt: supplied by the caller for this spawn.',
+    default: '- System prompt: the default research-assistant prompt.',
+  };
+  settings.push({
+    name: 'system prompt',
+    ...(fork && p ? { same: launch.systemPromptSource === 'parent' } : {}),
+    line: promptText[launch.systemPromptSource],
+  });
+
+  const notInherited = fork && p
+    ? " It doesn't inherit the parent's summaries or strategy state, though summary text already in the parent's compiled context comes with that context."
+    : '';
+  if (!p) {
+    settings.push({ name: 'strategy type', line: `- Strategy: a fresh ${s.name} instance.` });
+  } else if (p.strategy === undefined) {
+    settings.push({
+      name: 'strategy type',
+      uncompared: 'unreported',
+      line: `- Strategy: a fresh ${s.name} instance (${them}'s strategy doesn't report a name).${notInherited}`,
+    });
+  } else {
+    const same = p.strategy === s.name;
+    settings.push({
+      name: 'strategy type',
+      same,
+      line: `- Strategy: a fresh ${s.name} instance${same ? `, the same type as ${them}'s` : ` (${them}'s: ${p.strategy})`}.${notInherited}`,
+    });
+  }
+  tokens('head window', 'Head window', s.headWindowTokens, undefined);
+  tokens('recent window', 'Recent window', s.recentWindowTokens, p?.tailTokens);
+  tokens('message cap', 'Message cap', s.maxMessageTokens, p?.maxMessageTokens);
+  settings.push({
+    name: 'compression model',
+    ...(p ? { uncompared: 'unreported' as const } : {}),
+    line: `- Compression model: ${s.compressionModel}${p ? ` (${them}'s isn't reported)` : ''}.`,
+  });
+  settings.push({
+    name: 'context budget',
+    ...(p ? { uncompared: 'at-start' as const } : {}),
+    line: "- Context budget: not set by this launch, so the framework's default for a new stream applies, stated when the stream starts" +
+      (p ? ` (${them}'s: ${formatTokens(p.contextBudgetTokens)})` : '') + '.',
+  });
+  tokens('stream budget', 'Stream budget', launch.maxStreamTokens, p?.maxStreamTokens);
+  tokens('output limit', 'Output limit', launch.maxTokens, p?.maxTokens);
+
+  // What the stream is created with (tools.allowed): the caller's own rules,
+  // narrowed by a spawn's list, all resolved at the call; at the depth limit
+  // only what the process offered of them then, less the subagent tools but
+  // subagent--return. What the process offered of them is `granted`, which is
+  // what this names.
+  const allowed = launch.tools.allowed;
+  const requested = launch.tools.requested;
+  const callerRules = p?.allowedTools ?? 'all';
+  // filterToolNames' ensureReturn adds subagent--return to a restricted
+  // caller's rules, or a spawn's list, that lack it; each line says where
+  // it was added.
+  const addsReturn = callerRules !== 'all' && !callerRules.includes('subagent--return');
+  const listAddsReturn = requested !== undefined && !requested.includes('subagent--return');
+  const granted = launch.tools.granted ?? (allowed === 'all' ? [] : allowed);
+  const depth = launch.tools.depthLimited;
+  const explicit = launch.proseRouting === 'explicit';
+  // prose_help isn't on the board: explicit prose routing shows it to a
+  // stream whose rules allow it (agent-framework's
+  // availableToolsForPresentation checks canUseTool), so a
+  // stream gets it though the process doesn't offer it at the call. The
+  // depth limit's rules, built from what the process offers, never hold it.
+  const shownHelp = explicit && allowed !== 'all' && allowed.includes('prose_help');
+
+  // The stream runs its caller's prose routing, so with a calling stream it
+  // is the same by construction; without one the framework's default
+  // applies, and the stream's start states it.
+  const routing = launch.proseRouting;
+  settings.push(routing === undefined
+    ? {
+        name: 'prose routing',
+        ...(p ? { uncompared: 'at-start' as const } : {}),
+        line: "- Prose routing: not set by this launch, so the framework's default applies, stated when the stream starts.",
+      }
+    : {
+        name: 'prose routing',
+        ...(p ? { same: true } : {}),
+        line: `- Prose routing: ${routing}${p ? `, inherited from ${them}` : ''}: ` +
+          `${proseRoutingEffect(routing, allowed === 'all' || shownHelp)}.`,
+      });
+
+  // What the stream gets of its rules: what the process offered at the call,
+  // subagent--return among it, and prose_help where explicit prose routing
+  // shows it.
+  const gets = (fromList: string, offeredAt: string): string => {
+    if (!shownHelp) {
+      return granted.length === 1 ? 'only subagent--return' : `only these ${granted.length}${fromList}${offeredAt}: ${joinAll(granted)}`;
+    }
+    const offered = granted.length === 1
+      ? 'subagent--return, as the process offered it at the call'
+      : `${joinAll(granted)}, as the process offered them at the call`;
+    return `only these ${granted.length + 1}${fromList}: ${offered}, and prose_help, which explicit prose routing shows`;
+  };
+  // The names the stream's rules came from, a spawn's list or else the
+  // caller's own rules, that it isn't given at the call, in one list: kept
+  // in its rules for a tool the process doesn't offer yet, or left out of
+  // them. The stream can't act on which, and the caller, who could, chose
+  // them.
+  const notGiven = (held: readonly string[]): string[] =>
+    [...new Set(held)].filter((name) => !granted.includes(name) && !(shownHelp && name === 'prose_help'));
+  let toolRule: string;
+  // The rules are the caller's own: the line says so itself.
+  let inherited = false;
+  if (allowed === 'all') {
+    // Only a launch without a list, short of the depth limit, whose calling
+    // stream is unrestricted or absent, is unrestricted.
+    toolRule = 'no restriction';
+  } else if (requested !== undefined) {
+    // What the list grants, not the list: subagent--return named once, and
+    // said to be added where the list lacks it. The grant is the board at
+    // the call; the stream's own Tools line says what it's shown when it
+    // starts.
+    const onlyReturn = granted.length === 1 && !shownHelp;
+    toolRule = onlyReturn
+      ? `only subagent--return${listAddsReturn ? ', added' : ''}${requested.length === 0 ? ': the caller listed no tools' : ''}`
+      : gets(
+        ` from the caller's list${listAddsReturn ? ', with subagent--return added' : ''}`,
+        ', as the process offered them at the call',
+      );
+    const missing = notGiven(requested);
+    // "also" where the line has already named something from the list.
+    const also = onlyReturn && listAddsReturn ? '' : 'also ';
+    if (missing.length > 0) toolRule += `; the caller's list ${also}names ${joinAll(missing)}, which this stream isn't given at the call`;
+    if (depth) toolRule += '; at this depth, no subagent tool but subagent--return';
+  } else if (callerRules !== 'all') {
+    // A fork, or a spawn without a list, keeps a restricted caller's rules,
+    // with subagent--return: at the depth limit only what the process
+    // offers of them, less the subagent tools but subagent--return. Either
+    // way the line says where subagent--return was added.
+    inherited = true;
+    const n = callerRules.length;
+    // Short of the depth limit it keeps the rules whole, with subagent--return
+    // added where they lack it, and is given what the process offers of
+    // them: two facts, so that a stream given only subagent--return isn't
+    // read as keeping only that.
+    toolRule = `${them} is restricted to ${n === 0 ? 'no tools' : n}, and ` +
+      (depth
+        ? `at this depth it keeps only what the process offers of that at the call, less the subagent tools${addsReturn ? ', with subagent--return added' : ' but subagent--return'}: ${gets('', '')}`
+        : `this stream keeps those rules${addsReturn ? ', with subagent--return added' : ''}; it's given ${gets('', ', as the process offered them at the call')}`);
+    const missing = notGiven(callerRules);
+    if (missing.length > 0) toolRule += `; ${them}'s rules also allow ${joinSome(missing)}, which this stream isn't given at the call`;
+  } else {
+    // An unrestricted caller's launch at the depth limit.
+    toolRule = 'every tool the process offers at the call except the subagent tools, keeping subagent--return: no further forks or spawns at this depth';
+  }
+  if (p) {
+    // A launch without a list is the same as its caller's when the stream is
+    // created with the caller's rules: both unrestricted, or the same names
+    // once the depth limit and ensureReturn have had their say, so a
+    // subagent--return that ensureReturn adds makes them differ.
+    const same = requested === undefined && (allowed === 'all'
+      ? callerRules === 'all'
+      : callerRules !== 'all' && sameNames(allowed, callerRules));
+    const theirs = p.allowedTools === 'all'
+      ? `${them} has no restriction`
+      : p.allowedTools.length === 0
+        ? `${them} is restricted to no tools`
+        : `${them} is restricted to ${p.allowedTools.length}: ${joinSome(p.allowedTools)}`;
+    const relation = inherited ? '' : same ? `, the same as ${them}` : `; ${theirs}`;
+    settings.push({ name: 'tool rules', same, line: `- Tool rules: ${toolRule}${relation}.` });
+  } else {
+    settings.push({ name: 'tool rules', line: `- Tool rules: ${toolRule}.` });
+  }
+
+  if (fork && p) {
+    const differs = settings.filter((x) => x.same === false).map((x) => x.name);
+    const same = settings.filter((x) => x.same === true).map((x) => x.name);
+    const unreported = settings.filter((x) => x.uncompared === 'unreported').map((x) => x.name);
+    const atStart = settings.filter((x) => x.uncompared === 'at-start').map((x) => x.name);
+    const parts: string[] = [];
+    if (differs.length > 0) parts.push(`Differs in ${joinAll(differs)}.`);
+    if (same.length > 0) parts.push(`Same: ${joinAll(same)}.`);
+    const uncompared: string[] = [];
+    if (unreported.length > 0) {
+      uncompared.push(`${joinAll(unreported)} (the parent doesn't report ${unreported.length === 1 ? 'it' : 'them'})`);
+    }
+    if (atStart.length > 0) uncompared.push(`${joinAll(atStart)} (set when the stream starts)`);
+    if (uncompared.length > 0) parts.push(`Not compared: ${uncompared.join(', and ')}.`);
+    lines.push(`- Against the parent at the call: ${parts.join(' ')}`);
+  }
+  for (const x of settings) lines.push(x.line);
+  return lines.join('\n');
+}
+
+/**
+ * What the stream's own first context adds after the launch block: what it
+ * actually inherited, its context budget as created, its prose routing when
+ * the launch left that to the framework, and the tools it is shown, read
+ * from the board as the launch composes its context, beside what its caller
+ * is shown now. All
+ * of it is known only when the stream is created, which can be well after
+ * the call if the launch waited for a slot.
+ */
+export function describeSubagentStart(launch: SubagentLaunch, start: SubagentStart): string {
+  const fork = launch.kind === 'fork';
+  const p = launch.parent;
+  const them = fork ? 'the parent stream' : 'the calling stream';
+  const lines = ['At the start of this stream:'];
+
+  const inh = start.inherited;
+  if (inh.kind === 'cut-at-call') {
+    // What materialiseStructuralFork keeps: everything before the call's
+    // assistant message; that message and its result message with their
+    // other blocks; nothing else after the call.
+    lines.push(
+      // As the parent's compiled context had them when this stream started,
+      // which for a queued fork is after the slot wait; addMsg drops an exact
+      // repeat, as it always has.
+      "- Inherited: the parent's compiled context through the fork call's exchange. Messages before the call " +
+        'are as that context had them when this stream started, except that an exact repeat of an earlier ' +
+        "message is dropped, and this stream's own strategy caps and selects them as it does every message. " +
+        "The call's assistant message keeps its other blocks, with sibling fork calls removed. Its result " +
+        "message keeps the turn's other results, with sibling forks' results removed, and leads with this " +
+        "call's result rewritten as this message, so if that message is over the cap, what's cut is what comes " +
+        "after it. If the parent's context held no result message for the call, one is made holding this " +
+        "call's result alone. No other message after the call is included.",
+    );
+  } else if (inh.kind === 'compiled-at-start') {
+    lines.push(
+      "- Inherited: the parent's whole compiled context as it was when this stream started, because " +
+        // A sync fork's call, or one whose round isn't stored yet, was never
+        // in that context.
+        (inh.reason === 'no-call-id' ? 'the fork call had no id to cut at' : "the fork call wasn't in that context") +
+        '. It can include turns that came after the call. An exact repeat of an earlier message is dropped, ' +
+        "and this stream's own strategy caps and selects what remains as it does every message.",
+    );
+  } else if (inh.reason === 'spawn') {
+    lines.push("- Inherited: nothing; a spawn starts from its task.");
+  } else {
+    lines.push('- Inherited: nothing; there is no parent stream.');
+  }
+
+  lines.push(
+    `- Context budget: ${formatTokens(start.contextBudgetTokens)}` +
+      (p ? ` (${fork ? 'the parent' : 'the caller'}'s at the call: ${formatTokens(p.contextBudgetTokens)})` : '') + '.',
+  );
+  if (launch.proseRouting === undefined) {
+    lines.push(`- Prose routing: ${start.proseRouting}, the framework's default: ` +
+      `${proseRoutingEffect(start.proseRouting, start.tools.includes('prose_help'))}.`);
+  }
+
+  // Settings the stream's agent takes as the framework's defaults, set
+  // against the parent's or caller's as it is now.
+  const ours = start.agentSettings;
+  const names = Object.keys(ours);
+  const theirSettings = p ? start.parentAgentSettings : undefined;
+  if (theirSettings === undefined) {
+    lines.push(
+      `- Agent settings, the framework's defaults: ${names.map((n) => `${n} ${ours[n]}`).join(', ')}` +
+        '.',
+    );
+  } else {
+    // A value that couldn't be read is never counted as matching.
+    const differ = names.filter((n) => theirSettings[n] !== ours[n] || ours[n] === UNREADABLE);
+    lines.push(differ.length === 0
+      ? `- Agent settings: the framework's defaults, the same as ${them}'s now (${joinAll(names)}).`
+      : `- Agent settings not carried from ${them}, so the framework's defaults apply: ` +
+          `${differ.map((n) => `${n} ${ours[n]} (${them}'s: ${theirSettings[n]})`).join(', ')}. ` +
+          `The rest match: ${joinAll(names.filter((n) => !differ.includes(n)))}.`);
+  }
+
+  const mine = start.tools;
+  if (!fork || !p || start.parentTools === undefined) {
+    // A spawn isn't its caller, and with no parent there is nothing to set
+    // the surface against: name all of it.
+    lines.push(`- Tools: ${mine.length} available to this stream: ${joinAll(mine)}.` +
+      (fork && p && start.parentTools === undefined
+        ? " The parent stream's tools couldn't be read for comparison."
+        : ''));
+    return lines.join('\n');
+  }
+  const theirs = start.parentTools;
+  const extra = mine.filter((n) => !theirs.includes(n));
+  const missing = theirs.filter((n) => !mine.includes(n));
+  if (extra.length === 0 && missing.length === 0) {
+    lines.push(`- Tools: ${mine.length} available to this stream, the same set ${them} has now.`);
+  } else {
+    lines.push(`- Tools: ${mine.length} available to this stream. Compared with what ${them} has now, ${toolDifferences(extra, missing)}.`);
+  }
+  return lines.join('\n');
 }
 
 /** Structural subset of context-manager's Message — accepting this wider
@@ -285,6 +1142,7 @@ export function materialiseStructuralFork(
   forkTask: string,
   depth: number,
   maxDepth: number,
+  orientation?: string,
 ): MinimalMessage[] | null {
   // 1. Locate the assistant turn whose content includes the fork tool_use we're materialising.
   let forkAssistantIdx = -1;
@@ -330,39 +1188,37 @@ export function materialiseStructuralFork(
 
   // Fork assistant turn with sibling fork tool_use blocks stripped. The
   // matching tool_use is excluded from siblingForkIds by construction, so
-  // this filter always keeps at least one block.
-  const trimmedAssistantContent = forkAssistantMsg.content.filter(b => {
-    if (!isToolUseContent(b)) return true;
-    return !(b.name === 'subagent--fork' && siblingForkIds.has(b.id));
-  });
+  // this filter always keeps at least one block. In XML tool mode every
+  // call of a round carries the round's raw <function_calls> text (rawXml,
+  // agent-framework 0.22.3), which membrane's anthropic-xml formatter
+  // replays in place of the blocks, siblings included. So beside a removed
+  // sibling, the calls kept drop it and are rendered from their blocks.
+  const trimmedAssistantContent = forkAssistantMsg.content
+    .filter(b => !(isToolUseContent(b) && b.name === 'subagent--fork' && siblingForkIds.has(b.id)))
+    .map((b): ContentBlock => (siblingForkIds.size > 0 && isToolUseContent(b) && b.rawXml !== undefined ? withoutRawXml(b) : b));
   out.push({ participant: forkAssistantMsg.participant, content: trimmedAssistantContent });
 
   // Matching tool_result user turn — rewritten with intention framing; siblings stripped.
-  const intentionFramed = buildIntentionFramedForkResult(forkName, forkTask, depth, maxDepth);
+  const intentionFramed = buildIntentionFramedForkResult(forkName, forkTask, depth, maxDepth, orientation);
   if (matchingResultIdx >= 0) {
     const matchingMsg = compiled[matchingResultIdx];
-    const trimmedResultContent: ContentBlock[] = [];
+    // The fork's own result leads its message, ahead of the turn's other
+    // results: every message is capped and the cap keeps a message's
+    // beginning, so a sibling's length can't push out the framed result's
+    // head (its orientation). It's named as the framework names the results
+    // it stores from a tool round (agent-framework 0.22.3 keeps toolName for
+    // XML replay's <tool_name>): in XML tool mode a result carries no call id,
+    // so its name is what tells it apart when it leads results whose calls
+    // come first.
+    const trimmedResultContent: ContentBlock[] = [{
+      type: 'tool_result',
+      toolUseId: callToolUseId,
+      toolName: 'subagent--fork',
+      content: intentionFramed,
+    }];
     for (const b of matchingMsg.content) {
-      if (isToolResultContent(b)) {
-        if (siblingForkIds.has(b.toolUseId)) continue;
-        if (b.toolUseId === callToolUseId) {
-          trimmedResultContent.push({
-            type: 'tool_result',
-            toolUseId: callToolUseId,
-            content: intentionFramed,
-          });
-          continue;
-        }
-      }
+      if (isToolResultContent(b) && (siblingForkIds.has(b.toolUseId) || b.toolUseId === callToolUseId)) continue;
       trimmedResultContent.push(b);
-    }
-    if (trimmedResultContent.length === 0) {
-      // All siblings, nothing else — synthesise the matching result alone.
-      trimmedResultContent.push({
-        type: 'tool_result',
-        toolUseId: callToolUseId,
-        content: intentionFramed,
-      });
     }
     out.push({ participant: matchingMsg.participant, content: trimmedResultContent });
   } else {
@@ -372,6 +1228,7 @@ export function materialiseStructuralFork(
       content: [{
         type: 'tool_result',
         toolUseId: callToolUseId,
+        toolName: 'subagent--fork',
         content: intentionFramed,
       }],
     });
@@ -381,9 +1238,32 @@ export function materialiseStructuralFork(
   return out;
 }
 
+/** A block without the raw XML text of the round it was parsed from. */
+function withoutRawXml<T extends { rawXml?: string }>(block: T): T {
+  const copy = { ...block };
+  delete copy.rawXml;
+  return copy;
+}
+
 // ---------------------------------------------------------------------------
 // Module
 // ---------------------------------------------------------------------------
+
+/** A cancel that wins the race with creating a run's agent leaves the
+ *  creation running. The agent it gives is still the module's, so it's
+ *  given back when it comes; a creation that fails leaves nothing. */
+function giveBackWhenCreated(creating: Promise<{ cleanup: () => void }>, name: string): void {
+  creating.then(
+    (created) => {
+      try {
+        created.cleanup();
+      } catch (err) {
+        console.error(`[subagent] ${name}: giving back an agent created after its run was stopped failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    },
+    () => { /* a creation that failed leaves nothing to give back */ },
+  );
+}
 
 export class SubagentModule implements Module {
   readonly name = 'subagent';
@@ -399,10 +1279,19 @@ export class SubagentModule implements Module {
   // Concurrency control — adaptive rate-limit-aware semaphore
   private configuredMaxConcurrent: number;   // User's ceiling
   private effectiveConcurrent: number;       // Current effective limit (may be reduced)
-  private activeConcurrent = 0;
-  private waitQueue: Array<() => void> = [];
+  /** The slots runs hold, one each. A slot is released once, however its
+   *  run ends, so the count never falls below the runs holding one. */
+  private heldSlots = new Set<object>();
+  private waitQueue: Array<(slot: object) => void> = [];
+  /** The slot each running subagent holds, for a zombie reclaim to release. */
+  private slotOf = new WeakMap<ActiveSubagent, object>();
   private consecutiveSuccesses = 0;
-  private lastRateLimitAt = 0;
+  /** A rate limit has held the effective limit down, at or below the
+   *  configured ceiling, and successes haven't yet brought it back up to it.
+   *  A rate limit at an effective limit of 1 sets it too: the provider has
+   *  just pushed back. While it holds, raising the ceiling leaves the
+   *  effective limit to recover toward it, one step per three successes. */
+  private throttled = false;
   private rateLimitCooldownMs = 30_000;      // Delay after rate limit before releasing next slot
 
   // Periodic zombie reaper. The pre-existing reaper only ran on-demand
@@ -437,11 +1326,15 @@ export class SubagentModule implements Module {
   readonly parentMap = new Map<string, string>();
 
   // Stashed results from subagent--return tool calls, keyed by framework agent name
-  private returnedResults = new Map<string, string>();
+  private returnedResults = new Map<string, string | undefined>();
 
   // Live state for peek observability
   private liveSubagents = new Map<string, LiveSubagentState>();          // keyed by displayName
   private frameworkNameIndex = new Map<string, string>();                 // frameworkAgentName → displayName
+  /** Each attempt's agent name → its run's display name, for the run's
+   *  life, so a cancel reaches the children any attempt spawned, between
+   *  attempts too. frameworkNameIndex holds only the live attempt. */
+  private runOfAttempt = new Map<string, string>();
   private callIdIndex = new Map<string, string>();                        // toolCallId → displayName
   private streamSubscribers = new Map<string, Set<SubagentStreamCallback>>();  // displayName → callbacks
   private lastInputTokens = new Map<string, number>();  // displayName → context size: its latest call's prompt
@@ -480,12 +1373,8 @@ export class SubagentModule implements Module {
         // subagent from one that has been silently stuck. Look up the
         // ActiveSubagent record by entry-key (a separate index, since
         // displayName isn't the activeSubagents key directly).
-        for (const sa of this.activeSubagents.values()) {
-          if (sa.name === displayName) {
-            sa.lastActivityAt = Date.now();
-            break;
-          }
-        }
+        const sa = this.runningEntry(displayName);
+        if (sa) sa.lastActivityAt = Date.now();
 
         // inference:usage is emitted at runtime but not in the TraceEvent union — handle it first
         if ((event as { type: string }).type === 'inference:usage') {
@@ -542,11 +1431,26 @@ export class SubagentModule implements Module {
             break;
           }
           case 'inference:failed': {
-            const error = (event as { error?: string }).error ?? 'Unknown error';
             live.requestInFlightSince = undefined;
-            this.emit(displayName, { type: 'inference:failed', error });
+            this.emit(displayName, { type: 'inference:failed', error: traceError(event) });
             break;
           }
+          // The stream's other ends (state/turn-trace.ts), passed on so the
+          // peek panel shows each. requestInFlightSince stays as it was.
+          case 'inference:turn_ended':
+            this.emit(displayName, { type: 'inference:turn_ended' });
+            break;
+          case 'inference:aborted': {
+            const reason = (event as { reason?: unknown }).reason;
+            this.emit(displayName, {
+              type: 'inference:aborted',
+              ...(typeof reason === 'string' && reason !== '' ? { reason } : {}),
+            });
+            break;
+          }
+          case 'inference:exhausted':
+            this.emit(displayName, { type: 'inference:exhausted', error: traceError(event) });
+            break;
         }
         return;
       }
@@ -698,10 +1602,10 @@ export class SubagentModule implements Module {
             tools: {
               type: 'array',
               items: { type: 'string' },
-              description: 'Tool names the subagent can use (default: all). Note: subagent--return is always included automatically.',
+              description: 'Tool names the subagent can use (default: inherit the caller\'s allowed tools). An explicit list can only narrow the caller\'s tools. To give the subagent a utility, list `utils` and the utility\'s own name (module--name). Note: subagent--return is always included automatically.',
             },
             sync: { type: 'boolean', description: 'If true, block until subagent completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'systemPrompt', 'task'],
         },
@@ -722,7 +1626,7 @@ export class SubagentModule implements Module {
             model: { type: 'string', description: 'Model override (optional)' },
             maxTokens: { type: 'number', description: 'Max output tokens per inference (optional). Defaults to the recipe-level subagent default, else the parent agent\'s maxTokens.' },
             sync: { type: 'boolean', description: 'If true, block until fork completes (default: false)' },
-            timeoutMs: { type: 'number', description: 'Execution timeout in milliseconds. Sync tasks default to 600s (auto-detaches to background). Async tasks have no default timeout — only set this if you need a hard deadline.' },
+            timeoutMs: { type: 'number', description: `Milliseconds. A sync task still running then moves to the background and delivers its result as a message when it ends (default ${this.maxExecutionMs}). An async task is stopped once it has run that long, counted from when it starts after any wait for a concurrency slot, retries included; async tasks have no limit by default, so set one only for a hard deadline.` },
           },
           required: ['name', 'task'],
         },
@@ -774,21 +1678,29 @@ export class SubagentModule implements Module {
 
   async handleToolCall(call: ToolCall): Promise<ToolResult> {
     const caller = call.callerAgentName;
+    const input = inputsOf(call.input);
+    if (input === null) {
+      return Object.hasOwn(NOT_DONE, call.name)
+        ? { success: false, isError: true, error: `${NOT_DONE[call.name]}: the input must be an object of named inputs, not ${shown(call.input)}.` }
+        : unknownToolResult(this, call.name);
+    }
+    const refused = this.inputRefusal(call.name, input);
+    if (refused) return refused;
     switch (call.name) {
       case 'spawn':
-        return this.handleSpawn(call.input as SpawnInput, caller);
+        return this.handleSpawn(input as unknown as SpawnInput, caller);
       case 'fork':
-        return this.handleFork(call.input as ForkInput, caller, call.id);
+        return this.handleFork(input as unknown as ForkInput, caller, call.id);
       case 'hud':
-        return this.handleHud(call.input as { enabled: boolean });
+        return this.handleHud(input as { enabled: boolean });
       case 'concurrency':
-        return this.handleConcurrency(call.input as { maxConcurrent?: number });
+        return this.handleConcurrency(input as { maxConcurrent?: number });
       case 'peek':
-        return this.handlePeek(call.input as { name?: string }, caller);
+        return this.handlePeek(input as { name?: string }, caller);
       case 'return': {
         // Stash the result keyed by the tool call ID. The completion path
         // in runSpawn/runFork will pick it up via the callIdIndex → displayName.
-        const result = (call.input as { result: string }).result;
+        const result = input.result as string | undefined;
         // Find which subagent is calling this via the callIdIndex
         const callerName = this.callIdIndex.get(call.id);
         if (callerName) {
@@ -797,8 +1709,36 @@ export class SubagentModule implements Module {
         return { success: true, data: 'Result received.', endTurn: true };
       }
       default:
-        return { success: false, error: `Unknown tool: ${call.name}`, isError: true };
+        return unknownToolResult(this, call.name);
     }
+  }
+
+  /** The refusal for a call whose inputs aren't of the types its tool's
+   *  schema declares, naming every problem with its value or what to give;
+   *  null when they are, or when the module has no such tool. An input not
+   *  given is a problem where the schema requires it, apart from return's
+   *  result, whose absence the handler reads as the subagent's last words.
+   *  Ranges, and inputs a schema doesn't declare, are left as they are. */
+  private inputRefusal(tool: string, input: Record<string, unknown>): ToolResult | null {
+    const schema = this.getTools().find((t) => t.name === tool)?.inputSchema as
+      | { properties: Record<string, { type: DeclaredType }>; required?: string[] }
+      | undefined;
+    if (!schema) return null;
+    const problems: string[] = [];
+    for (const [key, declared] of Object.entries(schema.properties)) {
+      const value = input[key];
+      if (value === undefined) {
+        if (schema.required?.includes(key) && !(tool === 'return' && key === 'result')) {
+          const give = GIVE_MISSING[tool]?.[key];
+          problems.push(`${key} is missing${give ? `: ${give}` : ''}`);
+        }
+      } else if (!isDeclaredType(value, declared.type)) {
+        problems.push(`${key} must be ${TYPE_WORDS[declared.type]}, not ${shown(value)}`);
+      }
+    }
+    return problems.length === 0
+      ? null
+      : { success: false, isError: true, error: `${NOT_DONE[tool]}: ${problems.join('; ')}.` };
   }
 
   async onProcess(event: ProcessEvent, _state: ProcessState): Promise<EventResponse> {
@@ -861,35 +1801,40 @@ export class SubagentModule implements Module {
 
   /**
    * Acquire a concurrency slot. Returns how long the caller waited (0 = immediate).
-   * Throws if the slot is not acquired within `slotTimeoutMs`.
+   * Throws a SubagentFailure if the slot is not acquired within
+   * `slotTimeoutMs`, saying how to call `kind` again, and rejects with the
+   * run's SubagentTerminated if `cancelled`, the run's cancel from
+   * cancelFor, fires while it waits.
    */
-  private async acquireSlot(slotTimeoutMs = 120_000): Promise<{ waitedMs: number }> {
-    if (this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+  private async acquireSlot(
+    kind: 'spawn' | 'fork',
+    slotTimeoutMs = SLOT_TIMEOUT_MS,
+    /** The run's cancel (cancelFor): it takes a caller still waiting out of
+     *  the queue. */
+    cancelled?: Promise<never>,
+    /** Set synchronously, before the first await, when the caller has to
+     *  queue: run*() reaches this call without awaiting, so handle*() can
+     *  say in its receipt whether the launch is starting or waiting for a
+     *  slot. */
+    ticket?: { queued: boolean },
+  ): Promise<{ waitedMs: number; slot: object }> {
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
-    // Before queueing, try to reclaim slots from zombie subagents
-    const reclaimedZombies = this.reclaimZombieSlots();
-    if (reclaimedZombies > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      return { waitedMs: 0 };
-    }
+    // Before queueing, try to reclaim slots from zombie subagents. What a
+    // reclaim frees goes to the spawns already waiting first.
+    this.reclaimZombieSlots();
+    if (this.activeConcurrent < this.effectiveConcurrent) return { waitedMs: 0, slot: this.takeSlot() };
 
+    if (ticket) ticket.queued = true;
     const startWait = Date.now();
-    return new Promise<{ waitedMs: number }>((resolve, reject) => {
+    return new Promise<{ waitedMs: number; slot: object }>((resolve, reject) => {
       const timer = setTimeout(() => {
-        // Remove ourselves from the wait queue
+        // Last-chance zombie reclamation before failing. What it frees goes
+        // to the queue in order, this spawn included.
+        this.reclaimZombieSlots();
         const idx = this.waitQueue.indexOf(onSlot);
-        if (idx >= 0) this.waitQueue.splice(idx, 1);
-
-        // Last-chance zombie reclamation before failing
-        const reclaimed = this.reclaimZombieSlots();
-        if (reclaimed > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-          this.activeConcurrent++;
-          resolve({ waitedMs: Date.now() - startWait });
-          return;
-        }
+        if (idx < 0) return; // a freed slot has reached it
+        this.waitQueue.splice(idx, 1);
 
         // Surface which subagents currently hold the slots, with silence
         // and total runtime. Without this the caller only sees "5/5 in
@@ -901,22 +1846,42 @@ export class SubagentModule implements Module {
         const holderLines = holders.length > 0
           ? `\nSlots held by:\n${holders.map(h => `  - ${h}`).join('\n')}`
           : '';
+        const others = this.waitQueue.length;
+        const holder = holders.length > 0 ? 'one of the subagents below' : 'a running subagent';
+        // While `throttled` holds, as it does after a rate limit at a limit
+        // of 1 too, a higher ceiling leaves the limit where it is
+        // (setConcurrency), so only waiting helps. Below the ceiling, the
+        // concurrency tool's note says how the limit recovers.
+        const { note } = this.getConcurrencyStatus();
+        const remedy = this.throttled
+          ? `${note ?? "A rate limit was hit at this limit, so raising it wouldn't take effect at once."} ` +
+            `Wait for ${holder} to finish, then call subagent--${kind} again.`
+          : `Wait for ${holder} to finish, or raise the limit with subagent--concurrency, then call subagent--${kind} again.`;
 
-        reject(new Error(
-          `Timed out waiting for a concurrency slot after ${slotTimeoutMs}ms ` +
-          `(${this.activeConcurrent}/${this.effectiveConcurrent} slots in use, ` +
-          `${this.waitQueue.length} still queued). ` +
-          `Limit parallel forks/spawns to ${this.effectiveConcurrent}.` +
-          holderLines
+        reject(new SubagentFailure(
+          `no concurrency slot opened within ${duration(slotTimeoutMs)} (${this.activeConcurrent} running against ` +
+          `a limit of ${this.effectiveConcurrent}, ${others} other${others === 1 ? '' : 's'} waiting)`,
+          `${remedy} Start no more than ${this.effectiveConcurrent} at a time here.` +
+          holderLines,
         ));
       }, slotTimeoutMs);
 
-      const onSlot = () => {
+      const onSlot = (slot: object) => {
         clearTimeout(timer);
-        resolve({ waitedMs: Date.now() - startWait });
+        resolve({ waitedMs: Date.now() - startWait, slot });
       };
 
       this.waitQueue.push(onSlot);
+      // A cancel while it waits takes it out of the queue. One that comes
+      // after a slot reached it ends the run in its setup, before its
+      // attempt starts, or in the attempt's race once it has.
+      cancelled?.catch((err: unknown) => {
+        const idx = this.waitQueue.indexOf(onSlot);
+        if (idx < 0) return;
+        this.waitQueue.splice(idx, 1);
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
@@ -956,20 +1921,11 @@ export class SubagentModule implements Module {
    * Returns the number of slots reclaimed.
    */
   private reclaimZombieSlots(): number {
-    // Postmortem 2026-05-28 F3: bumped from 30_000ms — 30s was too tight for
-    // Opus on 100–165K-token contexts with rate-limited MCP tools; single-
-    // round TTFT routinely exceeds it. The `requestInFlightSince` guard
-    // (below) is the primary defence; the threshold bump is belt-and-braces
-    // for legitimate post-request pauses.
-    const ZOMBIE_THRESHOLD_MS = 120_000;
     let reclaimed = 0;
 
     for (const [displayName, live] of this.liveSubagents) {
-      let entry: ActiveSubagent | undefined;
-      for (const e of this.activeSubagents.values()) {
-        if (e.name === displayName) { entry = e; break; }
-      }
-      if (!entry || entry.status !== 'running') continue;
+      const entry = this.runningEntry(displayName);
+      if (!entry) continue;
 
       const silentMs = Date.now() - entry.lastActivityAt;
       // Postmortem 2026-05-28 F3: `!live.requestInFlightSince` protects the
@@ -994,7 +1950,7 @@ export class SubagentModule implements Module {
         // Cancel the zombie's framework agent
         try {
           const agent = this.getFramework().getAgent(live.frameworkAgentName);
-          if (agent) agent.cancelStream();
+          if (agent) this.stopRun(agent);
         } catch { /* best-effort */ }
 
         // Cancel via cancellation handle (unblocks the Promise.race in runSpawn/runFork)
@@ -1018,10 +1974,10 @@ export class SubagentModule implements Module {
         entry.completedAt = Date.now();
         entry.statusMessage = 'zombie — slot reclaimed';
 
-        // Release the slot (the finally block in runSpawn/runFork will also
-        // call releaseSlot, but that's safe — activeConcurrent just goes to
-        // max(0, activeConcurrent-1) effectively)
-        this.activeConcurrent = Math.max(0, this.activeConcurrent - 1);
+        // Release the zombie's own slot. Its run's finally releases the same
+        // slot, which by then is free, so nothing is released twice.
+        const slot = this.slotOf.get(entry);
+        if (slot) this.releaseSlot(slot);
         reclaimed++;
       }
     }
@@ -1029,13 +1985,49 @@ export class SubagentModule implements Module {
     return reclaimed;
   }
 
-  private releaseSlot(): void {
-    if (this.activeConcurrent <= 0) return; // Guard against double-release (e.g., zombie reclamation + finally)
-    this.activeConcurrent--;
-    if (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
+  /** The running entry for a display name. Spawn and fork entries are
+   *  keyed differently and stay after they end, so a finished entry of the
+   *  other type can share the name; the first match by name alone could be
+   *  that one. */
+  private runningEntry(displayName: string): ActiveSubagent | undefined {
+    for (const e of this.activeSubagents.values()) {
+      if (e.name === displayName && e.status === 'running') return e;
     }
+    return undefined;
+  }
+
+  private get activeConcurrent(): number {
+    return this.heldSlots.size;
+  }
+
+  private takeSlot(): object {
+    const slot = {};
+    this.heldSlots.add(slot);
+    return slot;
+  }
+
+  /** Release `slot`, if it's still held, and let waiting spawns start. */
+  private releaseSlot(slot: object): void {
+    if (!this.heldSlots.delete(slot)) return; // a zombie reclaim released it already
+    this.admitWaiters();
+  }
+
+  /** Start waiting spawns, in order, while the limit allows. Called wherever
+   *  a slot frees or the limit rises. */
+  private admitWaiters(): void {
+    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
+      this.waitQueue.shift()!(this.takeSlot());
+    }
+  }
+
+  /** Stop a run: cancel its live stream and set its agent idle.
+   *  agent-framework 0.22.3's Agent.cancelStream cancels a stream wherever
+   *  the agent holds one, at a tool boundary too, and the framework records
+   *  the stop as a deliberate cancel, not a failure. A tool call already
+   *  running isn't stopped: it finishes, and the framework drops its
+   *  result. */
+  private stopRun(agent: Agent): void {
+    agent.cancelStream();
   }
 
   /** Format a concurrency notice for tool results (empty string if no wait). */
@@ -1055,30 +2047,152 @@ export class SubagentModule implements Module {
       this.effectiveConcurrent++;
       this.consecutiveSuccesses = 0;
     }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
-  /** Call on rate limit error — halves concurrency and applies cooldown. */
-  private async onRateLimitHit(): Promise<void> {
+  /** Call on rate limit error — halves concurrency, and gives the cooldown
+   *  the run then waits, keeping its slot. A run with a deadline cools down
+   *  no later than its deadline; the halving holds either way. */
+  private onRateLimitHit(deadline?: number): number {
     const prev = this.effectiveConcurrent;
     this.effectiveConcurrent = Math.max(1, Math.floor(this.effectiveConcurrent / 2));
     this.consecutiveSuccesses = 0;
-    this.lastRateLimitAt = Date.now();
+    this.throttled = true;
+    const coolMs = deadline === undefined
+      ? this.rateLimitCooldownMs
+      : Math.max(0, Math.min(this.rateLimitCooldownMs, deadline - Date.now()));
     console.error(
       `[subagent] Rate limit hit — concurrency ${prev} → ${this.effectiveConcurrent}, ` +
-      `cooling down ${this.rateLimitCooldownMs}ms`
+      `cooling down ${coolMs}ms`
     );
-    await new Promise(resolve => setTimeout(resolve, this.rateLimitCooldownMs));
+    return coolMs;
   }
 
-  private isRateLimitError(err: unknown): boolean {
+  /** Wait `ms`, unless the run's cancel comes first; then its error. */
+  private async waitOrStop(ms: number, cancelled: Promise<never>): Promise<SubagentTerminated | null> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([new Promise((resolve) => { timer = setTimeout(resolve, ms); }), cancelled]);
+      return null;
+    } catch (err) {
+      if (err instanceof SubagentTerminated) return err;
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /** A cancel for one run, by its name, from before the run queues. A name
+   *  means one live run (nameInUse refuses a second), so the name finds it.
+   *  cancelSubagent and the zombie reaper reject it and drop it, and the
+   *  run's end drops it (dispose). Everything the run waits on races it:
+   *  the slot queue, an attempt's setup (creating the agent, a fork's read
+   *  of its parent's context, compiling its prompt), each attempt's race and
+   *  the waits between attempts. A cancel that lands just as compiling
+   *  settles, once the race has taken compile's result, is thrown before the
+   *  attempt starts (throwIfFired). */
+  private cancelFor(name: string): { promise: Promise<never>; throwIfFired(): void; dispose(): void } {
+    let reject!: (err: Error) => void;
+    let fired: Error | null = null;
+    const promise = new Promise<never>((_, r) => { reject = r; });
+    promise.catch(() => { /* raced wherever the run waits; one may be idle */ });
+    const handle = { reject: (err: Error) => { fired ??= err; reject(err); } };
+    this.cancellationHandles.set(name, handle);
+    return {
+      promise,
+      throwIfFired: () => { if (fired) throw fired; },
+      // The name is this run's until its result has come back, which is
+      // after this (nameInUse), so the handle under it is this run's or
+      // none, and deleting it can't drop another run's cancel.
+      dispose: () => { this.cancellationHandles.delete(name); },
+    };
+  }
+
+  /** End a run a cancel or the reaper stopped: 'cancelled', with what it
+   *  had said so far. `started` says whether an attempt reached its run
+   *  (failedRun), so a stop before that says nothing ran, as one while it
+   *  queued does (endQueued). */
+  private endTerminated(name: string, entry: ActiveSubagent, err: SubagentTerminated, waitedMs: number, started: boolean): SubagentResult {
+    // Postmortem 2026-05-28 P1 #4: terminal-but-benign — 'cancelled', not
+    // 'completed'. Before this, the TUI subagent list rendered these as
+    // "done" while the reducer-driven web tree rendered them red.
+    entry.status = 'cancelled';
+    entry.completedAt = Date.now();
+    entry.statusMessage = err.reason;
+    const notice = this.concurrencyNotice(waitedMs);
+    const output = err.partialOutput || (started ? '(no output yet)' : '(no output: it was stopped before its run began, so nothing ran)');
+    const summary = notice + `[${stopLabel(err.reason)}] ` + output;
+    this.emit(name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(name) });
+    return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
+  }
+
+  /** What a run under a name starts from, as it queues: no context size an
+   *  earlier run under the name reported, and its own parent link (or none),
+   *  so a parent's cancel reaches it while it waits. Each attempt clears
+   *  the `return` stash as it starts. nameInUse means no other run holds
+   *  the name. */
+  private claimName(name: string, parent: string | undefined): void {
+    this.lastInputTokens.delete(name);
+    if (parent) this.parentMap.set(name, parent);
+    else this.parentMap.delete(name);
+  }
+
+  /** Drop a run's attempts from the index as the run ends: nameInUse keeps
+   *  its name until its result has come back, after this, so every entry
+   *  under the name is this run's. */
+  private forgetAttempts(name: string): void {
+    for (const [agentName, run] of this.runOfAttempt) if (run === name) this.runOfAttempt.delete(agentName);
+  }
+
+  /** End a run cancelled while it waited for a slot: it never started. */
+  private endQueued(name: string, err: SubagentTerminated): SubagentResult {
+    const summary = `[${stopLabel(err.reason)}] (no output: it was still waiting for a concurrency slot, and never started)`;
+    this.emit(name, { type: 'done', summary });
+    return { summary, findings: [], issues: [], toolCallsCount: 0 };
+  }
+
+  /** The words the classifiers read: the failure's message without the
+   *  ephemeral agent's name, which the framework quotes in its own messages
+   *  ("Ephemeral agent \"spawn-migrate-…\" failed to start inference …") and
+   *  which holds the name the agent chose. agent-framework 0.22.3 gives an
+   *  ephemeral run's failure no other structure to read: it rejects with an
+   *  Error carrying the text, apart from its ProviderWaitNotSleptError,
+   *  which isUnsleptProviderWait reads by name. */
+  private classifiedText(err: Error, agentName?: string): string {
+    const text = agentName ? err.message.split(agentName).join('') : err.message;
+    return text.toLowerCase();
+  }
+
+  private isRateLimitError(err: unknown, agentName?: string): boolean {
     if (!(err instanceof Error)) return false;
-    const msg = err.message.toLowerCase();
-    return msg.includes('rate') || msg.includes('429') || msg.includes('too many');
+    const msg = this.classifiedText(err, agentName);
+    // Rate-limit phrases, not words: "rate" with no letter before it and
+    // "limit" or "exceeded" after it, so "generate", "moderate" or "rated"
+    // isn't a rate limit and "upstream_rate_limit_exceeded" is; "too many
+    // requests", not "too many", which also opens "too many tokens"; and
+    // the status code as a whole number, so a duration such as 14290ms
+    // isn't one.
+    return /(?<![a-z])rate[\s_-]?(limit|exceeded)/.test(msg)
+      || /\b429\b/.test(msg)
+      || /too many (\w+ )?requests/.test(msg);
+  }
+
+  /** The framework ended the run rather than sleep the stated wait of a
+   *  retryable failure: one longer than an ephemeral run sleeps, or one it
+   *  can't read as a number. Either way the provider asked for a wait the
+   *  run won't sit out, so a restart would only call it again too soon.
+   *  agent-framework 0.22.3 rejects such a run with its
+   *  `ProviderWaitNotSleptError`, read here by its name, which a second copy
+   *  of the package gives its own class too. */
+  private isUnsleptProviderWait(err: Error): boolean {
+    return err.name === 'ProviderWaitNotSleptError';
   }
 
   /** Transient = worth retrying the whole subagent from scratch. */
-  private isTransientError(err: Error): boolean {
-    const msg = err.message.toLowerCase();
+  private isTransientError(err: Error, agentName?: string): boolean {
+    if (this.isUnsleptProviderWait(err)) return false;
+    const msg = this.classifiedText(err, agentName);
     return (
       msg.includes('timeout') ||
       msg.includes('idle') ||
@@ -1087,34 +2201,37 @@ export class SubagentModule implements Module {
       msg.includes('network') ||
       msg.includes('stream aborted') ||
       msg.includes('overloaded') ||
-      msg.includes('529') ||
-      msg.includes('500') ||
-      msg.includes('502') ||
-      msg.includes('503') ||
-      this.isRateLimitError(err)
+      // Whole numbers, so a duration such as 15000ms isn't an HTTP 500.
+      /\b(500|502|503|529)\b/.test(msg) ||
+      this.isRateLimitError(err, agentName)
     );
   }
 
-  /** Set concurrency ceiling at runtime. Also raises effective if below new ceiling. */
+  /** Set the concurrency ceiling at runtime. The effective limit follows it,
+   *  up or down, except that while a rate limit's halving holds, a higher
+   *  ceiling leaves the effective limit to recover toward it after
+   *  successes. Spawns waiting for a slot start as the limit allows. */
   setConcurrency(n: number): void {
     this.configuredMaxConcurrent = Math.max(1, n);
-    if (this.effectiveConcurrent > this.configuredMaxConcurrent) {
+    if (!this.throttled || this.effectiveConcurrent > this.configuredMaxConcurrent) {
       this.effectiveConcurrent = this.configuredMaxConcurrent;
     }
-    // If we were throttled below the new ceiling, let waiters through
-    while (this.waitQueue.length > 0 && this.activeConcurrent < this.effectiveConcurrent) {
-      this.activeConcurrent++;
-      this.waitQueue.shift()!();
-    }
+    if (this.effectiveConcurrent >= this.configuredMaxConcurrent) this.throttled = false;
+    this.admitWaiters();
   }
 
   /** Get current concurrency status for observability. */
-  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number } {
+  getConcurrencyStatus(): { configured: number; effective: number; active: number; queued: number; note?: string } {
+    const held = this.throttled && this.effectiveConcurrent < this.configuredMaxConcurrent;
     return {
       configured: this.configuredMaxConcurrent,
       effective: this.effectiveConcurrent,
       active: this.activeConcurrent,
       queued: this.waitQueue.length,
+      ...(held ? {
+        note: `A rate limit holds the limit at ${this.effectiveConcurrent}. It rises by one after every three ` +
+          `subagents that finish without error, up to ${this.configuredMaxConcurrent}.`,
+      } : {}),
     };
   }
 
@@ -1123,16 +2240,43 @@ export class SubagentModule implements Module {
   // =========================================================================
 
   /**
-   * Force-stop a running subagent. Aborts the active HTTP stream and
-   * causes runSpawn/runFork to return with a "[Stopped by user]" result.
-   * Returns true if the subagent was found and cancelled.
+   * Force-stop a subagent: one running, between attempts, or still waiting
+   * for a concurrency slot. Stops its live stream, if it has one, and makes
+   * runSpawn/runFork return a "[Stopped by user]" result. Returns true if
+   * the subagent was found and cancelled.
    */
   cancelSubagent(displayName: string): boolean {
-    // Cancel children first (bottom-up) so their results propagate before the parent dies
-    this.cancelChildren(displayName);
+    const found = this.cancellationHandles.has(displayName);
+    this.stopTree(displayName);
+    return found;
+  }
+
+  /** Whether the framework agent named is a subagent's live attempt: an
+   *  operator's interrupt takes its turn to the follower before cancelAll
+   *  stops its run (interruptSubagents). */
+  isSubagentAgent(frameworkAgentName: string): boolean {
+    return this.frameworkNameIndex.has(frameworkAgentName);
+  }
+
+  /**
+   * Cancel all running subagents (e.g. on user Esc).
+   * Returns the number of subagents cancelled, each once: a child stopped
+   * through its parent counts there, and its own name then finds nothing.
+   */
+  cancelAll(): number {
+    let count = 0;
+    for (const name of [...this.cancellationHandles.keys()]) count += this.stopTree(name);
+    return count;
+  }
+
+  /** Stop the run named, its children first (bottom-up, so their results
+   *  propagate before the parent's), and return how many runs this stopped. */
+  private stopTree(displayName: string): number {
+    let stopped = 0;
+    for (const child of this.childrenOf(displayName)) stopped += this.stopTree(child);
 
     const handle = this.cancellationHandles.get(displayName);
-    if (!handle) return false;
+    if (!handle) return stopped;
 
     // Abort the active inference stream (cancels the HTTP request)
     const live = this.liveSubagents.get(displayName);
@@ -1140,27 +2284,14 @@ export class SubagentModule implements Module {
     if (live) {
       try {
         const agent = this.getFramework().getAgent(live.frameworkAgentName);
-        if (agent) agent.cancelStream();
+        if (agent) this.stopRun(agent);
       } catch { /* best-effort */ }
     }
 
-    // Unblock the Promise.race in runSpawn/runFork
+    // End the run wherever it waits: the slot queue, an attempt or a back-off
     handle.reject(new SubagentTerminated('cancelled', partial, `Subagent "${displayName}" cancelled by user`));
-    return true;
-  }
-
-  /**
-   * Cancel all running subagents (e.g. on user Esc).
-   * Returns the number of subagents cancelled.
-   */
-  cancelAll(): number {
-    // Collect all cancellable names first to avoid mutation during iteration
-    const names = [...this.cancellationHandles.keys()];
-    let count = 0;
-    for (const name of names) {
-      if (this.cancelSubagent(name)) count++;
-    }
-    return count;
+    this.cancellationHandles.delete(displayName);
+    return stopped + 1;
   }
 
   /**
@@ -1189,27 +2320,16 @@ export class SubagentModule implements Module {
     return result;
   }
 
-  /**
-   * Cancel all children (direct + transitive) of the given display name.
-   * Uses the parentMap to find descendants via framework agent names.
-   */
-  private cancelChildren(displayName: string): void {
-    const live = this.liveSubagents.get(displayName);
-    if (!live) return;
-
-    // Find direct children: entries in parentMap whose parent is this agent's framework name
-    const frameworkName = live.frameworkAgentName;
+  /** The direct children of the run named: the parentMap entries whose
+   *  parent is the framework agent of any of its attempts (runOfAttempt),
+   *  queued children included, since a run takes its parent link when it
+   *  queues. */
+  private childrenOf(displayName: string): string[] {
     const children: string[] = [];
     for (const [childName, parentFrameworkName] of this.parentMap) {
-      if (parentFrameworkName === frameworkName) {
-        children.push(childName);
-      }
+      if (this.runOfAttempt.get(parentFrameworkName) === displayName) children.push(childName);
     }
-
-    // Cancel each child (which recursively cancels its children)
-    for (const child of children) {
-      this.cancelSubagent(child);
-    }
+    return children;
   }
 
   // =========================================================================
@@ -1322,16 +2442,17 @@ export class SubagentModule implements Module {
     const live = this.liveSubagents.get(displayName);
     if (!live) return null;
 
-    // Find the matching ActiveSubagent entry for status/metadata
-    let entry: ActiveSubagent | undefined;
-    for (const e of this.activeSubagents.values()) {
-      if (e.name === displayName) { entry = e; break; }
-    }
+    // The matching ActiveSubagent entry for status/metadata
+    const entry = this.runningEntry(displayName);
 
     let messageCount = 0;
     let lastMessageSnippet = '';
     try {
-      const compiled = await live.contextManager.compile();
+      // A dry compile: a peek only reads, so it mustn't commit the stream's
+      // fold state or queue its compression, as a real compile would. A plan
+      // over the budget it compiles at is returned, where a real compile
+      // refuses it.
+      const compiled = await live.contextManager.compile(undefined, undefined, { dryRun: true });
       messageCount = compiled.messages.length;
       // Extract a short snippet from the last message for observability
       // without dumping the entire context into the caller's window.
@@ -1354,7 +2475,6 @@ export class SubagentModule implements Module {
     // it was between tokens — saturating peers' context with false alarms and
     // driving an orchestrator-level retry storm. Now keyed off `lastActivityAt`
     // and gated by `!requestInFlightSince` to match the reaper.
-    const ZOMBIE_THRESHOLD_MS = 120_000;
     const silentMs = entry ? Date.now() - entry.lastActivityAt : 0;
     const isZombie = (entry?.status === 'running')
       && silentMs > ZOMBIE_THRESHOLD_MS
@@ -1389,18 +2509,6 @@ export class SubagentModule implements Module {
    *   3. parent agent's `maxTokens` (by default, subagents inherit their caller's budget)
    *   4. last-resort framework fallback (4096) — only reached if there's no parent at all
    */
-  /** Ephemeral agents inherit the caller's prose-routing mode. AF's Agent
-   *  defaults to 'locus' (ambient locus capture publishes plain prose to the
-   *  open channel), so a resident running proseRouting 'disabled' would still
-   *  spawn divers whose between-tool-calls prose leaks into its live channel
-   *  as parent speech — field-confirmed 2026-08-26. Falls back to the
-   *  configured parent agent, then to AF's own default. */
-  private resolveProseRouting(callerAgentName?: string): 'locus' | 'explicit' | 'hybrid' | 'disabled' | undefined {
-    const parentName = callerAgentName ?? this.config.parentAgentName;
-    if (!parentName) return undefined;
-    return this.framework?.getAgent(parentName)?.proseRouting;
-  }
-
   private resolveMaxTokens(callMaxTokens: number | undefined, parentAgentName?: string): number {
     if (callMaxTokens !== undefined) return callMaxTokens;
     if (this.config.defaultMaxTokens !== undefined) return this.config.defaultMaxTokens;
@@ -1412,17 +2520,50 @@ export class SubagentModule implements Module {
     return 4096;
   }
 
-  private withTimeout<T>(promise: Promise<T>, name: string, timeoutMs?: number): Promise<T> {
-    if (timeoutMs === undefined) return promise;
-    return Promise.race([
-      promise,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error(`Subagent ${name} timed out after ${timeoutMs}ms`)),
-          timeoutMs,
-        )
-      ),
-    ]);
+  /** Race an attempt against its run's time limit: `limitMs` long, ending
+   *  at `deadline`, so every attempt shares one limit. At the deadline,
+   *  `stop` ends the run itself, and the error is the module's own, which
+   *  the retry loop doesn't retry. A stop that throws is logged, and the
+   *  limit still ends the attempt. The framework's startup watchdog for the
+   *  attempt ends at the deadline too (watchdogsFor), and its timer can
+   *  fire first, so a failure that ends the attempt at the deadline is
+   *  reported as the time limit, whichever settled it. The timer ends with
+   *  the attempt, so a finished run is never stopped late. */
+  private withTimeout<T>(promise: Promise<T>, name: string, kind: 'spawn' | 'fork', limitMs: number | undefined, deadline: number | undefined, stop: () => void): Promise<T> {
+    if (limitMs === undefined || deadline === undefined) return promise;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const limit = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        try {
+          stop();
+        } catch (err) {
+          console.error(`[subagent] ${name}: stopping the run at its time limit failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+        reject(this.timedOut(kind, limitMs));
+      }, timerDelay(deadline - Date.now()));
+    });
+    const attempt = promise.catch((err: unknown) => {
+      throw deadline - Date.now() <= TIMER_SLACK_MS ? this.timedOut(kind, limitMs) : err;
+    });
+    return Promise.race([attempt, limit]).finally(() => clearTimeout(timer));
+  }
+
+  /** An async run's time limit, which only its own timeoutMs sets. */
+  private timedOut(kind: 'spawn' | 'fork', limitMs: number): SubagentFailure {
+    return new SubagentFailure(
+      `its time limit of ${duration(limitMs)} ran out`,
+      `To give it longer, call subagent--${kind} again with a larger timeoutMs; an async ${kind} with no timeoutMs has no limit.`,
+    );
+  }
+
+  /** The framework's watchdogs for an attempt of a run with a deadline: its
+   *  startup watchdog no later than the deadline, so a run whose inference
+   *  hasn't started by then (held behind a provider wait, say) is dropped by
+   *  the framework rather than started after the run was reported timed
+   *  out. Without a deadline, the framework's own. */
+  private watchdogsFor(deadline: number | undefined): { startupTimeoutMs: number } | undefined {
+    if (deadline === undefined) return undefined;
+    return { startupTimeoutMs: Math.max(1, Math.min(30_000, deadline - Date.now())) };
   }
 
   // =========================================================================
@@ -1455,6 +2596,255 @@ export class SubagentModule implements Module {
   // Tool Handlers
   // =========================================================================
 
+  /**
+   * Resolve everything a new stream is launched with, once, at the call.
+   * run*() creates the stream from this description verbatim, and the
+   * receipt and the stream's first context both render it.
+   */
+  private resolveLaunch(
+    kind: 'fork' | 'spawn',
+    input: ForkInput | SpawnInput,
+    callerAgentName: string | undefined,
+    callerDepth: number,
+    callToolUseId?: string,
+  ): SubagentLaunch {
+    const framework = this.getFramework();
+    // The caller (recursive forks and spawns), else the configured parent
+    // agent. A caller named but not found is refused, before any slot.
+    const parentName = callerAgentName ?? this.config.parentAgentName;
+    const parentAgent = parentName === undefined ? null : (framework.getAgent(parentName) ?? null);
+    if (callerAgentName !== undefined && !parentAgent) {
+      throw new Error(`Cannot resolve subagent caller: ${callerAgentName}`);
+    }
+    const model = input.model ?? this.config.defaultModel ?? FALLBACK_SUBAGENT_MODEL;
+
+    let systemPrompt: string;
+    let systemPromptSource: SubagentLaunch['systemPromptSource'];
+    if (kind === 'spawn') {
+      systemPrompt = (input as SpawnInput).systemPrompt;
+      systemPromptSource = 'caller';
+    } else if (input.systemPrompt !== undefined && input.systemPrompt !== parentAgent?.systemPrompt) {
+      systemPrompt = input.systemPrompt;
+      systemPromptSource = 'override';
+    } else if (parentAgent) {
+      systemPrompt = parentAgent.systemPrompt;
+      systemPromptSource = 'parent';
+    } else {
+      // No prompt of its own (any it names differs from a missing
+      // parent's, so it took the override branch) and no parent.
+      systemPrompt = NO_PARENT_SYSTEM_PROMPT;
+      systemPromptSource = 'default';
+    }
+
+    const requestedTools = kind === 'spawn' ? (input as SpawnInput).tools : undefined;
+    // The caller's own tool rules, narrowed by the spawn's list (at the
+    // depth limit, only what the process offers of them, less the subagent
+    // tools): resolved now and kept through the slot wait and every retry.
+    const allowed = this.filterToolNames(requestedTools, callerDepth, parentAgent);
+    // What the process offers now, which the description can say the stream
+    // gets.
+    const offered = this.offeredNames();
+
+    // The parent's context settings at the call, from supported surfaces
+    // only: its runtime settings (budget, and the strategy's recent tail when
+    // the strategy reports one) and the strategy's own name and message cap.
+    // Anything else (head window, compression model) isn't reported, and the
+    // description says so rather than assuming a match.
+    let parentStrategy: string | undefined;
+    let parentMessageCap: number | undefined;
+    try {
+      const strategy = parentAgent?.getContextManager().getStrategy() as
+        { name?: unknown; maxMessageTokens?: unknown } | undefined;
+      if (typeof strategy?.name === 'string') parentStrategy = strategy.name;
+      if (typeof strategy?.maxMessageTokens === 'number') parentMessageCap = strategy.maxMessageTokens;
+    } catch { /* a strategy that can't be read reports nothing */ }
+    const parentRuntime = parentAgent?.getRuntimeSettings();
+
+    // Agent defaults to 'locus'. A resolved caller's mode is inherited, so
+    // children of a 'disabled' caller can't leak prose into its live channel.
+    const proseRouting = parentAgent?.proseRouting;
+    return {
+      kind,
+      name: input.name,
+      depth: callerDepth + 1,
+      maxDepth: this.maxDepth,
+      ...(kind === 'fork' && callToolUseId ? { forkPoint: callToolUseId } : {}),
+      ...(this.config.provider !== undefined ? { provider: this.config.provider } : {}),
+      model,
+      systemPrompt,
+      systemPromptSource,
+      maxTokens: this.resolveMaxTokens(input.maxTokens, callerAgentName),
+      maxStreamTokens: SUBAGENT_STREAM_TOKENS,
+      strategy: { ...SUBAGENT_STRATEGY, compressionModel: model },
+      ...(proseRouting !== undefined ? { proseRouting } : {}),
+      tools: {
+        allowed: allowed === 'all' ? 'all' : [...allowed],
+        ...(requestedTools !== undefined ? { requested: [...requestedTools] } : {}),
+        // Each name once: the stream gets a tool once however often its list
+        // names it (canUseTool tests membership).
+        ...(allowed !== 'all' ? { granted: [...new Set(allowed)].filter((name) => name === 'subagent--return' || offered.has(name)) } : {}),
+        // filterToolNames' own threshold.
+        depthLimited: callerDepth + 1 >= this.maxDepth,
+      },
+      parent: parentAgent
+        ? {
+            stream: parentAgent.name,
+            model: parentAgent.model,
+            maxTokens: parentAgent.maxTokens,
+            maxStreamTokens: parentAgent.maxStreamTokens,
+            contextBudgetTokens: parentRuntime!.contextBudgetTokens,
+            ...(parentRuntime?.tailTokens !== undefined ? { tailTokens: parentRuntime.tailTokens } : {}),
+            ...(parentStrategy !== undefined ? { strategy: parentStrategy } : {}),
+            ...(parentMessageCap !== undefined ? { maxMessageTokens: parentMessageCap } : {}),
+            allowedTools: Array.isArray(parentAgent.allowedTools) ? [...parentAgent.allowedTools] : 'all',
+          }
+        : null,
+      parentAgent,
+    };
+  }
+
+  /** The ephemeral agent a launch describes. Nothing here is re-resolved:
+   *  each value comes from the launch as resolved at the call, its tool
+   *  rules included. */
+  private ephemeralAgentConfig(launch: SubagentLaunch, agentName: string) {
+    return {
+      name: agentName,
+      model: launch.model,
+      systemPrompt: launch.systemPrompt,
+      maxTokens: launch.maxTokens,
+      ...(launch.proseRouting !== undefined ? { proseRouting: launch.proseRouting } : {}),
+      maxStreamTokens: launch.maxStreamTokens,
+      strategy: new KnowledgeStrategy({
+        headWindowTokens: launch.strategy.headWindowTokens,
+        recentWindowTokens: launch.strategy.recentWindowTokens,
+        compressionModel: launch.strategy.compressionModel,
+        autoTickOnNewMessage: true,
+        maxMessageTokens: launch.strategy.maxMessageTokens,
+      }),
+      allowedTools: launch.tools.allowed === 'all' ? 'all' as const : [...launch.tools.allowed],
+    };
+  }
+
+  /**
+   * The tools an ephemeral stream is shown, as the board stands when the
+   * launch composes its first context. The framework reads the board again
+   * when it assembles the first request, so a server that changes its tools
+   * in between isn't reflected here; the request's own tool list is what
+   * the stream can call. The framework builds that surface
+   * (agentToolSurface) from the shared board filtered by the agent's own
+   * permissions, plus prose_help under explicit
+   * prose routing when those permissions allow it (agent-framework 0.22.3's
+   * availableToolsForPresentation). An ephemeral agent has no presentation
+   * and isn't the subconscious, so nothing else applies, and it isn't
+   * registered until its run starts, so listToolClasses can't be asked yet.
+   * The orientation tests set this against listToolClasses once the stream
+   * is registered, and against the request it sends, so a change in the
+   * framework's rule fails them.
+   */
+  private streamSurface(agent: { canUseTool(name: string): boolean; proseRouting: ProseRouting }): string[] {
+    const names = this.getFramework().getAllTools()
+      .filter((t) => agent.canUseTool(t.name))
+      .map((t) => t.name);
+    if (agent.proseRouting === 'explicit' && agent.canUseTool('prose_help')) names.push('prose_help');
+    return names;
+  }
+
+  /** A refused fork's way out: a spawn, where the caller's tool rules allow
+   *  one. It takes a systemPrompt, which a fork's caller needn't have given,
+   *  and its own orientation and task must each fit one message, or it's
+   *  refused in turn. A caller whose rules don't allow subagent--spawn is
+   *  told to do the work in its own stream, rather than sent to a tool it
+   *  can't call. */
+  private spawnInstead(canSpawn: boolean, withCap = false): string {
+    if (!canSpawn) return "do it in this stream instead, since subagent--spawn isn't among your tools";
+    const cap = withCap ? ` (${formatTokens(SUBAGENT_STRATEGY.maxMessageTokens)})` : '';
+    return 'launch it as subagent--spawn instead, with a name, a systemPrompt, a short tools list and a task ' +
+      `that fits one message${cap} and says what it needs to know`;
+  }
+
+  /** Why a launch is refused when its stream wouldn't read what it
+   *  promises: each part that was cut, and the way out for it. A fork takes
+   *  no tools list, so its way out for a long orientation, or for a call the
+   *  context lost, is a spawn with a short one, so that the spawn's own
+   *  orientation fits, and a spawn inherits nothing: worth saying when the
+   *  fork would have inherited its parent's context, as a fork with a call
+   *  does. */
+  private launchRefusal(
+    kind: 'spawn' | 'fork',
+    cut: ReadonlyArray<'orientation' | 'task' | 'call'>,
+    delivery: LaunchDelivery,
+    /** Whether the caller's tool rules allow subagent--spawn: a fork's way
+     *  out names a spawn only then. */
+    canSpawn: boolean,
+  ): SubagentFailure {
+    const inheritsContext = delivery.kind === 'fork-result' && canSpawn;
+    const cap = formatTokens(SUBAGENT_STRATEGY.maxMessageTokens);
+    // A spawn's task is a message of its own, which the cap can cut, as a
+    // parentless fork's is; a fork with a parent carries its task whole in
+    // its call, so the spawn it becomes needs a task that fits one message.
+    const inherits = inheritsContext ? ', though a spawn inherits none of this context' : '';
+    const reasons = cut.map((part) => {
+      if (part === 'orientation') {
+        return kind === 'spawn'
+          ? `its orientation, which names the spawn's tools in full, is longer than one message holds (${cap}): give the spawn a shorter tools list`
+          : `its orientation is longer than one message holds (${cap}): ${this.spawnInstead(canSpawn)}${inherits}`;
+      }
+      if (part === 'task') {
+        return `its task is longer than one message holds (${cap}): shorten or split it, or put the detail in a file, ` +
+          `${kind === 'spawn' ? 'give the spawn a tool that can read it' : 'make sure its tools can read it'}, and pass the path`;
+      }
+      return `the fork call that carries its task, or its result, isn't in the context it would start from: ${this.spawnInstead(canSpawn, true)}${inherits}`;
+    });
+    return new SubagentFailure(reasons.join('; and '));
+  }
+
+  /** The stream's own orientation: the launch block as resolved at the
+   *  call, then what happened when the stream was created. */
+  private orientationFor(
+    launch: SubagentLaunch,
+    agent: Omit<Parameters<typeof agentSettingsOf>[0], 'getRuntimeSettings'> & {
+      canUseTool(name: string): boolean;
+      getRuntimeSettings(): { contextBudgetTokens: number; sameRoundThinkTextPolicy?: string };
+      proseRouting: ProseRouting;
+    },
+    inherited: SubagentStart['inherited'],
+  ): string {
+    const framework = this.getFramework();
+    let parentTools: string[] | undefined;
+    let parentAgentSettings: AgentSettings | undefined;
+    // The parent the launch was resolved against at the call, as the fork's
+    // context is: never another agent later registered under its name.
+    // listToolClasses looks agents up by name, so its surface is read only
+    // while the framework's agent of that name is still this one.
+    const parentAgent = launch.parentAgent;
+    if (launch.parent && parentAgent) {
+      if (framework.getAgent(parentAgent.name) === parentAgent) {
+        try {
+          parentTools = framework.listToolClasses(parentAgent.name).map((t) => t.tool);
+        } catch { /* stated as unreadable */ }
+      }
+      parentAgentSettings = agentSettingsOf(parentAgent as unknown as Parameters<typeof agentSettingsOf>[0]);
+    }
+    const start: SubagentStart = {
+      inherited,
+      contextBudgetTokens: agent.getRuntimeSettings().contextBudgetTokens,
+      proseRouting: agent.proseRouting,
+      tools: this.streamSurface(agent),
+      ...(parentTools !== undefined ? { parentTools } : {}),
+      agentSettings: agentSettingsOf(agent),
+      ...(parentAgentSettings !== undefined ? { parentAgentSettings } : {}),
+    };
+    return `${describeSubagentLaunch(launch)}\n${describeSubagentStart(launch, start)}`;
+  }
+
+  /** The caller's receipt: whether the launch started or is waiting for a
+   *  slot, then the launch description. */
+  private launchReceipt(launch: SubagentLaunch, head: string, ticket: { queued: boolean }): string {
+    const slot = ticket.queued
+      ? `Every subagent slot (${this.effectiveConcurrent}) is in use, so it waits for one to free, for up to ${Math.round(SLOT_TIMEOUT_MS / 1000)} s; if none does, it ends with an error, delivered as its result would be.`
+      : 'Starting in background.';
+    return `${head} ${slot}\n\n${describeSubagentLaunch(launch)}`;
+  }
   private async handleSpawn(input: SpawnInput, callerAgentName?: string): Promise<ToolResult> {
     const callerDepth = callerAgentName ? (this.agentDepths.get(callerAgentName) ?? 0) : 0;
     if (callerDepth >= this.maxDepth) {
@@ -1466,27 +2856,45 @@ export class SubagentModule implements Module {
     }
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
+    // Resolved once, before any slot, and kept through the slot wait and
+    // every retry: the caller's settings, context and tool rules as they are
+    // now. A caller that can't be resolved, or a module with no framework
+    // yet, answers with an error, never a throw.
+    let launch: SubagentLaunch;
+    try {
+      launch = this.resolveLaunch('spawn', input, callerAgentName, callerDepth);
+    } catch (error) {
+      return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
+    }
+    const ticket = { queued: false };
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    const inUse = this.nameInUse(input.name);
+    if (inUse) return inUse;
+
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runSpawn(input, callerAgentName, callerDepth, timeoutMs);
-      const result = await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs);
-      return result;
+      const promise = this.runSpawn(launch, input, callerAgentName, callerDepth, undefined, ticket);
+      return await this.runDetachable(input.name, 'spawn', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs, launch);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
     // No default timeout — async agents run until they finish unless
     // the caller explicitly sets timeoutMs.
-    const promise = this.runSpawn(input, callerAgentName, callerDepth, input.timeoutMs);
+    const promise = this.runSpawn(launch, input, callerAgentName, callerDepth, input.timeoutMs, ticket);
     this.asyncHandles.set(input.name, { name: input.name, type: 'spawn', promise, parentAgentName });
 
     promise
-      .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
-      .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
+      .then(
+        result => this.deliverAsyncResult(input.name, result, parentAgentName),
+        err => this.deliverAsyncError(input.name, err, parentAgentName),
+      )
+      .catch(err => console.error(`[subagent] delivering ${input.name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
-    return { success: true, data: `Subagent '${input.name}' spawned. Running in background.` };
+    // runSpawn ran synchronously up to its slot wait, so `ticket` already
+    // says whether this launch is starting or queued.
+    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' accepted as a spawn.`, ticket) };
   }
 
   private async handleFork(input: ForkInput, callerAgentName?: string, callToolUseId?: string): Promise<ToolResult> {
@@ -1500,27 +2908,71 @@ export class SubagentModule implements Module {
     }
 
     const parentAgentName = callerAgentName ?? this.config.parentAgentName ?? 'agent';
+    // Resolved once, before any slot, and kept through the slot wait and
+    // every retry: the caller's settings, context and tool rules as they are
+    // now. A caller that can't be resolved, or a module with no framework
+    // yet, answers with an error, never a throw.
+    let launch: SubagentLaunch;
+    try {
+      launch = this.resolveLaunch('fork', input, callerAgentName, callerDepth, callToolUseId);
+    } catch (error) {
+      return { success: false, isError: true, error: error instanceof Error ? error.message : String(error) };
+    }
+    const ticket = { queued: false };
 
-    // Sync mode: block until completion, but detachable mid-flight.
-    // Default timeout applies (600s) — auto-detaches to background.
+    const inUse = this.nameInUse(input.name);
+    if (inUse) return inUse;
+
+    // Sync mode: block until completion, but detachable mid-flight. At
+    // timeoutMs (default maxExecutionMs) the run moves to the background and
+    // goes on; a sync run has no hard limit.
     if (input.sync) {
-      const timeoutMs = input.timeoutMs ?? this.maxExecutionMs;
-      const promise = this.runFork(input, callerAgentName, callerDepth, timeoutMs, callToolUseId);
-      const result = await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs);
-      return result;
+      const promise = this.runFork(launch, input, callerAgentName, callerDepth, undefined, callToolUseId, ticket);
+      return await this.runDetachable(input.name, 'fork', promise, parentAgentName, input.timeoutMs ?? this.maxExecutionMs, launch);
     }
 
     // Async mode (default): fire-and-forget, deliver result as message.
     // No default timeout — async agents run until they finish unless
     // the caller explicitly sets timeoutMs.
-    const promise = this.runFork(input, callerAgentName, callerDepth, input.timeoutMs, callToolUseId);
+    const promise = this.runFork(launch, input, callerAgentName, callerDepth, input.timeoutMs, callToolUseId, ticket);
     this.asyncHandles.set(input.name, { name: input.name, type: 'fork', promise, parentAgentName });
 
     promise
-      .then(result => this.deliverAsyncResult(input.name, result, parentAgentName))
-      .catch(err => this.deliverAsyncError(input.name, err, parentAgentName));
+      .then(
+        result => this.deliverAsyncResult(input.name, result, parentAgentName),
+        err => this.deliverAsyncError(input.name, err, parentAgentName),
+      )
+      .catch(err => console.error(`[subagent] delivering ${input.name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
-    return { success: true, data: `Subagent '${input.name}' forked. Running in background.` };
+    // runFork ran synchronously up to its slot wait, so `ticket` already
+    // says whether this launch is starting or queued.
+    return { success: true, data: this.launchReceipt(launch, `Subagent '${input.name}' accepted as a fork.`, ticket) };
+  }
+
+  /** A refusal when a subagent already has this name. A name means one
+   *  subagent from its spawn until its result has come back: the agent
+   *  cancels, peeks at and waits for subagents by name, and the module keys
+   *  them by it. Until then an admitted run is in detachableHandles (a sync
+   *  run still blocking its caller, until the call returns or the run moves
+   *  to the background) or asyncHandles (an async run, or a sync one moved to
+   *  the background, until its result is delivered). A run that no longer
+   *  has its cancel was cancelled or reclaimed, or has ended, so it's
+   *  finishing, whatever its entry still says. */
+  private nameInUse(name: string): ToolResult | null {
+    if (!this.asyncHandles.has(name) && !this.detachableHandles.has(name)) return null;
+    const entry = this.runningEntry(name);
+    const state = !this.cancellationHandles.has(name)
+      ? 'is still finishing'
+      : entry
+        ? `is already running (for ${Math.round((Date.now() - entry.startedAt) / 1000)} s)`
+        : 'is already waiting for a concurrency slot';
+    return {
+      success: false,
+      isError: true,
+      error:
+        `Nothing was started: a subagent named '${name}' ${state}, and a name means one subagent ` +
+        `until its result has come back. Choose another name, or wait for that one's result.`,
+    };
   }
 
   private deliverAsyncResult(name: string, result: SubagentResult, parentAgentName: string): void {
@@ -1556,6 +3008,25 @@ export class SubagentModule implements Module {
     });
   }
 
+  /** A spawn's or fork's failure as the agent reads it, in the call's answer
+   *  or the async notice: whether anything ran, what ended it, and what to
+   *  do. The module's own failures say what ended them and what to do
+   *  (SubagentFailure); anything else is the run's own error. A run started
+   *  once an attempt reached runEphemeralToCompletion, the only place a
+   *  subagent acts. */
+  private failedRun(name: string, kind: 'spawn' | 'fork', err: unknown, run: { started: boolean; attempts: number }): Error {
+    const who = kind === 'fork' ? `Fork '${name}'` : `Subagent '${name}'`;
+    const own = err instanceof SubagentFailure ? err : null;
+    const why = (own ? own.why : err instanceof Error ? err.message : String(err)).replace(/[\s.]+$/, '');
+    const remedy = own?.remedy ? ` ${own.remedy}` : '';
+    if (!run.started) return new Error(`${who} didn't start, so nothing ran: ${why}.${remedy}`);
+    const tries = run.attempts > 1 ? ` after ${run.attempts} attempts` : '';
+    return new Error(
+      `${who} stopped${tries} and returned no result: ${why}. What it did before then stays done, and ` +
+      `${kind === 'fork' ? 'forking' : 'spawning'} it again starts its task over.${remedy}`,
+    );
+  }
+
   // =========================================================================
   // Detachable sync → async transition
   // =========================================================================
@@ -1571,7 +3042,11 @@ export class SubagentModule implements Module {
     promise: Promise<SubagentResult>,
     parentAgentName: string,
     autoDetachMs?: number,
+    /** Rendered into both returns, so a sync caller gets the same launch
+     *  description an async caller's receipt carries. */
+    launch?: SubagentLaunch,
   ): Promise<ToolResult> {
+    const launchText = launch ? describeSubagentLaunch(launch) : undefined;
     let detachResolve: ((value: 'detached') => void) | null = null;
     const detachPromise = new Promise<'detached'>(resolve => { detachResolve = resolve; });
 
@@ -1591,7 +3066,7 @@ export class SubagentModule implements Module {
         if (this.detachableHandles.has(name)) {
           handle.detach();
         }
-      }, autoDetachMs);
+      }, timerDelay(autoDetachMs));
     }
 
     type RaceResult =
@@ -1612,7 +3087,10 @@ export class SubagentModule implements Module {
       this.detachableHandles.delete(name);
 
       if (winner.kind === 'completed') {
-        return { success: true, data: winner.result };
+        return {
+          success: true,
+          data: launchText ? { ...winner.result, launch: launchText } : winner.result,
+        };
       }
 
       if (winner.kind === 'error') {
@@ -1627,12 +3105,16 @@ export class SubagentModule implements Module {
       // Detached: transition to async — wire up result delivery
       this.asyncHandles.set(name, { name, type, promise, parentAgentName });
       promise
-        .then(result => this.deliverAsyncResult(name, result, parentAgentName))
-        .catch(err => this.deliverAsyncError(name, err, parentAgentName));
+        .then(
+          result => this.deliverAsyncResult(name, result, parentAgentName),
+          err => this.deliverAsyncError(name, err, parentAgentName),
+        )
+        .catch(err => console.error(`[subagent] delivering ${name}'s result: ${err instanceof Error ? err.message : String(err)}`));
 
       return {
         success: true,
-        data: `Subagent '${name}' moved to background. Results will be delivered as a message when complete.`,
+        data: `Subagent '${name}' moved to background. Results will be delivered as a message when complete.` +
+          (launchText ? `\n\n${launchText}` : ''),
       };
     } catch {
       if (autoTimer) clearTimeout(autoTimer);
@@ -1691,7 +3173,13 @@ export class SubagentModule implements Module {
     if (snapshots.length === 0) {
       return {
         success: true,
-        data: { message: input.name ? `No running subagent named '${input.name}'` : 'No running subagents' },
+        data: {
+          message: input.name
+            ? `No subagent of yours named '${input.name}' is running now. It may have finished (an async subagent's ` +
+              'result arrives as a message), or not have started yet, such as while it waits for a concurrency slot. ' +
+              'subagent--peek with no name lists the ones running now.'
+            : 'None of your subagents is running now.',
+        },
       };
     }
     return { success: true, data: snapshots };
@@ -1701,9 +3189,34 @@ export class SubagentModule implements Module {
   // Subagent Execution
   // =========================================================================
 
-  private async runSpawn(input: SpawnInput, _callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+  private async runSpawn(
+    launch: SubagentLaunch,
+    input: SpawnInput,
+    _callerAgentName?: string,
+    callerDepth = 0,
+    executionTimeoutMs?: number,
+    ticket?: { queued: boolean },
+  ): Promise<SubagentResult> {
+    const cancel = this.cancelFor(input.name);
+    this.claimName(input.name, _callerAgentName);
+    // Whether an attempt reached its run, the only place a subagent acts,
+    // and how many attempts began: what a failure's account says (failedRun).
+    const run = { started: false, attempts: 0 };
+    let acquired: { waitedMs: number; slot: object };
+    try {
+      acquired = await this.acquireSlot('spawn', undefined, cancel.promise, ticket);
+    } catch (err) {
+      cancel.dispose();
+      // A run that never started leaves no parent link behind, whether a
+      // cancel or the slot's timeout ended its wait.
+      this.parentMap.delete(input.name);
+      if (err instanceof SubagentTerminated) return this.endQueued(input.name, err);
+      throw this.failedRun(input.name, 'spawn', err, run);
+    }
+    const { waitedMs, slot } = acquired;
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -1712,71 +3225,100 @@ export class SubagentModule implements Module {
       toolCallsCount: 0, findingsCount: 0,
     };
     const entryKey = `spawn-${input.name}`;
-    this.activeSubagents.set(entryKey, entry);
-    if (_callerAgentName) this.parentMap.set(input.name, _callerAgentName);
-    this.persistState();
 
     try {
+      this.activeSubagents.set(entryKey, entry);
+      this.slotOf.set(entry, slot);
+      this.persistState();
+
       const framework = this.getFramework();
-      const model = input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001';
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        const agentName = `spawn-${input.name}-${Date.now()}`;
-        const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
-          name: agentName,
-          model,
-          systemPrompt: input.systemPrompt,
-          maxTokens: this.resolveMaxTokens(input.maxTokens, _callerAgentName),
-          ...(this.resolveProseRouting(_callerAgentName) !== undefined
-            ? { proseRouting: this.resolveProseRouting(_callerAgentName) }
-            : {}),
-          maxStreamTokens: 500_000,
-          strategy: new KnowledgeStrategy({
-            headWindowTokens: 2_000,
-            recentWindowTokens: 80_000,
-            compressionModel: model,
-            autoTickOnNewMessage: true,
-            maxMessageTokens: 10_000,
-          }),
-          allowedTools: this.filterToolNames(input.tools, callerDepth),
-        });
+        run.attempts = attempt + 1;
+        const agentName = `spawn-${input.name}-${nameStamp()}`;
+        this.runOfAttempt.set(agentName, input.name);
+        // An attempt starts with no result an earlier attempt, or an earlier
+        // run under the name, stashed with return.
+        this.returnedResults.delete(input.name);
+        // Setup races the run's cancel too, so a cancel ends a run whose
+        // setup never finishes. A reclaim does once the run is registered
+        // (registerLive, below), since the reaper reads registered runs only.
+        let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent(this.ephemeralAgentConfig(launch, agentName));
+        try {
+          created = await Promise.race([creating, cancel.promise]);
+        } catch (err) {
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs, run.started);
+          }
+          throw err;
+        }
+        const { agent, contextManager, cleanup } = created;
 
         // Track depth for recursive fork/spawn calls from this agent
         this.agentDepths.set(agentName, childDepth);
 
         // Register live state for peek observability
-        this.registerLive(input.name, agentName, input.systemPrompt, contextManager);
+        this.registerLive(input.name, agentName, launch.systemPrompt, contextManager);
 
         try {
+          // What this stream runs on (the launch as resolved at the call,
+          // and the tool surface it actually has now), then the task, each
+          // its own message: the cap applies to each message alone, so each
+          // has all of it. The native formatter merges the two into one user
+          // turn after the cap; the anthropic-xml and openai-responses
+          // formatters send them as two consecutive user turns. The delivery
+          // check below refuses a stream that wouldn't read either whole.
+          const orientation = this.orientationFor(launch, agent, { kind: 'none', reason: 'spawn' });
+          contextManager.addMessage('user', [{ type: 'text', text: orientation }]);
           contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
 
+          // The stream must read what the launch promises: refuse it when
+          // its orientation or its whole task isn't in the launch's compile
+          // of its first context. It's a real compile, not a dry one: a dry
+          // compile returns an over-budget plan where a real one refuses it,
+          // and the stream's context is fresh, so its first request's compile
+          // starts from what this one leaves.
+          const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
+          // The race takes compile's result when compiling settles first, so
+          // a cancel that lands just after is thrown here: the run ends
+          // before its attempt starts, whatever the checks below would find.
+          // Nothing below awaits before the attempt's race.
+          cancel.throwIfFired();
+          const delivery: LaunchDelivery = { kind: 'message', orientation, taskBlock: input.task };
+          const cut = undeliveredLaunchParts(messages, delivery);
+          if (cut.length > 0) throw this.launchRefusal('spawn', cut, delivery, true);
+
           // Pre-validate prompt size
-          const { messages } = await contextManager.compile();
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
-              `Prompt too large for subagent ${input.name}: ~${est} tokens ` +
-              `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
+            throw new SubagentFailure(
+              `its prompt would be about ${est} tokens, over this host's limit of ${this.maxPromptTokens}`,
+              'Shorten its task or systemPrompt, or pass tools naming only the tools it needs, since every ' +
+                "tool's definition counts.",
             );
           }
 
-          // Race execution against both timeout and user cancellation
-          const cancelPromise = new Promise<never>((_, reject) => {
-            this.cancellationHandles.set(input.name, { reject });
-          });
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut('spawn', executionTimeoutMs!);
 
+          // Race execution against both timeout and the run's cancel
+          run.started = true;
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
+              'spawn',
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
-            cancelPromise,
+            cancel.promise,
           ]);
-
-          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -1797,33 +3339,35 @@ export class SubagentModule implements Module {
           return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
-          this.cancellationHandles.delete(input.name);
 
           // Non-retryable termination (user cancel, zombie reclaim, etc.).
           // Postmortem 2026-05-28 P1 #4: terminal-but-benign — 'cancelled',
           // not 'completed'. Before this, the TUI subagent list rendered these
           // as "done" while the reducer-driven web tree rendered them red.
-          if (lastError instanceof SubagentTerminated) {
-            entry.status = 'cancelled';
-            entry.completedAt = Date.now();
-            entry.statusMessage = lastError.reason;
-            const notice = this.concurrencyNotice(waitedMs);
-            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
-            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
-            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
-          }
+          if (lastError instanceof SubagentTerminated) return this.endTerminated(input.name, entry, lastError, waitedMs, run.started);
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          // So does a provider's stated wait the framework won't sleep: the
+          // run is never tried again, so neither the rate-limit cooldown nor
+          // a halved concurrency would serve it.
+          if (this.isUnsleptProviderWait(lastError)) break;
+          if (this.isRateLimitError(lastError, agentName)) {
+            const stopped = await this.waitOrStop(this.onRateLimitHit(deadline), cancel.promise);
+            if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs, run.started);
+          }
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
           );
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
-          await new Promise(resolve => setTimeout(resolve, delay));
+          const stopped = await this.waitOrStop(delay, cancel.promise);
+          if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs, run.started);
         } finally {
           this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
@@ -1835,15 +3379,53 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw this.failedRun(input.name, 'spawn', err, run);
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
+      cancel.dispose();
+      this.forgetAttempts(input.name);
       this.persistState();
-      this.releaseSlot();
     }
   }
 
-  private async runFork(input: ForkInput, callerAgentName?: string, callerDepth = 0, executionTimeoutMs?: number, callToolUseId?: string): Promise<SubagentResult> {
-    const { waitedMs } = await this.acquireSlot();
+  private async runFork(
+    launch: SubagentLaunch,
+    input: ForkInput,
+    callerAgentName?: string,
+    callerDepth = 0,
+    executionTimeoutMs?: number,
+    callToolUseId?: string,
+    ticket?: { queued: boolean },
+  ): Promise<SubagentResult> {
+    const cancel = this.cancelFor(input.name);
+    this.claimName(input.name, callerAgentName);
+    // Whether an attempt reached its run, the only place a subagent acts,
+    // and how many attempts began: what a failure's account says (failedRun).
+    const run = { started: false, attempts: 0 };
+    let acquired: { waitedMs: number; slot: object };
+    try {
+      acquired = await this.acquireSlot('fork', undefined, cancel.promise, ticket);
+    } catch (err) {
+      cancel.dispose();
+      // A run that never started leaves no parent link behind, whether a
+      // cancel or the slot's timeout ended its wait.
+      this.parentMap.delete(input.name);
+      if (err instanceof SubagentTerminated) return this.endQueued(input.name, err);
+      throw this.failedRun(input.name, 'fork', err, run);
+    }
+    const { waitedMs, slot } = acquired;
     const childDepth = callerDepth + 1;
+    // One limit for the whole run, retries included, from when it starts.
+    const deadline = executionTimeoutMs === undefined ? undefined : Date.now() + executionTimeoutMs;
 
     const now = Date.now();
     const entry: ActiveSubagent = {
@@ -1851,59 +3433,69 @@ export class SubagentModule implements Module {
       status: 'running', startedAt: now, lastActivityAt: now,
       toolCallsCount: 0, findingsCount: 0,
     };
-    this.activeSubagents.set(input.name, entry);
-    if (callerAgentName) this.parentMap.set(input.name, callerAgentName);
-    this.persistState();
-
     try {
+      this.activeSubagents.set(input.name, entry);
+      this.slotOf.set(entry, slot);
+      this.persistState();
+
       const framework = this.getFramework();
 
-      // Dynamic parent resolution: prefer the caller agent (enables recursive forks),
-      // fall back to the configured parent agent for backward compat.
-      const parentAgent = callerAgentName
-        ? framework.getAgent(callerAgentName)
-        : (this.config.parentAgentName ? framework.getAgent(this.config.parentAgentName) : null);
-
-      const systemPrompt = input.systemPrompt
-        ?? (parentAgent ? parentAgent.systemPrompt : 'You are a research assistant.');
-
-      const model = input.model ?? this.config.defaultModel ?? 'claude-haiku-4-5-20251001';
+      // The parent the launch was resolved against at the call (the caller,
+      // which enables recursive forks, else the configured parent agent),
+      // whose context is compiled now. A launch that found no parent at the
+      // call stays without one, and one that found a parent uses that agent,
+      // never another later registered under its name: the receipt and the
+      // stream's orientation describe the parent at the call.
+      const parentAgent = launch.parentAgent;
+      // A refused fork's way out is a spawn only for a caller whose rules
+      // allow one; with no parent stream there's no rule to read.
+      const canSpawn = parentAgent?.canUseTool('subagent--spawn') ?? true;
       let lastError: Error | null = null;
 
       for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-        // Unique agent name: include depth + timestamp to prevent collisions when
-        // a child fork uses the same display name as its parent (e.g. both called
-        // "fork-level-2"). Without this, the child overwrites the parent in the
-        // framework's agents Map, and the parent's completion promise never resolves.
-        const suffix = attempt === 0 ? `d${childDepth}-${Date.now()}` : `d${childDepth}-retry${attempt}-${Date.now()}`;
+        run.attempts = attempt + 1;
+        // Unique agent name: include depth and nameStamp()'s number to prevent
+        // collisions when a child fork uses the same display name as its parent
+        // (e.g. both called "fork-level-2"). Without this, the child overwrites
+        // the parent in the framework's agents Map, and the parent's completion
+        // promise never resolves.
+        const suffix = attempt === 0 ? `d${childDepth}-${nameStamp()}` : `d${childDepth}-retry${attempt}-${nameStamp()}`;
         const agentName = `${input.name}-${suffix}`;
+        this.runOfAttempt.set(agentName, input.name);
+        // An attempt starts with no result an earlier attempt, or an earlier
+        // run under the name, stashed with return.
+        this.returnedResults.delete(input.name);
 
-        const { agent, contextManager, cleanup } = await framework.createEphemeralAgent({
-          name: agentName,
-          model,
-          systemPrompt,
-          maxTokens: this.resolveMaxTokens(input.maxTokens, callerAgentName),
-          ...(this.resolveProseRouting(callerAgentName) !== undefined
-            ? { proseRouting: this.resolveProseRouting(callerAgentName) }
-            : {}),
-          maxStreamTokens: 500_000,
-          strategy: new KnowledgeStrategy({
-            headWindowTokens: 2_000,
-            recentWindowTokens: 80_000,
-            compressionModel: model,
-            autoTickOnNewMessage: true,
-            maxMessageTokens: 10_000,
-          }),
-          allowedTools: this.filterToolNames(undefined, callerDepth),
-        });
+        // Setup races the run's cancel too, so a cancel ends a run whose
+        // setup never finishes. A reclaim does once the run is registered
+        // (registerLive, below), since the reaper reads registered runs only.
+        let created: Awaited<ReturnType<AgentFramework['createEphemeralAgent']>>;
+        const creating = framework.createEphemeralAgent(this.ephemeralAgentConfig(launch, agentName));
+        try {
+          created = await Promise.race([creating, cancel.promise]);
+        } catch (err) {
+          if (err instanceof SubagentTerminated) {
+            giveBackWhenCreated(creating, input.name);
+            return this.endTerminated(input.name, entry, err, waitedMs, run.started);
+          }
+          throw err;
+        }
+        const { agent, contextManager, cleanup } = created;
 
         // Track depth for recursive fork/spawn calls from this agent
         this.agentDepths.set(agentName, childDepth);
 
         // Register live state for peek observability
-        this.registerLive(input.name, agentName, systemPrompt, contextManager);
+        this.registerLive(input.name, agentName, launch.systemPrompt, contextManager);
 
         try {
+          // What this stream runs on, stated before its first inference: the
+          // launch as resolved at the call, then what actually happened here
+          // (which inheritance path ran, budget as created, tools now).
+          const orient = (inherited: SubagentStart['inherited']): string =>
+            this.orientationFor(launch, agent, inherited);
+          // Each branch says what its stream must read, in the shape it composed.
+          let delivery: LaunchDelivery;
           // Materialise the fork's inherited context structurally:
           //  - locate the parent's matching subagent--fork tool_use by id
           //  - strip sibling fork tool_use blocks (and their tool_results) from
@@ -1918,7 +3510,18 @@ export class SubagentModule implements Module {
           // plus a synthetic intention-framed fork tool_use/tool_result.
           if (parentAgent) {
             const parentCM = parentAgent.getContextManager();
-            const { messages: compiled } = await parentCM.compile();
+            // A dry compile: the fork reads the parent's context as a real
+            // compile would give it, without committing the parent's fold
+            // state or queuing its compression on the parent's behalf. A plan
+            // over the budget it compiles at, the manager's default, is
+            // returned, where a real compile refused it and failed the fork;
+            // the fork's own launch check, a real compile of its own context,
+            // still refuses a first context the fork can't use.
+            const { messages: compiled } = await Promise.race([
+              parentCM.compile(undefined, undefined, { dryRun: true }),
+              cancel.promise,
+            ]);
+            const cutAtCall = orient({ kind: 'cut-at-call' });
             const transformed = callToolUseId
               ? materialiseStructuralFork(
                   compiled,
@@ -1927,6 +3530,7 @@ export class SubagentModule implements Module {
                   input.task,
                   childDepth,
                   this.maxDepth,
+                  cutAtCall,
                 )
               : null;
 
@@ -1941,6 +3545,12 @@ export class SubagentModule implements Module {
 
             if (transformed) {
               for (const msg of transformed) addMsg(msg);
+              delivery = {
+                kind: 'fork-result',
+                callId: callToolUseId!,
+                head: intentionFramedHead(childDepth, this.maxDepth, cutAtCall),
+                task: input.task,
+              };
             } else {
               // Fallback path: matching tool_use not located (parent compressed it
               // away, or no callToolUseId). Wholesale copy is safe here because
@@ -1951,6 +3561,7 @@ export class SubagentModule implements Module {
               for (const msg of compiled) addMsg(msg);
 
               const fallbackForkId = `fork-${input.name}-${crypto.randomUUID()}`;
+              const atStart = orient({ kind: 'compiled-at-start', reason: callToolUseId ? 'call-not-in-context' : 'no-call-id' });
               contextManager.addMessage(agentName, [{
                 type: 'tool_use',
                 id: fallbackForkId,
@@ -1960,37 +3571,76 @@ export class SubagentModule implements Module {
               contextManager.addMessage('user', [{
                 type: 'tool_result',
                 toolUseId: fallbackForkId,
-                content: buildIntentionFramedForkResult(input.name, input.task, childDepth, this.maxDepth),
+                toolName: 'subagent--fork',
+                content: buildIntentionFramedForkResult(input.name, input.task, childDepth, this.maxDepth, atStart),
               }] as ContentBlock[]);
+              delivery = {
+                kind: 'fork-result',
+                callId: fallbackForkId,
+                head: intentionFramedHead(childDepth, this.maxDepth, atStart),
+                task: input.task,
+              };
             }
+          } else {
+            // No parent stream: nothing to inherit, and no fork call to
+            // answer. The stream still gets its intention and its
+            // orientation as its first message, rather than starting with an
+            // empty context and no task at all.
+            // The orientation and the return instruction, then the task alone,
+            // each its own message, as for a spawn, so each has the whole cap
+            // and the task check measures the task itself.
+            const orientation = `${orient({ kind: 'none', reason: 'no-parent' })}\n\n` +
+              'When this intention is complete, return your findings via subagent--return. Your intention for this stream follows.';
+            contextManager.addMessage('user', [{ type: 'text', text: orientation }]);
+            contextManager.addMessage('user', [{ type: 'text', text: input.task }]);
+            delivery = { kind: 'message', orientation, taskBlock: input.task };
           }
 
+          // The stream must read what the launch promises: refuse it when
+          // its orientation or its whole task isn't in the launch's compile
+          // of its first context. A fork with a call reads its whole task in
+          // that call. It's a real compile, as a spawn's is, so an over-budget
+          // first context is refused here, before the run starts.
+          const { messages } = await Promise.race([contextManager.compile(), cancel.promise]);
+          // The race takes compile's result when compiling settles first, so
+          // a cancel that lands just after is thrown here: the run ends
+          // before its attempt starts, whatever the checks below would find.
+          // Nothing below awaits before the attempt's race.
+          cancel.throwIfFired();
+          const cut = undeliveredLaunchParts(messages, delivery);
+          if (cut.length > 0) throw this.launchRefusal('fork', cut, delivery, canSpawn);
+
           // Pre-validate prompt size
-          const { messages } = await contextManager.compile();
           const tools = framework.getAllTools().filter(t => agent.canUseTool(t.name));
           const est = this.estimatePromptTokens(agent.systemPrompt, messages, tools);
           if (est > this.maxPromptTokens) {
-            throw new Error(
-              `Prompt too large for subagent ${input.name}: ~${est} tokens ` +
-              `(limit: ${this.maxPromptTokens}). Reduce context or task size.`
+            // A parentless fork carries no conversation, so only a fork with
+            // a parent is told it's the cause, and that a spawn leaves it.
+            const spawn = this.spawnInstead(canSpawn, true);
+            throw new SubagentFailure(
+              `it would begin at about ${est} tokens, over this host's limit of ${this.maxPromptTokens}` +
+                (parentAgent ? ', because a fork carries your whole conversation' : ''),
+              `${spawn.charAt(0).toUpperCase()}${spawn.slice(1)}${parentAgent && canSpawn ? ', though a spawn inherits none of it' : ''}.`,
             );
           }
 
-          // Race execution against both timeout and user cancellation
-          const cancelPromise = new Promise<never>((_, reject) => {
-            this.cancellationHandles.set(input.name, { reject });
-          });
+          // The attempt's setup runs outside the limit's timer; a run whose
+          // deadline passed during it isn't started.
+          if (deadline !== undefined && Date.now() >= deadline) throw this.timedOut('fork', executionTimeoutMs!);
 
+          // Race execution against both timeout and the run's cancel
+          run.started = true;
           let { speech, toolCallsCount } = await Promise.race([
             this.withTimeout(
-              framework.runEphemeralToCompletion(agent, contextManager),
+              framework.runEphemeralToCompletion(agent, contextManager, this.watchdogsFor(deadline)),
               input.name,
+              'fork',
               executionTimeoutMs,
+              deadline,
+              () => this.stopRun(agent),
             ),
-            cancelPromise,
+            cancel.promise,
           ]);
-
-          this.cancellationHandles.delete(input.name);
 
           // Prefer explicit return over speech capture
           const returned = this.returnedResults.get(input.name);
@@ -2011,31 +3661,33 @@ export class SubagentModule implements Module {
           return { summary: finalSummary, findings: [], issues: [], toolCallsCount };
         } catch (err) {
           lastError = err instanceof Error ? err : new Error(String(err));
-          this.cancellationHandles.delete(input.name);
 
           // Non-retryable termination (user cancel, zombie reclaim, etc.).
           // See P1 #4 comment in runSpawn — 'cancelled', not 'completed'.
-          if (lastError instanceof SubagentTerminated) {
-            entry.status = 'cancelled';
-            entry.completedAt = Date.now();
-            entry.statusMessage = lastError.reason;
-            const notice = this.concurrencyNotice(waitedMs);
-            const label = lastError.reason === 'cancelled' ? 'Stopped by user' : `Terminated: ${lastError.reason}`;
-            const summary = notice + `[${label}] ` + (lastError.partialOutput || '(no output yet)');
-            this.emit(input.name, { type: 'done', summary, lastInputTokens: this.lastInputTokens.get(input.name) });
-            return { summary, findings: [], issues: [], toolCallsCount: entry.toolCallsCount };
-          }
+          if (lastError instanceof SubagentTerminated) return this.endTerminated(input.name, entry, lastError, waitedMs, run.started);
 
-          if (this.isRateLimitError(lastError)) await this.onRateLimitHit();
-          if (!this.isTransientError(lastError) || attempt === this.maxRetries) break;
+          // The module's own failures end the loop before any words are read.
+          if (lastError instanceof SubagentFailure) break;
+          // So does a provider's stated wait the framework won't sleep: the
+          // run is never tried again, so neither the rate-limit cooldown nor
+          // a halved concurrency would serve it.
+          if (this.isUnsleptProviderWait(lastError)) break;
+          if (this.isRateLimitError(lastError, agentName)) {
+            const stopped = await this.waitOrStop(this.onRateLimitHit(deadline), cancel.promise);
+            if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs, run.started);
+          }
+          if (!this.isTransientError(lastError, agentName) || attempt === this.maxRetries) break;
 
           const delay = Math.min(5_000 * (attempt + 1), 30_000);
+          // A retry starts only if it can start within the run's limit.
+          if (deadline !== undefined && Date.now() + delay >= deadline) break;
           console.error(
             `[subagent] ${input.name} attempt ${attempt + 1}/${this.maxRetries + 1} failed: ` +
             `${lastError.message}. Restarting in ${delay}ms...`
           );
           entry.statusMessage = `Retry ${attempt + 1}: ${lastError.message}`;
-          await new Promise(resolve => setTimeout(resolve, delay));
+          const stopped = await this.waitOrStop(delay, cancel.promise);
+          if (stopped) return this.endTerminated(input.name, entry, stopped, waitedMs, run.started);
         } finally {
           this.agentDepths.delete(agentName);
           this.unregisterLive(input.name, agentName);
@@ -2047,9 +3699,21 @@ export class SubagentModule implements Module {
       entry.completedAt = Date.now();
       entry.statusMessage = lastError!.message;
       throw lastError!;
+    } catch (err) {
+      // A failure outside an attempt's own handling (the framework refusing
+      // to create the agent, say) ends the run too.
+      if (entry.status === 'running') {
+        entry.status = 'failed';
+        entry.completedAt = Date.now();
+        entry.statusMessage = err instanceof Error ? err.message : String(err);
+      }
+      throw this.failedRun(input.name, 'fork', err, run);
     } finally {
+      // The slot first, so nothing after it can keep it held.
+      this.releaseSlot(slot);
+      cancel.dispose();
+      this.forgetAttempts(input.name);
       this.persistState();
-      this.releaseSlot();
     }
   }
 
@@ -2075,24 +3739,40 @@ export class SubagentModule implements Module {
     return '(no text output)';
   }
 
+  /** The tool names the process offers now: the board, and each utility's
+   *  own allowlist name where the framework lists utilities. What a launch
+   *  description can say a stream gets, and all the depth limit keeps. */
+  private offeredNames(): Set<string> {
+    const framework = this.getFramework();
+    // Published older Framework releases have only the collapsed utils surface.
+    // The paired permission release exposes each utility's own allowlist name.
+    const utilities = (framework as AgentFramework & {
+      getAllUtilities?: () => ToolDefinition[];
+    }).getAllUtilities?.() ?? [];
+    return new Set([...framework.getAllTools(), ...utilities].map((t) => t.name));
+  }
+
   /**
    * Build the allowedTools list for a subagent.
-   * Removes subagent tools if at depth limit.
-   *
+   * Inherits or narrows the caller's tools. At the depth limit it keeps only
+   * the tools the process offers now, less the subagent tools.
    */
-  private filterToolNames(allowedTools?: string[], callerDepth = 0): 'all' | string[] {
+  private filterToolNames(requestedTools: string[] | undefined, callerDepth: number, parent: Agent | null): 'all' | string[] {
+    const inheritedTools = parent?.allowedTools ?? 'all';
+    const allowedTools = inheritedTools === 'all'
+      ? requestedTools?.slice()
+      : (requestedTools === undefined
+        ? [...inheritedTools]
+        : requestedTools.filter(name => inheritedTools.includes(name)));
     // Always include subagent--return — subagents need it to deliver results
-    const ensureReturn = (list: string[]) => {
-      if (!list.includes('subagent--return')) list.push('subagent--return');
-      return list;
-    };
+    // A copy: the list may be the caller's own (a spawn's `tools`, or the
+    // launch description's), which must keep saying what was asked for.
+    const ensureReturn = (list: string[]) =>
+      list.includes('subagent--return') ? [...list] : [...list, 'subagent--return'];
 
     // Use per-agent depth (from caller) rather than the module's static depth
     if (callerDepth + 1 >= this.maxDepth) {
-      const allTools = this.getFramework().getAllTools();
-      const filtered = allTools
-        .filter(t => !t.name.startsWith('subagent--'))
-        .map(t => t.name);
+      const filtered = [...this.offeredNames()].filter(name => !name.startsWith('subagent--'));
       if (allowedTools) {
         const allowed = new Set(allowedTools);
         return ensureReturn(filtered.filter(n => allowed.has(n)));

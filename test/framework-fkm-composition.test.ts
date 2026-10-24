@@ -107,9 +107,9 @@ describe('framework FKM composition', () => {
         budgetTokens: 1_024,
       },
       refusalHandling: {
+        retries: 2,
         autoRewind: true,
         maxRewinds: 2,
-        announceHumanTurns: false,
       },
     }));
     const strategy = { kind: 'baseline-strategy' } as never;
@@ -139,11 +139,30 @@ describe('framework FKM composition', () => {
         budgetTokens: 1_024,
       },
       refusalHandling: {
+        retries: 2,
         autoRewind: true,
         maxRewinds: 2,
-        announceHumanTurns: false,
       },
+      // The one FKM addition a recipe gets without naming it: ten-minute clock
+      // rows (DEFAULT_RECIPE_CLOCK), off only with agent.clock: false.
+      clock: { intervalMinutes: 10 },
     });
+  });
+
+  test('loads a recipe that still sets refusalHandling.announceHumanTurns, and hands the framework its refusalHandling as written', () => {
+    // Among refusalHandling's keys, validateRecipe refuses only
+    // primarySummaryFallback, and an autoRewind that isn't a boolean or null
+    // (test/recipe-refusal-handling.test.ts has the values it refuses).
+    // This pins that a recipe still setting announceHumanTurns, which no
+    // agent-framework release reads, keeps loading, and that the host passes
+    // the key on with the rest.
+    const parsed = validateRecipe(recipe({
+      refusalHandling: { autoRewind: false, announceHumanTurns: true },
+    }));
+    const strategy = { kind: 'baseline-strategy' } as never;
+
+    expect(buildFrameworkAgentConfig(parsed, 'agent', 'model', strategy).refusalHandling)
+      .toEqual({ autoRewind: false, announceHumanTurns: true });
   });
 
   test('composes validation, serialization, and AF/CM wiring for the merged FKM settings without cross-agent bleed', async () => {

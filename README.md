@@ -34,7 +34,7 @@ the host is put together is in [ARCHITECTURE.md](ARCHITECTURE.md).
 ## Quick start
 
 ```bash
-# Prerequisites: Bun and Node.js 20+ (Node builds the web UI), plus credentials
+# Prerequisites: Bun 1.4.3+ and Node.js 22.12+ (Node builds the web UI), plus credentials
 export ANTHROPIC_API_KEY=sk-ant-...     # or ANTHROPIC_AUTH_TOKEN (Claude subscription)
 
 bun install                                   # also builds the web UI bundle
@@ -81,20 +81,59 @@ A recipe is a JSON file that configures everything specific to one agent:
 Every string value may reference the environment as `${VAR}` or
 `${VAR:-default}`; a missing required variable fails the load, naming it.
 Values and combinations are validated at load time and fail loudly, naming
-the key. Unrecognized keys, though, are generally *not* rejected — a
-misspelled key (`mcplServers`, a leftover `modules.files`) is silently
-ignored, so check spelling against this README and `src/recipe.ts`.
+the key. An unrecognized key at the recipe's top level or in `agent`,
+`agent.mock`, `agent.strategy.kvUnified` and its `policy`, or `modules`
+(`mcplServers`, a leftover `modules.files`) doesn't stop the load: the host
+warns, naming it and, where one is close, the key it was probably meant to
+be. Keys inside other objects aren't checked this way, so check spelling
+against this README and `src/recipe.ts`. Some objects refuse a key they
+don't have, naming it, such as `modules.workspace` and each of its mounts,
+`modules.history`, `agent.retry` and `agent.clock`; `agent.toolPresentation`
+refuses one without naming it.
 
 `agent.timezone` is an IANA zone used only for times rendered to the agent.
 Chronicle and MCPL protocol timestamps remain epoch/UTC. If the recipe omits
 it, `AGENT_TIMEZONE` is used, then the process timezone.
 
+`agent.clock` gives the agent clock rows in that zone, every ten minutes
+when the recipe omits it; `false` turns them off. With
+`{ "intervalMinutes": 10 }`, the default, once a ten-minute boundary of its local
+wall clock (counted from local midnight) has passed, the window takes one
+`Clock: 10:50 Europe/Berlin (UTC+02:00)` row at the next of these: before
+an incoming event such as a message, at the start of a turn (a silent
+heartbeat tick too), or, mid-turn, after a tool round's results. A window
+with no clock row yet, as when the clock is first turned on, takes one at
+the next of these. Only the latest boundary is written. It reads the
+boundary's time where that boundary falls among the rows, and the time it
+is written where it can't (after a tool round that spanned it), and it
+shows the weekday and date when the day has changed.
+`{ "intervalSeconds": 15 }` gives clocks finer than a minute (read to the
+second; `"precision": "seconds"` asks for that at any interval). A recipe
+gives one of the two intervals, as a positive whole number of at most a
+day, and `"precision": "minutes"` only for whole minutes; anything else
+stops the load, naming the key.
+
+Where the clock doesn't reach: with the `anthropic-xml` formatter
+(membrane's XML prefill path), a tool round's results take no clock, and
+the next event or turn start writes it. On some models a clock after a
+tool's results drops the loop's earlier thinking from the request, as any
+message heard while acting does there, at most once an interval. Subagents
+take no clock rows: a fork keeps the rows it inherits and gets no more, and
+its start orientation names its clock rows as off beside its parent's.
+Agents that share one window read each other's clock rows, one with no
+clock of its own included. The subconscious takes none of its own and reads
+them through its merged view.
+
 **Memory defaults**: `agent.strategy` may be omitted entirely. The default is
-the autobiographical memory strategy with adaptive resolution, **KV-stable
-folding** (compile plans that preserve prompt-cache prefixes), compression by
+the autobiographical memory strategy with adaptive resolution, **kv-unified
+folding** (a cost-aware solver that weighs budget fit, prompt-cache cost and
+continuity), a 300k context budget with a 120k verbatim tail, compression by
 the agent's own model, and summaries voiced as the agent itself
-(`summaryParticipant` defaults to `agent.name`). Set a `strategy` block only
-to tune windows/budgets or opt into a different strategy type (`frontdesk`
+(`summaryParticipant` defaults to `agent.name`). The 300k budget assumes a
+1M-window model: on a 200k-window model, set `agent.contextBudgetTokens`
+yourself. Set a `strategy` block only to tune windows/budgets, to pin
+`foldingStrategy: "kv-stable"` for a resident whose store was built under it,
+or to opt into a different strategy type (`frontdesk`
 for channel-staffing agents, `passthrough` for none) — see
 `docs/AGENT-ONBOARDING.md` for sizing guidance on long-lived agents and
 [`docs/AGENT-MEMORY-GUIDE.md`](docs/AGENT-MEMORY-GUIDE.md) for how it works.
@@ -139,14 +178,34 @@ See Agent Framework's `docs/disabled-prose-routing.md`,
 `docs/explicit-prose-routing.md`, and `docs/hybrid-prose-routing.md` for the
 full semantics of each mode.
 
+`agent.autoContinue` (off when omitted) keeps an agent going until it says
+it's done: a turn the model ends itself, with prose or with nothing, is
+followed by another turn straight away instead of a pause until the next
+event. The run stops when the agent calls `skip_reply` (or another tool that
+ends the turn), ends on a `>>skip_reply` / `>>>skip_reply` envelope, or has
+continued `maxConsecutive` times in a row (default 3, 1 to 20). Each next turn
+reads a short `[continue]` row naming `skip_reply` as the way to stop, with
+the count once the cap is near, and speaks in the same locus. Every
+continuation is a full inference, and in `locus` mode its prose is published,
+so keep the cap low. Ephemeral subagents don't inherit it: their streams run
+with it off, and a fork's or spawn's orientation lists `auto-continue` beside
+the parent's. It takes effect only with the agent-framework release that adds
+`AgentConfig.autoContinue` (agent-framework#744); with an earlier one, as this
+host's dependency is until it moves, the key validates but turns don't
+continue. See Agent Framework's `docs/auto-continue.md`.
+
+```json
+{ "agent": { "autoContinue": { "maxConsecutive": 3 } } }
+```
+
 ### Recipe loading
 
 | Command | Behavior |
 |---------|----------|
-| `bun src/index.ts` | Reuse last saved recipe, or start with generic default |
+| `bun src/index.ts` | Reuse last saved recipe, or start with generic default when there is none; a saved recipe that can't be used stops startup, naming it |
 | `bun src/index.ts <path>` | Load recipe from local file |
 | `bun src/index.ts <url>` | Fetch recipe from HTTP URL |
-| `bun src/index.ts --no-recipe` | Reset to default generic assistant |
+| `bun src/index.ts --no-recipe` | Reset to default generic assistant (a directory at the saved recipe's path stops it instead) |
 
 The loaded recipe is saved to `$DATA_DIR/.recipe.json` (mode 0600) in its
 **unresolved** form — `${VAR}` references kept, a URL system prompt kept as
@@ -194,11 +253,11 @@ Per server, `requestTimeoutMs` raises the framework's JSON-RPC timeout (60 s
 by default) for slow tools, and `agent.retry` passes a Membrane retry policy
 through for flaky gateways.
 
-Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the host's `DISCORD_SUPPRESSED_REACTIONS_BASELINE`, then the entry's `env`, then `AGENT_TIMEZONE`. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
+Stdio servers do **not** inherit the host environment. A child gets agent-framework's allowlist (`CHILD_ENV_ALLOWLIST`: `PATH`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `TERM`, `LANG`, `LC_*`, `TZ`, temp and XDG dirs, `DISPLAY`/`WAYLAND_DISPLAY`, TLS CA bundles, `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` in either case, and the Windows system variables), then the entry's `env`, then the host's `AGENT_TIMEZONE`. agent-framework then adds its derived `DISCORD_SUPPRESSED_REACTIONS_BASELINE` when the child spawns, unless the entry's `env` sets one with tokens, or, for an `inheritEnv` entry, the host's own environment does. A server that needs a value from `.env` must declare it, e.g. `"DISCORD_GUILD_ID": "${DISCORD_GUILD_ID}"`; a variable left only in `.env` is unset for the server.
 
-Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server. Put a full-inheritance grant in the recipe or operator server file instead.
+Operator-owned recipe/file entries can set `inheritEnv: true` to pass the full host environment, including credentials. Prefer explicit `env` entries for needed variables. Explicit recipe `false` overrides file `true`; omission preserves the file's policy. Agent-owned `mcpl-servers.agent.json` overlays strip `inheritEnv`, including when replacing an operator-defined server, as they strip `allowHostCommands`, `enabledCapabilities` and `toolLifecycle`, and the startup warnings name each one an overlay entry sets. Put `inheritEnv` or `toolLifecycle` in the recipe, or in `mcpl-servers.json` for a server the recipe names, instead, and `allowHostCommands` or `enabledCapabilities` in a server the recipe defines itself, with its own command or url and an id `mcpl-servers.json` doesn't define, since neither `mcpl-servers.json` nor a recipe's override of a server from it passes those two on.
 
-Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file.
+Check legacy configuration variables before enabling full inheritance. For Discord MCPL, an inherited `DISCORD_SUPPRESS_REACTION_EMOJIS=""` seeds an explicit empty suppression list when its configured filters file does not yet exist; that durable file then overrides the protective baseline. Remove an unintended stale variable before the first startup, or configure the intended suppression in the filters file. Likewise, a `DISCORD_SUPPRESSED_REACTIONS_BASELINE` with tokens in the host's environment becomes an inheriting child's whole baseline, in place of agent-framework's protective default. The framework logs when it does.
 
 ### Feature sets and tool names
 
@@ -312,6 +371,31 @@ action is pasting a new token. A credentials file with a refresh token
 (`ANTHROPIC_OAUTH_CREDENTIALS_FILE`) makes "Refresh token" available and warns
 30 minutes before expiry. See the credential-alerts note under the ChatGPT
 provider and [docs/subscription-transport.md](docs/subscription-transport.md).
+
+### OpenAI reasoning
+
+For `openai-responses` and `openai-codex`, primary-agent reasoning is configured
+under `agent.responses`. Omitted settings default to `reasoningEffort: "high"`
+and `reasoningContext: "all_turns"`. Add the following to an existing recipe to
+request a higher effort:
+
+```json
+{
+  "agent": {
+    "responses": {
+      "reasoningEffort": "xhigh",
+      "reasoningContext": "all_turns"
+    }
+  }
+}
+```
+
+The host accepts `none`, `low`, `medium`, `high`, `xhigh`, or `max` for
+`reasoningEffort`, and `current_turn` or `all_turns` for `reasoningContext`. The
+selected model must support the requested effort. These settings apply to the
+primary agent; `modules.retrieval` has its own reasoning setting described below.
+Memory sizing and compression-model settings are covered in
+`docs/AGENT-ONBOARDING.md`.
 
 ### ChatGPT subscription provider
 
@@ -439,7 +523,17 @@ unknown-key warning, like those at the other levels.
   [`docs/ATTENTION-AND-GATING.md`](docs/ATTENTION-AND-GATING.md)
 - **Workspace** (`modules.workspace`, on) — mounted directories backed by
   Chronicle: the agent's durable, verbatim notes. Default mounts `input`
-  (read-only `./input`) and `products` (read-write `./output`)
+  (read-only `./input`) and `products` (read-write `./output`). A mount with
+  `"backend": "direct"` reads disk as it is, with no store or watcher, for a
+  checkout an agent reads: it names `"mode": "read-only"`, the only mode
+  agent-framework takes on a direct mount, and a mount the agent writes, or
+  whose changes should wake it, leaves `backend` out. A direct mount that names no `ignore` passes over `node_modules`,
+  `.git`, `dist`, `build`, `coverage`, `target`, `__pycache__` and `.venv`,
+  and one that names any passes over only what it names. While its store
+  holds changes from when it ran as Chronicle, it runs as Chronicle until a
+  start after they're settled, and says at start how to settle them.
+  `include` limits what a mount holds. See `RecipeWorkspaceMount` in
+  `src/recipe.ts`
 - **History** (opt-in, `modules.history`) — the agent searches and extracts
   from its own uncompressed record. The object form
   `{ "semantic": { "url": … } }` adds `history--semantic_search`:
@@ -465,8 +559,9 @@ unknown-key warning, like those at the other levels.
   channels an @-mention never binds or triggers a fork. Still works; the host
   logs a `[deprecated]` line at startup
 - **Subconscious** (top-level `subconscious`) — a secondary agent that can
-  `tune_out` channels; **code execution** (top-level `codeExecution`) — a
-  Python tool runner
+  `tune_out` channels; **code execution** (top-level `codeExecution`) —
+  JavaScript scripts that call the agent's tools, in a QuickJS engine
+  (agent-framework 0.24)
 - **Activity** (`modules.activity`) typing indicators and a **TTS relay**
   (`modules.ttsRelay`) for voice clients
 - **Extensions** (top-level `extensions`) — local modules that register
@@ -477,6 +572,7 @@ unknown-key warning, like those at the other levels.
 - **Web UI** (`modules.webui`) — browser operator console, below
 - **TUI, readline and batch modes** — OpenTUI interactive terminal, `--no-tui` for a plain prompt, or piped stdin for a one-shot batch run
 - **Headless mode** — `--headless`: no terminal, JSONL over a Unix socket; how residents run under a supervisor
+- **Self-restart** (opt-in, `modules.selfRestart`) — `lifecycle--restart`: the agent restarts its own host, for an edited recipe or rebuilt code. It happens once the asking turn has ended; the host exits with code 75 for its supervisor to start it again, so enable it only under one that does (launchd `KeepAlive`, systemd `Restart=on-failure`, a fleet parent's `autoRestart`, which is off unless the child's entry sets it, and which counts a self-restart toward its cap of 3 restarts in 60 s). A fleet parent's own self-restart stops its children as any shutdown does, and the restarted parent starts again only its `autoStart` children. `cooldownMinutes` (default 10) spaces restarts out
 - **Time-travel** — Chronicle-backed undo/redo, checkpoints, branch exploration; in the web UI, rolling back to a message and suppressing messages
 - **Session management** — isolated sessions with auto-naming
 - **Ops alerts** — compression quarantine, refusal streaks, inference exhaustion and more surface as `ops:alert` traces, `logs/failures.log` records, and an optional webhook (`CONNECTOME_OPS_WEBHOOK`)
@@ -504,11 +600,13 @@ option.
 analogue) in a workspace mount and injects it into every agent's context on
 every turn — the resident agent and all ephemeral subagents. Edits take effect
 on the next turn; nothing is persisted to history. Defaults: path
-`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (reads are bounded
-to the cap); a missing file is fail-open (no injection, warn once), while a
-path naming a nonexistent mount fails at recipe load — including on the
-implicit default workspace (`input` + `products`), whose mount set can never
-satisfy the default path, so declare an `instructions` mount explicitly.
+`instructions/AGENTS.md`, `position: "system"`, 32 KiB cap (content past it is
+cut, with a marker); a missing or unreadable file is fail-open: no injection,
+and one log line and one `instructions-unavailable` ops alert for each reason
+in a session until the file loads again, which `instructions-unavailable-clear`
+stands down. A path naming a nonexistent mount fails at recipe load — including
+on the implicit default workspace (`input` + `products`), whose mount set can
+never satisfy the default path, so declare an `instructions` mount explicitly.
 
 **Who edits, and how it propagates**: the module reads *disk*; agent
 `workspace--write`/`edit` land in Chronicle and reach disk only on an
@@ -516,8 +614,15 @@ satisfy the default path, so declare an `instructions` mount explicitly.
 read-write instructions mount. On a read-only mount the flow reverses:
 human/deploy edits to disk reach the injection, but not `workspace--read`
 (which serves Chronicle) — prefer routing human feedback through conversation
-and letting the agent make the edit. Symlinks that lead outside the mount are
-rejected (realpath containment), never injected.
+and letting the agent make the edit. A mount running direct
+(`"backend": "direct"`) has no Chronicle copy: `workspace--read` reads disk
+too, so both see an edit to disk at once. The file is read through the
+workspace's `readFileFromDisk`, so on a mount that doesn't follow links, a
+recipe's default, a file that is itself a link isn't read (nor, from
+agent-framework's release with anima-research/agent-framework#468, is one
+reached through a linked directory), and on any mount one whose canonical
+path lies outside it isn't either, a link that leads out included: either
+raises the alert instead.
 
 **Cache note**: at `position: "system"` the block lives in every agent's
 prompt-cache prefix, so each edit is a fleet-wide cache cold start on the next
@@ -528,7 +633,7 @@ are one free-form curated document, always present verbatim.
 
 ## Prerequisites
 
-- [Bun](https://bun.sh/) runs the host; [Node.js](https://nodejs.org/) 20+ and npm build the web UI
+- [Bun](https://bun.sh/) 1.4.3+ runs the host; [Node.js](https://nodejs.org/) 22.12+ and npm build the web UI
 - No Rust toolchain: `@animalabs/chronicle` ships prebuilt native binaries
 - Credentials for one provider: an Anthropic API key, a Claude subscription
   OAuth token (`claude setup-token`), an OpenAI or OpenRouter key, AWS
@@ -540,6 +645,11 @@ are one free-form curated document, always present verbatim.
 ```bash
 bun install      # or npm install; the postinstall step builds the web UI
 ```
+
+Installed from npm instead (`npm install @animalabs/connectome-host`), the
+package carries the web UI already built. npm 12 and bun may report its
+`postinstall` as blocked: it builds the web UI only in a checkout, so nothing
+is lost.
 
 ## Environment variables
 
@@ -554,6 +664,7 @@ bun install      # or npm install; the postinstall step builds the web UI
 | `OPENAI_COMPATIBLE_API_KEY` | — | Key for `openai-compatible` recipes (no `OPENAI_API_KEY` fallback by design); omit for local servers |
 | `COMPRESSION_OPENAI_BASE_URL` | — | Run memory compression on its own OpenAI-compatible endpoint (a separate membrane, tagged `compression` in the llm-calls log). The model is `agent.strategy.compressionModel` (default: the agent's model) |
 | `COMPRESSION_OPENAI_API_KEY` | `OPENAI_API_KEY` | Key for `COMPRESSION_OPENAI_BASE_URL` |
+| `COMPRESSION_PROMPT_CACHE_KEY` | `<agent.responses.promptCacheKey>:compression` | `prompt_cache_key` sent on every compression call |
 | `OPENROUTER_API_KEY` | — | `openrouter` recipes |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION` | region `us-west-2` | `bedrock` recipes |
 | `BEDROCK_BASE_URL` | — | Route Bedrock calls through a gateway |
@@ -569,38 +680,12 @@ bun install      # or npm install; the postinstall step builds the web UI
 | `IDENTITY_KEY_FILE`, `IDENTITY_HOME` | `$DATA_DIR/identity-key.pem`, `id.animalabs.ai` | `modules.identity` |
 | `CONNECTOME_OPS_WEBHOOK` | — | Webhook for ops alerts |
 | `COUNT_TOKENS_MODEL` | the agent's model | Override the model used for exact token counts in the context-makeup panel |
-| `LLM_CALLS_FULL_PAYLOADS` | off | `1`/`true`: keep the full request on every llm-calls log entry (large) |
+| `LLM_CALLS_FULL_PAYLOADS` | off | `1`/`true`: keep the full request on every llm-calls log entry (large; a line over 16 MiB drops it) |
 | `GATE_TELEMETRY` | off | `1`: send `x-gate-*` telemetry headers — only when `ANTHROPIC_BASE_URL` is also set |
 
 Recipes may reference any further variables they need as `${VAR}` (for
 example `WEBUI_USERNAME` / `WEBUI_PASSWORD`, `ZULIP_CHANNEL`, `GITLAB_TOKEN`
 in the shipped recipes).
-
-OpenAI-compatible mode uses the Chat Completions protocol (`POST /chat/completions`).
-The recipe selects it and names the endpoint; the key comes from the
-environment ([above](#openai-compatible-endpoints-ollama-vllm-together-groq-nanogpt-)):
-
-```json
-{
-  "agent": {
-    "provider": "openai-compatible",
-    "baseUrl": "https://api.openai.com/v1",
-    "model": "gpt-5.1"
-  }
-}
-```
-
-```bash
-export OPENAI_COMPATIBLE_API_KEY=...
-# optional: memory compression on a separate endpoint
-export COMPRESSION_OPENAI_BASE_URL=https://api.example.com/v1
-export COMPRESSION_OPENAI_API_KEY=...
-bun src/index.ts my-recipe.json
-```
-
-If an OpenAI-compatible endpoint does not expose token counting, the WebUI
-context-debug endpoint reports exact token counting as unavailable instead of
-calling Anthropic's `/v1/messages/count_tokens` endpoint.
 
 ## Running
 
@@ -612,6 +697,7 @@ bun src/index.ts <recipe> --headless                     # Daemon: JSONL IPC ove
 bun src/index.ts <recipe> --headless --exit-when-idle    # One-shot: exit once the agent goes idle
 bun src/index.ts <recipe> --headless --socket-path <p>   # Custom socket path
 bun --watch src/index.ts            # Dev mode
+bun src/index.ts --audit-stores --recipe <recipe> <data dir>  # Store audit: starts no agent (below)
 ```
 
 Put the recipe before other arguments: the first argument that doesn't start
@@ -627,6 +713,18 @@ anything meant to keep serving needs `--headless`. The host prints a
 `[batch]` line at the start and before the teardown. If the recipe enables
 the web UI, its server outlives the agent by design, so the process keeps
 running, with no agent data behind the page, until interrupted.
+
+`--audit-stores [--recipe <recipe>] <data directory>…`, given first and in
+place of a recipe, starts no agent. It opens the agent's context in every
+session's store in each data directory, and its recipe's fleet children's,
+but one that reaches past what an update copies, of which it says why not, or
+one that isn't there yet, which a start makes empty,
+the way a start of this version opens it, under the recipe `--recipe` names or
+else the one the last start saved. It opens them in place, so run it after a copy you'd go
+back to. It prints a line on stderr for each store under each agent name it opens it under, the recipe's or the default and each session's own, or one for a store it doesn't open, and exits 0 when no store
+was refused and every one there was audited, 1 otherwise. Run it with the
+agents stopped: "Updating an install" in
+[`docs/DEPLOYMENTS.md`](docs/DEPLOYMENTS.md) says when.
 
 ## Web UI
 
@@ -644,8 +742,9 @@ or supply credentials for a remote deployment:
 "modules": { "webui": { "basicAuth": { "username": "${WEBUI_USERNAME}", "password": "${WEBUI_PASSWORD}" } } }
 ```
 
-Build the SPA bundle once with `bun run build:web` (also runs on install via
-postinstall). Deployment behind a reverse proxy, observer access and all
+In a checkout, build the SPA bundle once with `bun run build:web` (also runs
+on install via postinstall); the npm package carries it built. Deployment
+behind a reverse proxy, observer access and all
 endpoints are covered in [`docs/webui-deployment.md`](docs/webui-deployment.md).
 
 - Chat with full interiority: thinking blocks, tool calls + results, live streaming, inline images

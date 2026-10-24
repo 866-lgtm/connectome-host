@@ -34,18 +34,20 @@
  * The provider is the recipe's agent.provider (default anthropic); see README.
  */
 
+// First, so its warning about an old Bun prints before the modules below run.
+import './bun-floor-check.js';
+import { hostMembraneRetry } from './membrane-retry.js';
 import {
-  AnthropicXmlFormatter,
   BedrockAdapter,
   Membrane,
   MockAdapter,
   NativeFormatter,
-  OpenAICompatibleAdapter,
   OpenAIResponsesAPIAdapter,
-  OpenAIResponsesFormatter,
+  OpenAICompatibleAdapter,
   OpenRouterAdapter,
 } from '@animalabs/membrane';
-import { LoggingAnthropicAdapter } from './logging-adapter.js';
+import { LoggingAnthropicAdapter, offPathRefusalAlert } from './logging-adapter.js';
+import { recipeFormatter } from './recipe-formatter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
@@ -63,27 +65,32 @@ import { SubagentModule } from './modules/subagent-module.js';
 import { historyModuleOptions, assertSemanticSearchRegistered } from './history-semantic.js';
 import { LessonsModule } from './modules/lessons-module.js';
 import { RetrievalModule } from './modules/retrieval-module.js';
-import { MemoryModule } from './modules/memory-module.js';
-import type { RecipeWorkspaceMount } from './recipe.js';
 import { buildRetrievalModuleConfig } from './retrieval-config.js';
 import { TuiModule } from './modules/tui-module.js';
 import { TimeModule } from './modules/time-module.js';
+import { waitToBeListed } from './fleet-begin.js';
 import { FleetModule, type FleetModuleConfig } from './modules/fleet-module.js';
 import { ActivityModule } from './modules/activity-module.js';
 import { NoticesModule } from './modules/notices-module.js';
 import { SubscriptionGcModule } from './modules/subscription-gc-module.js';
 import { ChannelModeModule } from './modules/channel-mode-module.js';
-import { WebUiModule } from './modules/web-ui-module.js';
+import { WebUiModule, stopWebUiServer } from './modules/web-ui-module.js';
 import { ObserversModule } from './modules/observers-module.js';
 import { IdentityModule } from './modules/identity-module.js';
 import { McplAdminModule } from './modules/mcpl-admin-module.js';
+import { LifecycleModule } from './modules/lifecycle-module.js';
 import { TtsRelayModule } from './modules/tts-relay-module.js';
 import { InstructionsModule } from './modules/instructions-module.js';
 import { loadMcplServers, applyAgentOverlay, mergeRecipeServers, composeMcplChildEnv, overlayWarnings, DEFAULT_CONFIG_PATH, DEFAULT_AGENT_OVERLAY_PATH } from './mcpl-config.js';
 import { toolClassConfig } from './tool-lifecycle-config.js';
-import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
+import { batchModeStartNotice, batchTeardownNotice, batchWebUiNotice, batchEchoLine, BATCH_MCPL_LOG_NOTE } from './batch-mode.js';
+import { createPipedTurns, switchFollowing, traceFollower } from './piped-turns.js';
 import { setCallLogPath } from './bug-report.js';
 import { SessionManager } from './session-manager.js';
+import { startFramework } from './start-framework.js';
+import { currentForStart, releaseHere, type ReleaseHere } from './update/host.js';
+import { childrenFilePath, trialPlaces } from './update/contract.js';
+import { switchSessionSteps } from './session-switch.js';
 import { resolveAgentName } from './agent-name.js';
 import { generateSessionName } from './synesthete.js';
 import {
@@ -92,17 +99,25 @@ import {
   loadRecipeDetailed,
   saveRecipe,
   loadSavedRecipe,
+  SavedRecipeDirectoryError,
+  savedRecipeDirectory,
+  savedRecipePath,
   clearSavedRecipe,
   parseRecipeArg,
   deprecatedConversationsNotices,
+  resolveProvider,
 } from './recipe.js';
 import { createBranchState, resetBranchState, handleExport, type BranchState } from './commands.js';
-import { buildFrameworkAgentConfig, membraneCachingOverride } from './framework-agent-config.js';
+import { buildFrameworkAgentConfig, membraneCachingOverride, recipeModel, autoContinueSupportWarning } from './framework-agent-config.js';
 import { buildFrameworkStrategy, buildConversationsConfig } from './framework-strategy.js';
+import { AUDIT_STORES_FLAG, auditStoresFromEntry, checkActiveStore, placesOnTrial } from './update/audit-stores.js';
 import { buildWorkspaceMounts } from './workspace-mounts.js';
+import { quarantineAlarm, type QuarantineStatus } from './web/quarantine-alert.js';
+import { wireLoadRepairAlert } from './web/load-repair-alert.js';
 import { logKeepaliveEvent } from './cache-keepalive-log.js';
-import { loadExtensions } from './extensions.js';
+import { loadExtensions, type ExtensionRegistry } from './extensions.js';
 import { QuotaMeter, AnthropicOAuthQuotaSource, CodexQuotaSource, quotaProviderHold } from './quota-meter.js';
+import { stopForSessionSwitch } from './session-switch-stop.js';
 
 export type { AppContext };
 
@@ -161,6 +176,10 @@ interface AppContext {
    *  (openai-codex through an inference gateway, which tracks them per
    *  login): usage readouts still stay off dollars. */
   subscriptionUnmetered: boolean;
+  /** Set by the TUI's stop once it has begun; the host's other modes don't
+   *  set it. A session switch then makes nothing more, and stops what it has
+   *  already made (switchSessionSteps). */
+  stopping?: boolean;
 
   /** Stop current framework, switch to a different session, start new framework. */
   switchSession(id: string): Promise<void>;
@@ -174,23 +193,33 @@ async function resolveRecipe(): Promise<Recipe> {
   const { source, noRecipe } = parseRecipeArg(process.argv);
 
   if (noRecipe) {
-    clearSavedRecipe(config.dataDir);
+    try {
+      clearSavedRecipe(config.dataDir);
+    } catch (err) {
+      stopAtSavedRecipe('clear the saved recipe', err);
+    }
     console.log('Starting with default recipe.');
     return DEFAULT_RECIPE;
   }
 
   if (source) {
+    let loaded: Awaited<ReturnType<typeof loadRecipeDetailed>>;
     try {
-      // Save the unresolved (pre-substitution) form: $DATA_DIR is typically
-      // host-mounted and backed up, so resolved secrets must never land there.
-      const { recipe, persistable } = await loadRecipeDetailed(source);
-      saveRecipe(config.dataDir, persistable);
-      console.log(`Loaded recipe: ${recipe.name}${recipe.description ? ` — ${recipe.description}` : ''}`);
-      return recipe;
+      loaded = await loadRecipeDetailed(source);
     } catch (err) {
       console.error(`Failed to load recipe from ${source}:`, err instanceof Error ? err.message : err);
       process.exit(1);
     }
+    try {
+      // Save the unresolved (pre-substitution) form: $DATA_DIR is typically
+      // host-mounted and backed up, so resolved secrets must never land there.
+      saveRecipe(config.dataDir, loaded.persistable);
+    } catch (err) {
+      stopAtSavedRecipe('save the recipe to', err);
+    }
+    const { recipe } = loaded;
+    console.log(`Loaded recipe: ${recipe.name}${recipe.description ? ` — ${recipe.description}` : ''}`);
+    return recipe;
   }
 
   // Try saved recipe. Re-resolves ${VAR} references against the CURRENT
@@ -204,13 +233,36 @@ async function resolveRecipe(): Promise<Recipe> {
     }
   } catch (err) {
     console.error(
-      `Failed to resume saved recipe from ${config.dataDir}:`,
+      `Failed to resume the saved recipe ${savedRecipePath(config.dataDir)}:`,
       err instanceof Error ? err.message : err,
     );
+    console.error(err instanceof SavedRecipeDirectoryError
+      ? SAVED_RECIPE_DIRECTORY_LINE
+      : 'Fix what it names (the file, or a variable missing from the environment), start with a recipe file to replace it, or start with --no-recipe to clear it.');
     process.exit(1);
   }
 
   return DEFAULT_RECIPE;
+}
+
+/** What a directory at the saved recipe's path needs; nothing the host does replaces one. */
+const SAVED_RECIPE_DIRECTORY_LINE =
+  'Move or remove it, then start again: the host saves its recipe there as a file, so the source of a bind mount there has to be a file that exists before the container starts.';
+
+/**
+ * Stop startup on a failure to save or clear the saved recipe, naming its
+ * path, and saying so where the cause is a directory there: a save fails with
+ * EISDIR, and a clear with ERR_FS_EISDIR, when a directory there is what
+ * stopped it, itself or (for a save) through a link. Any other failure, such
+ * as a clear of a link in a data directory the host can't write, prints its
+ * own error.
+ */
+function stopAtSavedRecipe(failedTo: string, err: unknown): never {
+  const code = (err as NodeJS.ErrnoException | null)?.code;
+  const directory = code === 'EISDIR' || code === 'ERR_FS_EISDIR' ? savedRecipeDirectory(config.dataDir) : null;
+  console.error(`Failed to ${failedTo} ${savedRecipePath(config.dataDir)}:`, directory ?? (err instanceof Error ? err.message : err));
+  if (directory !== null) console.error(SAVED_RECIPE_DIRECTORY_LINE);
+  process.exit(1);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,12 +270,16 @@ async function resolveRecipe(): Promise<Recipe> {
 // ---------------------------------------------------------------------------
 
 function resolveModel(recipe: Recipe): string {
-  return config.model || recipe.agent.model ||
-    (recipe.agent.provider === 'openai-codex' ? 'gpt-5.4' : 'claude-opus-4-6');
+  return recipeModel(recipe, config.model);
 }
 
 /** The host's one NoticesModule, kept across session switches (see createFramework). */
 let noticesRef: NoticesModule | null = null;
+/** The host's one InstructionsModule, kept across session switches (see createFramework). */
+let instructionsRef: InstructionsModule | null = null;
+/** The install whose entry point started this host, and its release, or null
+ *  when none did. Set first thing in main(), and the same for the host's life. */
+let installHere: ReleaseHere | null = null;
 
 async function createFramework(
   membrane: Membrane,
@@ -235,6 +291,7 @@ async function createFramework(
   quotaMeter: QuotaMeter | null,
   credentials: CredentialMonitor | null,
   subscriptionUnmetered = false,
+  extensions?: ExtensionRegistry,
 ): Promise<AgentFramework> {
   const model = resolveModel(recipe);
   const modules = recipe.modules ?? {};
@@ -243,7 +300,10 @@ async function createFramework(
   // Load recipe extensions first — custom strategies must be registered
   // before buildFrameworkStrategy runs, and custom modules join the module
   // list below. The loader is a dumb local import; see src/extensions.ts.
-  const extensionRegistry = await loadExtensions(recipe);
+  // The start's own framework takes the ones main() loaded, which a trial's
+  // audit uses too; a session switch, once the framework before has stopped,
+  // loads them again.
+  const extensionRegistry = extensions ?? await loadExtensions(recipe);
 
   // -- Build module list --
   // SettingsModule is constructed in main() (before the adapter, so the
@@ -257,6 +317,7 @@ async function createFramework(
     const subagentConfig = typeof modules.subagents === 'object' ? modules.subagents : {};
     subagentModule = new SubagentModule({
       parentAgentName: agentName,
+      provider: resolveProvider(recipe),
       defaultModel: subagentConfig.defaultModel || model,
       defaultMaxTokens: subagentConfig.defaultMaxTokens,
     });
@@ -272,13 +333,16 @@ async function createFramework(
     moduleInstances.push(lessonsModule);
   }
 
-  // Fleet (cross-process child orchestration). Opt-in via recipe.
-  if (modules.fleet === true) {
-    moduleInstances.push(new FleetModule({ timeZone }));
-  } else if (modules.fleet && typeof modules.fleet === 'object') {
-    const fleetCfg = modules.fleet;
-    const fleetModuleConfig: FleetModuleConfig = {};
-    fleetModuleConfig.timeZone = timeZone;
+  // Fleet (cross-process child orchestration). Opt-in via recipe, as `true` or
+  // as its settings, which `true` leaves at their defaults. A host an install
+  // started keeps the children file its launcher reads before a switch.
+  let fleetModule: FleetModule | null = null;
+  if (modules.fleet === true || (modules.fleet && typeof modules.fleet === 'object')) {
+    const fleetCfg = modules.fleet === true ? {} : modules.fleet;
+    const fleetModuleConfig: FleetModuleConfig = {
+      timeZone,
+      childrenFile: installHere ? childrenFilePath(resolve(config.dataDir)) : undefined,
+    };
     if (fleetCfg.children) {
       fleetModuleConfig.autoStart = fleetCfg.children.map((c) => {
         const entry: NonNullable<FleetModuleConfig['autoStart']>[number] = {
@@ -299,7 +363,8 @@ async function createFramework(
     if (fleetCfg.readyTimeoutMs !== undefined) fleetModuleConfig.readyTimeoutMs = fleetCfg.readyTimeoutMs;
     if (fleetCfg.gracefulShutdownMs !== undefined) fleetModuleConfig.gracefulShutdownMs = fleetCfg.gracefulShutdownMs;
     if (fleetCfg.sigtermEscalationMs !== undefined) fleetModuleConfig.sigtermEscalationMs = fleetCfg.sigtermEscalationMs;
-    moduleInstances.push(new FleetModule(fleetModuleConfig));
+    fleetModule = new FleetModule(fleetModuleConfig);
+    moduleInstances.push(fleetModule);
   }
 
   // Retrieval (requires lessons). OPT-IN — not part of the standard recipe:
@@ -322,12 +387,6 @@ async function createFramework(
     historyModule = new HistoryModule(historyOpts);
     assertSemanticSearchRegistered(historyModule, historyOpts.semantic !== undefined);
     moduleInstances.push(historyModule);
-  }
-
-  // Vector memory shared with SillyTavern (thin client for the local
-  // memory-service, which owns embeddings + Qdrant). Opt-in via recipe.
-  if (modules.memory && typeof modules.memory === 'object') {
-    moduleInstances.push(new MemoryModule(modules.memory));
   }
 
   // Gate config — core AF EventGate feature.
@@ -365,12 +424,17 @@ async function createFramework(
   // via gatherContext. Requires the workspace module; validateRecipe rejects
   // the instructions+`workspace: false` pairing, so workspaceModule is
   // non-null here (the guard keeps the module fail-open regardless).
+  // ONE instance per host process, reused across session switches, as the
+  // notices module is: an instructions-unavailable alert raised in one
+  // session is stood down in the next once the file loads there. Its stop()
+  // lets go of the old session's workspace, so it's given this one's.
   if (modules.instructions) {
     const instructionsConfig =
       typeof modules.instructions === 'object' ? modules.instructions : {};
-    const instructionsModule = new InstructionsModule(instructionsConfig);
-    if (workspaceModule) instructionsModule.setWorkspace(workspaceModule);
-    moduleInstances.push(instructionsModule);
+    // Its alerts carry the agent's name, as the notices module's filter expects.
+    instructionsRef ??= new InstructionsModule({ ...instructionsConfig, agentName });
+    if (workspaceModule) instructionsRef.setWorkspace(workspaceModule);
+    moduleInstances.push(instructionsRef);
   }
 
   // Activity (typing indicators) — opt-in per recipe
@@ -445,6 +509,18 @@ async function createFramework(
     const surface = typeof modules.mcplAdmin === 'object' ? modules.mcplAdmin.surface : undefined;
     mcplAdminModule = new McplAdminModule({ timeZone, ...(surface ? { surface } : {}) });
     moduleInstances.push(mcplAdminModule);
+  }
+
+  // Self-restart (`lifecycle--restart`) — opt-in per recipe. The request and
+  // the last completed restart live in the data dir; only headless mode arms
+  // it (src/self-restart.ts).
+  if (modules.selfRestart !== undefined && modules.selfRestart !== false) {
+    const srCfg = typeof modules.selfRestart === 'object' ? modules.selfRestart : {};
+    moduleInstances.push(new LifecycleModule({
+      dataDir: resolve(config.dataDir),
+      timeZone,
+      ...(srCfg.cooldownMinutes !== undefined ? { cooldownMinutes: srCfg.cooldownMinutes } : {}),
+    }));
   }
 
   // Archipelago identity — opt-in per recipe. Utilities-only: enrollment is
@@ -546,10 +622,11 @@ async function createFramework(
   const finalServers = applyAgentOverlay(allServers, DEFAULT_AGENT_OVERLAY_PATH).map((server) => {
     const withEnv: { id: string; command?: string; url?: string; [k: string]: unknown } = {
       ...server,
-      // Stdio MCPL children inherit a single agent-facing wall clock plus the
-      // framework's refusal-annotation suppression baseline (operator env
-      // supersedes the baseline; see composeMcplChildEnv). Protocol
-      // timestamps remain UTC; only their rendered text uses AGENT_TIMEZONE.
+      // Stdio MCPL children share the recipe's agent-facing wall clock.
+      // The framework derives the reaction-suppression default when the
+      // child spawns; a baseline with tokens in the server's env (or, with
+      // inheritEnv, in the host's own) replaces it. Protocol timestamps
+      // remain UTC; only their rendered text uses AGENT_TIMEZONE.
       env: composeMcplChildEnv(server.env as Record<string, string> | undefined, timeZone),
     };
     // `access` is a declarative name (recipe/file/overlay); the credential
@@ -567,6 +644,10 @@ async function createFramework(
         );
       }
     }
+    // A credential over ws:// or http:// to another machine is readable on
+    // the network between. mcpl_deploy refuses one; an operator's recipe, or
+    // an overlay entry saved before that refusal, still loads, and
+    // agent-framework warns when it connects (serverConfigWarnings).
     return withEnv;
   });
 
@@ -622,43 +703,44 @@ agents: [agentConfig],
     }
   }
 
+  // agent.autoContinue only takes effect on a framework that has it.
+  const autoContinueWarning = autoContinueSupportWarning(recipe, framework.getAgent(agentName) ?? undefined);
+  if (autoContinueWarning) console.warn(autoContinueWarning);
+
   // Compression-quarantine klaxon → the framework's ops-alert channel
   // (failures.log + ops:alert trace + CONNECTOME_OPS_WEBHOOK). The strategy
-  // re-fires this every alarm interval for as long as ANY chunk is
+  // re-fires this every alarm interval for as long as ANY span is
   // quarantined: quarantined spans stay raw, the fold floor creeps, and the
   // picker eventually cannot fit the window — a guaranteed future outage
-  // that must never be a silent state.
+  // that must never be a silent state. quarantineAlarm decides what each
+  // call sends: the alarm, or the all-clear under its own kind.
   // Duck-typed on both sides so version skew in either dep degrades to a
   // no-op (the strategy's own stderr klaxon still fires) instead of a crash.
   {
     const alarmCapable = strategy as unknown as {
-      setQuarantineAlarmHandler?: (fn: (status: { count: number; keys: string[] }) => void) => void;
+      setQuarantineAlarmHandler?: (fn: (status: QuarantineStatus) => void) => void;
     };
     const notify = (framework as unknown as {
       notifyOps?: (kind: string, agent: string, message: string, data?: Record<string, unknown>) => void;
     }).notifyOps?.bind(framework);
     if (alarmCapable.setQuarantineAlarmHandler && notify) {
       alarmCapable.setQuarantineAlarmHandler((status) => {
-        if (status.count === 0) {
-          // All-clear travels the same channel the alarm did, under a
-          // DISTINCT kind: the alarm kind's 15-min ops cooldown must never
-          // swallow the stand-down (silence after an alarm is ambiguous).
-          notify(
-            'compression-quarantine-clear',
-            agentName,
-            'compression quarantine EMPTY — all debt paid; alarm stands down.',
-            { count: 0 },
-          );
-          return;
-        }
-        notify(
-          'compression-quarantine',
-          agentName,
-          `${status.count} chunk(s) in compression quarantine — spans stay raw and WILL eventually exhaust the context budget. Operator action required (inspect refusing content; branch, pin, or clear).`,
-          { count: status.count, keys: status.keys },
-        );
+        const alert = quarantineAlarm(status);
+        notify(alert.kind, agentName, alert.message, alert.data);
       });
     }
+
+    // A load whose repair dropped summaries holding text → the same channel,
+    // so the agent's keeper hears that its memory changed rather than the
+    // agent noticing first. context-manager hands this any reports from the
+    // loads `create` already ran, then each later one; /healthz reads the
+    // latest from the strategy itself (getLatestLoadRepairReport), and the
+    // Health tab reads /healthz.
+    // Duck-typed as the quarantine alarm is. A conversation fork's strategy
+    // gets no handler, as it gets no quarantine alarm: it opens a namespace
+    // no fork has used before, so its load almost never has anything to
+    // repair.
+    wireLoadRepairAlert(strategy, framework, agentName, storePath);
   }
 
   if (subagentModule) {
@@ -692,6 +774,10 @@ agents: [agentConfig],
 
   if (workspaceModule) {
     workspaceModule.initStore(framework.getStore());
+  }
+
+  if (fleetModule) {
+    fleetModule.setStoreSync(() => framework.getStore().sync());
   }
 
   // Stash the WebUiModule reference on the framework so main() can call
@@ -833,55 +919,13 @@ async function runPiped(app: AppContext) {
   const { createInterface } = await import('node:readline');
   const { handleCommand } = await import('./commands.js');
 
-  let inferenceResolve: (() => void) | null = null;
-
-  app.framework.onTrace((event) => {
-    const e = event as unknown as Record<string, unknown>;
-    switch (event.type) {
-      case 'inference:started':
-        process.stdout.write('\n');
-        break;
-      case 'inference:tokens': {
-        const content = e.content as string;
-        if (content) process.stdout.write(content);
-        break;
-      }
-      case 'inference:completed':
-        process.stdout.write('\n');
-        inferenceResolve?.();
-        inferenceResolve = null;
-        break;
-      case 'inference:failed':
-        console.error(`\nError: ${e.error}`);
-        inferenceResolve?.();
-        inferenceResolve = null;
-        break;
-      case 'inference:tool_calls_yielded': {
-        const calls = e.calls as Array<{ name: string }>;
-        console.log(`\n[tools] ${calls.map(c => c.name).join(', ')}`);
-        break;
-      }
-      case 'tool:started': {
-        const toolInput = e.input ? JSON.stringify(e.input) : '';
-        const truncated = toolInput.length > 120 ? toolInput.slice(0, 120) + '...' : toolInput;
-        console.log(`[tool] ${e.tool}${truncated ? ' ' + truncated : ''}`);
-        break;
-      }
-    }
+  const turns = createPipedTurns(app.agentName, {
+    write: (text) => { process.stdout.write(text); },
+    log: (line) => { console.log(line); },
+    error: (line) => { console.error(line); },
   });
-
-  function waitForInference(): Promise<void> {
-    return new Promise(resolve => {
-      // The timer only caps the wait. Clear it once the inference settles:
-      // a pending 120 s timer held the event loop open, so a batch run sat
-      // for two minutes after `Done.` before the process exited.
-      const timer = setTimeout(() => {
-        if (inferenceResolve === settle) { inferenceResolve = null; resolve(); }
-      }, 120_000);
-      const settle = (): void => { clearTimeout(timer); resolve(); };
-      inferenceResolve = settle;
-    });
-  }
+  const traces = traceFollower((event) => turns.onTrace(event as { type: string; [key: string]: unknown }));
+  traces.follow(app.framework);
 
   async function processLine(line: string): Promise<boolean> {
     const trimmed = line.trim();
@@ -897,7 +941,8 @@ async function runPiped(app: AppContext) {
         }
       }
       if (result.switchToSessionId) {
-        await app.switchSession(result.switchToSessionId);
+        const sessionId = result.switchToSessionId;
+        await switchFollowing(traces, () => app.switchSession(sessionId), () => app.framework);
         console.log('Session switched.');
       }
     } else {
@@ -905,7 +950,7 @@ async function runPiped(app: AppContext) {
         type: 'external-message', source: 'cli',
         content: trimmed, metadata: {}, triggerInference: true,
       });
-      await waitForInference();
+      await turns.waitForTurn();
     }
     return false;
   }
@@ -920,7 +965,7 @@ async function runPiped(app: AppContext) {
     for await (const line of rl) lines.push(line);
     console.log(`Processing ${lines.length} commands...`);
     for (const line of lines) {
-      console.log(`> ${line}`);
+      console.log(`> ${batchEchoLine(line)}`);
       if (await processLine(line)) break;
     }
     console.log('Done.');
@@ -981,21 +1026,26 @@ function countLines(path: string): number {
 // Main
 // ---------------------------------------------------------------------------
 
+/** What a fatal error waits for before exiting: headless mode's log. */
+let beforeFatalExit: (() => Promise<void>) | undefined;
+
 async function main() {
-  const recipe = await resolveRecipe();
-  // The provider is the recipe's. The fork-era LLM_PROVIDER env selector
-  // can no longer work on its own: the openai-compatible endpoint now comes
-  // from agent.baseUrl, which validation only accepts beside
-  // agent.provider "openai-compatible". Fail with the fix instead of a bare
-  // "requires baseURL" from the adapter.
-  if (!recipe.agent.provider && process.env.LLM_PROVIDER === 'openai-compatible') {
-    console.error(
-      'LLM_PROVIDER=openai-compatible is no longer read. Set agent.provider "openai-compatible" and ' +
-      'agent.baseUrl in the recipe, and the key in OPENAI_COMPATIBLE_API_KEY.',
-    );
-    process.exit(1);
+  // The store audit runs in place of a host: it opens the stores of the data
+  // directories given as a start of this release would, and starts no agent.
+  // It exits as soon as what it wrote has gone out, since an extension the
+  // saved recipe names can keep the process alive, as a timer can.
+  if (process.argv[2] === AUDIT_STORES_FLAG) {
+    process.exit(await auditStoresFromEntry(process.argv.slice(3)));
   }
-  const provider = recipe.agent.provider ?? 'anthropic';
+  // First, a fleet child of a host that keeps the children file begins only
+  // once that file lists it (waitToBeListed).
+  await waitToBeListed();
+  // Then, before anything else a host does: a host an install's entry point
+  // started has to be one of that install's releases, or it refuses to start
+  // (releaseHere).
+  installHere = releaseHere();
+  const recipe = await resolveRecipe();
+  const provider = resolveProvider(recipe);
 
   if (provider === 'openrouter' && !config.openrouterApiKey) {
     console.error('Missing OPENROUTER_API_KEY for recipe provider "openrouter".');
@@ -1017,7 +1067,7 @@ async function main() {
   // SettingsModule constructed early so the adapter can read its state for
   // cross-cutting concerns (currently: reasoning). It's wired into the
   // framework's module list inside createFramework().
-  const settingsModule = new SettingsModule();
+  const settingsModule = new SettingsModule(recipe.agent.thinking?.effort);
 
   // Append each LLM request/response/error to a JSONL log per process lifetime
   // (matches the Hermes-era `llm-calls.<iso>.jsonl` visibility). Anthropic mode
@@ -1297,15 +1347,12 @@ async function main() {
   const agentName = resolved.name;
 
   const membrane = new Membrane(adapter, {
-    // Recipe-level retry policy (agent.retry). Without it membrane's default
-    // gives generic retryable errors — e.g. a gateway 502 — zero retries; only
-    // 529/overloaded_error has a dedicated schedule.
-    ...(recipe.agent.retry ? { retry: recipe.agent.retry } : {}),
-    formatter: provider === 'openai-responses' || provider === 'openai-codex'
-      ? new OpenAIResponsesFormatter()
-      : recipe.agent.formatter === 'anthropic-xml'
-        ? new AnthropicXmlFormatter()
-        : new NativeFormatter(),
+    // Recipe-level retry policy (agent.retry) over the host's default, which
+    // retries a 529 as any other retryable failure rather than on membrane's
+    // ten-minute overloaded schedule inside each framework attempt (see
+    // membrane-retry.ts).
+    retry: hostMembraneRetry(recipe.agent.retry),
+    formatter: recipeFormatter(recipe, provider, resolveModel(recipe)),
     // Caching default for internal callers (autobio compression,
     // executeMerge), which read Membrane's defaultPromptCaching rather
     // than the per-agent flag. Applies on EVERY provider whenever the
@@ -1323,6 +1370,20 @@ async function main() {
   });
 
   const storePath = sessionManager.getStorePath(activeSession.id);
+  // On trial, while `current` names another release, the places its fallback
+  // puts back are settled, and the active session's store held to them,
+  // before the framework opens that store, since its open writes in place
+  // like any other: one that reaches past them ends the start having opened
+  // nothing. startFramework audits the rest before the commit.
+  let placesForTrial: string[] | null = null;
+  if (installHere !== null) {
+    const install = installHere;
+    const current = currentForStart(install.root);
+    if (current !== null && current !== install.release) {
+      placesForTrial = placesOnTrial(current, () => trialPlaces(install.root));
+      checkActiveStore(storePath, current, placesForTrial);
+    }
+  }
   // Credential monitor: one named state for the provider credential (spent
   // quota, expiring/expired/rejected token, pending device-code login) and
   // the operator actions that fit it, announced through the ops-alert
@@ -1355,11 +1416,16 @@ async function main() {
     : null;
   credentialsRef = credentials;
   if (credentials && (adapter instanceof LoggingAnthropicAdapter || adapter instanceof LoggingProviderAdapter)) {
-    adapter.onProviderError = (error) => credentials.observeError(error);
+    adapter.onProviderError = (error: unknown) => credentials.observeError(error);
     adapter.onProviderSuccess = () => credentials.observeSuccess();
   }
 
-  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
+  // Loaded once for this start: its framework's modules come from them, and
+  // a trial's audit builds its strategies from them while that framework is
+  // alive, making no register() call of its own. (A fleet child's audit, like
+  // the child itself, is a process of its own, which loads its own.)
+  const extensions = await loadExtensions(recipe);
+  const framework = await createFramework(membrane, storePath, recipe, agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate, extensions);
 
   // (local patch) Optional: separate membrane for compression/summarization.
   // Routes memory-formation LLM calls (L1 mints, merges, their refusal /
@@ -1413,7 +1479,14 @@ async function main() {
       console.warn(`[compression] no agent '${agentName}' to attach the compression membrane to — compression stays on the primary`);
       return;
     }
-    cm.setCompressionMembrane(compressionMembrane);
+    // setCompressionMembrane is a context-manager fork API (not in every
+    // release); without it compression stays on the primary, loudly.
+    const attach = (cm as { setCompressionMembrane?: (m: Membrane) => void }).setCompressionMembrane;
+    if (typeof attach !== 'function') {
+      console.warn('[compression] the installed context-manager has no setCompressionMembrane — compression stays on the primary');
+      return;
+    }
+    attach.call(cm, compressionMembrane);
   };
   attachCompressionMembrane(framework);
 
@@ -1433,22 +1506,34 @@ async function main() {
     subscriptionUnmetered: !!codexGate,
 
     async switchSession(id: string) {
-      handleExport(this);
-      await this.framework.stop();
-      sessionManager.setActiveSession(id);
       const newStorePath = sessionManager.getStorePath(id);
-      // Note: agentName stays as resolved at startup. A per-session
-      // re-resolution would matter only if recipe.agent.name is absent
-      // AND the user switches between imports that used different
-      // --agent values; not the canonical flow.
-      this.framework = await createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate);
-      attachCompressionMembrane(this.framework);
-      this.framework.start();
-      this.userMessageCount = 0;
-      resetBranchState(this.branchState);
-      setupSynesthete(this);
-      setupMcplStderrLog(this, newStorePath);
-      getWebUiModule(this.framework)?.setApp(this);
+      await switchSessionSteps(this, {
+        stopOld: async () => {
+          handleExport(this);
+          await stopForSessionSwitch(this.framework, id);
+        },
+        make: () => {
+          sessionManager.setActiveSession(id);
+          // Note: agentName stays as resolved at startup. A per-session
+          // re-resolution would matter only if recipe.agent.name is absent
+          // AND the user switches between imports that used different
+          // --agent values; not the canonical flow.
+          return createFramework(membrane, newStorePath, recipe, this.agentName, settingsModule, callLedger, quotaMeter, credentials, !!codexGate)
+            .then((next) => { attachCompressionMembrane(next); return next; });
+        },
+        install: async (next) => {
+          this.framework = next;
+          // No install: a switch can't change the release, which the host's own
+          // start committed before any agent ran, so there is nothing to commit.
+          await startFramework(next, null);
+          this.userMessageCount = 0;
+          resetBranchState(this.branchState);
+          setupSynesthete(this);
+          setupMcplStderrLog(this, newStorePath);
+          getWebUiModule(next)?.setApp(this);
+        },
+        stopServer: stopWebUiServer,
+      }, (line) => console.error(`${line} (switching to session ${id})`));
     },
   };
 
@@ -1467,17 +1552,17 @@ async function main() {
       const fw = app.framework as unknown as {
         notifyOpsAlert?: (kind: string, agent: string, msg: string, data?: Record<string, unknown>) => void;
       };
-      fw.notifyOpsAlert?.(
-        'refusal-offpath',
-        app.agentName,
-        `off-path refusal (category=${info.category ?? 'unknown'}) on a ${info.messages}-message ` +
-          `complete() call (~${Math.round(info.inputTokens / 1000)}k tok) — likely compression/summarizer`,
-        { ...info },
-      );
+      const alert = offPathRefusalAlert(info);
+      fw.notifyOpsAlert?.(alert.kind, app.agentName, alert.message, alert.data);
     };
   }
 
-  framework.start();
+  await startFramework(framework, installHere, {
+    dataDir: config.dataDir,
+    activeStore: storePath,
+    extensions,
+    places: () => placesForTrial ?? (installHere === null ? null : trialPlaces(installHere.root)),
+  });
   setupSynesthete(app);
   setupMcplStderrLog(app, storePath);
   getWebUiModule(framework)?.setApp(app);
@@ -1488,13 +1573,26 @@ async function main() {
 
   try {
     if (headless) {
-      const { runHeadless } = await import('./headless.js');
+      const { runHeadless, endHeadlessLog } = await import('./headless.js');
+      beforeFatalExit = endHeadlessLog;
       await runHeadless(app, process.argv.slice(2));
     } else if (noTui) {
       await runPiped(app);
     } else {
       const { runTui } = await import('./tui.js');
-      await runTui(app);
+      try {
+        await runTui(app);
+      } finally {
+        // WebUiModule.stop() leaves the web server up so it serves across
+        // session switches, and it would keep the process running. Once
+        // runTui settles, whether the TUI quit or its setup failed, the host
+        // is ending, so the server ends too. stopWebUiServer calls the
+        // server's stop first, so a throw in what it detaches after that is
+        // logged rather than failing a host whose stop succeeded.
+        await stopWebUiServer().catch((error: unknown) => {
+          console.error(`[webui] the TUI has ended, and closing the Web UI's server failed: ${error instanceof Error ? error.message : String(error)}`);
+        });
+      }
     }
   } finally {
     credentials?.dispose();
@@ -1502,7 +1600,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
+main().catch(async (err) => {
   console.error('Fatal error:', err);
+  // Headless, headless.log may still hold lines written just before the
+  // failure, such as the server's error; exiting at once would drop them.
+  await beforeFatalExit?.();
   process.exit(1);
 });

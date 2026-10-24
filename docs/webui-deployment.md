@@ -80,14 +80,49 @@ The module accepts three credentials:
   not send cached Basic credentials on WebSocket upgrades.
 - **Observer device keys** — Ed25519 grants in `$OBSERVERS_FILE` (default
   `DATA_DIR/observers.json`, hot-reloaded; the agent edits it with its
-  `observers--get/grant/revoke` tools). Once the file holds at least one grant,
-  the static app shell is served without auth and `/ws` accepts upgrades that
-  must then present a signed observer hello. Each observer sees only its
-  grant's scopes — `health`, `ops`, `messages`, `tools`, `thinking`, `debug` —
-  and gets a session cookie for the matching HTTP routes (`debug` for
-  `/debug/*` and `/curve`, `health` for `/healthz` and `/quota`, `messages`
-  for `/media/…`). Observers are read-only; `/files/…` and
-  `/debug/retrieval*` stay password-only.
+  `observers--get/grant/revoke` tools). A grant the viewer can't use, such as
+  one with an unknown scope or an expiry that isn't a date, is left out and
+  named in its log, and the file's other grants still apply; a file that isn't
+  valid JSON leaves a running viewer's previous grants in force until it
+  parses, and a viewer that starts on one admits none until then. A key may be
+  written in either base64 alphabet, padded or not, and is the same key either
+  way. Once the file holds at least one usable grant, the static app shell is
+  served without auth and `/ws` accepts upgrades that must then present a
+  signed observer hello. Removing the file takes every grant in it away within
+  about 6 s, once two checks in a row, 3 s apart, find it gone, and the log
+  says so then: no hello is admitted from it, and the shell needs the password
+  again. Revoking or expiring a grant ends the sessions and open connections
+  it gave within about 3 s, and removing the file ends them when it takes the
+  grants away. An entry the viewer can't use counts as no grant. Narrowing a
+  grant in place narrows its sessions for good, ending one it leaves with
+  none of its scopes, and closes its connections, which connect again with
+  the narrower scopes: a grant widened or given again applies from the
+  observer's next hello. A file back by the second check, as after an editor's
+  save that removes it before writing it again, changes nothing, and a read of
+  the file that fails counts as a check that didn't find it, so a read error
+  that passes changes nothing either. One that lasts two checks ends every
+  observer's sessions and connections, since the viewer can't tell who is
+  granted, and viewers stay off until someone reloads them, even once the file
+  reads again. A file that parses but isn't a grants file, such as one whose
+  `observers` isn't a list, holds no grant the viewer can use: at the check
+  that reads it, every observer's sessions end and their connections close as
+  final, so viewers need reloading once the file is fixed. To cut every
+  observer off, remove the file. A file that doesn't parse at all leaves the
+  grants as they were, since an editor's save can be read half-written. Each
+  observer sees only its grant's scopes — `health`, `ops`, `messages`,
+  `tools`, `thinking`, `debug` — and isn't sent a message whose every part
+  its grant leaves out, such as a tool's call without `tools`. It gets a
+  session cookie for the matching
+  HTTP routes (`debug` for `/debug/*` and `/curve`, `health` for `/healthz`,
+  `/quota` and `/credential`, `messages` for `/media/…`, with `tools` as well
+  for an image a tool returned). An observer with `health` and without `ops`
+  gets health without the text of failures, which are `ops`'s: the words of
+  an error, a failed read or a provider's wait come empty, the credential's
+  message among them, while its numbers, times, names and codes stay, and so
+  does a pending device-code login. The host's mode and its quiesce traces
+  still carry the reason an operator gave for quiescing, an operator's own
+  words. Observers are read-only; `/files/…` and `/debug/retrieval*` stay
+  password-only.
 
 ## Caddy
 
@@ -180,7 +215,7 @@ travel over the WebSocket.
 | `/healthz` | health JSON: gate state, queued work, per-agent status and last inference |
 | `/quota` | subscription quota windows (`{"subscription": false}` on API keys) |
 | `/media/<messageId>/<block>[?agent=]` | one inline transcript image |
-| `/files/<mount>/<path>` | a workspace file, within the mount's read permission |
+| `/files/<mount>/<path>` | a workspace file. `403` for: a path no mount holds or one leading out of its mount; one in another mount's directory nested in it (refused from agent-framework's release with anima-research/agent-framework#460), or reached through a link into one (from the release with anima-research/agent-framework#468); a file that is itself a link, on a mount that doesn't follow links (its `followSymlinks`, off unless the recipe sets it), or one reached through such a link among its directories (refused from agent-framework's release with anima-research/agent-framework#468); and one whose canonical path leaves its mount. `404` for a file the read can't give, such as one in a mount whose directory has gone, until agent-framework's release with anima-research/agent-framework#533. `503` with no workspace, or for a mount the read refuses as unavailable, which from that release includes a mount whose directory has gone |
 | `/curve` | the context-curve page (reads `/debug/context/curve`) |
 | `/debug/context` and `/debug/context/{makeup,coverage,curve,preview,maintenance}` | context debugging — see [`debug-context-api.md`](./debug-context-api.md) |
 | `/debug/retrieval[/view]` | retrieval traces — see [`retrieval-traces.md`](./retrieval-traces.md) |
@@ -215,10 +250,11 @@ emitted if the agent were activated right now** — the compiled messages,
 system prompt, model config, and filtered tool set. Useful for inspecting
 exactly what the model would see.
 
-**Transparent by default.** The endpoint runs no inference, writes no
-messages to Chronicle, and contacts no external MCPL server. It does run the
-same context compile the agent's next turn would, which can persist fold
-state and queue demanded summaries (details in the reference below). The cost
+**Transparent by default.** The endpoint runs no inference of its own, writes no
+messages to Chronicle, and contacts no external MCPL server. It compiles the
+context as the agent's next turn would, but dry, so it commits nothing of that
+compile's beyond releasing a compression hold whose deadline has passed
+(details in the reference below). The cost
 is that it omits the *dynamically-gathered* injections (lessons / retrieval /
 MCPL context), because gathering those is not transparent.
 
@@ -283,9 +319,10 @@ with that pattern.
 - **`/ws` upgrade gets 403 behind a proxy**: the Origin check rejected it.
   Forward the original `Host` header, or list the public origin in
   `allowedOrigins`.
-- **WebUI bundle not found at .../dist/web**: run `bun install` at the
-  package root; the `postinstall` script builds the SPA. For dev, run
-  `bun run build:web` from the package root.
+- **WebUI bundle not found at .../dist/web**: in a checkout, run
+  `bun install` at the repository root, whose `postinstall` script builds
+  the SPA, or `bun run build:web`. The npm package carries the SPA built,
+  so an installed package without it needs reinstalling.
 - **Disconnect banner stuck**: the host process may have crashed. Check
   `journalctl -u connectome-host -n 100` (or the equivalent for your
   init system). The SPA reconnects automatically once the host is back.

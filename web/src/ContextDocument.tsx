@@ -13,7 +13,6 @@
 
 import { createEffect, createSignal, on, For, Show } from 'solid-js';
 import { MediaView } from './Surgery';
-import { displayName } from './display';
 
 /** One compiled message. `sourceMessageId` is the chronicle id when the
  *  entry is a raw message (strategies stamp it); summaries have none. */
@@ -223,7 +222,7 @@ export function ContextDocument(props: {
             const zone = zoneOf(i());
             const firstOfZone = i() === 0 || zoneOf(i() - 1) !== zone;
             const summary = isSummary(m);
-            const who = displayName(m.participant ?? m.role ?? '?');
+            const who = m.participant ?? m.role ?? '?';
             const t = textOf(m.content);
             const kind = kindOf(m.content);
             const images = imagesOf(m.content);

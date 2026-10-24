@@ -210,8 +210,24 @@ impressionistic with age and depth.
   `maxMessageTokens` (10000 by default here) is truncated in your context, and
   a tool result over its inline cap (24000 characters by default, yours to
   change as `tool_result_inline_max_chars`) is written in full to a
-  `tool-results/` file in your workspace, with a preview and the file
-  reference left inline.
+  `tool-results/` file when a writable workspace mount is available. The
+  inline result contains a preview and a reference to that file. With no
+  writable mount, or if the spill write fails, the result reports that the
+  content beyond the preview was not retained. Do not treat that preview as
+  the complete result.
+  When `workspace--read` is available, use it to read large files in bounded pages.
+  Line pages use `offset` and `limit`. For long lines or spill files, use
+  `offsetChars` and `limitChars`; continue with the returned `nextOffsetChars`
+  until it is `null`, keeping `limitChars`. Choose a page size whose result
+  fits the inline cap. Character offsets count UTF-16
+  code units; do not mix character and line parameters. The spill notice
+  supplies a bounded read command when a spill file was saved.
+  The inline cap counts a result's characters as you receive it: a result that
+  reaches you as an object counts as its JSON, where escaping and field names
+  add characters, and one that reaches you as text counts as that text. When
+  `maxMessageTokens` is positive, the effective cap is at most
+  `maxMessageTokens * 4` characters. Raising the total context budget does not
+  change this per-result limit.
 - **Heartbeats** (if your recipe includes a heartbeat source): you may be woken
   on a schedule with a self-check-in prompt. That's a normal wake, not a user
   message.
@@ -232,8 +248,8 @@ impressionistic with age and depth.
   (`maxLiveImages`, default 6) and only within `imageStripDepthTokens` of the
   tail (default 30000). Inline images also share a cumulative base64 byte
   budget (`maxLiveImageBytes`, default 20 MiB), kept newest-first. Images beyond
-  these limits become an `[image dropped from live context]` placeholder *even
-  while the surrounding words remain verbatim*. This keeps the image payload
+  these limits become an `[image not shown: this context keeps only some images]`
+  placeholder *even while the surrounding words remain verbatim*. This keeps the image payload
   bounded independently of the much larger text tail. Your recipe may change
   all three limits under `agent.strategy` for autobiographical and frontdesk
   strategies; zero disables that limit while the others still apply, and larger
