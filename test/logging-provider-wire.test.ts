@@ -17,7 +17,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { OpenAICompatibleAdapter } from '@animalabs/membrane';
 import type { ProviderAdapter, ProviderRequest, ProviderResponse } from '@animalabs/membrane';
-import { LoggingProviderAdapter } from '../src/logging-provider-wrapper.js';
+import { LoggingProviderAdapter, stripInlineMedia } from '../src/logging-provider-wrapper.js';
 
 const BIG_B64 = 'iVBORw0KGgo' + 'A'.repeat(64 * 1024);
 
@@ -139,11 +139,11 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
       const wire = record!.rawRequest;
       expect(wire.model).toBe('gpt-5.1');
       expect(wire.prompt_cache_key).toBe('zz-agent');
-      expect(wire.prompt_cache_retention).toBe('24h');
-      expect(wire.reasoning_effort).toBe('high');
-      expect(wire.reasoning).toBeUndefined();
-      expect(wire.force_think_first).toBeUndefined();
-      expect(wire.tool_choice).toEqual({ type: 'function', function: { name: 'think' } });
+      // The log holds exactly what the endpoint got (base64 stripped).
+      // Which wire fields membrane derives from the request (24h ->
+      // prompt_cache_retention, reasoning effort spelling, a forced think
+      // tool_choice) depends on the membrane release; the logger must not.
+      expect(wire).toEqual(JSON.parse(JSON.stringify(received[0], stripInlineMedia)));
       expect(wire.messages[0]).toEqual({ role: 'system', content: 'zz-system' });
       expect(wire.messages.map((m: { role: string }) => m.role)).toEqual(['system', 'user', 'assistant', 'tool', 'user', 'user']);
       const sentImage = (received[0]!.messages as Array<{ content: unknown }>)[1]!.content as Array<{ image_url?: { url: string } }>;
@@ -155,10 +155,11 @@ describe('LoggingProviderAdapter wire capture (openai-compatible)', () => {
       }
 
       // Small top-level params repeated outside the raw bodies; arrays are not.
-      expect(record!.wireParams).toMatchObject({
-        model: 'gpt-5.1', prompt_cache_key: 'zz-agent', prompt_cache_retention: '24h',
-        reasoning_effort: 'high', tool_choice: { type: 'function', function: { name: 'think' } },
-      });
+      const sent = received[0]!;
+      expect(record!.wireParams).toMatchObject({ model: 'gpt-5.1', prompt_cache_key: 'zz-agent' });
+      for (const key of ['prompt_cache_retention', 'reasoning_effort', 'tool_choice'] as const) {
+        expect(record!.wireParams[key]).toEqual(sent[key]);
+      }
       expect(record!.wireParams.messages).toBeUndefined();
       expect(record!.wireParams.tools).toBeUndefined();
 

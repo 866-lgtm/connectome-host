@@ -105,9 +105,9 @@ export class SettingsModule implements Module {
     // non-Anthropic adapter read it, so a persisted `false` there carries no
     // intent: it is indistinguishable from "never touched". Re-apply the new
     // default once rather than let a dead flag keep reasoning switched off.
+    // Nothing is written here: the next persist() records schemaVersion.
     if (saved && (saved.schemaVersion ?? 1) < SCHEMA_VERSION) {
       this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
-      this.persist();
     }
   }
 
