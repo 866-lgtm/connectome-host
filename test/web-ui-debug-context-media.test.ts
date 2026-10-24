@@ -11,7 +11,7 @@ import {
   WebUiModule,
   stripBase64Media,
   __getSharedServerPortForTests,
-  __resetSharedServerForTests,
+  stopWebUiServer,
 } from '../src/modules/web-ui-module.js';
 
 const BIG_B64 = 'iVBORw0KGgo' + 'A'.repeat(300 * 1024);
@@ -59,6 +59,7 @@ beforeAll(async () => {
       getAllModules: () => [],
       getAgent: (name: string) => (name === 'Agent' ? { name } : undefined),
       previewActivation: async () => structuredClone(request),
+      getRequestToolPresentation: () => null,
       onTrace: () => {},
     },
     sessionManager: { getActiveSession: () => ({ id: 's', name: 's', manuallyNamed: true }) },
@@ -68,7 +69,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await webUiModule.stop();
-  await __resetSharedServerForTests();
+  await stopWebUiServer();
 });
 
 describe('/debug/context?media=0', () => {
