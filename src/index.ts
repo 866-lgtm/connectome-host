@@ -41,7 +41,6 @@ import {
   BedrockAdapter,
   Membrane,
   MockAdapter,
-  NativeFormatter,
   OpenAIResponsesAPIAdapter,
   OpenAICompatibleAdapter,
   OpenRouterAdapter,
@@ -51,6 +50,7 @@ import { recipeFormatter } from './recipe-formatter.js';
 import { CredentialMonitor } from './credential-state.js';
 import { AnthropicOAuthCredentials } from './anthropic-credentials.js';
 import { LoggingProviderAdapter } from './logging-provider-wrapper.js';
+import { buildCompressionMembrane } from './compression-membrane.js';
 import { mockAdapterConfig } from './mock-provider.js';
 import { gateTelemetryHeaders, stampedTrigger, type TurnTrigger } from './gate-telemetry.js';
 import { LoggingBedrockAdapter } from './logging-bedrock-adapter.js';
@@ -1067,7 +1067,12 @@ async function main() {
   // SettingsModule constructed early so the adapter can read its state for
   // cross-cutting concerns (currently: reasoning). It's wired into the
   // framework's module list inside createFramework().
-  const settingsModule = new SettingsModule(recipe.agent.thinking?.effort);
+  // Reasoning starts on for the OpenAI providers: there the switch only strips
+  // the recipe's own `reasoning` param when the agent turns it off (local patch).
+  const settingsModule = new SettingsModule(
+    recipe.agent.thinking?.effort,
+    provider === 'openai-responses' || provider === 'openai-codex' || provider === 'openai-compatible',
+  );
 
   // Append each LLM request/response/error to a JSONL log per process lifetime
   // (matches the Hermes-era `llm-calls.<iso>.jsonl` visibility). Anthropic mode
@@ -1435,6 +1440,8 @@ async function main() {
   // OPENAI_API_KEY when COMPRESSION_OPENAI_API_KEY is unset. The model is the
   // recipe's compressionModel (the strategy puts it on every request). Calls
   // land in the same llm-calls log as the primary's, tagged 'compression'.
+  // It never retries inside a call (retry: false): context-manager's
+  // compression lane owns retries and backoff (credit exhaustion included).
   //
   // Bypasses the framework's auxiliary-admission gate (which wraps only the
   // PRIMARY membrane): compression on another endpoint neither waits for nor
@@ -1443,28 +1450,16 @@ async function main() {
   const compressionCacheKey = process.env.COMPRESSION_PROMPT_CACHE_KEY
     || (recipe.agent.responses?.promptCacheKey ? `${recipe.agent.responses.promptCacheKey}:compression` : undefined);
   const compressionMembrane = process.env.COMPRESSION_OPENAI_BASE_URL
-    ? new Membrane(
-        new LoggingProviderAdapter(
-          new OpenAICompatibleAdapter({
-            baseURL: process.env.COMPRESSION_OPENAI_BASE_URL,
-            apiKey: process.env.COMPRESSION_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY,
-          }),
-          llmLogPath,
-          () => settingsModule.getReasoning(),
-          {
-            tag: 'compression',
-            // Stable cache-routing key so memory-writes (which share the
-            // compression system prompt and recall prefix) land on warm
-            // cache. COMPRESSION_PROMPT_CACHE_KEY overrides; default derives
-            // from the recipe's main key.
-            ...(compressionCacheKey ? { defaultExtra: { prompt_cache_key: compressionCacheKey } } : {}),
-          },
-        ),
-        {
-          formatter: new NativeFormatter(),
-          assistantParticipant: agentName,
-        },
-      )
+    ? buildCompressionMembrane({
+        baseURL: process.env.COMPRESSION_OPENAI_BASE_URL,
+        apiKey: process.env.COMPRESSION_OPENAI_API_KEY ?? process.env.OPENAI_API_KEY,
+        assistantParticipant: agentName,
+        llmLogPath,
+        getReasoning: () => settingsModule.getReasoning(),
+        // Stable cache-routing key so memory-writes (which share the
+        // compression system prompt and recall prefix) land on warm cache.
+        promptCacheKey: compressionCacheKey,
+      })
     : null;
   if (compressionMembrane) {
     console.log(`[compression] Using separate endpoint: ${process.env.COMPRESSION_OPENAI_BASE_URL}`);

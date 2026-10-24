@@ -73,15 +73,14 @@ export interface SettingsState {
   schemaVersion?: number;
 }
 
-/** v2 (2026-07-25): reasoning defaults ON. It was `false` while only the
- *  Anthropic adapter honored it; the openai-compatible path now honors it too
- *  (see LoggingProviderAdapter), and this deployment runs a reasoning model in
- *  a tool-heavy environment where thinking is the default-correct state. */
+/** v2: `enabled` can default ON (the host's `initialEnabled`, given for the
+ *  OpenAI providers, whose wrappers now honour the switch). State written
+ *  before v2 under a default-on host carries no intent in a persisted `false`:
+ *  nothing on those paths read it. */
 const SCHEMA_VERSION = 2;
 
 const DEFAULTS: SettingsState = {
-  reasoning: { enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'default' },
-  schemaVersion: SCHEMA_VERSION,
+  reasoning: { enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'default' },
 };
 
 export class SettingsModule implements Module {
@@ -91,23 +90,29 @@ export class SettingsModule implements Module {
   private state: SettingsState = clone(DEFAULTS);
   private effortOverride: ReasoningEffort | undefined;
 
-  constructor(private readonly initialEffort: ReasoningEffort = 'default') {
+  constructor(
+    private readonly initialEffort: ReasoningEffort = 'default',
+    /** Whether reasoning starts enabled for a session with no saved choice.
+     *  The host passes true on the OpenAI providers, where the switch only
+     *  strips the recipe's own `reasoning` param when turned off. */
+    private readonly initialEnabled = false,
+  ) {
     this.state.reasoning.effort = initialEffort;
+    this.state.reasoning.enabled = initialEnabled;
   }
 
   async start(ctx: ModuleContext): Promise<void> {
     this.ctx = ctx;
     const saved = ctx.getState<{ reasoning?: unknown; schemaVersion?: number }>();
-    const baseline = { ...DEFAULTS.reasoning, effort: this.initialEffort };
-    this.state = { reasoning: restoreReasoning(saved?.reasoning, baseline), schemaVersion: SCHEMA_VERSION };
+    const baseline = { ...DEFAULTS.reasoning, enabled: this.initialEnabled, effort: this.initialEffort };
+    this.state = { reasoning: restoreReasoning(saved?.reasoning, baseline) };
     this.effortOverride = savedEffortOverride(saved?.reasoning);
-    // Pre-v2 state was written while the default was `enabled: false` and no
-    // non-Anthropic adapter read it, so a persisted `false` there carries no
-    // intent: it is indistinguishable from "never touched". Re-apply the new
-    // default once rather than let a dead flag keep reasoning switched off.
-    // Nothing is written here: the next persist() records schemaVersion.
-    if (saved && (saved.schemaVersion ?? 1) < SCHEMA_VERSION) {
-      this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
+    // On a default-on host, a pre-v2 persisted `false` is indistinguishable
+    // from "never touched" (no OpenAI-path wrapper read it), so the default
+    // applies once. Nothing is written here: the next persist() records
+    // schemaVersion, after which a saved `false` is the agent's choice.
+    if (this.initialEnabled && saved && (saved.schemaVersion ?? 1) < SCHEMA_VERSION) {
+      this.state.reasoning.enabled = true;
     }
   }
 
@@ -240,7 +245,7 @@ export class SettingsModule implements Module {
       reset: (_agentName, keys) => {
         const all = !keys || keys.length === 0;
         if (all || keys?.includes('reasoning_enabled')) {
-          this.state.reasoning.enabled = DEFAULTS.reasoning.enabled;
+          this.state.reasoning.enabled = this.initialEnabled;
         }
         if (all || keys?.includes('reasoning_budget_tokens')) {
           this.state.reasoning.budgetTokens = DEFAULTS.reasoning.budgetTokens;
@@ -262,7 +267,7 @@ export class SettingsModule implements Module {
   private persist(): void {
     const { effort: _effort, ...reasoning } = this.state.reasoning;
     this.ctx?.setState({
-      schemaVersion: SCHEMA_VERSION,
+      ...(this.initialEnabled ? { schemaVersion: SCHEMA_VERSION } : {}),
       reasoning: {
         ...reasoning,
         ...(this.effortOverride === undefined ? {} : { effort: this.effortOverride, effortExplicit: true }),

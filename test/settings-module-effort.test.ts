@@ -17,7 +17,7 @@ describe('SettingsModule reasoning_effort', () => {
     expect(new SettingsModule('medium').getReasoning().effort).toBe('medium');
     const { mod } = await started(undefined, 'medium');
     expect(mod.getReasoning()).toEqual({
-      enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'medium',
+      enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'medium',
     });
   });
 
@@ -40,12 +40,11 @@ describe('SettingsModule reasoning_effort', () => {
       setState: (s: unknown) => { destinationSettings = JSON.parse(JSON.stringify(s)); },
     } as unknown as ModuleContext);
     expect(mod.getReasoning()).toEqual({
-      enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'medium',
+      enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'medium',
     });
     ext.update('a', { reasoning_effort: 'low' });
     expect(destinationSettings).toEqual({
-      schemaVersion: 2,
-      reasoning: { enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'low', effortExplicit: true },
+      reasoning: { enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'low', effortExplicit: true },
     });
     expect(persisted()).toEqual(previousSettings);
   });
@@ -137,7 +136,7 @@ describe('recipe effort baseline and explicit override across restarts', () => {
     first.ext.update('a', { reasoning_effort: 'max', reasoning_enabled: true });
     expect(first.ext.reset('a').reasoning_effort).toBe('medium');
     expect((await started(first.persisted(), 'low')).mod.getReasoning()).toEqual({
-      enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'low',
+      enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'low',
     });
   });
 
@@ -146,7 +145,7 @@ describe('recipe effort baseline and explicit override across restarts', () => {
       enabled: 'yes', budgetTokens: 'lots', display: 'full', effort: 'invalid', effortExplicit: true,
     } }, 'medium');
     expect(first.mod.getReasoning()).toEqual({
-      enabled: true, budgetTokens: 8192, display: 'summarized', effort: 'medium',
+      enabled: false, budgetTokens: 8192, display: 'summarized', effort: 'medium',
     });
     for (const marker of [false, 'true', 1]) {
       expect((await started({ reasoning: { effort: 'default', effortExplicit: marker } }, 'medium')).mod.getReasoning().effort).toBe('medium');
