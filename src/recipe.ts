@@ -1660,7 +1660,7 @@ const RECIPE_AGENT_KEYS = [
   'systemPrompt', 'maxTokens', 'maxStreamTokens', 'contextBudgetTokens', 'cacheTtl',
   'cacheKeepalive', 'promptCaching', 'sameRoundThinkTextPolicy', 'proseRouting',
   'toolWrapperProseGuard', 'anthropicBetas', 'strategy', 'thinking', 'responses', 'codex', 'mock',
-  'refusalHandling', 'homeChannel',
+  'refusalHandling', 'homeChannel', 'toolPresentation',
 ] as const;
 const RECIPE_AGENT_MOCK_KEYS = [
   'echoMode', 'defaultResponse', 'completeDelayMs', 'streamChunkDelayMs', 'streamChunkSize',
